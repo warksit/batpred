@@ -478,6 +478,8 @@ class Prediction:
         first_charge = end_record
         export_to_first_charge = 0
         clipped_today = 0
+        battery_grid_kwh = 0.0
+        battery_grid_cost = 0.0
         predict_soc = {}
         car_charging_soc_next = self.car_charging_soc_next[:]
         iboost_next = self.iboost_next
@@ -966,6 +968,29 @@ class Prediction:
                 soc = min(soc - battery_draw * battery_loss, soc_max)
             soc = round(soc, 6)
 
+            # LIFO battery cost tracking - track grid vs solar energy in battery
+            soc_change = soc - prev_soc
+            if soc_change > 0:
+                # Battery charged - determine grid vs solar fraction
+                if battery_state in ("e+", "f/"):
+                    grid_fraction = 0.0
+                else:
+                    charge_draw = abs(battery_draw)
+                    grid_fraction = max(1.0 - pv_dc / charge_draw, 0.0) if charge_draw > 0 else 0.0
+                grid_soc_added = soc_change * grid_fraction
+                battery_grid_kwh = min(battery_grid_kwh + grid_soc_added, soc)
+                if grid_soc_added > 0 and battery_loss > 0:
+                    battery_grid_cost += grid_soc_added / battery_loss * import_rate
+            elif soc_change < 0:
+                # Battery discharged - LIFO: solar leaves first, then grid
+                discharged = -soc_change
+                solar_in_battery = max(prev_soc - battery_grid_kwh, 0)
+                if discharged > solar_in_battery and battery_grid_kwh > 0:
+                    grid_removed = min(discharged - solar_in_battery, battery_grid_kwh)
+                    avg_cost = battery_grid_cost / battery_grid_kwh
+                    battery_grid_cost = max(battery_grid_cost - grid_removed * avg_cost, 0)
+                    battery_grid_kwh = max(battery_grid_kwh - grid_removed, 0)
+
             # Iboost finally count
             if self.iboost_enable:
                 # iBoost Solar diversion model
@@ -1029,6 +1054,17 @@ class Prediction:
                     carbon_g -= energy * carbon_intensity.get(minute, 0)
 
                 metric -= export_rate * energy
+
+                # Solar displacement penalty - penalise exporting solar below the cost
+                # of grid energy occupying battery capacity that solar could have filled
+                if energy > 0 and battery_grid_kwh > 0 and not export_window_active:
+                    avg_grid_rate = battery_grid_cost / battery_grid_kwh
+                    if avg_grid_rate > export_rate:
+                        displaced = min(energy, battery_grid_kwh)
+                        metric += avg_grid_rate * displaced
+                        battery_grid_cost = max(battery_grid_cost - displaced * avg_grid_rate, 0)
+                        battery_grid_kwh = max(battery_grid_kwh - displaced, 0)
+
                 if diff != 0:
                     grid_state = ">"
                 else:
