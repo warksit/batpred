@@ -2334,4 +2334,191 @@ def run_execute_tests(my_predbat):
     if failed:
         return failed
 
+    failed |= run_universal_execute_tests(my_predbat)
+    return failed
+
+
+# ============================================================================
+# Universal Execute Scenarios
+# ============================================================================
+
+# Each scenario is a dict with:
+#   name      - test name suffix
+#   inputs    - kwargs passed to run_execute_test
+#   profiles  - dict of profile_name → extra kwargs (overrides/additions)
+#
+# Each profile defines the inverter capability flags and any assertion overrides.
+# Scenarios only listed in profiles they're validated for.
+
+
+def run_universal_execute_tests(my_predbat):
+    """Run universal execute scenarios for each inverter profile."""
+    print("**** Running Universal Execute Tests ****\n")
+
+    # Set up 2 ActiveTestInverters (same as run_execute_tests)
+    inverters = [ActiveTestInverter(0, 0, 10.0, my_predbat.now_utc), ActiveTestInverter(1, 0, 10.0, my_predbat.now_utc)]
+    my_predbat.inverters = inverters
+    my_predbat.args["num_inverters"] = 2
+
+    failed = False
+
+    CW = [{"start": my_predbat.minutes_now, "end": my_predbat.minutes_now + 60, "average": 1}]
+    CL = [10]  # 10 kWh = 100% of 10 kWh max
+    CL_FRZ = [1]  # freeze threshold
+    CL_HOLD = [5]  # 5 kWh = 50%
+    EW = [{"start": my_predbat.minutes_now, "end": my_predbat.minutes_now + 60, "average": 1}]
+    EL = [0]
+    EL_FRZ = [99]
+
+    # Profile capability flags
+    GE = {"has_target_soc": True, "has_timed_pause": True, "has_charge_enable_time": True}
+    # SIG profiles will be added once SIG control PR (soc_limits_block_solar flag) is merged
+
+    scenarios = [
+        # --- Demand ---
+        {
+            "name": "demand",
+            "inputs": {"set_charge_window": True, "set_export_window": True, "soc_kw": 5},
+            "profiles": {
+                "GE": {**GE, "assert_status": "Demand"},
+                # SIG_main: skipped until SIG control PR (soc_limits_block_solar flag)
+            },
+        },
+        # --- Charging ---
+        {
+            "name": "charging",
+            "inputs": {
+                "charge_window_best": CW,
+                "charge_limit_best": CL,
+                "set_charge_window": True,
+                "set_export_window": True,
+                "soc_kw": 0,
+            },
+            "profiles": {
+                "GE": {
+                    **GE,
+                    "assert_status": "Charging",
+                    "assert_charge_time_enable": True,
+                    "assert_charge_start_time_minutes": -1,
+                    "assert_charge_end_time_minutes": my_predbat.minutes_now + 60,
+                },
+            },
+        },
+        # --- Freeze charge ---
+        {
+            "name": "freeze_charge",
+            "inputs": {
+                "charge_window_best": CW,
+                "charge_limit_best": CL_FRZ,
+                "set_charge_window": True,
+                "set_export_window": True,
+                "soc_kw": 10,
+            },
+            "profiles": {
+                "GE": {
+                    **GE,
+                    "assert_status": "Freeze charging",
+                    "assert_pause_discharge": True,
+                    "assert_soc_target": 100,
+                    "assert_immediate_soc_target": 100,
+                },
+            },
+        },
+        # --- Hold charge ---
+        {
+            "name": "hold_charge",
+            "inputs": {
+                "charge_window_best": CW,
+                "charge_limit_best": CL_HOLD,
+                "set_charge_window": True,
+                "set_export_window": True,
+                "soc_kw": 5,
+            },
+            "profiles": {
+                "GE": {
+                    **GE,
+                    "assert_status": "Hold charging",
+                    "assert_pause_discharge": True,
+                    "assert_discharge_rate": 1000,
+                    "assert_reserve": 0,
+                    "assert_immediate_soc_target": 50,
+                },
+            },
+        },
+        # --- Exporting ---
+        {
+            "name": "exporting",
+            "inputs": {
+                "export_window_best": EW,
+                "export_limits_best": EL,
+                "set_charge_window": True,
+                "set_export_window": True,
+                "soc_kw": 10,
+            },
+            "profiles": {
+                "GE": {
+                    **GE,
+                    "assert_status": "Exporting",
+                    "assert_force_export": True,
+                    "assert_immediate_soc_target": 0,
+                    "assert_discharge_start_time_minutes": -1,
+                    "assert_discharge_end_time_minutes": my_predbat.minutes_now + 60 + 1,
+                },
+            },
+        },
+        # --- Freeze export ---
+        {
+            "name": "freeze_export",
+            "inputs": {
+                "export_window_best": EW,
+                "export_limits_best": EL_FRZ,
+                "set_charge_window": True,
+                "set_export_window": True,
+                "soc_kw": 9,
+            },
+            "profiles": {
+                "GE": {
+                    **GE,
+                    "assert_status": "Freeze exporting",
+                    "assert_pause_charge": True,
+                    "assert_immediate_soc_target": 90,
+                },
+            },
+        },
+        # --- No discharge during charge ---
+        {
+            "name": "no_discharge_during_charge",
+            "inputs": {
+                "charge_window_best": CW,
+                "charge_limit_best": CL,
+                "set_charge_window": True,
+                "set_export_window": True,
+                "soc_kw": 0,
+                "set_discharge_during_charge": False,
+            },
+            "profiles": {
+                "GE": {
+                    **GE,
+                    "assert_status": "Charging",
+                    "assert_charge_time_enable": True,
+                    "assert_charge_start_time_minutes": -1,
+                    "assert_charge_end_time_minutes": my_predbat.minutes_now + 60,
+                    "assert_pause_discharge": True,
+                },
+            },
+        },
+    ]
+
+    for scenario in scenarios:
+        for profile_name, profile_kwargs in scenario["profiles"].items():
+            test_name = "universal_{}_{}".format(profile_name, scenario["name"])
+
+            all_kwargs = {}
+            all_kwargs.update(scenario["inputs"])
+            all_kwargs.update(profile_kwargs)
+
+            failed |= run_execute_test(my_predbat, test_name, **all_kwargs)
+            if failed:
+                return failed
+
     return failed

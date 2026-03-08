@@ -1972,4 +1972,275 @@ charge_start_service:
         return failed
 
     failed |= test_inverter_self_test("self_test1", my_predbat)
+    if failed:
+        return failed
+
+    failed |= run_mode_table_tests(my_predbat, ha, inv, dummy_items)
+    return failed
+
+
+# ============================================================================
+# Mode Table Test Infrastructure
+# ============================================================================
+
+# Shared mode definitions — universal for all inverter types.
+# Each mode describes:
+#   soc_percent  - the inverter's current SoC before the action
+#   setup        - calls execute.py makes before the immediate call
+#   action       - the adjust_*_immediate call
+INVERTER_MODES = {
+    "active_charge": {
+        "soc_percent": 30,
+        "setup": [
+            ("adjust_battery_target", {"soc": 50, "isCharging": True}),
+        ],
+        "action": ("adjust_charge_immediate", {"target_soc": 50, "freeze": False}),
+    },
+    "demand_charge": {
+        "soc_percent": 30,
+        "setup": [
+            ("adjust_battery_target", {"soc": 100, "isCharging": False}),
+        ],
+        "action": ("adjust_charge_immediate", {"target_soc": 0, "freeze": False}),
+    },
+    "freeze_charge": {
+        "soc_percent": 50,
+        "setup": [
+            ("adjust_battery_target", {"soc": 100, "isCharging": True}),
+            ("adjust_reserve", {"reserve": 50}),
+        ],
+        "action": ("adjust_charge_immediate", {"target_soc": 50, "freeze": True}),
+    },
+    "hold_charge": {
+        "soc_percent": 30,
+        "setup": [
+            ("adjust_battery_target", {"soc": 100, "isCharging": True}),
+            ("adjust_reserve", {"reserve": 30}),
+        ],
+        "action": ("adjust_charge_immediate", {"target_soc": 30, "freeze": False}),
+    },
+    "active_export": {
+        "soc_percent": 80,
+        "setup": [
+            ("adjust_battery_target", {"soc": 100, "isExporting": True}),
+        ],
+        "action": ("adjust_export_immediate", {"target_soc": 50, "freeze": False}),
+    },
+    "demand_export": {
+        "soc_percent": 80,
+        "setup": [
+            ("adjust_battery_target", {"soc": 100, "isExporting": False}),
+        ],
+        "action": ("adjust_export_immediate", {"target_soc": 100, "freeze": False}),
+    },
+    "freeze_export": {
+        "soc_percent": 80,
+        "setup": [
+            ("adjust_battery_target", {"soc": 80, "isExporting": True}),
+        ],
+        "action": ("adjust_export_immediate", {"target_soc": 50, "freeze": True}),
+    },
+}
+
+# GE expected service calls per mode.
+# Each entry lists (service_name, required_params) in call order.
+GE_EXPECTATIONS = {
+    "skip": False,
+    "expected": {
+        "active_charge": [
+            ("discharge_stop", {"device_id": "DID0"}),
+            ("charge_start", {"device_id": "DID0", "target_soc": 50}),
+        ],
+        "demand_charge": [
+            ("charge_stop", {"device_id": "DID0"}),
+        ],
+        "freeze_charge": [
+            ("discharge_stop", {"device_id": "DID0"}),
+            ("charge_freeze", {"device_id": "DID0", "target_soc": 50}),
+        ],
+        "hold_charge": [
+            ("discharge_stop", {"device_id": "DID0"}),
+            ("charge_freeze", {"device_id": "DID0", "target_soc": 30}),
+        ],
+        "active_export": [
+            ("charge_stop", {"device_id": "DID0"}),
+            ("discharge_start", {"device_id": "DID0", "target_soc": 50}),
+        ],
+        "demand_export": [
+            ("discharge_stop", {"device_id": "DID0"}),
+        ],
+        "freeze_export": [
+            ("charge_stop", {"device_id": "DID0"}),
+            ("discharge_freeze", {"device_id": "DID0", "target_soc": 50}),
+        ],
+    },
+}
+
+# SIG expected entity values per mode.
+# Skipped on main — requires SIG control PR (soc_limits_block_solar flag).
+SIG_EXPECTATIONS = {
+    "skip": True,
+    "skip_reason": "SIG control PR (soc_limits_block_solar flag)",
+    "expected": {},
+}
+
+# Transition sequences — detect state-leak bugs (e.g. discharge_cut_off_soc not reset after freeze charge).
+GE_TRANSITIONS = [
+    {
+        "name": "freeze_charge_to_demand",
+        "steps": ["freeze_charge", "demand_charge"],
+        "expected": [
+            ("charge_stop", {"device_id": "DID0"}),
+        ],
+    },
+    {
+        "name": "active_charge_to_demand",
+        "steps": ["active_charge", "demand_charge"],
+        "expected": [
+            ("charge_stop", {"device_id": "DID0"}),
+        ],
+    },
+    {
+        "name": "freeze_export_to_demand",
+        "steps": ["freeze_export", "demand_export"],
+        "expected": [
+            ("discharge_stop", {"device_id": "DID0"}),
+        ],
+    },
+    {
+        "name": "charge_to_export",
+        "steps": ["active_charge", "active_export"],
+        "expected": [
+            ("charge_stop", {"device_id": "DID0"}),
+            ("discharge_start", {"device_id": "DID0", "target_soc": 50}),
+        ],
+    },
+    {
+        "name": "export_to_charge",
+        "steps": ["active_export", "active_charge"],
+        "expected": [
+            ("discharge_stop", {"device_id": "DID0"}),
+            ("charge_start", {"device_id": "DID0", "target_soc": 50}),
+        ],
+    },
+]
+
+
+def verify_service_calls(test_name, expected_calls, ha):
+    """Verify that service calls match expected sequence (name + key params)."""
+    failed = False
+    actual_calls = ha.get_service_store()
+
+    if len(actual_calls) != len(expected_calls):
+        print("ERROR: {} expected {} service calls, got {} - expected {} got {}".format(test_name, len(expected_calls), len(actual_calls), expected_calls, actual_calls))
+        return True
+
+    for i, (exp_service, exp_params) in enumerate(expected_calls):
+        actual_service, actual_params = actual_calls[i]
+        if actual_service != exp_service:
+            print("ERROR: {} call {} service should be '{}' got '{}'".format(test_name, i, exp_service, actual_service))
+            failed = True
+        for key, val in exp_params.items():
+            if key not in actual_params or actual_params[key] != val:
+                print("ERROR: {} call {} param '{}' should be {} got {}".format(test_name, i, key, val, actual_params.get(key, "<missing>")))
+                failed = True
+
+    return failed
+
+
+def run_single_mode(inv, ha, my_predbat, dummy_items, mode_name, reset_entities=True):
+    """Execute a single mode on the inverter: setup calls then immediate action."""
+    mode_def = INVERTER_MODES[mode_name]
+
+    # Ensure non-REST mode (previous tests may have set rest_data)
+    inv.rest_data = None
+    inv.rest_api = None
+
+    # Ensure service args are set (previous tests may have cleared them)
+    my_predbat.args["charge_start_service"] = "charge_start"
+    my_predbat.args["charge_stop_service"] = "charge_stop"
+    my_predbat.args["charge_freeze_service"] = "charge_freeze"
+    my_predbat.args["discharge_start_service"] = "discharge_start"
+    my_predbat.args["discharge_stop_service"] = "discharge_stop"
+    my_predbat.args["discharge_freeze_service"] = "discharge_freeze"
+    my_predbat.args["device_id"] = "DID0"
+
+    # Set inverter SoC for this mode
+    inv.soc_percent = mode_def["soc_percent"]
+    inv.reserve_percent = 4
+    inv.reserve_max = 100
+
+    if reset_entities:
+        # Reset entities to avoid no-change skip in adjust_battery_target/adjust_reserve
+        dummy_items["number.charge_limit"] = 0
+        dummy_items["number.reserve"] = 0
+
+    # Run setup calls (what execute.py does before the immediate call)
+    for method_name, kwargs in mode_def["setup"]:
+        getattr(inv, method_name)(**kwargs)
+
+    # Clear service store — we only verify the immediate call's services
+    ha.service_store = []
+    my_predbat.last_service_hash = {}
+
+    # Run the immediate action
+    action_method, action_kwargs = mode_def["action"]
+    getattr(inv, action_method)(**action_kwargs)
+
+
+def run_mode_table_tests(my_predbat, ha, inv, dummy_items):
+    """Run mode table tests for all configured inverter types."""
+    failed = False
+
+    print("**** Running Mode Table Tests ****")
+
+    mode_tables = {
+        "GE": GE_EXPECTATIONS,
+        "SIG": SIG_EXPECTATIONS,
+    }
+
+    for type_name, expectations in mode_tables.items():
+        if expectations.get("skip"):
+            print("SKIP: {} mode table tests ({})".format(type_name, expectations.get("skip_reason", "")))
+            continue
+
+        # Per-mode tests
+        for mode_name in INVERTER_MODES:
+            test_name = "mode_table_{}_{}".format(type_name, mode_name)
+            print("**** Running Test: {} ****".format(test_name))
+
+            ha.service_store_enable = True
+            ha.service_store = []
+            my_predbat.last_service_hash = {}
+
+            run_single_mode(inv, ha, my_predbat, dummy_items, mode_name)
+
+            expected = expectations["expected"][mode_name]
+            failed |= verify_service_calls(test_name, expected, ha)
+
+        if failed:
+            ha.service_store_enable = False
+            return failed
+
+        # Transition tests
+        transitions = GE_TRANSITIONS if type_name == "GE" else []
+        for transition in transitions:
+            test_name = "mode_table_{}_transition_{}".format(type_name, transition["name"])
+            print("**** Running Test: {} ****".format(test_name))
+
+            ha.service_store_enable = True
+
+            for step_name in transition["steps"]:
+                ha.service_store = []
+                my_predbat.last_service_hash = {}
+                run_single_mode(inv, ha, my_predbat, dummy_items, step_name)
+
+            # Verify only the last step's service calls
+            failed |= verify_service_calls(test_name, transition["expected"], ha)
+
+        if failed:
+            ha.service_store_enable = False
+            return failed
+
+    ha.service_store_enable = False
     return failed
