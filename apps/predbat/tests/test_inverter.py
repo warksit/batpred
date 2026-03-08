@@ -2024,4 +2024,7 @@ charge_start_service:
         return failed
 
     failed |= test_inverter_self_test("self_test1", my_predbat)
+    if failed:
+        return failed
+
     return failed
