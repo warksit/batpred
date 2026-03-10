@@ -426,6 +426,18 @@ CONFIG_ITEMS = [
         "default": 0,
     },
     {
+        "name": "best_soc_keep_solar_offset",
+        "friendly_name": "Best SOC Keep Solar Offset",
+        "type": "input_number",
+        "min": 0,
+        "max": 10,
+        "step": 0.5,
+        "unit": "kWh",
+        "icon": "mdi:battery-minus-outline",
+        "enable": "expert_mode",
+        "default": 0,
+    },
+    {
         "name": "metric_battery_value_scaling",
         "friendly_name": "Metric Battery Value Scaling",
         "type": "input_number",

@@ -497,6 +497,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
         self.octopus_saving_slots = []
         self.car_charging_slots = []
         self.reserve = 0
+        self.best_soc_keep_solar_offset = 0.0
         self.reserve_current = 0
         self.battery_loss = 1.0
         self.battery_loss_discharge = 1.0
