@@ -1823,8 +1823,8 @@ INVERTER_DEF = {
         "charge_control_immediate": True,
         "has_charge_enable_time": False,
         "has_discharge_enable_time": False,
-        "has_target_soc": False,
-        "has_reserve_soc": False,
+        "has_target_soc": True,
+        "has_reserve_soc": True,
         "has_timed_pause": False,
         "charge_time_format": "S",
         "charge_time_entity_is_option": False,
@@ -1842,6 +1842,7 @@ INVERTER_DEF = {
         "can_span_midnight": True,
         "charge_discharge_with_rate": False,
         "target_soc_used_for_discharge": True,
+        "soc_limits_block_solar": True,
     },
     "FoxESS": {
         "name": "FoxESS",
