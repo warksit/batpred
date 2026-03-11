@@ -174,7 +174,6 @@ class TestHAInterface:
         print("Calling service: {} {}".format(service, kwargs))
         if self.service_store_enable:
             self.service_store.append([service, kwargs])
-            return None
 
         if service == "number/set_value":
             entity_id = kwargs.get("entity_id", None)

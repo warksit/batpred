@@ -29,7 +29,7 @@ def run_inverter_integration_tests(my_predbat_dummy):
     ha = my_predbat.ha_interface
 
     time_now = my_predbat.now_utc.strftime("%Y-%m-%dT%H:%M:%S%z")
-    dummy_items = {
+    base_dummy_items = {
         "number.charge_rate": 1100,
         "number.discharge_rate": 1500,
         "number.charge_rate_percent": 100,
@@ -59,20 +59,12 @@ def run_inverter_integration_tests(my_predbat_dummy):
         "number.discharge_target_soc": 4,
         "switch.inverter_button": False,
     }
-    my_predbat.ha_interface.dummy_items = dummy_items
+
     my_predbat.args["auto_restart"] = [{"service": "switch/turn_on", "entity_id": "switch.restart"}]
     my_predbat.args["givtcp_rest"] = None
-    my_predbat.args["inverter_type"] = ["GE"]
     my_predbat.args["schedule_write_button"] = "switch.inverter_button"
-    for entity_id in dummy_items.keys():
-        arg_name = entity_id.split(".")[1]
-        my_predbat.args[arg_name] = entity_id
 
-    # Create the inverter with dummy sleep to avoid real sleeps in write_and_poll retries
     from inverter import Inverter
-
-    inv = Inverter(my_predbat, 0)
-    inv.sleep = lambda seconds: None
 
     failed = False
     print("**** Running Inverter Integration Tests ****")
@@ -86,6 +78,28 @@ def run_inverter_integration_tests(my_predbat_dummy):
 
         expectations = definition["mode_expectations"]
         transitions = definition.get("transitions", [])
+        inverter_type = definition.get("inverter_type", "GE")
+
+        # Build dummy_items for this inverter type
+        dummy_items = dict(base_dummy_items)
+        dummy_items.update(definition.get("extra_entities", {}))
+
+        ha.dummy_items = dummy_items
+        my_predbat.ha_interface.dummy_items = dummy_items
+
+        # Set inverter type and configure args
+        my_predbat.args["inverter_type"] = [inverter_type]
+        for entity_id in dummy_items.keys():
+            arg_name = entity_id.split(".")[1]
+            my_predbat.args[arg_name] = entity_id
+
+        # Add extra args (entity mappings not derivable from dummy_items keys)
+        for arg_name, arg_value in definition.get("extra_args", {}).items():
+            my_predbat.args[arg_name] = arg_value
+
+        # Create fresh inverter for this type
+        inv = Inverter(my_predbat, 0)
+        inv.sleep = lambda seconds: None
 
         # Per-mode tests
         for mode_name in INVERTER_MODES:
