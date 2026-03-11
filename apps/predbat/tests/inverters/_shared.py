@@ -111,6 +111,15 @@ def run_single_mode(inv, ha, my_predbat, dummy_items, mode_name, reset_entities=
         # Reset entities to avoid no-change skip in adjust_battery_target/adjust_reserve
         dummy_items["number.charge_limit"] = 0
         dummy_items["number.reserve"] = 0
+        # Reset EMS entities for SIG (ensure writes are always captured)
+        if "select.inverter_mode" in dummy_items:
+            dummy_items["select.inverter_mode"] = "__reset__"
+        if "number.sig_discharge_cut_off_soc" in dummy_items:
+            dummy_items["number.sig_discharge_cut_off_soc"] = -1
+        if "number.charge_rate" in dummy_items:
+            dummy_items["number.charge_rate"] = 99999
+        if "number.discharge_rate" in dummy_items:
+            dummy_items["number.discharge_rate"] = 99999
 
     # Run setup calls (what execute.py does before the immediate call)
     for method_name, kwargs in mode_def["setup"]:

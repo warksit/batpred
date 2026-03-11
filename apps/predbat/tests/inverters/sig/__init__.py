@@ -10,8 +10,8 @@ DISCHARGE_ESS_FIRST = "Command Discharging (ESS First)"
 STANDBY = "Standby"
 
 # Default test values
-MAX_CHARGE_RATE = 1100  # matches dummy_items charge_rate
-MAX_DISCHARGE_RATE = 1500  # matches dummy_items discharge_rate
+MAX_CHARGE_RATE = 2600  # battery_rate_max_charge * MINUTE_WATT (from battery_rate_max_raw default)
+MAX_DISCHARGE_RATE = 2600  # battery_rate_max_discharge * MINUTE_WATT
 RESERVE = 4  # matches inv.reserve_percent default
 
 # Extra entities SIG needs beyond the shared set
@@ -55,14 +55,14 @@ DEFINITION = {
             ("number/set_value", {"entity_id": "number.discharge_rate", "value": MAX_DISCHARGE_RATE}),
         ],
         # hold_charge: MSC, rates=max, floor=reserve
-        # (charge_limit=soc% is set by adjust_battery_target in setup, not by immediate call)
+        # (charge_limit=soc% set by adjust_battery_target in setup, not by immediate call)
         "hold_charge": [
             ("select/select_option", {"entity_id": "select.inverter_mode", "option": MSC}),
             ("number/set_value", {"entity_id": "number.sig_discharge_cut_off_soc", "value": RESERVE}),
             ("number/set_value", {"entity_id": "number.charge_rate", "value": MAX_CHARGE_RATE}),
             ("number/set_value", {"entity_id": "number.discharge_rate", "value": MAX_DISCHARGE_RATE}),
         ],
-        # active_export: Mode 7 (ESS First), disch_rate=safe, charge_rate=0, floor=reserve
+        # active_export: Mode 7 (ESS First), discharge_rate=safe, charge_rate=0, floor=reserve
         # Safe rate calculation depends on PV power and export limit
         "active_export": [
             ("select/select_option", {"entity_id": "select.inverter_mode", "option": DISCHARGE_ESS_FIRST}),
