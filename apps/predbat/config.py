@@ -2034,6 +2034,7 @@ APPS_SCHEMA = {
     "givtcp_rest": {"type": "string_list", "entries": "num_inverters"},
     "charge_rate": {"type": "sensor_list", "sensor_type": "float", "modify": True, "entries": "num_inverters"},
     "discharge_rate": {"type": "sensor_list", "sensor_type": "float", "modify": True, "entries": "num_inverters"},
+    "sig_discharge_cut_off_soc": {"type": "sensor_list", "sensor_type": "float", "modify": True, "entries": "num_inverters"},
     "battery_power": {"type": "sensor_list", "sensor_type": "float", "entries": "num_inverters"},
     "pv_power": {"type": "sensor_list", "sensor_type": "float", "entries": "num_inverters"},
     "load_power": {"type": "sensor_list", "sensor_type": "float", "entries": "num_inverters"},
