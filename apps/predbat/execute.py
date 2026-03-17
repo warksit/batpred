@@ -641,8 +641,10 @@ class Execute:
         (soc_limits_block_solar), freeze charge must keep charge_limit at 100%
         to allow solar charging. The freeze is handled by EMS mode, not the charge ceiling.
         """
-        # SIG: charge_limit blocks ALL charging — keep at 100% during freeze to allow solar
-        if isFreezeCharge and getattr(inverter, "inv_soc_limits_block_solar", False):
+        # SIG: charge_limit blocks ALL charging including solar.
+        # "Don't charge" (soc=0) must become charge_limit=100% to allow solar through.
+        # Freeze charge also keeps charge_limit=100% — the freeze is handled by EMS mode.
+        if getattr(inverter, "inv_soc_limits_block_solar", False) and (isFreezeCharge or soc == 0):
             soc = 100.0
 
         target_kwh = dp2(self.soc_max * (soc / 100.0))
