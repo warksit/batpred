@@ -13,7 +13,6 @@
 
 from curtailment_calc import compute_remaining_overflow, compute_target_soc, should_activate
 from plugin_system import PredBatPlugin
-from utils import calc_percent_limit
 
 # SIG entity names (Mum's system)
 SIG_EMS_MODE = "select.sigen_plant_remote_ems_control_mode"
@@ -23,7 +22,7 @@ SIG_CHARGE_LIMIT = "number.sigen_plant_ess_charge_cut_off_state_of_charge"
 
 # HA input helper entity IDs
 HA_ENABLE = "input_boolean.curtailment_manager_enable"
-HA_DNO_LIMIT = "input_number.curtailment_manager_dno_limit"
+HA_BUFFER = "input_number.curtailment_manager_buffer"
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
@@ -49,24 +48,29 @@ class CurtailmentPlugin(PredBatPlugin):
         self.last_charge_limit = None
         self.was_active = False
         self._dno_limit = 4.0
+        self.last_phase = None
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update)
 
     def get_config(self):
-        """Read configuration from HA input helpers."""
+        """Read configuration from HA input helpers and Predbat config."""
         enabled = self.base.get_state_wrapper(HA_ENABLE, default="off")
         enabled = str(enabled).lower() in ("on", "true")
 
-        dno_limit = self.base.get_state_wrapper(HA_DNO_LIMIT, default=4.0)
+        # DNO limit from Predbat's export_limit config (apps.yaml, in Watts)
+        dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
+
+        # Buffer for forecast error (kWh)
+        buffer = self.base.get_state_wrapper(HA_BUFFER, default=1.0)
         try:
-            dno_limit = float(dno_limit)
+            buffer = float(buffer)
         except (ValueError, TypeError):
-            dno_limit = 4.0
+            buffer = 1.0
 
-        return enabled, dno_limit
+        return enabled, dno_limit, buffer
 
-    def calculate(self, dno_limit_kw):
+    def calculate(self, dno_limit_kw, buffer_kwh=1.0):
         """
         Compute curtailment target SOC using v5 iterative algorithm.
 
@@ -81,30 +85,17 @@ class CurtailmentPlugin(PredBatPlugin):
         if not pv_step or not soc_max:
             return soc_max, 0, "off", -1
 
-        # Only look at TODAY's solar — find sunset (PV drops to ~0 then
-        # comes back next day). Prevents over-draining for tomorrow's overflow.
-        step_to_kw = 60.0 / PREDICT_STEP  # kWh-per-step → kW
-        solar_end_minute = forecast_minutes
-        pv_ended = False
-        for minute in range(PREDICT_STEP, forecast_minutes, PREDICT_STEP):
-            pv_kw = pv_step.get(minute, 0) * step_to_kw
-            if pv_kw < 0.1:
-                pv_ended = True
-            elif pv_ended and pv_kw > 0.1:
-                solar_end_minute = minute
-                break
+        # Only look at TODAY's solar (up to 23:00) to avoid over-draining
+        # for tomorrow's overflow. No PV after 23:00 even in UK midsummer.
+        minutes_now = getattr(self.base, "minutes_now", 720)
+        solar_end_minute = min(forecast_minutes, max(PREDICT_STEP, 23 * 60 - minutes_now))
 
         # Compute remaining overflow from next step to end of today's solar
         # Predbat forecast values are kWh per step (not kW)
-        remaining_overflow = compute_remaining_overflow(
-            pv_step, load_step, dno_limit_kw,
-            start_minute=PREDICT_STEP,
-            end_minute=solar_end_minute,
-            step_minutes=PREDICT_STEP,
-            values_are_kwh=True
-        )
+        step_to_kw = 60.0 / PREDICT_STEP  # kWh-per-step → kW
+        remaining_overflow = compute_remaining_overflow(pv_step, load_step, dno_limit_kw, start_minute=PREDICT_STEP, end_minute=solar_end_minute, step_minutes=PREDICT_STEP, values_are_kwh=True)
 
-        target_soc_kwh = compute_target_soc(remaining_overflow, soc_max)
+        target_soc_kwh = compute_target_soc(remaining_overflow, soc_max, buffer_kwh)
         active = should_activate(remaining_overflow)
 
         # Safety net: activate if PV > DNO and battery near full,
@@ -112,12 +103,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # if it does, investigate why the forecast didn't predict overflow.
         pv_now_kw = pv_step.get(0, 0) * step_to_kw
         if not active and pv_now_kw > dno_limit_kw and soc_kw >= soc_max - SOC_MARGIN_KWH:
-            self.log(
-                "Curtailment: WARNING — real-time activation (forecast missed overflow). "
-                "PV {:.1f}kW > DNO {:.1f}kW, SOC {:.1f}kWh near full".format(
-                    pv_now_kw, dno_limit_kw, soc_kw
-                )
-            )
+            self.log("Curtailment: WARNING — real-time activation (forecast missed overflow). " "PV {:.1f}kW > DNO {:.1f}kW, SOC {:.1f}kWh near full".format(pv_now_kw, dno_limit_kw, soc_kw))
             active = True
             target_soc_kwh = soc_max - SOC_MARGIN_KWH
 
@@ -140,7 +126,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         return target_soc_kwh, remaining_overflow, phase, export_target_kw
 
-    def publish(self, phase, target_soc_kwh, remaining_overflow_kwh, export_target_kw):
+    def publish(self, phase, target_soc_kwh, remaining_overflow_kwh, export_target_kw, dno_limit_kw):
         """Publish curtailment sensors via dashboard_item."""
         prefix = self.base.prefix
         soc_max = getattr(self.base, "soc_max", 10)
@@ -162,6 +148,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "friendly_name": "Curtailment Export Target",
                 "unit_of_measurement": "kW",
                 "icon": "mdi:transmission-tower-export",
+                "dno_limit": round(dno_limit_kw, 2),
             },
         )
 
@@ -281,33 +268,66 @@ class CurtailmentPlugin(PredBatPlugin):
         try:
             self._cleanup_read_only()
 
-            enabled, dno_limit = self.get_config()
+            enabled, dno_limit, buffer = self.get_config()
             self._dno_limit = dno_limit
 
             if not enabled:
                 if self.was_active:
                     self.apply("off", -1)
                 soc_max = getattr(self.base, "soc_max", 10)
-                self.publish("off", soc_max, 0, -1)
+                self.publish("off", soc_max, 0, -1, dno_limit)
                 return
 
-            target_soc_kwh, remaining_overflow, phase, export_target_kw = self.calculate(dno_limit)
+            target_soc_kwh, remaining_overflow, phase, export_target_kw = self.calculate(dno_limit, buffer)
 
-            self.log(
-                "Curtailment: phase={} target={:.1f}kWh ({:.0f}%) overflow={:.1f}kWh export_target={:.1f}kW".format(
-                    phase, target_soc_kwh,
-                    target_soc_kwh / max(getattr(self.base, "soc_max", 10), 0.1) * 100,
-                    remaining_overflow, export_target_kw
+            # Don't take inverter control until PV is generating
+            pv_step = getattr(self.base, "pv_forecast_minute_step", {})
+            pv_now_kw = pv_step.get(0, 0) * (60.0 / PREDICT_STEP)
+            if phase != "off" and pv_now_kw < 0.1:
+                if self.last_phase != "off":
+                    self.log("Curtailment: waiting for PV (currently {:.2f}kW)".format(pv_now_kw))
+                phase = "off"
+                export_target_kw = -1
+
+            # Defer to Predbat during planned grid charge windows
+            if phase != "off":
+                charge_window_best = getattr(self.base, "charge_window_best", [])
+                minutes_now = getattr(self.base, "minutes_now", 0)
+                charge_window_n = self.base.in_charge_window(charge_window_best, minutes_now)
+                if charge_window_n >= 0:
+                    charge_limit_best = getattr(self.base, "charge_limit_best", [])
+                    if charge_window_n < len(charge_limit_best):
+                        charge_limit = charge_limit_best[charge_window_n]
+                        if not self.base.is_freeze_charge(charge_limit):
+                            if self.last_phase != "off":
+                                self.log("Curtailment: deferring to Predbat charge window")
+                            phase = "off"
+                            export_target_kw = -1
+
+            soc_kw = getattr(self.base, "soc_kw", 0)
+            soc_max = getattr(self.base, "soc_max", 10)
+            target_pct = target_soc_kwh / max(soc_max, 0.1) * 100
+            soc_pct = soc_kw / max(soc_max, 0.1) * 100
+
+            # Log phase transitions
+            if phase != self.last_phase:
+                self.log(
+                    "Curtailment: PHASE {} -> {} | SOC={:.1f}kWh ({:.0f}%) target={:.1f}kWh ({:.0f}%) "
+                    "overflow={:.1f}kWh buffer={:.1f}kWh dno={:.1f}kW".format(
+                        self.last_phase or "none", phase,
+                        soc_kw, soc_pct, target_soc_kwh, target_pct,
+                        remaining_overflow, buffer, dno_limit,
+                    )
                 )
-            )
+                self.last_phase = phase
 
-            self.publish(phase, target_soc_kwh, remaining_overflow, export_target_kw)
+            self.publish(phase, target_soc_kwh, remaining_overflow, export_target_kw, dno_limit)
             self.apply(phase, export_target_kw)
 
         except Exception as e:
             self.log("Curtailment plugin error: {}".format(e))
             soc_max = getattr(self.base, "soc_max", 10)
-            self.publish("off", soc_max, 0, -1)
+            self.publish("off", soc_max, 0, -1, dno_limit)
             if self.was_active:
                 try:
                     self.apply("off", -1)

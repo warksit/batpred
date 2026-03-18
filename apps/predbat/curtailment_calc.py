@@ -39,20 +39,21 @@ def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minu
     return total
 
 
-def compute_target_soc(remaining_overflow, battery_max_kwh):
+def compute_target_soc(remaining_overflow, battery_max_kwh, margin_kwh=0.0):
     """
     Compute target SOC: leave room in battery to absorb remaining overflow.
 
-    target_soc = battery_max - remaining_overflow, clamped to [0, battery_max]
+    target_soc = battery_max - remaining_overflow - margin, clamped to [0, battery_max]
 
     Args:
         remaining_overflow: float kWh — overflow still expected
         battery_max_kwh: float kWh — battery capacity
+        margin_kwh: float kWh — extra buffer for forecast error
 
     Returns:
         float — target SOC in kWh
     """
-    return max(0.0, min(battery_max_kwh, battery_max_kwh - remaining_overflow))
+    return max(0.0, min(battery_max_kwh, battery_max_kwh - remaining_overflow - margin_kwh))
 
 
 def should_activate(remaining_overflow):

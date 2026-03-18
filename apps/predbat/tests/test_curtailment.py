@@ -41,7 +41,7 @@ VALIDATION_DAYS = [
 def _parse_csv_value(val):
     """Parse a CSV value, handling quoted strings and comma decimals."""
     val = val.strip().strip('"')
-    val = val.replace(',', '')
+    val = val.replace(",", "")
     try:
         return float(val)
     except ValueError:
@@ -58,16 +58,16 @@ def _load_csv_to_forecasts(filepath, watts=False, step_minutes=STEP_MINUTES):
     pv_forecast = {}
     load_forecast = {}
 
-    with open(filepath, 'r') as f:
+    with open(filepath, "r") as f:
         lines = f.readlines()
 
     for line in lines[1:]:
-        parts = line.strip().split(';')
+        parts = line.strip().split(";")
         if len(parts) < 7:
             continue
 
         # Parse time (format: "=""HH:MM""" or "HH:MM")
-        match = re.search(r'(\d{2}):(\d{2})', parts[0])
+        match = re.search(r"(\d{2}):(\d{2})", parts[0])
         if not match:
             continue
         hour, minute = int(match.group(1)), int(match.group(2))
@@ -91,10 +91,7 @@ def _load_csv_to_forecasts(filepath, watts=False, step_minutes=STEP_MINUTES):
     return pv_forecast, load_forecast
 
 
-def _simulate_day(pv_forecast, load_forecast, dno_limit=DNO_LIMIT,
-                  battery_kwh=BATTERY_KWH, max_charge_kw=MAX_CHARGE_KW,
-                  max_discharge_kw=MAX_DISCHARGE_KW, start_soc_pct=START_SOC_PCT,
-                  step_minutes=STEP_MINUTES):
+def _simulate_day(pv_forecast, load_forecast, dno_limit=DNO_LIMIT, battery_kwh=BATTERY_KWH, max_charge_kw=MAX_CHARGE_KW, max_discharge_kw=MAX_DISCHARGE_KW, start_soc_pct=START_SOC_PCT, step_minutes=STEP_MINUTES):
     """
     Simulate a full day using the curtailment calc pure functions.
 
@@ -110,10 +107,7 @@ def _simulate_day(pv_forecast, load_forecast, dno_limit=DNO_LIMIT,
     end_minute = 1440  # Full day
 
     # Compute initial (dawn) overflow — total for the whole day
-    initial_overflow = compute_remaining_overflow(
-        pv_forecast, load_forecast, dno_limit,
-        start_minute=0, end_minute=end_minute, step_minutes=step_minutes
-    )
+    initial_overflow = compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=end_minute, step_minutes=step_minutes)
     dawn_target = compute_target_soc(initial_overflow, battery_kwh)
     dawn_target_pct = dawn_target / battery_kwh * 100
 
@@ -128,11 +122,7 @@ def _simulate_day(pv_forecast, load_forecast, dno_limit=DNO_LIMIT,
         excess = pv - load
 
         # Remaining overflow from NEXT step onward
-        remaining = compute_remaining_overflow(
-            pv_forecast, load_forecast, dno_limit,
-            start_minute=m + step_minutes, end_minute=end_minute,
-            step_minutes=step_minutes
-        )
+        remaining = compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minute=m + step_minutes, end_minute=end_minute, step_minutes=step_minutes)
         target_soc = compute_target_soc(remaining, battery_kwh)
 
         # Battery constraints
@@ -194,29 +184,38 @@ def _simulate_day(pv_forecast, load_forecast, dno_limit=DNO_LIMIT,
         if export > max_export_kw:
             max_export_kw = export
 
-        results.append({
-            'minute': m, 'pv': pv, 'load': load, 'soc': soc,
-            'soc_pct': soc / battery_kwh * 100,
-            'target_soc': target_soc, 'target_pct': target_soc / battery_kwh * 100,
-            'export': export, 'curtailed': curtailed,
-            'charge': charge, 'discharge': discharge,
-        })
+        results.append(
+            {
+                "minute": m,
+                "pv": pv,
+                "load": load,
+                "soc": soc,
+                "soc_pct": soc / battery_kwh * 100,
+                "target_soc": target_soc,
+                "target_pct": target_soc / battery_kwh * 100,
+                "export": export,
+                "curtailed": curtailed,
+                "charge": charge,
+                "discharge": discharge,
+            }
+        )
 
     return {
-        'results': results,
-        'total_curtailed': total_curtailed,
-        'total_export': total_export,
-        'end_soc': soc,
-        'end_soc_pct': soc / battery_kwh * 100,
-        'dawn_target_pct': dawn_target_pct,
-        'max_export_kw': max_export_kw,
-        'initial_overflow': initial_overflow,
+        "results": results,
+        "total_curtailed": total_curtailed,
+        "total_export": total_export,
+        "end_soc": soc,
+        "end_soc_pct": soc / battery_kwh * 100,
+        "dawn_target_pct": dawn_target_pct,
+        "max_export_kw": max_export_kw,
+        "initial_overflow": initial_overflow,
     }
 
 
 # ============================================================================
 # Pure function unit tests
 # ============================================================================
+
 
 def test_compute_remaining_overflow_basic():
     """Test overflow computation with simple known data."""
@@ -292,6 +291,7 @@ def test_should_activate():
 # Edge case tests (synthetic data)
 # ============================================================================
 
+
 def test_no_overflow_day():
     """Low PV day — plugin stays inactive, target = 100%."""
     # PV never exceeds load + DNO limit (4kW)
@@ -310,8 +310,8 @@ def test_no_overflow_day():
     assert should_activate(overflow) is False
 
     sim = _simulate_day(pv, load)
-    assert sim['total_curtailed'] < 0.01, f"Expected no curtailment, got {sim['total_curtailed']:.3f}"
-    assert sim['dawn_target_pct'] > 99.9, f"Expected ~100% target, got {sim['dawn_target_pct']:.1f}%"
+    assert sim["total_curtailed"] < 0.01, f"Expected no curtailment, got {sim['total_curtailed']:.3f}"
+    assert sim["dawn_target_pct"] > 99.9, f"Expected ~100% target, got {sim['dawn_target_pct']:.1f}%"
     print("  test_no_overflow_day: PASSED")
 
 
@@ -332,9 +332,9 @@ def test_battery_starts_full():
 
     sim = _simulate_day(pv, load, start_soc_pct=1.0)
     # Allow tiny curtailment (<0.1 kWh) from 5-min step boundary effects
-    assert sim['total_curtailed'] < 0.1, f"Curtailment: {sim['total_curtailed']:.3f} kWh"
-    assert sim['max_export_kw'] <= DNO_LIMIT + 0.01, f"Max export {sim['max_export_kw']:.2f} exceeds DNO limit"
-    assert sim['dawn_target_pct'] < 100, f"Expected target < 100%, got {sim['dawn_target_pct']:.1f}%"
+    assert sim["total_curtailed"] < 0.1, f"Curtailment: {sim['total_curtailed']:.3f} kWh"
+    assert sim["max_export_kw"] <= DNO_LIMIT + 0.01, f"Max export {sim['max_export_kw']:.2f} exceeds DNO limit"
+    assert sim["dawn_target_pct"] < 100, f"Expected target < 100%, got {sim['dawn_target_pct']:.1f}%"
     print("  test_battery_starts_full: PASSED")
 
 
@@ -351,8 +351,8 @@ def test_battery_starts_empty():
         load[m] = 1.0
 
     sim = _simulate_day(pv, load, start_soc_pct=0.0)
-    assert sim['total_curtailed'] < 0.01, f"Curtailment: {sim['total_curtailed']:.3f} kWh"
-    assert sim['max_export_kw'] <= DNO_LIMIT + 0.01, f"Max export {sim['max_export_kw']:.2f} exceeds DNO limit"
+    assert sim["total_curtailed"] < 0.01, f"Curtailment: {sim['total_curtailed']:.3f} kWh"
+    assert sim["max_export_kw"] <= DNO_LIMIT + 0.01, f"Max export {sim['max_export_kw']:.2f} exceeds DNO limit"
     print("  test_battery_starts_empty: PASSED")
 
 
@@ -369,15 +369,15 @@ def test_export_never_exceeds_dno():
         load[m] = 0.5
 
     sim = _simulate_day(pv, load, start_soc_pct=0.5)
-    for r in sim['results']:
-        assert r['export'] <= DNO_LIMIT + 0.01, \
-            f"Minute {r['minute']}: export {r['export']:.2f} exceeds DNO limit {DNO_LIMIT}"
+    for r in sim["results"]:
+        assert r["export"] <= DNO_LIMIT + 0.01, f"Minute {r['minute']}: export {r['export']:.2f} exceeds DNO limit {DNO_LIMIT}"
     print("  test_export_never_exceeds_dno: PASSED")
 
 
 # ============================================================================
 # CSV validation tests (real-world data)
 # ============================================================================
+
 
 def _run_csv_day_test(label, filename, watts, expected):
     """Run a single day validation test from CSV data."""
@@ -392,52 +392,219 @@ def _run_csv_day_test(label, filename, watts, expected):
     errors = []
 
     # 1. Zero curtailment (the main goal)
-    if sim['total_curtailed'] > 0.01:
+    if sim["total_curtailed"] > 0.01:
         errors.append(f"curtailment={sim['total_curtailed']:.3f} kWh (expected ~0)")
 
     # 2. Export never exceeds DNO limit
-    for r in sim['results']:
-        if r['export'] > DNO_LIMIT + 0.01:
+    for r in sim["results"]:
+        if r["export"] > DNO_LIMIT + 0.01:
             errors.append(f"minute {r['minute']}: export={r['export']:.2f}kW > DNO {DNO_LIMIT}kW")
             break
 
     # 3. Dawn target SOC (±10% tolerance due to 5-min vs 30-min resolution)
-    if abs(sim['dawn_target_pct'] - expected['dawn_target_approx']) > 10:
-        errors.append(
-            f"dawn target={sim['dawn_target_pct']:.0f}% "
-            f"(expected ~{expected['dawn_target_approx']}%)"
-        )
+    if abs(sim["dawn_target_pct"] - expected["dawn_target_approx"]) > 10:
+        errors.append(f"dawn target={sim['dawn_target_pct']:.0f}% " f"(expected ~{expected['dawn_target_approx']}%)")
 
     # 4. End SOC (±10% tolerance)
-    if abs(sim['end_soc_pct'] - expected['end_soc_approx']) > 10:
-        errors.append(
-            f"end SOC={sim['end_soc_pct']:.0f}% "
-            f"(expected ~{expected['end_soc_approx']}%)"
-        )
+    if abs(sim["end_soc_pct"] - expected["end_soc_approx"]) > 10:
+        errors.append(f"end SOC={sim['end_soc_pct']:.0f}% " f"(expected ~{expected['end_soc_approx']}%)")
 
     # 5. Overflow kWh (±3 kWh tolerance for 5-min vs 30-min resolution)
-    if abs(sim['initial_overflow'] - expected['overflow_approx']) > 3:
-        errors.append(
-            f"overflow={sim['initial_overflow']:.1f} kWh "
-            f"(expected ~{expected['overflow_approx']})"
-        )
+    if abs(sim["initial_overflow"] - expected["overflow_approx"]) > 3:
+        errors.append(f"overflow={sim['initial_overflow']:.1f} kWh " f"(expected ~{expected['overflow_approx']})")
 
     if errors:
         detail = "; ".join(errors)
         print(f"  {label}: FAILED — {detail}")
-        print(f"    overflow={sim['initial_overflow']:.1f}kWh dawn_target={sim['dawn_target_pct']:.0f}% "
-              f"curtailed={sim['total_curtailed']:.3f}kWh end_soc={sim['end_soc_pct']:.0f}%")
+        print(f"    overflow={sim['initial_overflow']:.1f}kWh dawn_target={sim['dawn_target_pct']:.0f}% " f"curtailed={sim['total_curtailed']:.3f}kWh end_soc={sim['end_soc_pct']:.0f}%")
         return True  # failed
 
-    print(f"  {label}: PASSED "
-          f"(overflow={sim['initial_overflow']:.1f}kWh target={sim['dawn_target_pct']:.0f}% "
-          f"curtailed={sim['total_curtailed']:.3f}kWh end_soc={sim['end_soc_pct']:.0f}%)")
+    print(f"  {label}: PASSED " f"(overflow={sim['initial_overflow']:.1f}kWh target={sim['dawn_target_pct']:.0f}% " f"curtailed={sim['total_curtailed']:.3f}kWh end_soc={sim['end_soc_pct']:.0f}%)")
     return False  # passed
+
+
+# ============================================================================
+# Plugin integration tests (on_update deferral logic)
+# ============================================================================
+
+from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP
+
+
+class MockBase:
+    """Minimal mock of Predbat base for plugin tests."""
+
+    def __init__(self, pv_step=None, load_step=None, soc_kw=5.0, soc_max=18.08,
+                 minutes_now=720, forecast_minutes=1440, charge_window_best=None,
+                 charge_limit_best=None, reserve_percent=4):
+        step_kwh_factor = PLUGIN_STEP / 60.0  # kW→kWh per step
+        # Store as kWh per step (matching Predbat convention)
+        self.pv_forecast_minute_step = {k: v * step_kwh_factor for k, v in (pv_step or {}).items()}
+        self.load_minutes_step = {k: v * step_kwh_factor for k, v in (load_step or {}).items()}
+        self.soc_kw = soc_kw
+        self.soc_max = soc_max
+        self.minutes_now = minutes_now
+        self.forecast_minutes = forecast_minutes
+        self.charge_window_best = charge_window_best or []
+        self.charge_limit_best = charge_limit_best or []
+        self.reserve_percent = reserve_percent
+        self.set_read_only = False
+        self.config_index = {}
+        self.prefix = "predbat"
+        self.logs = []
+        self.published = {}
+        self.services = []
+
+    def log(self, msg, *args, **kwargs):
+        self.logs.append(msg)
+
+    def get_state_wrapper(self, entity, default=None):
+        if entity == "input_boolean.curtailment_manager_enable":
+            return "on"
+        if entity == "input_number.curtailment_manager_buffer":
+            return 1.0
+        return default
+
+    def get_arg(self, key, default=None, index=None):
+        if key == "export_limit":
+            return 4000
+        return default
+
+    def dashboard_item(self, entity, value, attrs=None):
+        self.published[entity] = {"value": value, "attrs": attrs or {}}
+
+    def call_service_wrapper(self, service, **kwargs):
+        self.services.append((service, kwargs))
+
+    def in_charge_window(self, charge_window, minute_abs):
+        for i, window in enumerate(charge_window):
+            if window["start"] <= minute_abs < window["end"]:
+                return i
+        return -1
+
+    def is_freeze_charge(self, charge_limit_kwh):
+        # Freeze = charge limit equals reserve (simplified)
+        limit_pct = round(charge_limit_kwh / self.soc_max * 100)
+        return limit_pct == self.reserve_percent
+
+
+def _make_overflow_pv(minutes_now=720):
+    """Create PV/load forecasts that produce overflow (PV=8kW, load=1kW, excess=7kW > DNO 4kW)."""
+    pv = {}
+    load = {}
+    # Fill future slots with overflow-producing values
+    for m in range(0, 1440 - minutes_now, PLUGIN_STEP):
+        pv[m] = 8.0
+        load[m] = 1.0
+    return pv, load
+
+
+def test_plugin_pv_below_threshold_blocks_activation():
+    """Plugin should stay off when PV < 0.1kW even if overflow is predicted."""
+    pv, load = _make_overflow_pv(minutes_now=300)  # 5am
+    # Set current PV (minute 0) to near-zero (pre-dawn)
+    pv[0] = 0.0
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=300)
+    plugin = CurtailmentPlugin(base)
+
+    plugin.on_update()
+
+    # Phase should be "off" — plugin doesn't control inverter
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    assert phase_sensor.get("value") == "off", \
+        f"Expected phase='off' with no PV, got '{phase_sensor.get('value')}'"
+    # read_only should NOT be set
+    assert base.set_read_only is False, "read_only should be False when plugin is off"
+    # But overflow sensor should still show the calculated overflow
+    overflow_sensor = base.published.get("sensor.predbat_curtailment_overflow_kwh", {})
+    # Overflow is published as the raw calculated value (not zeroed out)
+    # The target SOC sensor should show a value < 100% indicating overflow exists
+    target_sensor = base.published.get("sensor.predbat_curtailment_target_soc", {})
+    assert target_sensor.get("value") is not None, "Target SOC sensor should be published"
+    print("  test_plugin_pv_below_threshold_blocks_activation: PASSED")
+
+
+def test_plugin_pv_above_threshold_allows_activation():
+    """Plugin should activate normally when PV >= 0.1kW and overflow exists."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    # Current PV is already 8kW (well above threshold)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
+    plugin = CurtailmentPlugin(base)
+
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    assert phase_sensor.get("value") != "off", \
+        f"Expected active phase with high PV, got '{phase_sensor.get('value')}'"
+    assert base.set_read_only is True, "read_only should be True when plugin is active"
+    print("  test_plugin_pv_above_threshold_allows_activation: PASSED")
+
+
+def test_plugin_defers_to_charge_window():
+    """Plugin should defer to Predbat during a planned grid charge window."""
+    pv, load = _make_overflow_pv(minutes_now=300)
+    # PV is generating (above threshold)
+    pv[0] = 2.0
+    base = MockBase(
+        pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=300,
+        # Charge window active right now: 4am-7am (240-420)
+        charge_window_best=[{"start": 240, "end": 420}],
+        charge_limit_best=[10.0],  # 10kWh target — real charge, not freeze
+    )
+    plugin = CurtailmentPlugin(base)
+
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    assert phase_sensor.get("value") == "off", \
+        f"Expected phase='off' during charge window, got '{phase_sensor.get('value')}'"
+    assert base.set_read_only is False, "read_only should be False when deferring to charge window"
+    print("  test_plugin_defers_to_charge_window: PASSED")
+
+
+def test_plugin_ignores_freeze_charge_window():
+    """Plugin should NOT defer to a freeze charge window (freeze = hold at reserve)."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    # Freeze charge: limit = reserve SOC (4% of 18.08 = 0.7232 kWh)
+    reserve_kwh = 18.08 * 4 / 100  # 0.7232
+    base = MockBase(
+        pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720,
+        charge_window_best=[{"start": 700, "end": 800}],
+        charge_limit_best=[reserve_kwh],
+        reserve_percent=4,
+    )
+    plugin = CurtailmentPlugin(base)
+
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    assert phase_sensor.get("value") != "off", \
+        f"Expected active phase during freeze window, got '{phase_sensor.get('value')}'"
+    print("  test_plugin_ignores_freeze_charge_window: PASSED")
+
+
+def test_plugin_no_charge_window_activates_normally():
+    """Plugin activates when no charge window is active."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(
+        pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720,
+        # Charge window exists but not active right now (starts later)
+        charge_window_best=[{"start": 1400, "end": 1440}],
+        charge_limit_best=[10.0],
+    )
+    plugin = CurtailmentPlugin(base)
+
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    assert phase_sensor.get("value") != "off", \
+        f"Expected active phase outside charge window, got '{phase_sensor.get('value')}'"
+    print("  test_plugin_no_charge_window_activates_normally: PASSED")
 
 
 # ============================================================================
 # Test runner
 # ============================================================================
+
 
 def run_curtailment_tests(my_predbat=None):
     """Run all curtailment calculator tests. Returns True if any failed."""
@@ -458,6 +625,12 @@ def run_curtailment_tests(my_predbat=None):
         test_battery_starts_full,
         test_battery_starts_empty,
         test_export_never_exceeds_dno,
+        # Plugin integration tests
+        test_plugin_pv_below_threshold_blocks_activation,
+        test_plugin_pv_above_threshold_allows_activation,
+        test_plugin_defers_to_charge_window,
+        test_plugin_ignores_freeze_charge_window,
+        test_plugin_no_charge_window_activates_normally,
     ]
 
     for test_fn in tests:
