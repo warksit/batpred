@@ -134,7 +134,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
-            phase,
+            phase.capitalize(),
             {
                 "friendly_name": "Curtailment Phase",
                 "icon": "mdi:solar-power-variant",

@@ -510,8 +510,8 @@ def test_plugin_pv_below_threshold_blocks_activation():
 
     # Phase should be "off" — plugin doesn't control inverter
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") == "off", \
-        f"Expected phase='off' with no PV, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") == "Off", \
+        f"Expected phase='Off' with no PV, got '{phase_sensor.get('value')}'"
     # read_only should NOT be set
     assert base.set_read_only is False, "read_only should be False when plugin is off"
     # But overflow sensor should still show the calculated overflow
@@ -555,8 +555,8 @@ def test_plugin_defers_to_charge_window():
     plugin.on_update()
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") == "off", \
-        f"Expected phase='off' during charge window, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") == "Off", \
+        f"Expected phase='Off' during charge window, got '{phase_sensor.get('value')}'"
     assert base.set_read_only is False, "read_only should be False when deferring to charge window"
     print("  test_plugin_defers_to_charge_window: PASSED")
 
