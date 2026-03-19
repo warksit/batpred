@@ -54,7 +54,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._dno_limit = 4.0
         self.last_phase = None
         self.overflow_history = []
-        self.pv_history = []
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update)
@@ -125,23 +124,10 @@ class CurtailmentPlugin(PredBatPlugin):
         reserve = getattr(self.base, "reserve", 0)
         target_soc_kwh = max(target_soc_kwh, soc_keep, reserve)
 
-        # Stay active while PV has been above DNO limit recently to prevent
-        # SIG hard-stop fault. Use max PV over last 15 min (3 cycles) so a
-        # brief cloud dip doesn't cause deactivation.
+        # Safety net: force activation if PV > DNO and battery near full,
+        # even if forecast missed the overflow.
         pv_now_kw = pv_step.get(0, 0) * step_to_kw
-        self.pv_history.append(pv_now_kw)
-        if len(self.pv_history) > 3:
-            self.pv_history = self.pv_history[-3:]
-        pv_recent_max = max(self.pv_history)
-
-        if not active and pv_recent_max > dno_limit_kw:
-            active = True
-            if remaining_overflow <= 0:
-                # Forecast says no overflow but PV is high — use buffer as headroom
-                target_soc_kwh = soc_max - dynamic_buffer
-
-        # Safety net: force lower target if PV > DNO and battery near full
-        if active and pv_now_kw > dno_limit_kw and soc_kw >= soc_max - SOC_MARGIN_KWH:
+        if not active and pv_now_kw > dno_limit_kw and soc_kw >= soc_max - SOC_MARGIN_KWH:
             self.log("Curtailment: WARNING — real-time activation (forecast missed overflow). " "PV {:.1f}kW > DNO {:.1f}kW, SOC {:.1f}kWh near full".format(pv_now_kw, dno_limit_kw, soc_kw))
             target_soc_kwh = min(target_soc_kwh, soc_max - SOC_MARGIN_KWH)
 
