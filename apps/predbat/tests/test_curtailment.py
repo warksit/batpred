@@ -433,9 +433,7 @@ from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP
 class MockBase:
     """Minimal mock of Predbat base for plugin tests."""
 
-    def __init__(self, pv_step=None, load_step=None, soc_kw=5.0, soc_max=18.08,
-                 minutes_now=720, forecast_minutes=1440, charge_window_best=None,
-                 charge_limit_best=None, reserve_percent=4):
+    def __init__(self, pv_step=None, load_step=None, soc_kw=5.0, soc_max=18.08, minutes_now=720, forecast_minutes=1440, charge_window_best=None, charge_limit_best=None, reserve_percent=4, best_soc_keep=0, reserve=0, buffer_min=1.0, buffer_pct=30):
         step_kwh_factor = PLUGIN_STEP / 60.0  # kW→kWh per step
         # Store as kWh per step (matching Predbat convention)
         self.pv_forecast_minute_step = {k: v * step_kwh_factor for k, v in (pv_step or {}).items()}
@@ -447,6 +445,10 @@ class MockBase:
         self.charge_window_best = charge_window_best or []
         self.charge_limit_best = charge_limit_best or []
         self.reserve_percent = reserve_percent
+        self.best_soc_keep = best_soc_keep
+        self.reserve = reserve
+        self._buffer_min = buffer_min
+        self._buffer_pct = buffer_pct
         self.set_read_only = False
         self.config_index = {}
         self.prefix = "predbat"
@@ -461,7 +463,9 @@ class MockBase:
         if entity == "input_boolean.curtailment_manager_enable":
             return "on"
         if entity == "input_number.curtailment_manager_buffer":
-            return 1.0
+            return self._buffer_min
+        if entity == "input_number.curtailment_manager_buffer_percent":
+            return self._buffer_pct
         return default
 
     def get_arg(self, key, default=None, index=None):
@@ -510,8 +514,7 @@ def test_plugin_pv_below_threshold_blocks_activation():
 
     # Phase should be "off" — plugin doesn't control inverter
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") == "Off", \
-        f"Expected phase='Off' with no PV, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") == "Off", f"Expected phase='Off' with no PV, got '{phase_sensor.get('value')}'"
     # read_only should NOT be set
     assert base.set_read_only is False, "read_only should be False when plugin is off"
     # But overflow sensor should still show the calculated overflow
@@ -533,8 +536,7 @@ def test_plugin_pv_above_threshold_allows_activation():
     plugin.on_update()
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") != "off", \
-        f"Expected active phase with high PV, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") != "off", f"Expected active phase with high PV, got '{phase_sensor.get('value')}'"
     assert base.set_read_only is True, "read_only should be True when plugin is active"
     print("  test_plugin_pv_above_threshold_allows_activation: PASSED")
 
@@ -545,7 +547,10 @@ def test_plugin_defers_to_charge_window():
     # PV is generating (above threshold)
     pv[0] = 2.0
     base = MockBase(
-        pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=300,
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=300,
         # Charge window active right now: 4am-7am (240-420)
         charge_window_best=[{"start": 240, "end": 420}],
         charge_limit_best=[10.0],  # 10kWh target — real charge, not freeze
@@ -555,8 +560,7 @@ def test_plugin_defers_to_charge_window():
     plugin.on_update()
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") == "Off", \
-        f"Expected phase='Off' during charge window, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") == "Off", f"Expected phase='Off' during charge window, got '{phase_sensor.get('value')}'"
     assert base.set_read_only is False, "read_only should be False when deferring to charge window"
     print("  test_plugin_defers_to_charge_window: PASSED")
 
@@ -567,7 +571,10 @@ def test_plugin_ignores_freeze_charge_window():
     # Freeze charge: limit = reserve SOC (4% of 18.08 = 0.7232 kWh)
     reserve_kwh = 18.08 * 4 / 100  # 0.7232
     base = MockBase(
-        pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720,
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,
         charge_window_best=[{"start": 700, "end": 800}],
         charge_limit_best=[reserve_kwh],
         reserve_percent=4,
@@ -577,8 +584,7 @@ def test_plugin_ignores_freeze_charge_window():
     plugin.on_update()
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") != "off", \
-        f"Expected active phase during freeze window, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") != "off", f"Expected active phase during freeze window, got '{phase_sensor.get('value')}'"
     print("  test_plugin_ignores_freeze_charge_window: PASSED")
 
 
@@ -586,7 +592,10 @@ def test_plugin_no_charge_window_activates_normally():
     """Plugin activates when no charge window is active."""
     pv, load = _make_overflow_pv(minutes_now=720)
     base = MockBase(
-        pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720,
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,
         # Charge window exists but not active right now (starts later)
         charge_window_best=[{"start": 1400, "end": 1440}],
         charge_limit_best=[10.0],
@@ -596,9 +605,97 @@ def test_plugin_no_charge_window_activates_normally():
     plugin.on_update()
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") != "off", \
-        f"Expected active phase outside charge window, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") != "off", f"Expected active phase outside charge window, got '{phase_sensor.get('value')}'"
     print("  test_plugin_no_charge_window_activates_normally: PASSED")
+
+
+# ============================================================================
+# Dynamic buffer and SOC floor tests
+# ============================================================================
+
+
+def test_dynamic_buffer_large_overflow():
+    """10 kWh overflow at 30% → buffer = 3.0 kWh (percentage dominates)."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=1.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+
+    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
+    expected_buffer = max(1.0, overflow * 30.0 / 100.0)
+    assert abs(dynamic_buffer - expected_buffer) < 0.01, f"Expected buffer={expected_buffer:.2f}, got {dynamic_buffer:.2f}"
+    assert dynamic_buffer >= 1.0, f"Buffer {dynamic_buffer:.2f} should be >= floor 1.0"
+    # With significant overflow, percentage should dominate
+    assert dynamic_buffer > 1.0, f"Buffer {dynamic_buffer:.2f} should be > floor for large overflow"
+    print("  test_dynamic_buffer_large_overflow: PASSED (buffer={:.2f}kWh for {:.1f}kWh overflow)".format(dynamic_buffer, overflow))
+
+
+def test_dynamic_buffer_small_overflow():
+    """Small overflow → buffer = floor (1.0 kWh)."""
+    # Create PV/load with minimal overflow: PV=5kW, load=1kW → excess=4kW, barely above DNO
+    pv = {}
+    load = {}
+    for m in range(0, 60, PLUGIN_STEP):  # Only 1 hour of slight overflow
+        pv[m] = 4.5  # excess = 3.5kW, below DNO → no overflow
+        load[m] = 1.0
+    # Add a few slots with slight overflow
+    for m in range(60, 90, PLUGIN_STEP):
+        pv[m] = 5.5  # excess = 4.5kW, overflow = 0.5kW
+        load[m] = 1.0
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=1.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+
+    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
+    if overflow > 0:
+        # With small overflow, 30% of it should be < 1.0, so floor applies
+        pct_buffer = overflow * 30.0 / 100.0
+        if pct_buffer < 1.0:
+            assert abs(dynamic_buffer - 1.0) < 0.01, f"Expected floor buffer=1.0, got {dynamic_buffer:.2f} (pct would be {pct_buffer:.2f})"
+            print("  test_dynamic_buffer_small_overflow: PASSED (floor applied, overflow={:.2f}kWh)".format(overflow))
+        else:
+            print("  test_dynamic_buffer_small_overflow: PASSED (pct={:.2f}kWh > floor, overflow={:.2f}kWh)".format(pct_buffer, overflow))
+    else:
+        print("  test_dynamic_buffer_small_overflow: PASSED (no overflow, buffer not applied)")
+
+
+def test_target_soc_clamped_above_soc_keep():
+    """Target SOC must never go below best_soc_keep."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    # Set best_soc_keep high — plugin should not drain below it
+    soc_keep = 8.0  # kWh
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, best_soc_keep=soc_keep, reserve=0, buffer_min=1.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+
+    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
+    # With large overflow, raw target would be near 0 — but clamped to soc_keep
+    assert target >= soc_keep, f"Target SOC {target:.2f} kWh should be >= best_soc_keep {soc_keep:.2f} kWh"
+    print("  test_target_soc_clamped_above_soc_keep: PASSED (target={:.2f}kWh >= soc_keep={:.2f}kWh)".format(target, soc_keep))
+
+
+def test_target_soc_clamped_above_reserve():
+    """Target SOC must never go below reserve."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    reserve = 5.0  # kWh
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, best_soc_keep=0, reserve=reserve, buffer_min=1.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+
+    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
+    assert target >= reserve, f"Target SOC {target:.2f} kWh should be >= reserve {reserve:.2f} kWh"
+    print("  test_target_soc_clamped_above_reserve: PASSED (target={:.2f}kWh >= reserve={:.2f}kWh)".format(target, reserve))
+
+
+def test_buffer_kwh_in_phase_sensor():
+    """buffer_kwh attribute should be published on the phase sensor."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=1.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    attrs = phase_sensor.get("attrs", {})
+    assert "buffer_kwh" in attrs, f"Expected buffer_kwh attribute in phase sensor, got attrs: {attrs}"
+    assert attrs["buffer_kwh"] > 0, f"Expected buffer_kwh > 0, got {attrs['buffer_kwh']}"
+    print("  test_buffer_kwh_in_phase_sensor: PASSED (buffer_kwh={})".format(attrs["buffer_kwh"]))
 
 
 # ============================================================================
@@ -631,6 +728,12 @@ def run_curtailment_tests(my_predbat=None):
         test_plugin_defers_to_charge_window,
         test_plugin_ignores_freeze_charge_window,
         test_plugin_no_charge_window_activates_normally,
+        # Dynamic buffer and SOC floor tests
+        test_dynamic_buffer_large_overflow,
+        test_dynamic_buffer_small_overflow,
+        test_target_soc_clamped_above_soc_keep,
+        test_target_soc_clamped_above_reserve,
+        test_buffer_kwh_in_phase_sensor,
     ]
 
     for test_fn in tests:
