@@ -50,6 +50,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self.last_ems_mode = None
         self.last_import_limit = None
         self.last_charge_limit = None
+        self.last_export_limit = None
         self.was_active = False
         self._dno_limit = 4.0
         self.last_phase = None
@@ -203,8 +204,23 @@ class CurtailmentPlugin(PredBatPlugin):
             },
         )
 
-    def write_sig(self, ems_mode, import_limit, charge_limit):
-        """Write SIG entities, only when values change."""
+    def write_sig(self, ems_mode, import_limit, charge_limit, export_limit=None):
+        """Write SIG entities, only when values change.
+
+        Export limit is written FIRST (before EMS mode) to ensure there is
+        never a window where D-ESS is active with a stale export limit.
+        """
+        # Write export limit BEFORE EMS mode to avoid race condition:
+        # D-ESS + stale export limit could force-discharge battery to grid
+        if export_limit is not None and export_limit != self.last_export_limit:
+            self.base.call_service_wrapper(
+                "number/set_value",
+                entity_id=SIG_EXPORT_LIMIT,
+                value=export_limit,
+            )
+            self.last_export_limit = export_limit
+            self.log("Curtailment: Set export limit -> {}kW".format(export_limit))
+
         if ems_mode != self.last_ems_mode:
             self.base.call_service_wrapper(
                 "select/select_option",
@@ -251,11 +267,23 @@ class CurtailmentPlugin(PredBatPlugin):
             if not self.was_active:
                 self.log("Curtailment activating (phase={})".format(phase))
 
+            # Set export limit directly for Draining/Absorbing (don't rely on
+            # HA automation which needs D-ESS condition that may not be met yet).
+            # Tracking: let HA automation handle reactive PV-load adjustments.
+            if phase == "absorbing":
+                export_limit = 0
+            elif phase == "draining":
+                export_limit = self._dno_limit
+            else:  # tracking
+                export_limit = None  # HA automation handles
+
             # D-ESS mode, block grid import, allow solar charging to 100%
+            # Export limit is written FIRST inside write_sig() to avoid race
             self.write_sig(
                 ems_mode="Command Discharging (ESS First)",
                 import_limit=0,
                 charge_limit=100,
+                export_limit=export_limit,
             )
 
             # Suppress Predbat's normal inverter control
@@ -285,6 +313,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self.last_ems_mode = None
             self.last_import_limit = None
             self.last_charge_limit = None
+            self.last_export_limit = None
             self.was_active = False
 
     def _cleanup_read_only(self):
@@ -357,8 +386,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 )
                 self.last_phase = phase
 
-            self.publish(phase, target_soc_kwh, remaining_overflow, export_target_kw, dno_limit, dynamic_buffer)
+            # Apply BEFORE publish: EMS mode must be set before sensor publish
+            # triggers the HA automation (which requires D-ESS as a condition)
             self.apply(phase, export_target_kw)
+            self.publish(phase, target_soc_kwh, remaining_overflow, export_target_kw, dno_limit, dynamic_buffer)
 
         except Exception as e:
             self.log("Curtailment plugin error: {}".format(e))
