@@ -131,16 +131,14 @@ class CurtailmentPlugin(PredBatPlugin):
         if not active and pv_now_kw > dno_limit_kw and soc_kw >= soc_max - SOC_MARGIN_KWH:
             self.log("Curtailment: WARNING — real-time activation (forecast missed overflow). " "PV {:.1f}kW > DNO {:.1f}kW, SOC {:.1f}kWh near full".format(pv_now_kw, dno_limit_kw, soc_kw))
             target_soc_kwh = min(target_soc_kwh, soc_max - SOC_MARGIN_KWH)
+            active = True
+            remaining_overflow = max(remaining_overflow, 0.1)
 
         if not active:
             return soc_max, 0, "off", -1, 0
 
         # Phase determination based on SOC vs target
-        if remaining_overflow <= dynamic_buffer:
-            # Overflow is smaller than forecast uncertainty — just track PV-load
-            phase = "tracking"
-            export_target_kw = -1
-        elif soc_kw > target_soc_kwh + SOC_MARGIN_KWH:
+        if soc_kw > target_soc_kwh + SOC_MARGIN_KWH:
             # Above target — drain battery toward target
             phase = "draining"
             export_target_kw = dno_limit_kw
