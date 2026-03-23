@@ -5,7 +5,8 @@
 #
 # Self-improving: fits a 3-variable linear regression model from historical
 # GSHP consumption vs temperature, wind speed, and overnight temperature drop.
-# Bootstraps from Open-Meteo + HA statistics on first run.
+# Pre-populate cold_weather_history.json for instant model training,
+# or let the plugin cold-start with a conservative default and learn over ~7 days.
 # -----------------------------------------------------------------------------
 
 import json
@@ -65,7 +66,6 @@ class ColdWeatherPlugin(PredBatPlugin):
         self._recorded_today = False
         self._last_record_date = None
         self._gshp_energy_at_start = None
-        self._bootstrapped = False
         self._history_path = os.path.join(getattr(base, "config_root", "./"), HISTORY_FILE)
         self._load_history()
 
@@ -231,166 +231,6 @@ class ColdWeatherPlugin(PredBatPlugin):
     # Bootstrap from historical data
     # =========================================================================
 
-    def _bootstrap(self):
-        """Populate history from Open-Meteo + HA statistics on first run."""
-        if self._bootstrapped:
-            return
-        self._bootstrapped = True
-
-        if len(self.history) >= MIN_TRAINING_DAYS:
-            return  # Already have enough data
-
-        self.log("Cold weather: bootstrapping from historical data...")
-
-        try:
-            # Get location from zone.home
-            zone_state = self.base.get_state_wrapper("zone.home", attribute="latitude")
-            zone_lon = self.base.get_state_wrapper("zone.home", attribute="longitude")
-            if not zone_state or not zone_lon:
-                self.log("Cold weather: cannot bootstrap — zone.home not found")
-                return
-            lat = float(zone_state)
-            lon = float(zone_lon)
-        except (ValueError, TypeError):
-            self.log("Cold weather: cannot bootstrap — invalid zone coordinates")
-            return
-
-        # Get GSHP energy history from HA
-        try:
-            gshp_history = self.base.get_history_wrapper(HA_GSHP_ENERGY, days=BOOTSTRAP_DAYS, required=False)
-        except Exception as e:
-            self.log("Cold weather: cannot get GSHP history: {}".format(e))
-            return
-
-        if not gshp_history or not gshp_history[0]:
-            self.log("Cold weather: no GSHP history available")
-            return
-
-        # Build hourly GSHP energy lookup
-        gshp_by_hour = {}
-        for entry in gshp_history[0]:
-            try:
-                state = float(entry.get("state", 0))
-                ts = entry.get("last_changed", "")
-                if "T" in ts:
-                    date_part, time_part = ts.split("T")
-                    y, mo, d = date_part.split("-")
-                    h = int(time_part.split(":")[0])
-                    gshp_by_hour[(int(y), int(mo), int(d), h)] = state
-            except (ValueError, TypeError):
-                continue
-
-        if len(gshp_by_hour) < 48:
-            self.log("Cold weather: insufficient GSHP history ({} hours)".format(len(gshp_by_hour)))
-            return
-
-        # Get weather history from Open-Meteo
-        now = self.base.now_utc
-        end_date = now.strftime("%Y-%m-%d")
-        from datetime import timedelta
-
-        start_date = (now - timedelta(days=BOOTSTRAP_DAYS)).strftime("%Y-%m-%d")
-
-        try:
-            resp = requests.get(
-                OPEN_METEO_URL,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "hourly": "temperature_2m,wind_speed_10m",
-                    "timezone": "UTC",
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            wx = resp.json()
-        except Exception as e:
-            self.log("Cold weather: Open-Meteo API failed: {}".format(e))
-            return
-
-        # Build hourly weather lookup
-        wx_by_hour = {}
-        times = wx.get("hourly", {}).get("time", [])
-        temps = wx.get("hourly", {}).get("temperature_2m", [])
-        winds = wx.get("hourly", {}).get("wind_speed_10m", [])
-
-        for i, t_str in enumerate(times):
-            try:
-                date_part, time_part = t_str.split("T")
-                y, mo, d = date_part.split("-")
-                h = int(time_part.split(":")[0])
-                key = (int(y), int(mo), int(d), h)
-                if temps[i] is not None and winds[i] is not None:
-                    wx_by_hour[key] = (temps[i], winds[i])
-            except (ValueError, IndexError):
-                continue
-
-        # Compute features and consumption for each night
-        existing_dates = {h["date"] for h in self.history}
-        from datetime import date as date_cls
-
-        d = date_cls.fromisoformat(start_date) + timedelta(days=2)
-        end = date_cls.fromisoformat(end_date)
-        added = 0
-
-        while d < end:
-            date_str = d.isoformat()
-            if date_str in existing_dates:
-                d += timedelta(days=1)
-                continue
-
-            # GSHP energy delta 04:00-08:00
-            k_start = (d.year, d.month, d.day, GSHP_START_HOUR)
-            k_end = (d.year, d.month, d.day, GSHP_END_HOUR)
-            if k_start not in gshp_by_hour or k_end not in gshp_by_hour:
-                d += timedelta(days=1)
-                continue
-            heat = gshp_by_hour[k_end] - gshp_by_hour[k_start]
-            if heat < 0 or heat > 20:  # Sanity check
-                d += timedelta(days=1)
-                continue
-
-            # Weather features (hour offsets relative to midnight of d)
-            hourly_temp = {}
-            hourly_wind = {}
-            for h_off in range(-12, 8):
-                ref = d
-                off = h_off
-                while off < 0:
-                    ref = ref - timedelta(days=1)
-                    off += 24
-                k = (ref.year, ref.month, ref.day, off)
-                if k in wx_by_hour:
-                    hourly_temp[h_off] = wx_by_hour[k][0]
-                    hourly_wind[h_off] = wx_by_hour[k][1]
-
-            features = self._extract_features_from_hourly(hourly_temp, hourly_wind, 0)
-            if features is None:
-                d += timedelta(days=1)
-                continue
-
-            avg_temp, avg_wind, t_drop = features
-            self.history.append(
-                {
-                    "date": date_str,
-                    "heat_kwh": round(heat, 2),
-                    "avg_temp": avg_temp,
-                    "avg_wind": avg_wind,
-                    "t_drop": t_drop,
-                }
-            )
-            added += 1
-            d += timedelta(days=1)
-
-        if added > 0:
-            self._save_history()
-            self._fit_model()
-            self.log("Cold weather: bootstrapped {} days of history (total {})".format(added, len(self.history)))
-        else:
-            self.log("Cold weather: bootstrap found no new data to add")
-
     # =========================================================================
     # Daily recording
     # =========================================================================
@@ -516,10 +356,6 @@ class ColdWeatherPlugin(PredBatPlugin):
         if not enabled:
             return
 
-        # Bootstrap on first run
-        if not self._bootstrapped:
-            self._bootstrap()
-
         minutes_now = getattr(self.base, "minutes_now", 0)
 
         # Snapshot GSHP energy at start of measurement window
@@ -571,7 +407,7 @@ class ColdWeatherPlugin(PredBatPlugin):
             return None
 
         try:
-            result = self.base.call_service("weather/get_forecasts", type="hourly", entity_id=HA_WEATHER, return_response=True)
+            result = self.base.call_service_wrapper("weather/get_forecasts", type="hourly", entity_id=HA_WEATHER, return_response=True)
             if not result:
                 return None
 
