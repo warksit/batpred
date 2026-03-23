@@ -47,18 +47,19 @@ DEFINITION = {
             ("number/set_value", {"entity_id": "number.charge_rate", "value": MAX_CHARGE_RATE}),
             ("number/set_value", {"entity_id": "number.discharge_rate", "value": MAX_DISCHARGE_RATE}),
         ],
-        # freeze_charge: MSC, rates=max, floor=reserve (same as demand on SIG)
+        # freeze_charge: MSC, rates=max, floor=soc_percent (not reserve!)
+        # On SIG, floor > SOC causes grid charging, so floor must equal current SOC
         "freeze_charge": [
             ("select/select_option", {"entity_id": "select.inverter_mode", "option": MSC}),
-            ("number/set_value", {"entity_id": "number.sig_discharge_cut_off_soc", "value": RESERVE}),
+            ("number/set_value", {"entity_id": "number.sig_discharge_cut_off_soc", "value": 50}),  # soc_percent=50
             ("number/set_value", {"entity_id": "number.charge_rate", "value": MAX_CHARGE_RATE}),
             ("number/set_value", {"entity_id": "number.discharge_rate", "value": MAX_DISCHARGE_RATE}),
         ],
-        # hold_charge: MSC, rates=max, floor=reserve
-        # (charge_limit=soc% set by adjust_battery_target in setup, not by immediate call)
+        # hold_charge: MSC, rates=max, floor=soc_percent (not reserve!)
+        # On SIG, floor > SOC causes grid charging, floor = SOC prevents discharge without grid pull
         "hold_charge": [
             ("select/select_option", {"entity_id": "select.inverter_mode", "option": MSC}),
-            ("number/set_value", {"entity_id": "number.sig_discharge_cut_off_soc", "value": RESERVE}),
+            ("number/set_value", {"entity_id": "number.sig_discharge_cut_off_soc", "value": 30}),  # soc_percent=30
             ("number/set_value", {"entity_id": "number.charge_rate", "value": MAX_CHARGE_RATE}),
             ("number/set_value", {"entity_id": "number.discharge_rate", "value": MAX_DISCHARGE_RATE}),
         ],
