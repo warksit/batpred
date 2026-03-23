@@ -965,14 +965,6 @@ class Plan:
         self.pv_forecast_minute_step = pv_forecast_minute_step
         self.pv_forecast_minute10_step = pv_forecast_minute10_step
 
-        # Dynamic SOC keep: reduce best_soc_keep on sunny days
-        if recompute and self.best_soc_keep_solar_offset > 0 and self.best_soc_keep > 0:
-            total_pv_excess = sum(max(pv_forecast_minute_step.get(m, 0) - load_minutes_step.get(m, 0), 0) for m in range(0, self.forecast_minutes, PREDICT_STEP))
-            if total_pv_excess > self.soc_max * 0.5:
-                old_keep = self.best_soc_keep
-                self.best_soc_keep = max(self.best_soc_keep - self.best_soc_keep_solar_offset, 0)
-                self.log("Solar offset: PV excess {:.1f} kWh > {:.1f} kWh threshold, reducing best_soc_keep from {:.1f} to {:.1f}".format(total_pv_excess, self.soc_max * 0.5, old_keep, self.best_soc_keep))
-
         # Yesterday data
         if recompute and self.calculate_savings and publish:
             self.calculate_yesterday()

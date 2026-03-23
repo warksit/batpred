@@ -2179,7 +2179,6 @@ class Fetch:
         self.import_export_scaling = self.get_arg("import_export_scaling", 1.0)
         self.best_soc_margin = 0.0
         self.best_soc_min = self.get_arg("best_soc_min")
-        self.best_soc_keep_solar_offset = self.get_arg("best_soc_keep_solar_offset", 0)
         self.best_soc_max = self.get_arg("best_soc_max")
         self.best_soc_keep = self.get_arg("best_soc_keep")
         self.best_soc_keep_weight = self.get_arg("best_soc_keep_weight")
