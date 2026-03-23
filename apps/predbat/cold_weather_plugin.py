@@ -392,12 +392,17 @@ class ColdWeatherPlugin(PredBatPlugin):
         if prediction is None:
             return context
 
-        target_keep = prediction + MARGIN_KWH
+        # Boost = how much more GSHP than the rolling average (what LoadML has learned).
+        # LoadML and Predbat already handle average load + charge windows.
+        # We only boost for the excess that LoadML will miss.
+        rolling_avg = self._rolling_avg()
+        boost = max(0.0, prediction - rolling_avg)
         current = context.get("best_soc_keep", 0)
 
-        if target_keep > current:
-            self.log("Cold weather: raising best_soc_keep {:.2f} -> {:.2f} kWh (predicted heat={:.2f})".format(current, target_keep, prediction))
-            context["best_soc_keep"] = target_keep
+        if boost > 0:
+            new_keep = current + boost
+            self.log("Cold weather: boosting best_soc_keep {:.2f} -> {:.2f} kWh " "(predicted={:.2f}, rolling_avg={:.2f}, boost={:.2f})".format(current, new_keep, prediction, rolling_avg, boost))
+            context["best_soc_keep"] = new_keep
 
         return context
 
@@ -488,12 +493,24 @@ class ColdWeatherPlugin(PredBatPlugin):
             self.log("Cold weather: forecast prediction failed: {}".format(e))
             return None
 
+    def _rolling_avg(self):
+        """Rolling average of recent GSHP consumption (approximates what LoadML has learned)."""
+        if not self.history:
+            return 0.0
+        recent = self.history[-14:]  # Last 14 days
+        return sum(h["heat_kwh"] for h in recent) / len(recent)
+
     def _publish(self):
         """Publish cold weather sensor."""
+        rolling_avg = self._rolling_avg()
+        boost = max(0.0, self._prediction - rolling_avg) if self._prediction is not None else 0.0
+
         attrs = {
             "friendly_name": "Cold Weather GSHP Prediction",
             "unit_of_measurement": "kWh",
             "icon": "mdi:snowflake-thermometer",
+            "boost": round(boost, 2),
+            "rolling_avg": round(rolling_avg, 2),
             "model_r2": round(self.model_r2, 3) if self.coefficients else None,
             "data_points": len(self.history),
             "coefficients": [round(c, 4) for c in self.coefficients] if self.coefficients else None,
