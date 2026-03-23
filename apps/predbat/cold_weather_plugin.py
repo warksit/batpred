@@ -1,0 +1,649 @@
+# -----------------------------------------------------------------------------
+# Cold Weather Plugin for Predbat
+# Predicts morning GSHP heating load from weather data and adjusts
+# best_soc_keep to ensure sufficient battery for the overnight/morning period.
+#
+# Self-improving: fits a 3-variable linear regression model from historical
+# GSHP consumption vs temperature, wind speed, and overnight temperature drop.
+# Bootstraps from Open-Meteo + HA statistics on first run.
+# -----------------------------------------------------------------------------
+
+import json
+import os
+import time
+
+import requests
+
+from plugin_system import PredBatPlugin
+
+# HA entity IDs
+HA_GSHP_HEATING = "input_boolean.cold_weather_gshp_heating"
+HA_GSHP_ENERGY = "sensor.heat_pump_energy_meter_energy"
+HA_WEATHER = "weather.forecast_home"
+
+# Open-Meteo API for historical hourly weather
+OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# Time windows for feature extraction (hours relative to midnight of heating day)
+# These were determined by exhaustive sweep over 23 nights of data (R²=0.71)
+TEMP_WINDOW = (-4, 3)  # 20:00 to 03:00 — heat loss after heating off
+WIND_WINDOW = (-12, 3)  # 12:00 to 03:00 — infiltration while heating on
+DROP_EVENING = (-2, 0)  # 22:00 to 00:00 — evening reference
+DROP_DAWN = (4, 7)  # 04:00 to 07:00 — dawn reference
+
+# GSHP measurement window
+GSHP_START_HOUR = 4  # 04:00
+GSHP_END_HOUR = 8  # 08:00
+
+HISTORY_FILE = "cold_weather_history.json"
+MARGIN_KWH = 0.5  # Safety margin added to prediction
+DEFAULT_KEEP_KWH = 6.0  # Conservative default before model is trained
+MIN_TRAINING_DAYS = 7  # Minimum history for model to be used
+BOOTSTRAP_DAYS = 60  # Days of history to fetch on first run
+
+
+class ColdWeatherPlugin(PredBatPlugin):
+    """
+    Predicts morning GSHP heating load and adjusts best_soc_keep.
+
+    Model: heat_kWh = b0 + b1*avg_temp + b2*avg_wind + b3*temp_drop
+    - avg_temp: outdoor temp 20:00-03:00 (heat loss after heating off)
+    - avg_wind: wind speed 12:00-03:00 (infiltration losses)
+    - temp_drop: evening temp minus dawn temp (overnight cooling)
+
+    Self-improving: records actual consumption daily, refits model.
+    Bootstrap: queries Open-Meteo + HA statistics on first run.
+    """
+
+    priority = 50  # Run before curtailment_plugin (priority 200)
+
+    def __init__(self, base):
+        super().__init__(base)
+        self.history = []
+        self.coefficients = None  # (b0, b1, b2, b3) or None
+        self.model_r2 = 0.0
+        self._prediction = None  # Cached prediction
+        self._recorded_today = False
+        self._last_record_date = None
+        self._gshp_energy_at_start = None
+        self._bootstrapped = False
+        self._history_path = os.path.join(getattr(base, "config_root", "./"), HISTORY_FILE)
+        self._load_history()
+
+    def register_hooks(self, plugin_system):
+        plugin_system.register_hook("on_before_plan", self.on_before_plan, plugin=self)
+        plugin_system.register_hook("on_update", self.on_update, plugin=self)
+
+    # =========================================================================
+    # History persistence
+    # =========================================================================
+
+    def _load_history(self):
+        """Load history from JSON file."""
+        try:
+            if os.path.exists(self._history_path):
+                with open(self._history_path) as f:
+                    self.history = json.load(f)
+                self.log("Cold weather: loaded {} history entries".format(len(self.history)))
+                if len(self.history) >= MIN_TRAINING_DAYS:
+                    self._fit_model()
+        except Exception as e:
+            self.log("Cold weather: failed to load history: {}".format(e))
+            self.history = []
+
+    def _save_history(self):
+        """Save history to JSON file."""
+        try:
+            with open(self._history_path, "w") as f:
+                json.dump(self.history, f, indent=2)
+        except Exception as e:
+            self.log("Cold weather: failed to save history: {}".format(e))
+
+    # =========================================================================
+    # Linear regression (pure Python, no numpy)
+    # =========================================================================
+
+    def _fit_model(self):
+        """Fit 3-variable linear regression via normal equations."""
+        n = len(self.history)
+        if n < MIN_TRAINING_DAYS:
+            self.coefficients = None
+            return
+
+        # Extract arrays
+        y = [h["heat_kwh"] for h in self.history]
+        x1 = [h["avg_temp"] for h in self.history]
+        x2 = [h["avg_wind"] for h in self.history]
+        x3 = [h["t_drop"] for h in self.history]
+
+        # Normal equations: (X^T X) b = X^T y
+        # X = [1, x1, x2, x3] for each row
+        # Build X^T X (4x4) and X^T y (4x1)
+        xtx = [[0.0] * 4 for _ in range(4)]
+        xty = [0.0] * 4
+        cols = [
+            [1.0] * n,
+            x1,
+            x2,
+            x3,
+        ]
+
+        for i in range(4):
+            for j in range(4):
+                xtx[i][j] = sum(cols[i][k] * cols[j][k] for k in range(n))
+            xty[i] = sum(cols[i][k] * y[k] for k in range(n))
+
+        # Solve via Gaussian elimination
+        b = self._solve_4x4(xtx, xty)
+        if b is None:
+            self.coefficients = None
+            return
+
+        self.coefficients = tuple(b)
+
+        # Compute R²
+        y_mean = sum(y) / n
+        ss_tot = sum((yi - y_mean) ** 2 for yi in y)
+        ss_res = sum((y[k] - (b[0] + b[1] * x1[k] + b[2] * x2[k] + b[3] * x3[k])) ** 2 for k in range(n))
+        self.model_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+        self.log(
+            "Cold weather: model fitted (n={}, R²={:.3f}) "
+            "b0={:.2f} temp={:+.4f} wind={:+.4f} drop={:+.4f}".format(n, self.model_r2, *self.coefficients)
+        )
+
+    @staticmethod
+    def _solve_4x4(a, b):
+        """Solve 4x4 linear system via Gaussian elimination with partial pivoting."""
+        n = 4
+        # Augmented matrix
+        m = [a[i][:] + [b[i]] for i in range(n)]
+
+        for col in range(n):
+            # Partial pivoting
+            max_row = col
+            for row in range(col + 1, n):
+                if abs(m[row][col]) > abs(m[max_row][col]):
+                    max_row = row
+            m[col], m[max_row] = m[max_row], m[col]
+
+            if abs(m[col][col]) < 1e-10:
+                return None  # Singular
+
+            # Eliminate below
+            for row in range(col + 1, n):
+                factor = m[row][col] / m[col][col]
+                for j in range(col, n + 1):
+                    m[row][j] -= factor * m[col][j]
+
+        # Back substitution
+        x = [0.0] * n
+        for i in range(n - 1, -1, -1):
+            x[i] = m[i][n]
+            for j in range(i + 1, n):
+                x[i] -= m[i][j] * x[j]
+            x[i] /= m[i][i]
+
+        return x
+
+    # =========================================================================
+    # Feature extraction
+    # =========================================================================
+
+    @staticmethod
+    def _extract_features_from_hourly(hourly_temp, hourly_wind, day_offset_hours):
+        """Extract model features from hourly weather data.
+
+        Args:
+            hourly_temp: dict {hour_offset: temp_C} where 0 = midnight of heating day
+            hourly_wind: dict {hour_offset: wind_kmh}
+            day_offset_hours: not used, data already offset
+
+        Returns:
+            (avg_temp, avg_wind, t_drop) or None if insufficient data
+        """
+        # Avg temp 20:00-03:00 (offsets -4 to 3)
+        temps = [hourly_temp[h] for h in range(TEMP_WINDOW[0], TEMP_WINDOW[1]) if h in hourly_temp]
+        if len(temps) < 4:
+            return None
+
+        # Avg wind 12:00-03:00 (offsets -12 to 3)
+        winds = [hourly_wind[h] for h in range(WIND_WINDOW[0], WIND_WINDOW[1]) if h in hourly_wind]
+        if len(winds) < 8:
+            return None
+
+        # Temp drop: evening (22:00-00:00) minus dawn (04:00-07:00)
+        eve_temps = [hourly_temp[h] for h in range(DROP_EVENING[0], DROP_EVENING[1]) if h in hourly_temp]
+        dawn_temps = [hourly_temp[h] for h in range(DROP_DAWN[0], DROP_DAWN[1]) if h in hourly_temp]
+        if not eve_temps or not dawn_temps:
+            return None
+
+        avg_temp = sum(temps) / len(temps)
+        avg_wind = sum(winds) / len(winds)
+        t_drop = sum(eve_temps) / len(eve_temps) - sum(dawn_temps) / len(dawn_temps)
+
+        return (round(avg_temp, 2), round(avg_wind, 2), round(t_drop, 2))
+
+    def _predict(self, avg_temp, avg_wind, t_drop):
+        """Predict GSHP morning consumption from features."""
+        if self.coefficients is None:
+            return DEFAULT_KEEP_KWH
+        b = self.coefficients
+        return max(0.0, b[0] + b[1] * avg_temp + b[2] * avg_wind + b[3] * t_drop)
+
+    # =========================================================================
+    # Bootstrap from historical data
+    # =========================================================================
+
+    def _bootstrap(self):
+        """Populate history from Open-Meteo + HA statistics on first run."""
+        if self._bootstrapped:
+            return
+        self._bootstrapped = True
+
+        if len(self.history) >= MIN_TRAINING_DAYS:
+            return  # Already have enough data
+
+        self.log("Cold weather: bootstrapping from historical data...")
+
+        try:
+            # Get location from zone.home
+            zone_state = self.base.get_state_wrapper("zone.home", attribute="latitude")
+            zone_lon = self.base.get_state_wrapper("zone.home", attribute="longitude")
+            if not zone_state or not zone_lon:
+                self.log("Cold weather: cannot bootstrap — zone.home not found")
+                return
+            lat = float(zone_state)
+            lon = float(zone_lon)
+        except (ValueError, TypeError):
+            self.log("Cold weather: cannot bootstrap — invalid zone coordinates")
+            return
+
+        # Get GSHP energy history from HA
+        try:
+            gshp_history = self.base.get_history(HA_GSHP_ENERGY, days=BOOTSTRAP_DAYS)
+        except Exception as e:
+            self.log("Cold weather: cannot get GSHP history: {}".format(e))
+            return
+
+        if not gshp_history or not gshp_history[0]:
+            self.log("Cold weather: no GSHP history available")
+            return
+
+        # Build hourly GSHP energy lookup
+        gshp_by_hour = {}
+        for entry in gshp_history[0]:
+            try:
+                state = float(entry.get("state", 0))
+                ts = entry.get("last_changed", "")
+                if "T" in ts:
+                    date_part, time_part = ts.split("T")
+                    y, mo, d = date_part.split("-")
+                    h = int(time_part.split(":")[0])
+                    gshp_by_hour[(int(y), int(mo), int(d), h)] = state
+            except (ValueError, TypeError):
+                continue
+
+        if len(gshp_by_hour) < 48:
+            self.log("Cold weather: insufficient GSHP history ({} hours)".format(len(gshp_by_hour)))
+            return
+
+        # Get weather history from Open-Meteo
+        now = self.base.now_utc
+        end_date = now.strftime("%Y-%m-%d")
+        from datetime import timedelta
+
+        start_date = (now - timedelta(days=BOOTSTRAP_DAYS)).strftime("%Y-%m-%d")
+
+        try:
+            resp = requests.get(
+                OPEN_METEO_URL,
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "hourly": "temperature_2m,wind_speed_10m",
+                    "timezone": "UTC",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            wx = resp.json()
+        except Exception as e:
+            self.log("Cold weather: Open-Meteo API failed: {}".format(e))
+            return
+
+        # Build hourly weather lookup
+        wx_by_hour = {}
+        times = wx.get("hourly", {}).get("time", [])
+        temps = wx.get("hourly", {}).get("temperature_2m", [])
+        winds = wx.get("hourly", {}).get("wind_speed_10m", [])
+
+        for i, t_str in enumerate(times):
+            try:
+                date_part, time_part = t_str.split("T")
+                y, mo, d = date_part.split("-")
+                h = int(time_part.split(":")[0])
+                key = (int(y), int(mo), int(d), h)
+                if temps[i] is not None and winds[i] is not None:
+                    wx_by_hour[key] = (temps[i], winds[i])
+            except (ValueError, IndexError):
+                continue
+
+        # Compute features and consumption for each night
+        existing_dates = {h["date"] for h in self.history}
+        from datetime import date as date_cls
+
+        d = date_cls.fromisoformat(start_date) + timedelta(days=2)
+        end = date_cls.fromisoformat(end_date)
+        added = 0
+
+        while d < end:
+            date_str = d.isoformat()
+            if date_str in existing_dates:
+                d += timedelta(days=1)
+                continue
+
+            # GSHP energy delta 04:00-08:00
+            k_start = (d.year, d.month, d.day, GSHP_START_HOUR)
+            k_end = (d.year, d.month, d.day, GSHP_END_HOUR)
+            if k_start not in gshp_by_hour or k_end not in gshp_by_hour:
+                d += timedelta(days=1)
+                continue
+            heat = gshp_by_hour[k_end] - gshp_by_hour[k_start]
+            if heat < 0 or heat > 20:  # Sanity check
+                d += timedelta(days=1)
+                continue
+
+            # Weather features (hour offsets relative to midnight of d)
+            hourly_temp = {}
+            hourly_wind = {}
+            for h_off in range(-12, 8):
+                ref = d
+                off = h_off
+                while off < 0:
+                    ref = ref - timedelta(days=1)
+                    off += 24
+                k = (ref.year, ref.month, ref.day, off)
+                if k in wx_by_hour:
+                    hourly_temp[h_off] = wx_by_hour[k][0]
+                    hourly_wind[h_off] = wx_by_hour[k][1]
+
+            features = self._extract_features_from_hourly(hourly_temp, hourly_wind, 0)
+            if features is None:
+                d += timedelta(days=1)
+                continue
+
+            avg_temp, avg_wind, t_drop = features
+            self.history.append(
+                {
+                    "date": date_str,
+                    "heat_kwh": round(heat, 2),
+                    "avg_temp": avg_temp,
+                    "avg_wind": avg_wind,
+                    "t_drop": t_drop,
+                }
+            )
+            added += 1
+            d += timedelta(days=1)
+
+        if added > 0:
+            self._save_history()
+            self._fit_model()
+            self.log("Cold weather: bootstrapped {} days of history (total {})".format(added, len(self.history)))
+        else:
+            self.log("Cold weather: bootstrap found no new data to add")
+
+    # =========================================================================
+    # Daily recording
+    # =========================================================================
+
+    def _record_daily(self):
+        """Record today's GSHP consumption and weather features at ~08:00."""
+        now = self.base.now_utc
+        today_str = now.strftime("%Y-%m-%d")
+
+        if self._last_record_date == today_str:
+            return  # Already recorded today
+
+        minutes_now = getattr(self.base, "minutes_now", 0)
+        if minutes_now < GSHP_END_HOUR * 60 + 10:
+            return  # Too early, wait until after 08:10
+
+        # Snapshot GSHP energy at start of window if not done
+        if self._gshp_energy_at_start is None:
+            # Can't compute delta without start snapshot — skip today
+            # Will catch it next day via bootstrap/history
+            self._last_record_date = today_str
+            return
+
+        # Get current GSHP energy
+        try:
+            energy_now = float(self.base.get_state_wrapper(HA_GSHP_ENERGY, default=0))
+        except (ValueError, TypeError):
+            return
+
+        heat_kwh = energy_now - self._gshp_energy_at_start
+        if heat_kwh < 0 or heat_kwh > 20:
+            self._last_record_date = today_str
+            return
+
+        # Get weather features for today from Open-Meteo recent data or HA history
+        # Use forecast_home current attributes as approximation for recent hours
+        # (the on_update cycle builds up hourly observations)
+        # For now, use the weather data we've been collecting
+        try:
+            zone_lat = float(self.base.get_state_wrapper("zone.home", attribute="latitude"))
+            zone_lon = float(self.base.get_state_wrapper("zone.home", attribute="longitude"))
+
+            from datetime import timedelta
+
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            resp = requests.get(
+                OPEN_METEO_URL,
+                params={
+                    "latitude": zone_lat,
+                    "longitude": zone_lon,
+                    "start_date": yesterday,
+                    "end_date": today_str,
+                    "hourly": "temperature_2m,wind_speed_10m",
+                    "timezone": "UTC",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            wx = resp.json()
+
+            hourly_temp = {}
+            hourly_wind = {}
+            times = wx.get("hourly", {}).get("time", [])
+            temps = wx.get("hourly", {}).get("temperature_2m", [])
+            winds = wx.get("hourly", {}).get("wind_speed_10m", [])
+
+            today_parts = today_str.split("-")
+            today_tuple = (int(today_parts[0]), int(today_parts[1]), int(today_parts[2]))
+
+            for i, t_str in enumerate(times):
+                try:
+                    dp, tp = t_str.split("T")
+                    y, mo, d = dp.split("-")
+                    h = int(tp.split(":")[0])
+                    # Convert to offset from midnight of today
+                    if (int(y), int(mo), int(d)) == today_tuple:
+                        h_off = h
+                    else:
+                        h_off = h - 24  # Yesterday
+                    if temps[i] is not None and winds[i] is not None:
+                        hourly_temp[h_off] = temps[i]
+                        hourly_wind[h_off] = winds[i]
+                except (ValueError, IndexError):
+                    continue
+
+            features = self._extract_features_from_hourly(hourly_temp, hourly_wind, 0)
+        except Exception as e:
+            self.log("Cold weather: failed to get weather for recording: {}".format(e))
+            features = None
+
+        if features is None:
+            self._last_record_date = today_str
+            return
+
+        avg_temp, avg_wind, t_drop = features
+
+        # Check for duplicate date
+        existing_dates = {h["date"] for h in self.history}
+        if today_str not in existing_dates:
+            self.history.append(
+                {
+                    "date": today_str,
+                    "heat_kwh": round(heat_kwh, 2),
+                    "avg_temp": avg_temp,
+                    "avg_wind": avg_wind,
+                    "t_drop": t_drop,
+                }
+            )
+            self._save_history()
+            self._fit_model()
+            self.log(
+                "Cold weather: recorded day {} heat={:.1f}kWh temp={:.1f} wind={:.1f} drop={:.1f}".format(
+                    today_str, heat_kwh, avg_temp, avg_wind, t_drop
+                )
+            )
+
+        self._last_record_date = today_str
+        self._gshp_energy_at_start = None  # Reset for next day
+
+    # =========================================================================
+    # Hooks
+    # =========================================================================
+
+    def on_update(self):
+        """Called every Predbat cycle. Handles GSHP energy snapshots and daily recording."""
+        enabled = str(self.base.get_state_wrapper(HA_GSHP_HEATING, default="off")).lower() in ("on", "true")
+        if not enabled:
+            return
+
+        # Bootstrap on first run
+        if not self._bootstrapped:
+            self._bootstrap()
+
+        minutes_now = getattr(self.base, "minutes_now", 0)
+
+        # Snapshot GSHP energy at start of measurement window
+        if GSHP_START_HOUR * 60 <= minutes_now < GSHP_START_HOUR * 60 + 10:
+            if self._gshp_energy_at_start is None:
+                try:
+                    self._gshp_energy_at_start = float(self.base.get_state_wrapper(HA_GSHP_ENERGY, default=0))
+                    self.log("Cold weather: GSHP energy snapshot at 04:00 = {:.2f} kWh".format(self._gshp_energy_at_start))
+                except (ValueError, TypeError):
+                    pass
+
+        # Record daily consumption after 08:10
+        if minutes_now >= GSHP_END_HOUR * 60 + 10:
+            self._record_daily()
+
+        # Publish sensor
+        self._publish()
+
+    def on_before_plan(self, context):
+        """Adjust best_soc_keep based on predicted morning GSHP consumption."""
+        enabled = str(self.base.get_state_wrapper(HA_GSHP_HEATING, default="off")).lower() in ("on", "true")
+        if not enabled:
+            return context
+
+        if self.coefficients is None:
+            # No model yet — use conservative default
+            current = context.get("best_soc_keep", 0)
+            if DEFAULT_KEEP_KWH > current:
+                context["best_soc_keep"] = DEFAULT_KEEP_KWH
+            return context
+
+        # Get tonight's weather forecast
+        prediction = self._get_tonight_prediction()
+        if prediction is None:
+            return context
+
+        target_keep = prediction + MARGIN_KWH
+        current = context.get("best_soc_keep", 0)
+
+        if target_keep > current:
+            self.log("Cold weather: raising best_soc_keep {:.2f} -> {:.2f} kWh (predicted heat={:.2f})".format(current, target_keep, prediction))
+            context["best_soc_keep"] = target_keep
+
+        return context
+
+    def _get_tonight_prediction(self):
+        """Predict tonight's GSHP consumption from weather forecast."""
+        if self.coefficients is None:
+            return None
+
+        try:
+            result = self.base.call_service("weather/get_forecasts", type="hourly", entity_id=HA_WEATHER, return_response=True)
+            if not result:
+                return None
+
+            forecasts = result.get(HA_WEATHER, {}).get("forecast", [])
+            if not forecasts:
+                return None
+
+            # Build hourly temp/wind from forecast
+            # Find tonight's data (next 20:00 to 07:00)
+            from datetime import datetime, timezone
+
+            now = self.base.now_utc
+            today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            hourly_temp = {}
+            hourly_wind = {}
+
+            for f in forecasts:
+                try:
+                    dt_str = f.get("datetime", "")
+                    dt = datetime.fromisoformat(dt_str)
+                    # Offset from midnight of the target heating morning
+                    # If it's before 12:00, target = today; otherwise target = tomorrow
+                    if now.hour < 12:
+                        target_midnight = today_midnight
+                    else:
+                        from datetime import timedelta
+
+                        target_midnight = today_midnight + timedelta(days=1)
+
+                    h_off = int((dt - target_midnight).total_seconds() / 3600)
+                    if -12 <= h_off < 8:
+                        hourly_temp[h_off] = f.get("temperature", f.get("temp"))
+                        hourly_wind[h_off] = f.get("wind_speed")
+                except (ValueError, TypeError, KeyError):
+                    continue
+
+            features = self._extract_features_from_hourly(hourly_temp, hourly_wind, 0)
+            if features is None:
+                return None
+
+            avg_temp, avg_wind, t_drop = features
+            prediction = self._predict(avg_temp, avg_wind, t_drop)
+            self._prediction = prediction
+            return prediction
+
+        except Exception as e:
+            self.log("Cold weather: forecast prediction failed: {}".format(e))
+            return None
+
+    def _publish(self):
+        """Publish cold weather sensor."""
+        attrs = {
+            "friendly_name": "Cold Weather GSHP Prediction",
+            "unit_of_measurement": "kWh",
+            "icon": "mdi:snowflake-thermometer",
+            "model_r2": round(self.model_r2, 3) if self.coefficients else None,
+            "data_points": len(self.history),
+            "coefficients": [round(c, 4) for c in self.coefficients] if self.coefficients else None,
+        }
+
+        value = round(self._prediction, 2) if self._prediction is not None else "unknown"
+        self.base.dashboard_item(
+            "sensor.{}_cold_weather_prediction".format(self.base.prefix),
+            value,
+            attrs,
+        )
