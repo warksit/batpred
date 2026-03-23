@@ -2483,14 +2483,18 @@ class Inverter:
             reserve = self.reserve_percent
             max_charge = int(self.battery_rate_max_charge * MINUTE_WATT + 0.5)
             max_discharge = int(self.battery_rate_max_discharge * MINUTE_WATT + 0.5)
-            if target_soc > 0 and not freeze and target_soc != self.soc_percent and self.soc_percent < target_soc:
-                # Active charge: Grid First mode with max rates (only when SOC is below target)
+            if target_soc > 0 and not freeze and self.soc_percent < target_soc:
+                # Active charge: Grid First mode with max rates
                 self.adjust_ems_mode("Command Charging (Grid First)", reserve, charge_rate=max_charge, discharge_rate=max_discharge)
             elif target_soc > 0 and not freeze and self.soc_percent > target_soc:
-                # Hold above target: MSC with discharge floor at target so battery serves load down to target
+                # Hold above target: MSC with discharge floor at target
                 self.adjust_ems_mode("Maximum Self Consumption", target_soc, charge_rate=max_charge, discharge_rate=max_discharge)
+            elif target_soc > 0:
+                # Freeze or hold at target: MSC with discharge floor at current SOC
+                # Use soc_percent (not soc+1) — on SIG, floor > SOC causes grid charging
+                self.adjust_ems_mode("Maximum Self Consumption", self.soc_percent, charge_rate=max_charge, discharge_rate=max_discharge)
             else:
-                # Demand / freeze / hold: MSC with max rates
+                # Demand (target_soc=0): MSC with discharge floor at reserve
                 self.adjust_ems_mode("Maximum Self Consumption", reserve, charge_rate=max_charge, discharge_rate=max_discharge)
             return
 
