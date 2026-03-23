@@ -116,7 +116,7 @@ class MockBase:
     def call_service(self, service, **kwargs):
         return None
 
-    def get_history(self, entity_id, days=30):
+    def get_history_wrapper(self, entity_id, days=30, required=False, tracked=True):
         return [[]]
 
 

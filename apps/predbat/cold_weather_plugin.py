@@ -10,7 +10,6 @@
 
 import json
 import os
-import time
 
 import requests
 
@@ -147,10 +146,7 @@ class ColdWeatherPlugin(PredBatPlugin):
         ss_res = sum((y[k] - (b[0] + b[1] * x1[k] + b[2] * x2[k] + b[3] * x3[k])) ** 2 for k in range(n))
         self.model_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
 
-        self.log(
-            "Cold weather: model fitted (n={}, R²={:.3f}) "
-            "b0={:.2f} temp={:+.4f} wind={:+.4f} drop={:+.4f}".format(n, self.model_r2, *self.coefficients)
-        )
+        self.log("Cold weather: model fitted (n={}, R²={:.3f}) " "b0={:.2f} temp={:+.4f} wind={:+.4f} drop={:+.4f}".format(n, self.model_r2, *self.coefficients))
 
     @staticmethod
     def _solve_4x4(a, b):
@@ -261,7 +257,7 @@ class ColdWeatherPlugin(PredBatPlugin):
 
         # Get GSHP energy history from HA
         try:
-            gshp_history = self.base.get_history(HA_GSHP_ENERGY, days=BOOTSTRAP_DAYS)
+            gshp_history = self.base.get_history_wrapper(HA_GSHP_ENERGY, days=BOOTSTRAP_DAYS, required=False)
         except Exception as e:
             self.log("Cold weather: cannot get GSHP history: {}".format(e))
             return
@@ -505,11 +501,7 @@ class ColdWeatherPlugin(PredBatPlugin):
             )
             self._save_history()
             self._fit_model()
-            self.log(
-                "Cold weather: recorded day {} heat={:.1f}kWh temp={:.1f} wind={:.1f} drop={:.1f}".format(
-                    today_str, heat_kwh, avg_temp, avg_wind, t_drop
-                )
-            )
+            self.log("Cold weather: recorded day {} heat={:.1f}kWh temp={:.1f} wind={:.1f} drop={:.1f}".format(today_str, heat_kwh, avg_temp, avg_wind, t_drop))
 
         self._last_record_date = today_str
         self._gshp_energy_at_start = None  # Reset for next day
@@ -589,7 +581,7 @@ class ColdWeatherPlugin(PredBatPlugin):
 
             # Build hourly temp/wind from forecast
             # Find tonight's data (next 20:00 to 07:00)
-            from datetime import datetime, timezone
+            from datetime import datetime
 
             now = self.base.now_utc
             today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
