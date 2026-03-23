@@ -13,7 +13,7 @@ import sys
 # Ensure apps/predbat is on the path when run standalone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from curtailment_calc import compute_remaining_overflow, compute_target_soc, should_activate
+from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate
 
 # Battery constants (Mum's SIG system)
 BATTERY_KWH = 18.08
@@ -630,7 +630,7 @@ def test_dynamic_buffer_large_overflow():
 
 
 def test_dynamic_buffer_small_overflow():
-    """Small overflow → buffer = floor (1.0 kWh)."""
+    """Small overflow → buffer capped at overflow (not the floor)."""
     # Create PV/load with minimal overflow: PV=5kW, load=1kW → excess=4kW, barely above DNO
     pv = {}
     load = {}
@@ -646,13 +646,9 @@ def test_dynamic_buffer_small_overflow():
 
     target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
     if overflow > 0:
-        # With small overflow, 30% of it should be < 1.0, so floor applies
-        pct_buffer = overflow * 30.0 / 100.0
-        if pct_buffer < 1.0:
-            assert abs(dynamic_buffer - 1.0) < 0.01, f"Expected floor buffer=1.0, got {dynamic_buffer:.2f} (pct would be {pct_buffer:.2f})"
-            print("  test_dynamic_buffer_small_overflow: PASSED (floor applied, overflow={:.2f}kWh)".format(overflow))
-        else:
-            print("  test_dynamic_buffer_small_overflow: PASSED (pct={:.2f}kWh > floor, overflow={:.2f}kWh)".format(pct_buffer, overflow))
+        # Buffer should be capped at overflow, not the 1.0 kWh floor
+        assert dynamic_buffer <= overflow + 0.01, "Buffer {:.2f} should be <= overflow {:.2f} (cap prevents buffer exceeding overflow)".format(dynamic_buffer, overflow)
+        print("  test_dynamic_buffer_small_overflow: PASSED (buffer={:.2f}, capped at overflow={:.2f}kWh)".format(dynamic_buffer, overflow))
     else:
         print("  test_dynamic_buffer_small_overflow: PASSED (no overflow, buffer not applied)")
 
@@ -699,6 +695,161 @@ def test_buffer_kwh_in_phase_sensor():
 
 
 # ============================================================================
+# Morning gap tests
+# ============================================================================
+
+
+def test_morning_gap_pre_dawn():
+    """Pre-dawn: load exceeds PV for hours, then solar takes over."""
+    pv = {}
+    load = {}
+    # 5am start (minute 0), PV ramps up, load steady at 1kW
+    for m in range(0, 480, 5):  # 8 hours
+        hour = m / 60.0
+        pv[m] = max(0, hour - 2) * 1.5  # ramps from 0 at hour 2 to 9kW at hour 8
+        load[m] = 1.0
+
+    gap = compute_morning_gap(pv, load, start_minute=0, end_minute=480, step_minutes=5)
+    # Load > PV for first ~2.7 hours (until PV ramp reaches 1kW)
+    # Gap should be roughly 2.7 kWh (1kW × 2.7h minus small PV ramp)
+    assert 1.5 < gap < 4.0, f"Expected morning gap 1.5-4.0 kWh, got {gap:.2f}"
+    print("  test_morning_gap_pre_dawn: PASSED (gap={:.2f}kWh)".format(gap))
+
+
+def test_morning_gap_solar_already_covers():
+    """Mid-morning: PV already exceeds load, gap should be 0."""
+    pv = {}
+    load = {}
+    for m in range(0, 480, 5):
+        pv[m] = 5.0
+        load[m] = 1.0
+    gap = compute_morning_gap(pv, load, start_minute=0, end_minute=480, step_minutes=5)
+    assert gap == 0.0, f"Expected gap=0 when PV already covers load, got {gap:.2f}"
+    print("  test_morning_gap_solar_already_covers: PASSED (gap={:.2f}kWh)".format(gap))
+
+
+def test_morning_gap_cloudy_never_covers():
+    """Cloudy day: PV never sustainably exceeds load."""
+    pv = {}
+    load = {}
+    for m in range(0, 480, 5):
+        pv[m] = 0.5  # low PV all day
+        load[m] = 1.0
+    gap = compute_morning_gap(pv, load, start_minute=0, end_minute=480, step_minutes=5)
+    # 0.5kW deficit × 8 hours = 4 kWh
+    assert 3.5 < gap < 4.5, f"Expected ~4kWh gap on cloudy day, got {gap:.2f}"
+    print("  test_morning_gap_cloudy_never_covers: PASSED (gap={:.2f}kWh)".format(gap))
+
+
+def test_morning_gap_kwh_values():
+    """Morning gap with kWh-per-step values (Predbat format)."""
+    pv = {}
+    load = {}
+    step_kwh = 5 / 60.0  # kW→kWh per 5-min step
+    for m in range(0, 480, 5):
+        hour = m / 60.0
+        pv[m] = max(0, hour - 2) * 1.5 * step_kwh
+        load[m] = 1.0 * step_kwh
+    gap = compute_morning_gap(pv, load, start_minute=0, end_minute=480, step_minutes=5, values_are_kwh=True)
+    assert 1.5 < gap < 4.0, f"Expected morning gap 1.5-4.0 kWh with kWh values, got {gap:.2f}"
+    print("  test_morning_gap_kwh_values: PASSED (gap={:.2f}kWh)".format(gap))
+
+
+# ============================================================================
+# Buffer cap tests
+# ============================================================================
+
+
+def test_buffer_cap_small_overflow():
+    """Buffer should be capped at overflow on marginal days."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    # Reduce PV so overflow is small (~0.3kWh)
+    for m in pv:
+        pv[m] = 4.3  # barely above DNO 4kW + 1kW load = 4.3kW excess, overflow = 0.3kW
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=17.0, minutes_now=720, buffer_min=2.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=2.0, buffer_pct=30.0)
+    # Buffer should be capped at overflow, not the 2.0 kWh floor
+    assert dynamic_buffer <= overflow + 0.01, f"Buffer {dynamic_buffer:.2f} should be <= overflow {overflow:.2f}"
+    print("  test_buffer_cap_small_overflow: PASSED (buffer={:.2f}, overflow={:.2f})".format(dynamic_buffer, overflow))
+
+
+def test_buffer_cap_large_overflow():
+    """Buffer floor should apply normally on high overflow days."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=2.0, buffer_pct=30)
+    plugin = CurtailmentPlugin(base)
+    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=2.0, buffer_pct=30.0)
+    # High overflow: buffer should be max(floor, pct) and less than overflow
+    assert dynamic_buffer >= 2.0, f"Buffer {dynamic_buffer:.2f} should be >= floor 2.0"
+    assert dynamic_buffer <= overflow, f"Buffer {dynamic_buffer:.2f} should be <= overflow {overflow:.2f}"
+    print("  test_buffer_cap_large_overflow: PASSED (buffer={:.2f}, overflow={:.2f})".format(dynamic_buffer, overflow))
+
+
+# ============================================================================
+# on_before_plan tests
+# ============================================================================
+
+
+def test_before_plan_reduces_keep_on_overflow_day():
+    """on_before_plan should reduce best_soc_keep when overflow is forecast."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
+    plugin = CurtailmentPlugin(base)
+
+    context = {"best_soc_keep": 6.0}
+    result = plugin.on_before_plan(context)
+    assert result["best_soc_keep"] < 6.0, f"Expected soc_keep < 6.0, got {result['best_soc_keep']:.2f}"
+    # With PV=8kW and load=1kW, morning gap should be 0 (solar already covers)
+    # So adjusted keep should be near reserve + margin
+    assert result["best_soc_keep"] <= 1.0, f"Expected keep <= 1.0 (margin only), got {result['best_soc_keep']:.2f}"
+    print("  test_before_plan_reduces_keep_on_overflow_day: PASSED (keep={:.2f})".format(result["best_soc_keep"]))
+
+
+def test_before_plan_no_change_without_overflow():
+    """on_before_plan should not reduce best_soc_keep when no overflow."""
+    pv = {}
+    load = {}
+    for m in range(0, 720, 5):
+        pv[m] = 2.0  # moderate PV
+        load[m] = 3.0  # load exceeds PV, no overflow
+    step_kwh = 5 / 60.0
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
+    plugin = CurtailmentPlugin(base)
+
+    context = {"best_soc_keep": 6.0}
+    result = plugin.on_before_plan(context)
+    assert result["best_soc_keep"] == 6.0, f"Expected soc_keep unchanged at 6.0, got {result['best_soc_keep']:.2f}"
+    print("  test_before_plan_no_change_without_overflow: PASSED")
+
+
+def test_before_plan_never_increases():
+    """on_before_plan should only reduce, never increase best_soc_keep."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
+    plugin = CurtailmentPlugin(base)
+
+    context = {"best_soc_keep": 0.5}  # already very low
+    result = plugin.on_before_plan(context)
+    assert result["best_soc_keep"] == 0.5, f"Expected keep unchanged at 0.5 (not increased), got {result['best_soc_keep']:.2f}"
+    print("  test_before_plan_never_increases: PASSED")
+
+
+def test_before_plan_disabled():
+    """on_before_plan should return context unchanged when disabled."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
+    # Override enable to off
+    base.get_state_wrapper = lambda entity, default=None: "off" if "enable" in entity else default
+    plugin = CurtailmentPlugin(base)
+
+    context = {"best_soc_keep": 6.0}
+    result = plugin.on_before_plan(context)
+    assert result["best_soc_keep"] == 6.0, f"Expected keep unchanged when disabled, got {result['best_soc_keep']:.2f}"
+    print("  test_before_plan_disabled: PASSED")
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -734,6 +885,19 @@ def run_curtailment_tests(my_predbat=None):
         test_target_soc_clamped_above_soc_keep,
         test_target_soc_clamped_above_reserve,
         test_buffer_kwh_in_phase_sensor,
+        # Morning gap tests
+        test_morning_gap_pre_dawn,
+        test_morning_gap_solar_already_covers,
+        test_morning_gap_cloudy_never_covers,
+        test_morning_gap_kwh_values,
+        # Buffer cap tests
+        test_buffer_cap_small_overflow,
+        test_buffer_cap_large_overflow,
+        # on_before_plan tests
+        test_before_plan_reduces_keep_on_overflow_day,
+        test_before_plan_no_change_without_overflow,
+        test_before_plan_never_increases,
+        test_before_plan_disabled,
     ]
 
     for test_fn in tests:

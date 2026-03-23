@@ -11,7 +11,7 @@
 #   Inactive: MSC mode, read_only=False (Predbat resumes)
 # -----------------------------------------------------------------------------
 
-from curtailment_calc import compute_remaining_overflow, compute_target_soc, should_activate
+from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate
 from plugin_system import PredBatPlugin
 
 # SIG entity names (Mum's system)
@@ -45,6 +45,8 @@ class CurtailmentPlugin(PredBatPlugin):
     5. SOC < target: charge from PV (export_target = 0)
     """
 
+    priority = 200  # Run after cold_weather_plugin (priority 100)
+
     def __init__(self, base):
         super().__init__(base)
         self.last_ems_mode = None
@@ -55,9 +57,114 @@ class CurtailmentPlugin(PredBatPlugin):
         self._dno_limit = 4.0
         self.last_phase = None
         self.overflow_history = []
+        # Caching for on_before_plan
+        self._cached_keep = None
+        self._cached_at = 0  # minutes_now when last computed
 
     def register_hooks(self, plugin_system):
-        plugin_system.register_hook("on_update", self.on_update)
+        plugin_system.register_hook("on_update", self.on_update, plugin=self)
+        plugin_system.register_hook("on_before_plan", self.on_before_plan, plugin=self)
+
+    def on_before_plan(self, context):
+        """Reduce best_soc_keep on sunny days when solar will refill the battery.
+
+        Only reduces, never increases. If there's forecast overflow, the battery
+        will be refilled by solar, so soc_keep only needs to cover the morning
+        energy gap (load minus PV until solar takes over).
+        """
+        enabled = str(self.base.get_state_wrapper(HA_ENABLE, default="off")).lower() in ("on", "true")
+        if not enabled:
+            return context
+
+        minutes_now = getattr(self.base, "minutes_now", 720)
+
+        # Caching: overnight (22:00-06:00) recompute max every 30 min,
+        # morning (06:00-12:00) recalculate each cycle, afternoon skip
+        if self._cached_keep is not None:
+            minutes_since = minutes_now - self._cached_at
+            if minutes_since < 0:
+                minutes_since += 1440  # wrapped past midnight
+            # 06:00=360, 12:00=720, 22:00=1320
+            if 360 <= minutes_now < 720:
+                pass  # morning: always recalculate
+            elif minutes_since < 30:
+                context["best_soc_keep"] = min(context["best_soc_keep"], self._cached_keep)
+                return context
+
+        pv_step = getattr(self.base, "pv_forecast_minute_step", {})
+        load_step = getattr(self.base, "load_minutes_step", {})
+        soc_max = getattr(self.base, "soc_max", 10)
+        reserve = getattr(self.base, "reserve", 0)
+        forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
+
+        if not pv_step:
+            return context
+
+        dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
+        solar_end = min(forecast_minutes, max(PREDICT_STEP, 23 * 60 - minutes_now))
+
+        overflow = compute_remaining_overflow(
+            pv_step,
+            load_step,
+            dno_limit,
+            start_minute=PREDICT_STEP,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+
+        if overflow <= 0:
+            self._cached_keep = context["best_soc_keep"]
+            self._cached_at = minutes_now
+            return context
+
+        morning_gap = compute_morning_gap(
+            pv_step,
+            load_step,
+            start_minute=0,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+
+        margin = 0.5
+        solar_adjusted_keep = max(morning_gap + margin, reserve)
+        current_keep = context["best_soc_keep"]
+
+        if solar_adjusted_keep < current_keep:
+            self.log("Curtailment: reducing best_soc_keep {:.2f} -> {:.2f} kWh " "(morning_gap={:.2f}, overflow={:.2f})".format(current_keep, solar_adjusted_keep, morning_gap, overflow))
+            context["best_soc_keep"] = solar_adjusted_keep
+
+            self.base.dashboard_item(
+                "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
+                round(current_keep - solar_adjusted_keep, 2),
+                {
+                    "friendly_name": "Curtailment Solar SOC Keep Offset",
+                    "unit_of_measurement": "kWh",
+                    "icon": "mdi:solar-power",
+                    "morning_gap_kwh": round(morning_gap, 2),
+                    "overflow_kwh": round(overflow, 2),
+                    "original_keep": round(current_keep, 2),
+                    "adjusted_keep": round(solar_adjusted_keep, 2),
+                },
+            )
+        else:
+            self.base.dashboard_item(
+                "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
+                0.0,
+                {
+                    "friendly_name": "Curtailment Solar SOC Keep Offset",
+                    "unit_of_measurement": "kWh",
+                    "icon": "mdi:solar-power",
+                    "morning_gap_kwh": round(morning_gap, 2),
+                    "overflow_kwh": round(overflow, 2),
+                    "original_keep": round(current_keep, 2),
+                },
+            )
+
+        self._cached_keep = context["best_soc_keep"]
+        self._cached_at = minutes_now
+        return context
 
     def get_config(self):
         """Read configuration from HA input helpers and Predbat config."""
@@ -114,8 +221,9 @@ class CurtailmentPlugin(PredBatPlugin):
             self.overflow_history = self.overflow_history[-OVERFLOW_SMOOTH_WINDOW:]
         remaining_overflow = sum(self.overflow_history) / len(self.overflow_history)
 
-        # Dynamic buffer: percentage of remaining overflow, floored at minimum
-        dynamic_buffer = max(buffer_min_kwh, remaining_overflow * buffer_pct / 100.0)
+        # Dynamic buffer: percentage of remaining overflow, floored at minimum,
+        # but never exceeding the overflow itself (prevents buffer dominating on marginal days)
+        dynamic_buffer = min(max(buffer_min_kwh, remaining_overflow * buffer_pct / 100.0), remaining_overflow)
 
         target_soc_kwh = compute_target_soc(remaining_overflow, soc_max, dynamic_buffer)
         active = should_activate(remaining_overflow)
