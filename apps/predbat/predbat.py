@@ -812,6 +812,11 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
             plan_age_minutes = plan_age.seconds / 60.0
             self.log("Plan was last updated on {} and is now {} minutes old".format(self.plan_last_updated, dp1(plan_age_minutes)))
 
+        # Allow plugins to adjust planning parameters before plan calculation
+        if self.plugin_system:
+            ctx = self.plugin_system.call_before_plan_hooks({"best_soc_keep": self.best_soc_keep})
+            self.best_soc_keep = ctx.get("best_soc_keep", self.best_soc_keep)
+
         # Calculate the new plan (or re-use existing)
         recompute = self.calculate_plan(recompute=recompute)
 
