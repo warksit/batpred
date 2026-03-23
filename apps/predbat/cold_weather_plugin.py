@@ -402,56 +402,86 @@ class ColdWeatherPlugin(PredBatPlugin):
         return context
 
     def _get_tonight_prediction(self):
-        """Predict tonight's GSHP consumption from weather forecast."""
+        """Predict tonight's GSHP consumption from weather forecast.
+
+        The forecast only contains future hours. For past hours we use the
+        current weather state as a stand-in. The model needs:
+        - avg_temp: 20:00-03:00 (offsets -4 to 3 from midnight)
+        - avg_wind: 12:00-03:00 (offsets -12 to 3 from midnight)
+        - temp_drop: evening (22:00-00:00) minus dawn (04:00-07:00)
+
+        At evening time most of the temp window is available from forecast
+        but the wind window reaches back into the afternoon. We fill past
+        hours with the current weather conditions.
+        """
         if self.coefficients is None:
             return None
 
         try:
             result = self.base.call_service_wrapper("weather/get_forecasts", type="hourly", entity_id=HA_WEATHER, return_response=True)
             if not result:
+                self.log("Cold weather: weather forecast returned no result")
                 return None
 
             forecasts = result.get(HA_WEATHER, {}).get("forecast", [])
             if not forecasts:
+                self.log("Cold weather: no forecast entries in result")
                 return None
 
-            # Build hourly temp/wind from forecast
-            # Find tonight's data (next 20:00 to 07:00)
-            from datetime import datetime
+            from datetime import datetime, timedelta
 
             now = self.base.now_utc
             today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
+            # Target heating morning: today if before noon, tomorrow if after
+            if now.hour < 12:
+                target_midnight = today_midnight
+            else:
+                target_midnight = today_midnight + timedelta(days=1)
+
+            # Fill from forecast (future hours)
             hourly_temp = {}
             hourly_wind = {}
-
             for f in forecasts:
                 try:
                     dt_str = f.get("datetime", "")
                     dt = datetime.fromisoformat(dt_str)
-                    # Offset from midnight of the target heating morning
-                    # If it's before 12:00, target = today; otherwise target = tomorrow
-                    if now.hour < 12:
-                        target_midnight = today_midnight
-                    else:
-                        from datetime import timedelta
-
-                        target_midnight = today_midnight + timedelta(days=1)
-
                     h_off = int((dt - target_midnight).total_seconds() / 3600)
                     if -12 <= h_off < 8:
-                        hourly_temp[h_off] = f.get("temperature", f.get("temp"))
-                        hourly_wind[h_off] = f.get("wind_speed")
+                        temp = f.get("temperature", f.get("temp"))
+                        wind = f.get("wind_speed")
+                        if temp is not None:
+                            hourly_temp[h_off] = temp
+                        if wind is not None:
+                            hourly_wind[h_off] = wind
                 except (ValueError, TypeError, KeyError):
                     continue
 
+            # Fill past hours with current weather state (for the wind window
+            # which reaches back to 12:00 — mostly past by evening)
+            current_temp = self.base.get_state_wrapper(HA_WEATHER, attribute="temperature")
+            current_wind = self.base.get_state_wrapper(HA_WEATHER, attribute="wind_speed")
+            if current_temp is not None and current_wind is not None:
+                try:
+                    current_temp = float(current_temp)
+                    current_wind = float(current_wind)
+                    for h_off in range(-12, 8):
+                        if h_off not in hourly_temp:
+                            hourly_temp[h_off] = current_temp
+                        if h_off not in hourly_wind:
+                            hourly_wind[h_off] = current_wind
+                except (ValueError, TypeError):
+                    pass
+
             features = self._extract_features_from_hourly(hourly_temp, hourly_wind, 0)
             if features is None:
+                self.log("Cold weather: insufficient data for features (temp={}, wind={})".format(len(hourly_temp), len(hourly_wind)))
                 return None
 
             avg_temp, avg_wind, t_drop = features
             prediction = self._predict(avg_temp, avg_wind, t_drop)
             self._prediction = prediction
+            self.log("Cold weather: prediction={:.2f}kWh (temp={:.1f}, wind={:.1f}, drop={:.1f})".format(prediction, avg_temp, avg_wind, t_drop))
             return prediction
 
         except Exception as e:
