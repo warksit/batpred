@@ -638,13 +638,16 @@ class Execute:
         charge rates and battery capacities
 
         For inverters where charge_limit blocks all charging including solar
-        (soc_limits_block_solar), freeze charge must keep charge_limit at 100%
-        to allow solar charging. The freeze is handled by EMS mode, not the charge ceiling.
+        (soc_limits_block_solar), charge_limit MUST always be 100%. Setting it
+        below 100% blocks ALL charging including solar, which can cause over-export
+        and CLS faults. Charge control is handled by EMS mode switching (Grid First
+        → MSC), not the charge ceiling. The discharge floor prevents discharge
+        below target.
         """
         # SIG: charge_limit blocks ALL charging including solar.
-        # "Don't charge" (soc=0) must become charge_limit=100% to allow solar through.
-        # Freeze charge also keeps charge_limit=100% — the freeze is handled by EMS mode.
-        if getattr(inverter, "inv_soc_limits_block_solar", False) and (isFreezeCharge or soc == 0):
+        # ALWAYS set charge_limit=100% — charge control uses EMS mode, not the ceiling.
+        # Setting charge_limit < 100% blocks solar → forced export → CLS fault risk.
+        if getattr(inverter, "inv_soc_limits_block_solar", False):
             soc = 100.0
 
         target_kwh = dp2(self.soc_max * (soc / 100.0))
