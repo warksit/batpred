@@ -8,7 +8,7 @@
 # pylint: disable=line-too-long
 # pylint: disable=attribute-defined-outside-init
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 
 def process_octopus_intelligent_slots(my_predbat):
@@ -193,13 +193,17 @@ def run_multi_car_iog_load_slots_test(testname, my_predbat):
     my_predbat.octopus_intelligent_consider_full = False
     # octopus_slots must be pre-initialised per production code in fetch_sensor_data
     my_predbat.octopus_slots = [[] for _ in range(my_predbat.num_cars)]
-    # Ensure minutes_now is before the IOG slots so they are not filtered as past events.
-    # dynamic_load_car sets minutes_now=720 which would put slots at ~60-120 min in the "past".
+    # Pin now_utc to noon today so slot times (now+1h..now+3h) don't cross
+    # midnight regardless of when the test runs. Also set minutes_now=0 so
+    # slots are not filtered as past events (dynamic_load_car default is 720).
+    now = datetime.now(tz=timezone.utc)
+    my_predbat.now_utc = now.replace(hour=12, minute=0, second=0, microsecond=0)
     my_predbat.minutes_now = 0
 
     # apps.yaml config args needed by fetch_sensor_data_cars
     my_predbat.args["car_charging_loss"] = 0.0  # loss = 1 - 0.0 = 1.0
     my_predbat.args["car_charging_soc"] = [50.0, 50.0]  # 50% SoC for both cars
+    my_predbat.args["car_charging_limit"] = [100.0, 80.0]  # must match num_cars
 
     # Two IOG sensors - one per car
     slot1_start = (my_predbat.now_utc + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S%z")

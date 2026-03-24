@@ -6,6 +6,7 @@ Unit tests for Ohme EV charger integration
 
 import datetime
 import time
+import unittest.mock
 from unittest.mock import patch, MagicMock, AsyncMock
 from typing import Dict, Optional
 from tests.test_infra import run_async
@@ -313,21 +314,19 @@ def _test_ohme_time_next_occurs_today(my_predbat=None):
     """Test time_next_occurs for a time later today"""
     print("**** Running test_ohme_time_next_occurs_today ****")
 
-    # Get current time
-    now = datetime.datetime.now()
+    # Pin to 14:00 so "2 hours from now" (16:00) is unambiguously today
+    fixed_now = datetime.datetime(2026, 3, 15, 14, 0, 0)
+    future_time = fixed_now + datetime.timedelta(hours=2)
 
-    # Calculate a time 2 hours from now
-    future_time = now + datetime.timedelta(hours=2)
-    hour = future_time.hour
-    minute = future_time.minute
+    with unittest.mock.patch("ohme.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = fixed_now
+        mock_dt.datetime.side_effect = lambda *a, **kw: datetime.datetime(*a, **kw)
+        mock_dt.timedelta = datetime.timedelta
+        result = time_next_occurs(future_time.hour, future_time.minute)
 
-    # Get the next occurrence
-    result = time_next_occurs(hour, minute)
-
-    # Should be today (within 24 hours from now)
-    assert result.date() == future_time.date(), f"Expected date {future_time.date()}, got {result.date()}"
-    assert result.hour == hour, f"Expected hour {hour}, got {result.hour}"
-    assert result.minute == minute, f"Expected minute {minute}, got {result.minute}"
+    assert result.date() == fixed_now.date(), f"Expected date {fixed_now.date()}, got {result.date()}"
+    assert result.hour == future_time.hour, f"Expected hour {future_time.hour}, got {result.hour}"
+    assert result.minute == future_time.minute, f"Expected minute {future_time.minute}, got {result.minute}"
 
     print("PASS: time_next_occurs correctly returns future time today")
     return 0
@@ -337,22 +336,20 @@ def _test_ohme_time_next_occurs_tomorrow(my_predbat=None):
     """Test time_next_occurs for a time that should be tomorrow"""
     print("**** Running test_ohme_time_next_occurs_tomorrow ****")
 
-    # Get current time
-    now = datetime.datetime.now()
+    # Pin to 14:00 so "1 hour ago" (13:00) is unambiguously in the past
+    fixed_now = datetime.datetime(2026, 3, 15, 14, 0, 0)
+    past_time = fixed_now - datetime.timedelta(hours=1)
 
-    # Calculate a time 1 hour ago (should roll to tomorrow)
-    past_time = now - datetime.timedelta(hours=1)
-    hour = past_time.hour
-    minute = past_time.minute
+    with unittest.mock.patch("ohme.datetime") as mock_dt:
+        mock_dt.datetime.now.return_value = fixed_now
+        mock_dt.datetime.side_effect = lambda *a, **kw: datetime.datetime(*a, **kw)
+        mock_dt.timedelta = datetime.timedelta
+        result = time_next_occurs(past_time.hour, past_time.minute)
 
-    # Get the next occurrence
-    result = time_next_occurs(hour, minute)
-
-    # Should be tomorrow
-    expected_date = (now + datetime.timedelta(days=1)).date()
+    expected_date = (fixed_now + datetime.timedelta(days=1)).date()
     assert result.date() == expected_date, f"Expected date {expected_date}, got {result.date()}"
-    assert result.hour == hour, f"Expected hour {hour}, got {result.hour}"
-    assert result.minute == minute, f"Expected minute {minute}, got {result.minute}"
+    assert result.hour == past_time.hour, f"Expected hour {past_time.hour}, got {result.hour}"
+    assert result.minute == past_time.minute, f"Expected minute {past_time.minute}, got {result.minute}"
 
     print("PASS: time_next_occurs correctly returns time tomorrow")
     return 0
