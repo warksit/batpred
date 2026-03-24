@@ -66,6 +66,7 @@ class ColdWeatherPlugin(PredBatPlugin):
         self._recorded_today = False
         self._last_record_date = None
         self._gshp_energy_at_start = None
+        self._morning_min_soc = 999.0  # Track lowest SOC 04:00-08:00
         self._history_path = os.path.join(getattr(base, "config_root", "./"), HISTORY_FILE)
         self._load_history()
 
@@ -330,6 +331,9 @@ class ColdWeatherPlugin(PredBatPlugin):
         # Check for duplicate date
         existing_dates = {h["date"] for h in self.history}
         if today_str not in existing_dates:
+            rolling_avg = self._rolling_avg()
+            boost = max(0.0, (self._prediction or 0) - rolling_avg)
+            min_soc = round(self._morning_min_soc, 1) if self._morning_min_soc < 999 else None
             self.history.append(
                 {
                     "date": today_str,
@@ -337,11 +341,17 @@ class ColdWeatherPlugin(PredBatPlugin):
                     "avg_temp": avg_temp,
                     "avg_wind": avg_wind,
                     "t_drop": t_drop,
+                    "prediction": round(self._prediction, 2) if self._prediction else None,
+                    "boost": round(boost, 2),
+                    "morning_min_soc_pct": min_soc,
                 }
             )
             self._save_history()
             self._fit_model()
-            self.log("Cold weather: recorded day {} heat={:.1f}kWh temp={:.1f} wind={:.1f} drop={:.1f}".format(today_str, heat_kwh, avg_temp, avg_wind, t_drop))
+            self.log(
+                "Cold weather: recorded day {} heat={:.1f}kWh temp={:.1f} wind={:.1f} drop={:.1f} "
+                "prediction={} boost={:.2f} min_soc={}%".format(today_str, heat_kwh, avg_temp, avg_wind, t_drop, round(self._prediction, 1) if self._prediction else "?", boost, min_soc)
+            )
 
         self._last_record_date = today_str
         self._gshp_energy_at_start = None  # Reset for next day
@@ -361,11 +371,19 @@ class ColdWeatherPlugin(PredBatPlugin):
         # Snapshot GSHP energy at start of measurement window
         if GSHP_START_HOUR * 60 <= minutes_now < GSHP_START_HOUR * 60 + 10:
             if self._gshp_energy_at_start is None:
+                self._morning_min_soc = 999.0  # Reset for new day
                 try:
                     self._gshp_energy_at_start = float(self.base.get_state_wrapper(HA_GSHP_ENERGY, default=0))
                     self.log("Cold weather: GSHP energy snapshot at 04:00 = {:.2f} kWh".format(self._gshp_energy_at_start))
                 except (ValueError, TypeError):
                     pass
+
+        # Track min SOC during morning window (04:00-08:00)
+        if GSHP_START_HOUR * 60 <= minutes_now < GSHP_END_HOUR * 60:
+            soc_kw = getattr(self.base, "soc_kw", 999)
+            soc_max = getattr(self.base, "soc_max", 18.08)
+            soc_pct = (soc_kw / soc_max * 100) if soc_max > 0 else 0
+            self._morning_min_soc = min(self._morning_min_soc, soc_pct)
 
         # Record daily consumption after 08:10
         if minutes_now >= GSHP_END_HOUR * 60 + 10:
