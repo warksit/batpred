@@ -95,6 +95,8 @@ class MockBase:
         self.now_utc = None
         self.minutes_now = 720
         self.prefix = "predbat"
+        self.soc_max = 18.08
+        self.all_active_keep = {}
         self.logs = []
         self.published = {}
         self._states = {}
@@ -135,6 +137,7 @@ def _make_plugin_with_history(history):
     plugin._last_record_date = None
     plugin._gshp_energy_at_start = None
     plugin._bootstrapped = True
+    plugin._morning_min_soc = 999.0
     plugin._history_path = "/tmp/test_cold_weather.json"
     return plugin
 
@@ -194,70 +197,126 @@ def test_predict_without_model():
 
 
 # ============================================================================
-# on_before_plan tests
+# on_before_plan tests (alert_keep injection)
 # ============================================================================
 
 
-def test_before_plan_raises_keep():
-    """on_before_plan should raise best_soc_keep when prediction exceeds current."""
-    history = []
-    # Create history where heat is always ~5 kWh
-    for i in range(8):
-        history.append({"date": "2026-03-{:02d}".format(i + 1), "heat_kwh": 5.0, "avg_temp": 4.0, "avg_wind": 10.0, "t_drop": 3.0})
-    plugin = _make_plugin_with_history(history)
-    plugin._fit_model()
-    # Set prediction directly (bypass weather forecast)
-    plugin._prediction = 5.0
-    plugin.coefficients = (5.0, 0, 0, 0)  # Constant model: always 5.0
-
-    context = {"best_soc_keep": 3.0}
-    # Mock get_state_wrapper for enable check
+def test_before_plan_injects_alert_keep():
+    """on_before_plan should inject tapered alert_keep into all_active_keep."""
+    plugin = _make_plugin_with_history([])
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base.minutes_now = 720  # Noon → target tomorrow 04:00-08:00
+    plugin.base.all_active_keep = {}
 
-    # Need to mock the forecast call - set prediction manually
-    # The on_before_plan calls _get_tonight_prediction which needs weather service
-    # Let's test the logic directly
-    prediction = 5.0
-    target_keep = prediction + 0.5  # margin
-    if target_keep > context["best_soc_keep"]:
-        context["best_soc_keep"] = target_keep
+    # No model → uses DEFAULT_KEEP_KWH=6.0
+    context = {"best_soc_keep": 2.0}
+    result = plugin.on_before_plan(context)
 
-    assert context["best_soc_keep"] == 5.5, "Expected 5.5, got {}".format(context["best_soc_keep"])
-    print("  test_before_plan_raises_keep: PASSED (keep={})".format(context["best_soc_keep"]))
+    # Should inject for tomorrow's window: (24+4)*60=1680 to (24+8)*60=1920
+    max_pct = (6.0 + 0.5) / 18.08 * 100.0  # ~35.9%
+    assert len(plugin.base.all_active_keep) == 240, "Expected 240 entries (04:00-08:00), got {}".format(len(plugin.base.all_active_keep))
+    assert 1680 in plugin.base.all_active_keep, "Expected minute 1680 (04:00 tomorrow)"
+    assert 1919 in plugin.base.all_active_keep, "Expected minute 1919 (07:59 tomorrow)"
+    assert 1920 not in plugin.base.all_active_keep, "Should not include minute 1920 (08:00)"
+    # Start of window: full keep
+    assert abs(plugin.base.all_active_keep[1680] - max_pct) < 0.1, "Start: expected {:.1f}%, got {:.1f}%".format(max_pct, plugin.base.all_active_keep[1680])
+    # Midpoint (06:00 = 1800): 50% of keep
+    assert abs(plugin.base.all_active_keep[1800] - max_pct * 0.5) < 0.2, "Midpoint: expected {:.1f}%, got {:.1f}%".format(max_pct * 0.5, plugin.base.all_active_keep[1800])
+    # Last minute (1919): ~0.4% (1/240 of keep)
+    assert plugin.base.all_active_keep[1919] < 1.0, "End should taper near zero, got {:.1f}%".format(plugin.base.all_active_keep[1919])
+    # best_soc_keep should be boosted by prediction * 0.5 (DEFAULT_KEEP_KWH=6.0 → +3.0)
+    assert abs(result["best_soc_keep"] - 5.0) < 0.1, "Expected soc_keep=5.0, got {}".format(result["best_soc_keep"])
+    # weight should be boosted too
+    assert result["best_soc_keep_weight"] > 2.0, "Expected weight > 2.0, got {}".format(result["best_soc_keep_weight"])
+    print("  test_before_plan_injects_alert_keep: PASSED (keep_pct={:.1f}%->0%, soc_keep={:.1f}, entries={})".format(max_pct, result["best_soc_keep"], len(plugin.base.all_active_keep)))
 
 
-def test_before_plan_no_change_when_keep_already_higher():
-    """on_before_plan should not lower best_soc_keep."""
-    context = {"best_soc_keep": 8.0}
-    prediction = 5.0
-    target_keep = prediction + 0.5  # 5.5 < 8.0
-    if target_keep > context["best_soc_keep"]:
-        context["best_soc_keep"] = target_keep
+def test_before_plan_morning_targets_today():
+    """Before noon, should target today's GSHP window (04:00-08:00 today)."""
+    plugin = _make_plugin_with_history([])
+    plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base.minutes_now = 180  # 03:00 → target today
+    plugin.base.all_active_keep = {}
 
-    assert context["best_soc_keep"] == 8.0, "Expected unchanged 8.0, got {}".format(context["best_soc_keep"])
-    print("  test_before_plan_no_change_when_keep_already_higher: PASSED")
+    context = {"best_soc_keep": 2.0}
+    plugin.on_before_plan(context)
+
+    # Today's window: 4*60=240 to 8*60=480
+    assert 240 in plugin.base.all_active_keep, "Expected minute 240 (04:00 today)"
+    assert 479 in plugin.base.all_active_keep, "Expected minute 479 (07:59 today)"
+    assert 1680 not in plugin.base.all_active_keep, "Should not have tomorrow's entries"
+    print("  test_before_plan_morning_targets_today: PASSED")
+
+
+def test_before_plan_respects_existing_keep():
+    """Should not lower existing all_active_keep entries."""
+    plugin = _make_plugin_with_history([])
+    plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base.minutes_now = 180  # 03:00
+    plugin.base.all_active_keep = {240: 99.0}  # Existing high keep at 04:00
+
+    context = {"best_soc_keep": 2.0}
+    plugin.on_before_plan(context)
+
+    assert plugin.base.all_active_keep[240] == 99.0, "Should not lower existing 99%, got {}".format(plugin.base.all_active_keep[240])
+    print("  test_before_plan_respects_existing_keep: PASSED")
+
+
+def test_before_plan_below_threshold():
+    """Should not inject when prediction is below MIN_KEEP_KWH."""
+    plugin = _make_plugin_with_history([])
+    plugin.coefficients = (2.0, 0, 0, 0)  # Constant model: always 2.0 kWh
+    plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base.minutes_now = 720
+    plugin.base.all_active_keep = {}
+
+    # Mock _get_tonight_prediction to return 2.0 (below MIN_KEEP_KWH=3.0)
+    plugin._prediction = 2.0
+    original_method = plugin._get_tonight_prediction
+    plugin._get_tonight_prediction = lambda: 2.0
+
+    context = {"best_soc_keep": 2.0}
+    result = plugin.on_before_plan(context)
+
+    assert len(plugin.base.all_active_keep) == 0, "Should not inject below threshold, got {} entries".format(len(plugin.base.all_active_keep))
+    plugin._get_tonight_prediction = original_method
+    print("  test_before_plan_below_threshold: PASSED")
 
 
 def test_before_plan_disabled():
     """on_before_plan should return context unchanged when heating toggle is off."""
     plugin = _make_plugin_with_history([])
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "off"
+    plugin.base.all_active_keep = {}
 
     context = {"best_soc_keep": 3.0}
     result = plugin.on_before_plan(context)
     assert result["best_soc_keep"] == 3.0, "Expected unchanged 3.0, got {}".format(result["best_soc_keep"])
+    assert len(plugin.base.all_active_keep) == 0, "Should not inject when disabled"
     print("  test_before_plan_disabled: PASSED")
 
 
-def test_before_plan_no_model_uses_default():
-    """With no model, should use conservative default."""
+def test_before_plan_with_model_prediction():
+    """With a trained model, should use predicted kWh for tapered alert_keep."""
     plugin = _make_plugin_with_history([])
+    plugin.coefficients = (5.0, 0, 0, 0)  # Constant model: always 5.0 kWh
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base.minutes_now = 720
+    plugin.base.all_active_keep = {}
 
-    context = {"best_soc_keep": 3.0}
-    result = plugin.on_before_plan(context)
-    assert result["best_soc_keep"] == 6.0, "Expected default 6.0, got {}".format(result["best_soc_keep"])
-    print("  test_before_plan_no_model_uses_default: PASSED")
+    # Mock prediction
+    plugin._get_tonight_prediction = lambda: 5.0
+
+    context = {"best_soc_keep": 2.0}
+    plugin.on_before_plan(context)
+
+    max_pct = (5.0 + 0.5) / 18.08 * 100.0  # ~30.4%
+    assert len(plugin.base.all_active_keep) == 240
+    # Start: full keep
+    assert abs(plugin.base.all_active_keep[1680] - max_pct) < 0.1, "Start: expected {:.1f}%, got {:.1f}%".format(max_pct, plugin.base.all_active_keep[1680])
+    # 75% through (07:00 = 1860): 25% of keep
+    assert abs(plugin.base.all_active_keep[1860] - max_pct * 0.25) < 0.2, "75%: expected {:.1f}%, got {:.1f}%".format(max_pct * 0.25, plugin.base.all_active_keep[1860])
+    print("  test_before_plan_with_model_prediction: PASSED (keep={:.1f}%->0%)".format(max_pct))
 
 
 # ============================================================================
@@ -283,11 +342,13 @@ def run_cold_weather_tests():
         test_fit_model_insufficient_data,
         test_predict_with_model,
         test_predict_without_model,
-        # on_before_plan
-        test_before_plan_raises_keep,
-        test_before_plan_no_change_when_keep_already_higher,
+        # on_before_plan (alert_keep injection)
+        test_before_plan_injects_alert_keep,
+        test_before_plan_morning_targets_today,
+        test_before_plan_respects_existing_keep,
+        test_before_plan_below_threshold,
         test_before_plan_disabled,
-        test_before_plan_no_model_uses_default,
+        test_before_plan_with_model_prediction,
     ]
 
     for test_fn in tests:

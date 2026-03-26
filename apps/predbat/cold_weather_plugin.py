@@ -40,6 +40,7 @@ MARGIN_KWH = 0.5  # Safety margin added to prediction
 DEFAULT_KEEP_KWH = 6.0  # Conservative default before model is trained
 MIN_TRAINING_DAYS = 7  # Minimum history for model to be used
 BOOTSTRAP_DAYS = 60  # Days of history to fetch on first run
+MIN_KEEP_KWH = 3.0  # Don't inject alert_keep below this threshold
 
 
 class ColdWeatherPlugin(PredBatPlugin):
@@ -67,6 +68,9 @@ class ColdWeatherPlugin(PredBatPlugin):
         self._last_record_date = None
         self._gshp_energy_at_start = None
         self._morning_min_soc = 999.0  # Track lowest SOC 04:00-08:00
+        self._keep_pct = None  # Last injected alert_keep start %
+        self._keep_kwh = None  # Last injected keep kWh
+        self._keep_weight = None  # Last applied soc_keep weight
         self._history_path = os.path.join(getattr(base, "config_root", "./"), HISTORY_FILE)
         self._load_history()
 
@@ -393,34 +397,82 @@ class ColdWeatherPlugin(PredBatPlugin):
         self._publish()
 
     def on_before_plan(self, context):
-        """Adjust best_soc_keep based on predicted morning GSHP consumption."""
+        """Inject alert_keep for GSHP morning window so optimizer respects it.
+
+        The old approach boosted best_soc_keep (soft penalty, weight=0.5) which
+        the optimizer ignored during cheap rate — the penalty was less than the
+        cost of charging. Now we inject into all_active_keep which triggers the
+        alert_keep path in prediction.py: keep_minute_scaling is forced to 10.0,
+        bypassing the four-hour ramp and making the penalty 20x stronger.
+        """
         enabled = str(self.base.get_state_wrapper(HA_GSHP_HEATING, default="off")).lower() in ("on", "true")
         if not enabled:
             return context
 
         if self.coefficients is None:
-            # No model yet — use conservative default
-            current = context.get("best_soc_keep", 0)
-            if DEFAULT_KEEP_KWH > current:
-                context["best_soc_keep"] = DEFAULT_KEEP_KWH
+            prediction = DEFAULT_KEEP_KWH
+        else:
+            prediction = self._get_tonight_prediction()
+            if prediction is None:
+                return context
+
+        if prediction < MIN_KEEP_KWH:
             return context
 
-        # Get tonight's weather forecast
-        prediction = self._get_tonight_prediction()
-        if prediction is None:
-            return context
+        # Convert predicted load to SOC percentage for alert_keep
+        soc_max = getattr(self.base, "soc_max", 18.08)
+        keep_kwh = prediction + MARGIN_KWH
+        keep_pct = min(keep_kwh / soc_max * 100.0, 100.0)
 
-        # Boost = how much more GSHP than the rolling average (what LoadML has learned).
-        # LoadML and Predbat already handle average load + charge windows.
-        # We only boost for the excess that LoadML will miss.
-        rolling_avg = self._rolling_avg()
-        boost = max(0.0, prediction - rolling_avg)
-        current = context.get("best_soc_keep", 0)
+        # Determine next GSHP morning window in absolute minutes (from midnight today)
+        minutes_now = getattr(self.base, "minutes_now", 0)
+        if minutes_now < 12 * 60:
+            gshp_start = GSHP_START_HOUR * 60
+            gshp_end = GSHP_END_HOUR * 60
+        else:
+            gshp_start = (24 + GSHP_START_HOUR) * 60
+            gshp_end = (24 + GSHP_END_HOUR) * 60
 
-        if boost > 0:
-            new_keep = current + boost
-            self.log("Cold weather: boosting best_soc_keep {:.2f} -> {:.2f} kWh " "(predicted={:.2f}, rolling_avg={:.2f}, boost={:.2f})".format(current, new_keep, prediction, rolling_avg, boost))
-            context["best_soc_keep"] = new_keep
+        # Inject into all_active_keep with linear taper — at 04:00 the full
+        # GSHP load remains, by 08:00 it's consumed so keep drops to zero.
+        all_active_keep = getattr(self.base, "all_active_keep", {})
+        window_len = gshp_end - gshp_start
+        for minute in range(gshp_start, gshp_end):
+            remaining = (gshp_end - minute) / window_len
+            tapered_pct = keep_pct * remaining
+            if minute not in all_active_keep or all_active_keep[minute] < tapered_pct:
+                all_active_keep[minute] = tapered_pct
+
+        # Boost best_soc_keep and weight so optimizer resists draining all day.
+        # Scale both with prediction severity (proxy for how cold the day is).
+        base_keep = context.get("best_soc_keep", 0)
+        keep_boost = prediction * 0.5  # Half the morning prediction as all-day buffer
+        context["best_soc_keep"] = base_keep + keep_boost
+
+        base_weight = context.get("best_soc_keep_weight", 0.5)
+        weight_boost = prediction / DEFAULT_KEEP_KWH * 2.0
+        new_weight = min(base_weight + weight_boost, 5.0)
+        context["best_soc_keep_weight"] = new_weight
+
+        self._keep_pct = round(keep_pct, 1)
+        self._keep_kwh = round(keep_kwh, 1)
+        self._keep_weight = round(new_weight, 1)
+
+        self.log(
+            "Cold weather: alert_keep={:.1f}%->{:.0f}% for {:02d}:00-{:02d}:00, "
+            "soc_keep={:.1f}->{:.1f}kWh, weight={:.1f}->{:.1f} "
+            "(predicted={:.1f}kWh)".format(
+                keep_pct,
+                0.0,
+                GSHP_START_HOUR,
+                GSHP_END_HOUR,
+                base_keep,
+                base_keep + keep_boost,
+                base_weight,
+                new_weight,
+                prediction,
+            )
+        )
 
         return context
 
@@ -529,6 +581,9 @@ class ColdWeatherPlugin(PredBatPlugin):
             "icon": "mdi:snowflake-thermometer",
             "boost": round(boost, 2),
             "rolling_avg": round(rolling_avg, 2),
+            "alert_keep_pct": self._keep_pct,
+            "alert_keep_kwh": self._keep_kwh,
+            "keep_weight": self._keep_weight,
             "model_r2": round(self.model_r2, 3) if self.coefficients else None,
             "data_points": len(self.history),
             "coefficients": [round(c, 4) for c in self.coefficients] if self.coefficients else None,
