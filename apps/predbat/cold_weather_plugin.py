@@ -34,6 +34,7 @@ DROP_DAWN = (4, 7)  # 04:00 to 07:00 — dawn reference
 # GSHP measurement window
 GSHP_START_HOUR = 4  # 04:00
 GSHP_END_HOUR = 8  # 08:00
+CHEAP_RATE_END_HOUR = 7  # 07:00 — only inject alert_keep during cheap rate
 
 HISTORY_FILE = "cold_weather_history.json"
 MARGIN_KWH = 0.5  # Safety margin added to prediction
@@ -429,48 +430,40 @@ class ColdWeatherPlugin(PredBatPlugin):
         if minutes_now < 12 * 60:
             gshp_start = GSHP_START_HOUR * 60
             gshp_end = GSHP_END_HOUR * 60
+            inject_end = CHEAP_RATE_END_HOUR * 60
         else:
             gshp_start = (24 + GSHP_START_HOUR) * 60
             gshp_end = (24 + GSHP_END_HOUR) * 60
+            inject_end = (24 + CHEAP_RATE_END_HOUR) * 60
 
-        # Inject into all_active_keep with linear taper — at 04:00 the full
-        # GSHP load remains, by 08:00 it's consumed so keep drops to zero.
+        # Inject alert_keep only during cheap rate (04:00-07:00). The taper
+        # references the full GSHP window (04:00-08:00) so remaining fraction
+        # represents how much GSHP load is still to come. At 07:00 (end of
+        # cheap rate) ~25% of the prediction remains — enough for the last
+        # hour. After 07:00: no penalty, battery drains naturally for load.
         all_active_keep = getattr(self.base, "all_active_keep", {})
         window_len = gshp_end - gshp_start
-        for minute in range(gshp_start, gshp_end):
+        end_pct = 0.0
+        for minute in range(gshp_start, inject_end):
             remaining = (gshp_end - minute) / window_len
             tapered_pct = keep_pct * remaining
             if minute not in all_active_keep or all_active_keep[minute] < tapered_pct:
                 all_active_keep[minute] = tapered_pct
-
-        # Boost best_soc_keep and weight so optimizer resists draining all day.
-        # Scale both with prediction severity (proxy for how cold the day is).
-        base_keep = context.get("best_soc_keep", 0)
-        keep_boost = prediction * 0.5  # Half the morning prediction as all-day buffer
-        context["best_soc_keep"] = base_keep + keep_boost
-
-        base_weight = context.get("best_soc_keep_weight", 0.5)
-        weight_boost = prediction / DEFAULT_KEEP_KWH * 2.0
-        new_weight = min(base_weight + weight_boost, 5.0)
-        context["best_soc_keep_weight"] = new_weight
+            end_pct = tapered_pct
 
         self._keep_pct = round(keep_pct, 1)
         self._keep_kwh = round(keep_kwh, 1)
-        self._keep_weight = round(new_weight, 1)
+        self._keep_weight = None
 
         self.log(
-            "Cold weather: alert_keep={:.1f}%->{:.0f}% for {:02d}:00-{:02d}:00, "
-            "soc_keep={:.1f}->{:.1f}kWh, weight={:.1f}->{:.1f} "
-            "(predicted={:.1f}kWh)".format(
+            "Cold weather: alert_keep={:.1f}%->{:.1f}% for {:02d}:00-{:02d}:00 "
+            "(predicted={:.1f}kWh, keep={:.1f}kWh)".format(
                 keep_pct,
-                0.0,
+                end_pct,
                 GSHP_START_HOUR,
-                GSHP_END_HOUR,
-                base_keep,
-                base_keep + keep_boost,
-                base_weight,
-                new_weight,
+                CHEAP_RATE_END_HOUR,
                 prediction,
+                keep_kwh,
             )
         )
 
