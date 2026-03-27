@@ -1,17 +1,29 @@
 # -----------------------------------------------------------------------------
 # Curtailment Manager Plugin for Predbat
-# Iterative target SOC algorithm to eliminate solar curtailment
+# Time-aware algorithm (v6) to eliminate solar curtailment
 #
 # Works WITH the HA automation (curtailment_manager_dynamic_export_limit):
-#   - Plugin (5-min): computes target SOC, switches EMS mode, publishes sensors
-#   - HA automation (~5s): reactive export limit control (reads export_target sensor)
+#   - Plugin (5-min): computes phase from overflow timing, publishes sensors
+#   - HA automation (~5s): reactive export limit control in holding phase
 #
 # Control model (SIG inverter):
 #   Active:  D-ESS mode, read_only=True (suppresses Predbat inverter control)
 #   Inactive: MSC mode, read_only=False (Predbat resumes)
+#
+# Time-aware phases:
+#   Pre-overflow:  drain to target or hold (NEVER absorb — no pointless cycles)
+#   Overflow:      export=DNO, battery absorbs excess; drains on PV dips
+#   Post-overflow: top up to 100% from remaining PV
 # -----------------------------------------------------------------------------
 
-from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate
+from curtailment_calc import (
+    compute_remaining_overflow,
+    compute_morning_gap,
+    compute_target_soc,
+    compute_overflow_window,
+    compute_post_overflow_energy,
+    should_activate,
+)
 from plugin_system import PredBatPlugin
 
 # SIG entity names (Mum's system)
@@ -19,6 +31,8 @@ SIG_EMS_MODE = "select.sigen_plant_remote_ems_control_mode"
 SIG_EXPORT_LIMIT = "number.sigen_plant_grid_export_limitation"
 SIG_IMPORT_LIMIT = "number.sigen_plant_grid_import_limitation"
 SIG_CHARGE_LIMIT = "number.sigen_plant_ess_charge_cut_off_state_of_charge"
+SIG_PV_POWER = "sensor.sigen_plant_pv_power"
+SIG_LOAD_POWER = "sensor.sigen_plant_consumed_power"
 
 # HA input helper entity IDs
 HA_ENABLE = "input_boolean.curtailment_manager_enable"
@@ -27,22 +41,25 @@ HA_BUFFER_PCT = "input_number.curtailment_manager_buffer_percent"  # % of overfl
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
-# Smooth overflow over 6 cycles (30 min) to cancel LoadML's 30-min oscillation
-# caused by heat pump compressor cycling in the autoregressive lookback buffer
-OVERFLOW_SMOOTH_WINDOW = 6
+# Sustained sub-DNO slots to confirm overflow window has ended (not just a cloud gap)
+OVERFLOW_END_SUSTAINED_SLOTS = 6  # 30 min
 
 
 class CurtailmentPlugin(PredBatPlugin):
     """
-    Curtailment manager — computes target SOC from forecast overflow,
-    switches EMS mode, and publishes sensors for the HA automation.
+    Curtailment manager v6 — time-aware algorithm.
 
-    Algorithm (v5 iterative target SOC):
-    1. remaining_overflow = sum of max(0, excess - DNO) × step_hours for future slots
-    2. target_soc = battery_max - remaining_overflow
-    3. SOC > target: drain (export_target = DNO limit)
-    4. SOC ≈ target: hold (export_target = -1, HA automation tracks PV-load)
-    5. SOC < target: charge from PV (export_target = 0)
+    Key insight: once PV-load exceeds DNO, the battery charges regardless of
+    what we do (AC-coupled solar). We can only drain BEFORE overflow starts.
+    So phase selection is based on WHEN we are relative to the overflow window,
+    not just SOC vs target.
+
+    Phases:
+        draining:   Pre-overflow, SOC above target → export=DNO, discharge battery
+        holding:    Pre-overflow, SOC at/below target → export=PV-load (HA automation)
+        overflow:   During overflow window → export=DNO (absorb excess, drain on dips)
+        topping_up: Post-overflow → export=0, charge to 100% from remaining PV
+        off:        No overflow expected or solar done → hand to Predbat
     """
 
     priority = 200  # Run after cold_weather_plugin (priority 100)
@@ -56,7 +73,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self.was_active = False
         self._dno_limit = 4.0
         self.last_phase = None
-        self.overflow_history = []
+        self._max_pv_scale = 1.0  # track peak PV scale factor across cycles
+        self._was_overflowing = False  # have we seen overflow at all today?
+        self._pv_excess_history = []  # rolling actual PV-load history for trend detection
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0  # minutes_now when last computed
@@ -132,7 +151,7 @@ class CurtailmentPlugin(PredBatPlugin):
         current_keep = context["best_soc_keep"]
 
         if solar_adjusted_keep < current_keep:
-            self.log("Curtailment: reducing best_soc_keep {:.2f} -> {:.2f} kWh " "(morning_gap={:.2f}, overflow={:.2f})".format(current_keep, solar_adjusted_keep, morning_gap, overflow))
+            self.log("Curtailment: reducing best_soc_keep {:.2f} -> {:.2f} kWh (morning_gap={:.2f}, overflow={:.2f})".format(current_keep, solar_adjusted_keep, morning_gap, overflow))
             context["best_soc_keep"] = solar_adjusted_keep
 
             self.base.dashboard_item(
@@ -190,9 +209,35 @@ class CurtailmentPlugin(PredBatPlugin):
 
         return enabled, dno_limit, buffer_min, buffer_pct
 
+    def _get_pv_scale(self, pv_step, dno_limit_kw):
+        """Read actual PV/load sensors and compute scale factor vs forecast.
+
+        Returns (actual_pv, actual_load, pv_scale). Scale > 1 means actual
+        exceeds forecast (underforecast). Scale < 1 means overforecast.
+        Tracks the peak scale factor across cycles for the day.
+        """
+        step_to_kw = 60.0 / PREDICT_STEP
+        try:
+            actual_pv = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0))
+            actual_load = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0))
+        except (ValueError, TypeError):
+            return 0.0, 0.0, 1.0
+
+        forecast_pv_kw = pv_step.get(0, 0) * step_to_kw
+        if forecast_pv_kw > 0.5 and actual_pv > 0.5:
+            pv_scale = actual_pv / forecast_pv_kw
+            if pv_scale > 1.1:
+                if pv_scale > self._max_pv_scale:
+                    self.log("Curtailment: PV scale {:.2f}x (actual {:.1f}kW vs forecast {:.1f}kW)".format(pv_scale, actual_pv, forecast_pv_kw))
+                self._max_pv_scale = max(self._max_pv_scale, pv_scale)
+        else:
+            pv_scale = 1.0
+
+        return actual_pv, actual_load, pv_scale
+
     def calculate(self, dno_limit_kw, buffer_min_kwh=1.0, buffer_pct=30.0):
         """
-        Compute curtailment target SOC using v5 iterative algorithm.
+        Compute curtailment phase using v6 time-aware algorithm.
 
         Returns (target_soc_kwh, remaining_overflow_kwh, phase, export_target_kw, dynamic_buffer)
         """
@@ -205,58 +250,150 @@ class CurtailmentPlugin(PredBatPlugin):
         if not pv_step or not soc_max:
             return soc_max, 0, "off", -1, 0
 
-        # Only look at TODAY's solar (up to 23:00) to avoid over-draining
-        # for tomorrow's overflow. No PV after 23:00 even in UK midsummer.
         minutes_now = getattr(self.base, "minutes_now", 720)
         solar_end_minute = min(forecast_minutes, max(PREDICT_STEP, 23 * 60 - minutes_now))
 
-        # Compute remaining overflow from next step to end of today's solar
-        # Predbat forecast values are kWh per step (not kW)
-        step_to_kw = 60.0 / PREDICT_STEP  # kWh-per-step → kW
-        raw_overflow = compute_remaining_overflow(pv_step, load_step, dno_limit_kw, start_minute=PREDICT_STEP, end_minute=solar_end_minute, step_minutes=PREDICT_STEP, values_are_kwh=True)
+        # --- PV scaling and actual trend tracking ---
+        actual_pv, actual_load, pv_scale = self._get_pv_scale(pv_step, dno_limit_kw)
+        currently_overflowing = (actual_pv - actual_load) > dno_limit_kw
 
-        # Smooth overflow to cancel LoadML's 30-min oscillation
-        self.overflow_history.append(raw_overflow)
-        if len(self.overflow_history) > OVERFLOW_SMOOTH_WINDOW:
-            self.overflow_history = self.overflow_history[-OVERFLOW_SMOOTH_WINDOW:]
-        remaining_overflow = sum(self.overflow_history) / len(self.overflow_history)
+        # Track actual PV trend for post-overflow detection (ground truth).
+        # Uses rolling 15-min max of actual excess: if no overflow spike in the
+        # last 15 min after we've seen overflow today, switch to topping_up.
+        # If a cloud falsely triggers this, the charge gained is negligible
+        # (barely any PV during clouds), and the self-correcting mechanism
+        # goes back to draining when PV recovers above DNO.
+        if currently_overflowing:
+            self._was_overflowing = True
+        actual_excess_kw = actual_pv - actual_load
+        if actual_pv > 0.1:
+            self._pv_excess_history.append(actual_excess_kw)
+        # Keep 15 min of history (3 cycles × 5 min)
+        if len(self._pv_excess_history) > 3:
+            self._pv_excess_history = self._pv_excess_history[-3:]
 
-        # Dynamic buffer: percentage of remaining overflow, floored at minimum,
-        # but never exceeding the overflow itself (prevents buffer dominating on marginal days)
-        dynamic_buffer = min(max(buffer_min_kwh, remaining_overflow * buffer_pct / 100.0), remaining_overflow)
+        actual_overflow_ended = False
+        if self._was_overflowing and len(self._pv_excess_history) >= 3:
+            recent_peak = max(self._pv_excess_history)
+            actual_overflow_ended = recent_peak < dno_limit_kw
 
-        target_soc_kwh = compute_target_soc(remaining_overflow, soc_max, dynamic_buffer)
-        active = should_activate(remaining_overflow)
+        # Use peak scale factor for overflow estimate (most conservative)
+        effective_scale = max(pv_scale, self._max_pv_scale) if self._max_pv_scale > 1.1 else max(pv_scale, 1.0)
+        if effective_scale > 1.1:
+            pv_effective = {m: v * effective_scale for m, v in pv_step.items()}
+        else:
+            pv_effective = pv_step
 
-        # Respect Predbat's minimum SOC (already reduced by solar offset on big days)
-        soc_keep = getattr(self.base, "best_soc_keep", 0)
-        reserve = getattr(self.base, "reserve", 0)
-        target_soc_kwh = max(target_soc_kwh, soc_keep, reserve)
+        # --- Overflow computation ---
+        remaining_overflow = compute_remaining_overflow(
+            pv_effective,
+            load_step,
+            dno_limit_kw,
+            start_minute=PREDICT_STEP,
+            end_minute=solar_end_minute,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
 
-        # Safety net: force activation if PV > DNO and battery near full,
-        # even if forecast missed the overflow.
-        pv_now_kw = pv_step.get(0, 0) * step_to_kw
-        if not active and pv_now_kw > dno_limit_kw and soc_kw >= soc_max - SOC_MARGIN_KWH:
-            self.log("Curtailment: WARNING — real-time activation (forecast missed overflow). " "PV {:.1f}kW > DNO {:.1f}kW, SOC {:.1f}kWh near full".format(pv_now_kw, dno_limit_kw, soc_kw))
-            target_soc_kwh = min(target_soc_kwh, soc_max - SOC_MARGIN_KWH)
-            active = True
-            remaining_overflow = max(remaining_overflow, 0.1)
-
-        if not active:
+        if not should_activate(remaining_overflow) and not currently_overflowing and not actual_overflow_ended:
+            self._max_pv_scale = 1.0  # reset for next day
+            self._was_overflowing = False
+            self._pv_excess_history.clear()
             return soc_max, 0, "off", -1, 0
 
-        # Phase determination based on SOC vs target
-        if soc_kw > target_soc_kwh + SOC_MARGIN_KWH:
-            # Above target — drain battery toward target
+        # --- Overflow window timing ---
+        overflow_start, overflow_end = compute_overflow_window(
+            pv_effective,
+            load_step,
+            dno_limit_kw,
+            start_minute=0,
+            end_minute=solar_end_minute,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+            sustained_slots=OVERFLOW_END_SUSTAINED_SLOTS,
+        )
+
+        # --- Post-overflow energy (for "am I on track?" check) ---
+        post_start = (overflow_end or 0) + PREDICT_STEP
+        post_overflow_energy = compute_post_overflow_energy(
+            pv_effective,
+            load_step,
+            after_minute=post_start,
+            end_minute=solar_end_minute,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+        # Scale down if actual PV < forecast (afternoon overforecast detection)
+        if pv_scale < 0.9 and actual_pv > 0.5:
+            post_overflow_energy *= pv_scale
+
+        # --- Target SOC ---
+        dynamic_buffer = min(max(buffer_min_kwh, remaining_overflow * buffer_pct / 100.0), remaining_overflow)
+
+        # Post-overflow credit: halve it conservatively
+        post_credit = min(post_overflow_energy * 0.5, soc_max)
+
+        target_soc_kwh = compute_target_soc(remaining_overflow, soc_max, dynamic_buffer)
+        target_soc_kwh = min(soc_max, target_soc_kwh + post_credit)
+
+        # Floor: never drain below soc_keep or reserve
+        soc_keep = getattr(self.base, "best_soc_keep", 0)
+        reserve = getattr(self.base, "reserve", 0)
+        soc_floor = max(soc_keep, reserve)
+        target_soc_kwh = max(target_soc_kwh, soc_floor)
+
+        # --- Time-based phase determination ---
+        # overflow_start/end from FORECAST for pre-overflow drain timing
+        pre_overflow = overflow_start is not None and overflow_start > PREDICT_STEP
+        in_overflow = currently_overflowing or (overflow_start is not None and overflow_end is not None and overflow_start <= PREDICT_STEP and overflow_end >= 0)
+        # Post-overflow uses ACTUAL PV trend (ground truth), not forecast.
+        # Triggered by 30 min sustained actual PV-load < DNO after overflow was seen.
+        # A brief cloud won't trigger this — requires sustained decline.
+        post_overflow = actual_overflow_ended
+
+        # "Am I on track for 100%?" — detect afternoon shortfall
+        energy_needed = max(0, soc_max - soc_kw - SOC_MARGIN_KWH)
+        falling_behind = post_overflow and actual_pv > 0.1 and post_overflow_energy < energy_needed * 0.8
+
+        if in_overflow:
+            # DURING OVERFLOW: export=DNO. Battery absorbs excess when PV high,
+            # drains when PV dips below load+DNO — catches every opportunity.
             phase = "draining"
             export_target_kw = dno_limit_kw
-        elif soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
-            # Below target — charge from PV toward target
-            phase = "absorbing"
+        elif pre_overflow:
+            # PRE-OVERFLOW: drain, charge to target, or hold
+            if soc_kw > target_soc_kwh + SOC_MARGIN_KWH:
+                phase = "draining"
+                export_target_kw = dno_limit_kw
+            elif soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
+                # Well below target — charge from PV to reach target.
+                # This is NOT a pointless cycle: on small-overflow days the
+                # battery needs to be at target so overflow fills it to 100%.
+                # On big-overflow days target is low so this rarely triggers.
+                phase = "topping_up"
+                export_target_kw = 0
+            else:
+                # Near target — hold. Don't overshoot due to forecast error.
+                # HA automation sets export=min(PV-load, DNO), battery stays flat.
+                phase = "holding"
+                export_target_kw = -1
+        elif post_overflow and soc_kw < soc_max - 0.1 and actual_pv > 0.1:
+            # POST-OVERFLOW (actual PV trend confirms afternoon decline):
+            # No risk (PV-load < DNO for 30 min sustained), greedily charge to 100%.
+            # Once full, excess export is guaranteed safe. Battery will be 100%
+            # when evening load > PV crossover arrives. No buffer needed.
+            phase = "topping_up"
             export_target_kw = 0
+        elif post_overflow and soc_kw >= soc_max - 0.1 and actual_pv > 0.1:
+            # POST-OVERFLOW, FULL: battery at 100%, export PV-load (safe, < DNO).
+            phase = "holding"
+            export_target_kw = -1
+        elif remaining_overflow > 0 and actual_pv > 0.1:
+            # Overflow expected but timing unclear — hold and monitor
+            phase = "holding"
+            export_target_kw = -1
         else:
-            # At target — HA automation tracks PV-load
-            phase = "tracking"
+            phase = "off"
             export_target_kw = -1
 
         return target_soc_kwh, remaining_overflow, phase, export_target_kw, dynamic_buffer
@@ -274,6 +411,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "friendly_name": "Curtailment Phase",
                 "icon": "mdi:solar-power-variant",
                 "buffer_kwh": round(buffer_kwh, 2),
+                "pv_scale": round(self._max_pv_scale, 2),
             },
         )
 
@@ -306,7 +444,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 "friendly_name": "Curtailment Remaining Overflow",
                 "unit_of_measurement": "kWh",
                 "icon": "mdi:flash-alert",
-                "raw_kwh": round(self.overflow_history[-1], 2) if self.overflow_history else 0,
             },
         )
 
@@ -367,21 +504,19 @@ class CurtailmentPlugin(PredBatPlugin):
 
     def apply(self, phase, export_target_kw):
         """Apply inverter control based on phase. Manages read_only toggle."""
-        activating = phase in ("draining", "tracking", "absorbing")
+        activating = phase in ("draining", "holding", "topping_up")
 
         if activating:
             if not self.was_active:
                 self.log("Curtailment activating (phase={})".format(phase))
 
-            # Set export limit directly for Draining/Absorbing (don't rely on
-            # HA automation which needs D-ESS condition that may not be met yet).
-            # Tracking: let HA automation handle reactive PV-load adjustments.
-            if phase == "absorbing":
+            # Map phase to export limit
+            if phase == "topping_up":
                 export_limit = 0
             elif phase == "draining":
                 export_limit = self._dno_limit
-            else:  # tracking
-                export_limit = None  # HA automation handles
+            else:  # holding
+                export_limit = None  # HA automation tracks PV-load
 
             # D-ESS mode, block grid import, allow solar charging to 100%
             # Export limit is written FIRST inside write_sig() to avoid race
@@ -391,6 +526,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 charge_limit=100,
                 export_limit=export_limit,
             )
+
+            # In holding mode, HA automation controls export limit directly,
+            # so our cached value becomes stale. Clear it so next phase
+            # transition will always write the correct value.
+            if export_limit is None:
+                self.last_export_limit = None
 
             # Suppress Predbat's normal inverter control
             self._set_read_only(True)
@@ -449,10 +590,15 @@ class CurtailmentPlugin(PredBatPlugin):
             pv_step = getattr(self.base, "pv_forecast_minute_step", {})
             pv_now_kw = pv_step.get(0, 0) * (60.0 / PREDICT_STEP)
             if phase != "off" and pv_now_kw < 0.1:
-                if self.last_phase != "off":
-                    self.log("Curtailment: waiting for PV (currently {:.2f}kW)".format(pv_now_kw))
-                phase = "off"
-                export_target_kw = -1
+                try:
+                    actual_pv = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0))
+                except (ValueError, TypeError):
+                    actual_pv = 0
+                if actual_pv < 0.1:
+                    if self.last_phase != "off":
+                        self.log("Curtailment: waiting for PV (forecast {:.2f}kW, actual {:.1f}kW)".format(pv_now_kw, actual_pv))
+                    phase = "off"
+                    export_target_kw = -1
 
             # Defer to Predbat during planned grid charge windows
             if phase != "off":
@@ -478,7 +624,7 @@ class CurtailmentPlugin(PredBatPlugin):
             if phase != self.last_phase:
                 self.log(
                     "Curtailment: PHASE {} -> {} | SOC={:.1f}kWh ({:.0f}%) target={:.1f}kWh ({:.0f}%) "
-                    "overflow={:.1f}kWh buffer={:.1f}kWh dno={:.1f}kW".format(
+                    "overflow={:.1f}kWh buffer={:.1f}kWh dno={:.1f}kW pv_scale={:.2f}x".format(
                         self.last_phase or "none",
                         phase,
                         soc_kw,
@@ -488,6 +634,7 @@ class CurtailmentPlugin(PredBatPlugin):
                         remaining_overflow,
                         dynamic_buffer,
                         dno_limit,
+                        self._max_pv_scale,
                     )
                 )
                 self.last_phase = phase
@@ -500,7 +647,7 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self.log("Curtailment plugin error: {}".format(e))
             soc_max = getattr(self.base, "soc_max", 10)
-            self.publish("off", soc_max, 0, -1, dno_limit)
+            self.publish("off", soc_max, 0, -1, self._dno_limit)
             if self.was_active:
                 try:
                     self.apply("off", -1)

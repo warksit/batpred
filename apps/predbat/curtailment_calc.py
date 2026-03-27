@@ -113,3 +113,88 @@ def should_activate(remaining_overflow):
         bool
     """
     return remaining_overflow > 0.0
+
+
+def compute_overflow_window(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, sustained_slots=6):
+    """
+    Find the time window where PV excess exceeds the DNO limit.
+
+    Returns the first and last minute of sustained overflow. Uses hysteresis
+    (sustained_slots) to avoid brief cloud gaps splitting the window.
+
+    Args:
+        pv_forecast: dict {minute: value}
+        load_forecast: dict {minute: value}
+        dno_limit: float kW
+        start_minute: int — first minute to consider
+        end_minute: int — last minute (exclusive)
+        step_minutes: int
+        values_are_kwh: bool
+        sustained_slots: int — consecutive sub-DNO slots to end the window
+
+    Returns:
+        (overflow_start, overflow_end) — minutes from start_minute.
+        overflow_start = first minute where PV-load > DNO.
+        overflow_end = last minute where PV-load > DNO, extended past brief dips.
+        Returns (None, None) if no overflow found.
+    """
+    step_hours = step_minutes / 60.0
+    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
+
+    overflow_start = None
+    overflow_end = None
+    consecutive_below = 0
+
+    for m in range(start_minute, end_minute, step_minutes):
+        pv_kw = pv_forecast.get(m, 0.0) * to_kw
+        load_kw = load_forecast.get(m, 0.0) * to_kw
+        excess_kw = pv_kw - load_kw
+
+        if excess_kw > dno_limit:
+            if overflow_start is None:
+                overflow_start = m
+            overflow_end = m
+            consecutive_below = 0
+        elif overflow_start is not None:
+            consecutive_below += 1
+            if consecutive_below >= sustained_slots:
+                break  # sustained dip — overflow window is closed
+
+    return overflow_start, overflow_end
+
+
+def compute_post_overflow_energy(pv_forecast, load_forecast, after_minute, end_minute=1440, step_minutes=5, dno_limit=None, values_are_kwh=False):
+    """
+    Compute energy available for battery charging after the overflow window.
+
+    Sums min(max(0, PV-load), dno_limit) for each slot after after_minute.
+    This is the solar excess that can charge the battery when overflow has ended
+    (PV-load is positive but below DNO, so all excess can go to battery if
+    export is set to 0).
+
+    If dno_limit is None, no cap is applied (all PV-load excess counts).
+
+    Args:
+        pv_forecast: dict {minute: value}
+        load_forecast: dict {minute: value}
+        after_minute: int — first minute to consider (typically overflow_end + step)
+        end_minute: int — last minute (exclusive)
+        step_minutes: int
+        dno_limit: float kW or None — cap per-slot charging rate
+        values_are_kwh: bool
+
+    Returns:
+        float — total chargeable energy in kWh
+    """
+    step_hours = step_minutes / 60.0
+    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
+
+    total = 0.0
+    for m in range(after_minute, end_minute, step_minutes):
+        pv_kw = pv_forecast.get(m, 0.0) * to_kw
+        load_kw = load_forecast.get(m, 0.0) * to_kw
+        excess_kw = max(0.0, pv_kw - load_kw)
+        if dno_limit is not None:
+            excess_kw = min(excess_kw, dno_limit)
+        total += excess_kw * step_hours
+    return total
