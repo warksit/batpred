@@ -390,7 +390,7 @@ def _simulate_day_forecast_error(
             elif pre_overflow:
                 # PRE-OVERFLOW
                 if soc > target_soc + 0.5:
-                    phase = "draining"
+                    phase = "export"
                     drain_wanted = min((soc - target_soc) / step_hours, max_discharge_kw)
                     discharge = min(drain_wanted, max_discharge_slot)
                     total_out = max(0, actual_excess) + discharge
@@ -404,7 +404,7 @@ def _simulate_day_forecast_error(
                     charge = min(charge_wanted, actual_excess, max_charge_slot)
                     export = min(actual_excess - charge, dno_limit)
                 else:
-                    phase = "holding"
+                    phase = "hold"
                     if actual_excess > 0:
                         export = min(actual_excess, dno_limit)
                     else:
@@ -430,19 +430,19 @@ def _simulate_day_forecast_error(
             elif (falling_behind or post_overflow) and actual_excess > 0 and soc < battery_kwh - 0.1:
                 # POST-OVERFLOW: no risk (PV-load < DNO), greedily charge to 100%.
                 # All PV excess goes to battery. Once full, excess exports safely.
-                phase = "topping_up"
+                phase = "charge"
                 charge = min(actual_excess, max_charge_slot)
                 export = min(actual_excess - charge, dno_limit)
 
             elif post_overflow and actual_excess > 0 and soc >= battery_kwh - 0.1:
                 # POST-OVERFLOW, FULL: battery at 100%, export excess (safe, < DNO)
-                phase = "holding_full"
+                phase = "hold_full"
                 export = min(actual_excess, dno_limit)
 
             elif remaining_forecast > 0 and actual_excess > 0:
                 # Overflow expected but timing unclear (window not yet computed
                 # or between bursts on a cloudy day) — hold, don't drain.
-                phase = "holding"
+                phase = "hold"
                 export = min(actual_excess, dno_limit)
 
             else:
@@ -819,8 +819,6 @@ class MockBase:
         reserve_percent=4,
         best_soc_keep=0,
         reserve=0,
-        buffer_min=1.0,
-        buffer_pct=30,
         sensor_overrides=None,
     ):
         step_kwh_factor = PLUGIN_STEP / 60.0  # kW→kWh per step
@@ -836,8 +834,6 @@ class MockBase:
         self.reserve_percent = reserve_percent
         self.best_soc_keep = best_soc_keep
         self.reserve = reserve
-        self._buffer_min = buffer_min
-        self._buffer_pct = buffer_pct
         self.set_read_only = False
         self.config_index = {}
         self.prefix = "predbat"
@@ -854,10 +850,6 @@ class MockBase:
             return self._sensor_overrides[entity]
         if entity == "input_boolean.curtailment_manager_enable":
             return "on"
-        if entity == "input_number.curtailment_manager_buffer":
-            return self._buffer_min
-        if entity == "input_number.curtailment_manager_buffer_percent":
-            return self._buffer_pct
         return default
 
     def get_arg(self, key, default=None, index=None):
@@ -1002,47 +994,8 @@ def test_plugin_no_charge_window_activates_normally():
 
 
 # ============================================================================
-# Dynamic buffer and SOC floor tests
+# SOC floor tests
 # ============================================================================
-
-
-def test_dynamic_buffer_large_overflow():
-    """10 kWh overflow at 30% → buffer = 3.0 kWh (percentage dominates)."""
-    pv, load = _make_overflow_pv(minutes_now=720)
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=1.0, buffer_pct=30)
-    plugin = CurtailmentPlugin(base)
-
-    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
-    expected_buffer = max(1.0, overflow * 30.0 / 100.0)
-    assert abs(dynamic_buffer - expected_buffer) < 0.01, f"Expected buffer={expected_buffer:.2f}, got {dynamic_buffer:.2f}"
-    assert dynamic_buffer >= 1.0, f"Buffer {dynamic_buffer:.2f} should be >= floor 1.0"
-    # With significant overflow, percentage should dominate
-    assert dynamic_buffer > 1.0, f"Buffer {dynamic_buffer:.2f} should be > floor for large overflow"
-    print("  test_dynamic_buffer_large_overflow: PASSED (buffer={:.2f}kWh for {:.1f}kWh overflow)".format(dynamic_buffer, overflow))
-
-
-def test_dynamic_buffer_small_overflow():
-    """Small overflow → buffer capped at overflow (not the floor)."""
-    # Create PV/load with minimal overflow: PV=5kW, load=1kW → excess=4kW, barely above DNO
-    pv = {}
-    load = {}
-    for m in range(0, 60, PLUGIN_STEP):  # Only 1 hour of slight overflow
-        pv[m] = 4.5  # excess = 3.5kW, below DNO → no overflow
-        load[m] = 1.0
-    # Add a few slots with slight overflow
-    for m in range(60, 90, PLUGIN_STEP):
-        pv[m] = 5.5  # excess = 4.5kW, overflow = 0.5kW
-        load[m] = 1.0
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=1.0, buffer_pct=30)
-    plugin = CurtailmentPlugin(base)
-
-    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
-    if overflow > 0:
-        # Buffer should be capped at overflow, not the 1.0 kWh floor
-        assert dynamic_buffer <= overflow + 0.01, "Buffer {:.2f} should be <= overflow {:.2f} (cap prevents buffer exceeding overflow)".format(dynamic_buffer, overflow)
-        print("  test_dynamic_buffer_small_overflow: PASSED (buffer={:.2f}, capped at overflow={:.2f}kWh)".format(dynamic_buffer, overflow))
-    else:
-        print("  test_dynamic_buffer_small_overflow: PASSED (no overflow, buffer not applied)")
 
 
 def test_target_soc_clamped_above_soc_keep():
@@ -1050,10 +1003,17 @@ def test_target_soc_clamped_above_soc_keep():
     pv, load = _make_overflow_pv(minutes_now=720)
     # Set best_soc_keep high — plugin should not drain below it
     soc_keep = 8.0  # kWh
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, best_soc_keep=soc_keep, reserve=0, buffer_min=1.0, buffer_pct=30)
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=10.0,
+        minutes_now=720,
+        best_soc_keep=soc_keep,
+        reserve=0,
+    )
     plugin = CurtailmentPlugin(base)
 
-    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
+    target, overflow, phase, export = plugin.calculate(dno_limit_kw=4.0)
     # With large overflow, raw target would be near 0 — but clamped to soc_keep
     assert target >= soc_keep, f"Target SOC {target:.2f} kWh should be >= best_soc_keep {soc_keep:.2f} kWh"
     print("  test_target_soc_clamped_above_soc_keep: PASSED (target={:.2f}kWh >= soc_keep={:.2f}kWh)".format(target, soc_keep))
@@ -1063,27 +1023,19 @@ def test_target_soc_clamped_above_reserve():
     """Target SOC must never go below reserve."""
     pv, load = _make_overflow_pv(minutes_now=720)
     reserve = 5.0  # kWh
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, best_soc_keep=0, reserve=reserve, buffer_min=1.0, buffer_pct=30)
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=10.0,
+        minutes_now=720,
+        best_soc_keep=0,
+        reserve=reserve,
+    )
     plugin = CurtailmentPlugin(base)
 
-    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=1.0, buffer_pct=30.0)
+    target, overflow, phase, export = plugin.calculate(dno_limit_kw=4.0)
     assert target >= reserve, f"Target SOC {target:.2f} kWh should be >= reserve {reserve:.2f} kWh"
     print("  test_target_soc_clamped_above_reserve: PASSED (target={:.2f}kWh >= reserve={:.2f}kWh)".format(target, reserve))
-
-
-def test_buffer_kwh_in_phase_sensor():
-    """buffer_kwh attribute should be published on the phase sensor."""
-    pv, load = _make_overflow_pv(minutes_now=720)
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=1.0, buffer_pct=30)
-    plugin = CurtailmentPlugin(base)
-
-    plugin.on_update()
-
-    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    attrs = phase_sensor.get("attrs", {})
-    assert "buffer_kwh" in attrs, f"Expected buffer_kwh attribute in phase sensor, got attrs: {attrs}"
-    assert attrs["buffer_kwh"] > 0, f"Expected buffer_kwh > 0, got {attrs['buffer_kwh']}"
-    print("  test_buffer_kwh_in_phase_sensor: PASSED (buffer_kwh={})".format(attrs["buffer_kwh"]))
 
 
 # ============================================================================
@@ -1148,34 +1100,80 @@ def test_morning_gap_kwh_values():
 
 
 # ============================================================================
-# Buffer cap tests
+# Phase logic matrix tests — PV state × SOC state
 # ============================================================================
 
+PHASE_TEST_DNO = 4.0
+PHASE_TEST_SOC_MAX = 18.08
+PHASE_TEST_STEP = PLUGIN_STEP
 
-def test_buffer_cap_small_overflow():
-    """Buffer should be capped at overflow on marginal days."""
-    pv, load = _make_overflow_pv(minutes_now=720)
-    # Reduce PV so overflow is small (~0.3kWh)
-    for m in pv:
-        pv[m] = 4.3  # barely above DNO 4kW + 1kW load = 4.3kW excess, overflow = 0.3kW
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=17.0, minutes_now=720, buffer_min=2.0, buffer_pct=30)
+
+def _make_phase_test_plugin(pv_kw, load_kw, soc_pct, target_pct):
+    """Create a plugin with specific PV, load, SOC, and a pre-set smoothed floor."""
+    # Create forecast with overflow so curtailment activates
+    pv = {}
+    load = {}
+    for m in range(0, 660, PHASE_TEST_STEP):
+        pv[m] = 6.0  # forecast: enough overflow to activate
+        load[m] = 1.0
+
+    soc_kwh = PHASE_TEST_SOC_MAX * soc_pct / 100.0
+    target_kwh = PHASE_TEST_SOC_MAX * target_pct / 100.0
+
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=soc_kwh,
+        soc_max=PHASE_TEST_SOC_MAX,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": pv_kw,
+            "sensor.sigen_plant_consumed_power": load_kw,
+        },
+    )
     plugin = CurtailmentPlugin(base)
-    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=2.0, buffer_pct=30.0)
-    # Buffer should be capped at overflow, not the 2.0 kWh floor
-    assert dynamic_buffer <= overflow + 0.01, f"Buffer {dynamic_buffer:.2f} should be <= overflow {overflow:.2f}"
-    print("  test_buffer_cap_small_overflow: PASSED (buffer={:.2f}, overflow={:.2f})".format(dynamic_buffer, overflow))
+    # Pre-set the smoothed floor to the desired target
+    # floor is raw now, no smoothing
+    # Mark as having seen overflow (so post-overflow detection works)
+    plugin._was_overflowing = True
+    return plugin, base
 
 
-def test_buffer_cap_large_overflow():
-    """Buffer floor should apply normally on high overflow days."""
-    pv, load = _make_overflow_pv(minutes_now=720)
-    base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720, buffer_min=2.0, buffer_pct=30)
-    plugin = CurtailmentPlugin(base)
-    target, overflow, phase, export, dynamic_buffer = plugin.calculate(dno_limit_kw=4.0, buffer_min_kwh=2.0, buffer_pct=30.0)
-    # High overflow: buffer should be max(floor, pct) and less than overflow
-    assert dynamic_buffer >= 2.0, f"Buffer {dynamic_buffer:.2f} should be >= floor 2.0"
-    assert dynamic_buffer <= overflow, f"Buffer {dynamic_buffer:.2f} should be <= overflow {overflow:.2f}"
-    print("  test_buffer_cap_large_overflow: PASSED (buffer={:.2f}, overflow={:.2f})".format(dynamic_buffer, overflow))
+def test_phase_overflow_any_soc():
+    """When PV-load > DNO: phase is always export (overflow)."""
+    for label, soc_pct in [("below", 5), ("above", 80)]:
+        plugin, base = _make_phase_test_plugin(pv_kw=8.0, load_kw=0.5, soc_pct=soc_pct, target_pct=45)
+        target, overflow, phase, export = plugin.calculate(PHASE_TEST_DNO)
+        assert phase == "export", f"Overflow SOC {label}: expected export phase, got {phase}"
+    print("  test_phase_overflow_any_soc: PASSED (export phase at all SOC levels)")
+
+
+def test_phase_excess_soc_below_target():
+    """PV excess < DNO, SOC well below computed target: charge phase."""
+    # Low SOC ensures we're below whatever target the forecast computes
+    plugin, base = _make_phase_test_plugin(pv_kw=3.0, load_kw=0.5, soc_pct=5, target_pct=45)
+    target, overflow, phase, export = plugin.calculate(PHASE_TEST_DNO)
+    assert phase == "charge", f"Expected charge phase, got {phase}"
+    print("  test_phase_excess_soc_below_target: PASSED (charge from PV)")
+
+
+def test_phase_excess_soc_above_target():
+    """PV excess < DNO, SOC well above computed target: export phase (drain)."""
+    # High SOC ensures we're well above whatever target the forecast computes
+    plugin, base = _make_phase_test_plugin(pv_kw=3.0, load_kw=0.5, soc_pct=90, target_pct=45)
+    target, overflow, phase, export = plugin.calculate(PHASE_TEST_DNO)
+    # With big overflow forecast, target is low. SOC at 90% is well above → drain
+    assert phase == "export", f"Expected export phase (drain), got {phase}"
+    print("  test_phase_excess_soc_above_target: PASSED (drain toward target)")
+
+
+def test_phase_deficit_not_export():
+    """PV < load: phase should not be export."""
+    for label, soc_pct in [("below", 5), ("above", 90)]:
+        plugin, base = _make_phase_test_plugin(pv_kw=0.3, load_kw=0.8, soc_pct=soc_pct, target_pct=45)
+        target, overflow, phase, export = plugin.calculate(PHASE_TEST_DNO)
+        assert phase != "export", f"Deficit SOC {label}: should not be export phase, got {phase}"
+    print("  test_phase_deficit_not_export: PASSED (no export during deficit)")
 
 
 # ============================================================================
@@ -1250,7 +1248,7 @@ def test_realtime_pv_correction_raises_overflow():
         },
     )
     plugin = CurtailmentPlugin(base)
-    target_soc, overflow, phase, export_target, buffer = plugin.calculate(4.0, buffer_min_kwh=2.0, buffer_pct=50)
+    target_soc, overflow, phase, export_target = plugin.calculate(4.0)
 
     # Scaled overflow should be substantial — many kWh across remaining solar hours
     assert overflow >= 10.0, f"Expected scaled overflow >= 10.0 kWh, got {overflow:.2f}"
@@ -1258,7 +1256,7 @@ def test_realtime_pv_correction_raises_overflow():
     target_pct = target_soc / 18.08 * 100
     assert target_pct < 50, f"Expected target < 50% with scaled PV correction, got {target_pct:.1f}%"
     # SOC 16.0 (88.5%) well above target → draining
-    assert phase == "draining", f"Expected draining phase, got {phase}"
+    assert phase == "export", f"Expected draining phase, got {phase}"
     assert any("PV scale" in log for log in base.logs), "Expected PV scale log message"
     print(f"  test_realtime_pv_correction_raises_overflow: PASSED (overflow={overflow:.2f}, target={target_pct:.0f}%)")
 
@@ -1278,7 +1276,7 @@ def test_realtime_pv_correction_no_effect_when_forecast_higher():
         },
     )
     plugin = CurtailmentPlugin(base)
-    target_soc, overflow, phase, export_target, buffer = plugin.calculate(4.0, buffer_min_kwh=2.0, buffer_pct=50)
+    target_soc, overflow, phase, export_target = plugin.calculate(4.0)
 
     # Actual excess = 5-1 = 4kW, overflow rate = 0kW (at DNO limit) → no correction
     # Forecast overflow should dominate
@@ -1509,20 +1507,19 @@ def run_curtailment_tests(my_predbat=None):
         test_plugin_defers_to_charge_window,
         test_plugin_ignores_freeze_charge_window,
         test_plugin_no_charge_window_activates_normally,
-        # Dynamic buffer and SOC floor tests
-        test_dynamic_buffer_large_overflow,
-        test_dynamic_buffer_small_overflow,
+        # SOC floor tests
         test_target_soc_clamped_above_soc_keep,
         test_target_soc_clamped_above_reserve,
-        test_buffer_kwh_in_phase_sensor,
         # Morning gap tests
         test_morning_gap_pre_dawn,
         test_morning_gap_solar_already_covers,
         test_morning_gap_cloudy_never_covers,
         test_morning_gap_kwh_values,
-        # Buffer cap tests
-        test_buffer_cap_small_overflow,
-        test_buffer_cap_large_overflow,
+        # Phase logic matrix tests
+        test_phase_overflow_any_soc,
+        test_phase_excess_soc_below_target,
+        test_phase_excess_soc_above_target,
+        test_phase_deficit_not_export,
         # Real-time PV correction tests
         test_realtime_pv_correction_raises_overflow,
         test_realtime_pv_correction_no_effect_when_forecast_higher,
