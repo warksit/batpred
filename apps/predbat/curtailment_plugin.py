@@ -29,7 +29,6 @@ from plugin_system import PredBatPlugin
 # SIG entity names (Mum's system)
 SIG_EMS_MODE = "select.sigen_plant_remote_ems_control_mode"
 SIG_EXPORT_LIMIT = "number.sigen_plant_grid_export_limitation"
-SIG_IMPORT_LIMIT = "number.sigen_plant_grid_import_limitation"
 SIG_CHARGE_LIMIT = "number.sigen_plant_ess_charge_cut_off_state_of_charge"
 SIG_PV_POWER = "sensor.sigen_plant_pv_power"
 SIG_LOAD_POWER = "sensor.sigen_plant_consumed_power"
@@ -71,7 +70,6 @@ class CurtailmentPlugin(PredBatPlugin):
     def __init__(self, base):
         super().__init__(base)
         self.last_ems_mode = None
-        self.last_import_limit = None
         self.last_charge_limit = None
         self.last_export_limit = None
         self.was_active = False
@@ -377,7 +375,7 @@ class CurtailmentPlugin(PredBatPlugin):
             },
         )
 
-    def write_sig(self, ems_mode, import_limit, charge_limit, export_limit=None):
+    def write_sig(self, ems_mode, charge_limit, export_limit=None):
         """Write SIG entities, only when values change.
 
         Export limit is written FIRST (before EMS mode) to ensure there is
@@ -402,15 +400,6 @@ class CurtailmentPlugin(PredBatPlugin):
             )
             self.last_ems_mode = ems_mode
             self.log("Curtailment: Set EMS mode -> {}".format(ems_mode))
-
-        if import_limit != self.last_import_limit:
-            self.base.call_service_wrapper(
-                "number/set_value",
-                entity_id=SIG_IMPORT_LIMIT,
-                value=import_limit,
-            )
-            self.last_import_limit = import_limit
-            self.log("Curtailment: Set import limit -> {}%".format(import_limit))
 
         if charge_limit != self.last_charge_limit:
             self.base.call_service_wrapper(
@@ -452,7 +441,6 @@ class CurtailmentPlugin(PredBatPlugin):
             # Export limit is written FIRST inside write_sig() to avoid race
             self.write_sig(
                 ems_mode="Command Discharging (ESS First)",
-                import_limit=0,
                 charge_limit=100,
                 export_limit=export_limit,
             )
@@ -482,8 +470,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 self.log("Curtailment: phase off but PV={:.1f}kW — keeping D-ESS".format(actual_pv_now))
                 self.write_sig(
                     ems_mode="Command Discharging (ESS First)",
-                    import_limit=0,
-                    charge_limit=100,
+                        charge_limit=100,
                     export_limit=self._dno_limit,
                 )
                 self._set_read_only(True)
@@ -492,7 +479,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self.log("Curtailment deactivating, restoring MSC and read_only")
                 self.write_sig(
                     ems_mode="Maximum Self Consumption",
-                    import_limit=100,
                     charge_limit=100,
                 )
                 # Restore export limit to DNO limit (HA automation leaves it at last value)
@@ -508,8 +494,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
                 # Reset tracked values so next activation re-writes everything
                 self.last_ems_mode = None
-                self.last_import_limit = None
-                self.last_charge_limit = None
+                        self.last_charge_limit = None
                 self.last_export_limit = None
                 self.was_active = False
 
