@@ -134,6 +134,17 @@ class CurtailmentPlugin(PredBatPlugin):
         )
 
         if overflow <= 0:
+            self.base.dashboard_item(
+                "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
+                0.0,
+                {
+                    "friendly_name": "Curtailment Solar SOC Keep Offset",
+                    "unit_of_measurement": "kWh",
+                    "icon": "mdi:solar-power",
+                    "overflow_kwh": 0.0,
+                    "original_keep": round(context["best_soc_keep"], 2),
+                },
+            )
             self._cached_keep = context["best_soc_keep"]
             self._cached_at = minutes_now
             return context
