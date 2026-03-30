@@ -168,7 +168,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
             self.base.dashboard_item(
                 "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
-                round(current_keep - solar_adjusted_keep, 2),
+                round(solar_adjusted_keep - current_keep, 2),
                 {
                     "friendly_name": "Curtailment Solar SOC Keep Offset",
                     "unit_of_measurement": "kWh",
