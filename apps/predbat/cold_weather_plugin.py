@@ -451,19 +451,52 @@ class ColdWeatherPlugin(PredBatPlugin):
                 all_active_keep[minute] = tapered_pct
             end_pct = tapered_pct
 
+        # Boost best_soc_keep — covers GSHP uncertainty beyond LoadML's average.
+        # best_soc_keep is a planning floor (buffer for forecast error), not the
+        # load itself. Predbat already accounts for load in charge targets.
+        base_keep = context.get("best_soc_keep", 0)
+        keep_boost = prediction * 0.5
+        context["best_soc_keep"] = base_keep + keep_boost
+
+        # Boost weight so penalty exceeds cheap rate cost, forcing the optimizer
+        # to actually charge enough during cheap windows.
+        base_weight = context.get("best_soc_keep_weight", 0.5)
+        weight_boost = prediction / DEFAULT_KEEP_KWH * 2.0
+        new_weight = min(base_weight + weight_boost, 5.0)
+        context["best_soc_keep_weight"] = new_weight
+
         self._keep_pct = round(keep_pct, 1)
         self._keep_kwh = round(keep_kwh, 1)
-        self._keep_weight = None
+        self._keep_weight = round(new_weight, 1)
+
+        # Publish adjustment for visibility
+        self.base.dashboard_item(
+            "sensor.{}_cold_weather_soc_keep_boost".format(self.base.prefix),
+            round(keep_boost, 2),
+            {
+                "friendly_name": "Cold Weather SOC Keep Boost",
+                "unit_of_measurement": "kWh",
+                "icon": "mdi:snowflake-thermometer",
+                "base_keep": round(base_keep, 2),
+                "boosted_keep": round(context["best_soc_keep"], 2),
+                "weight": round(new_weight, 1),
+                "prediction": round(prediction, 2),
+            },
+        )
 
         self.log(
-            "Cold weather: alert_keep={:.1f}%->{:.1f}% for {:02d}:00-{:02d}:00 "
-            "(predicted={:.1f}kWh, keep={:.1f}kWh)".format(
+            "Cold weather: alert_keep={:.1f}%->{:.1f}% for {:02d}:00-{:02d}:00, "
+            "soc_keep={:.1f}->{:.1f}kWh, weight={:.1f}->{:.1f} "
+            "(predicted={:.1f}kWh)".format(
                 keep_pct,
                 end_pct,
                 GSHP_START_HOUR,
                 CHEAP_RATE_END_HOUR,
+                base_keep,
+                context["best_soc_keep"],
+                base_weight,
+                new_weight,
                 prediction,
-                keep_kwh,
             )
         )
 

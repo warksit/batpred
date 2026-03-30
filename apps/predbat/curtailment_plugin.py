@@ -470,7 +470,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 self.log("Curtailment: phase off but PV={:.1f}kW — keeping D-ESS".format(actual_pv_now))
                 self.write_sig(
                     ems_mode="Command Discharging (ESS First)",
-                        charge_limit=100,
+                    charge_limit=100,
                     export_limit=self._dno_limit,
                 )
                 self._set_read_only(True)
@@ -494,7 +494,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
                 # Reset tracked values so next activation re-writes everything
                 self.last_ems_mode = None
-                        self.last_charge_limit = None
+                self.last_charge_limit = None
                 self.last_export_limit = None
                 self.was_active = False
 
