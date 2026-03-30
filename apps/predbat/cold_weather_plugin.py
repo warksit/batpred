@@ -408,6 +408,7 @@ class ColdWeatherPlugin(PredBatPlugin):
         """
         enabled = str(self.base.get_state_wrapper(HA_GSHP_HEATING, default="off")).lower() in ("on", "true")
         if not enabled:
+            self._publish_boost(0.0, context, reason="disabled")
             return context
 
         if self.coefficients is None:
@@ -415,9 +416,11 @@ class ColdWeatherPlugin(PredBatPlugin):
         else:
             prediction = self._get_tonight_prediction()
             if prediction is None:
+                self._publish_boost(0.0, context, reason="no_forecast")
                 return context
 
         if prediction < MIN_KEEP_KWH:
+            self._publish_boost(0.0, context, reason="below_threshold")
             return context
 
         # Convert predicted load to SOC percentage for alert_keep
@@ -469,20 +472,7 @@ class ColdWeatherPlugin(PredBatPlugin):
         self._keep_kwh = round(keep_kwh, 1)
         self._keep_weight = round(new_weight, 1)
 
-        # Publish adjustment for visibility
-        self.base.dashboard_item(
-            "sensor.{}_cold_weather_soc_keep_boost".format(self.base.prefix),
-            round(keep_boost, 2),
-            {
-                "friendly_name": "Cold Weather SOC Keep Boost",
-                "unit_of_measurement": "kWh",
-                "icon": "mdi:snowflake-thermometer",
-                "base_keep": round(base_keep, 2),
-                "boosted_keep": round(context["best_soc_keep"], 2),
-                "weight": round(new_weight, 1),
-                "prediction": round(prediction, 2),
-            },
-        )
+        self._publish_boost(round(keep_boost, 2), context, base_keep=base_keep, weight=new_weight, prediction=prediction)
 
         self.log(
             "Cold weather: alert_keep={:.1f}%->{:.1f}% for {:02d}:00-{:02d}:00, "
@@ -595,6 +585,21 @@ class ColdWeatherPlugin(PredBatPlugin):
             return 0.0
         recent = self.history[-14:]  # Last 14 days
         return sum(h["heat_kwh"] for h in recent) / len(recent)
+
+    def _publish_boost(self, value, context, reason=None, base_keep=None, weight=None, prediction=None):
+        """Publish SOC keep boost sensor on every exit path."""
+        attrs = {"friendly_name": "Cold Weather SOC Keep Boost", "unit_of_measurement": "kWh", "icon": "mdi:snowflake-thermometer"}
+        if reason:
+            attrs["reason"] = reason
+        if base_keep is not None:
+            attrs["base_keep"] = round(base_keep, 2)
+            attrs["boosted_keep"] = round(context.get("best_soc_keep", 0), 2)
+        if weight is not None:
+            attrs["weight"] = round(weight, 1)
+        if prediction is not None:
+            attrs["prediction"] = round(prediction, 2)
+        attrs["original_keep"] = round(context.get("best_soc_keep", 0), 2)
+        self.base.dashboard_item("sensor.{}_cold_weather_soc_keep_boost".format(self.base.prefix), value, attrs)
 
     def _publish(self):
         """Publish cold weather sensor."""
