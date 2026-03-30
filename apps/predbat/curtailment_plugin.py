@@ -125,6 +125,7 @@ class CurtailmentPlugin(PredBatPlugin):
         forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
 
         if not pv_step:
+            self._publish_offset(0.0, {"original_keep": round(context["best_soc_keep"], 2), "reason": "no_pv_forecast"})
             return context
 
         dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
