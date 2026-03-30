@@ -80,6 +80,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0  # minutes_now when last computed
+        self._cached_offset = None  # (value, attrs) for republishing on cache hit
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update, plugin=self)
@@ -109,6 +110,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 pass  # morning: always recalculate
             elif minutes_since < 30:
                 context["best_soc_keep"] = min(context["best_soc_keep"], self._cached_keep)
+                if self._cached_offset is not None:
+                    self.base.dashboard_item(
+                        "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
+                        self._cached_offset[0],
+                        self._cached_offset[1],
+                    )
                 return context
 
         pv_step = getattr(self.base, "pv_forecast_minute_step", {})
@@ -134,17 +141,7 @@ class CurtailmentPlugin(PredBatPlugin):
         )
 
         if overflow <= 0:
-            self.base.dashboard_item(
-                "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
-                0.0,
-                {
-                    "friendly_name": "Curtailment Solar SOC Keep Offset",
-                    "unit_of_measurement": "kWh",
-                    "icon": "mdi:solar-power",
-                    "overflow_kwh": 0.0,
-                    "original_keep": round(context["best_soc_keep"], 2),
-                },
-            )
+            self._publish_offset(0.0, {"overflow_kwh": 0.0, "original_keep": round(context["best_soc_keep"], 2)})
             self._cached_keep = context["best_soc_keep"]
             self._cached_at = minutes_now
             return context
@@ -165,33 +162,9 @@ class CurtailmentPlugin(PredBatPlugin):
         if solar_adjusted_keep < current_keep:
             self.log("Curtailment: reducing best_soc_keep {:.2f} -> {:.2f} kWh (morning_gap={:.2f}, overflow={:.2f})".format(current_keep, solar_adjusted_keep, morning_gap, overflow))
             context["best_soc_keep"] = solar_adjusted_keep
-
-            self.base.dashboard_item(
-                "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
-                round(solar_adjusted_keep - current_keep, 2),
-                {
-                    "friendly_name": "Curtailment Solar SOC Keep Offset",
-                    "unit_of_measurement": "kWh",
-                    "icon": "mdi:solar-power",
-                    "morning_gap_kwh": round(morning_gap, 2),
-                    "overflow_kwh": round(overflow, 2),
-                    "original_keep": round(current_keep, 2),
-                    "adjusted_keep": round(solar_adjusted_keep, 2),
-                },
-            )
+            self._publish_offset(round(solar_adjusted_keep - current_keep, 2), {"morning_gap_kwh": round(morning_gap, 2), "overflow_kwh": round(overflow, 2), "original_keep": round(current_keep, 2), "adjusted_keep": round(solar_adjusted_keep, 2)})
         else:
-            self.base.dashboard_item(
-                "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
-                0.0,
-                {
-                    "friendly_name": "Curtailment Solar SOC Keep Offset",
-                    "unit_of_measurement": "kWh",
-                    "icon": "mdi:solar-power",
-                    "morning_gap_kwh": round(morning_gap, 2),
-                    "overflow_kwh": round(overflow, 2),
-                    "original_keep": round(current_keep, 2),
-                },
-            )
+            self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap, 2), "overflow_kwh": round(overflow, 2), "original_keep": round(current_keep, 2)})
 
         self._cached_keep = context["best_soc_keep"]
         self._cached_at = minutes_now
@@ -206,6 +179,12 @@ class CurtailmentPlugin(PredBatPlugin):
         dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
 
         return enabled, dno_limit
+
+    def _publish_offset(self, value, attrs):
+        """Publish curtailment solar offset sensor and cache for reuse."""
+        attrs.update({"friendly_name": "Curtailment Solar SOC Keep Offset", "unit_of_measurement": "kWh", "icon": "mdi:solar-power"})
+        self.base.dashboard_item("sensor.{}_curtailment_solar_offset".format(self.base.prefix), value, attrs)
+        self._cached_offset = (value, attrs)
 
     def _get_energy_ratio(self):
         """Compute energy ratio: actual cumulative PV / calibrated forecast cumulative PV.
