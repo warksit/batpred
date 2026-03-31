@@ -434,9 +434,9 @@ class ColdWeatherPlugin(PredBatPlugin):
         # imports to maintain the floor at standard rate.
         minutes_now = getattr(self.base, "minutes_now", 0)
         morning_boost_cutoff = CHEAP_RATE_END_HOUR * 60
-        evening_boost_start = 18 * 60  # Start boosting again for tomorrow's planning
-        # Only boost during planning period: 18:00 through 07:00.
-        # 07:00-18:00: boost served its purpose, don't influence daytime planning.
+        evening_boost_start = 22 * 60  # Start boosting when evening cheap window opens
+        # Only boost during planning period: 22:00 through 07:00.
+        # 07:00-22:00: boost served its purpose, don't influence daytime planning.
         after_morning_cheap = morning_boost_cutoff <= minutes_now < evening_boost_start
 
         if minutes_now < 12 * 60:
