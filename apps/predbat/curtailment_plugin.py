@@ -307,17 +307,17 @@ class CurtailmentPlugin(PredBatPlugin):
 
         target_soc_kwh = floor
 
-        # --- 95% cap during overflow ---
-        soc_cap = soc_max * SOC_CAP_PCT if recently_overflowing else soc_max
+        # --- 95% cap during overflow (sticky: applies all day once overflow seen) ---
+        soc_cap = soc_max * SOC_CAP_PCT if (recently_overflowing or self._seen_overflow_today) else soc_max
 
         # --- Reactive phase (SOC vs floor) ---
         post_overflow = remaining_overflow <= 0 and actual_pv > 0.1
 
         if currently_overflowing:
             phase = "export"
-        elif post_overflow and soc_kw < soc_max - 0.1:
-            phase = "charge"  # post-overflow greedy top-up (no 95% cap)
-            target_soc_kwh = soc_max
+        elif post_overflow and soc_kw < soc_cap - 0.1:
+            phase = "charge"  # post-overflow top-up (respects 95% cap on overflow days)
+            target_soc_kwh = soc_cap
         elif soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
             phase = "charge"
         elif soc_kw > target_soc_kwh + 1.0 and actual_excess > 0:
