@@ -2123,6 +2123,78 @@ def test_v8_floor_bidirectional():
     print(f"  test_v8_floor_bidirectional: PASSED (6kW floor={floor_moderate:.1f}%, 9kW floor={floor_high:.1f}%)")
 
 
+def test_trajectory_unmanaged_vs_managed():
+    """Unmanaged (MSC) fills battery, managed (D-ESS) doesn't — activation must use unmanaged.
+
+    This is the Mar 31 bug: managed trajectory showed 42% peak (no activation) while
+    unmanaged showed 100% (battery fills without intervention). Without unmanaged check,
+    curtailment never activates and battery fills → SIG fault.
+    """
+    # Moderate PV day: 5kW peak, 1kW load. Excess 4kW = just at DNO limit.
+    # Unmanaged: all 4kW excess charges battery → fills from 40%.
+    # Managed: excess = DNO, overflow = 0 → battery stays at starting SOC.
+    pv, load = _make_trajectory_pv(peak_kw=5.0, load_kw=1.0, hours=8)
+
+    start = 18.08 * 0.40  # 40%
+    peak_u, _, _ = simulate_soc_trajectory(pv, load, start, 18.08, 4.0, unmanaged=True)
+    peak_m, _, _ = simulate_soc_trajectory(pv, load, start, 18.08, 4.0, unmanaged=False)
+
+    assert peak_u > 18.08 * 0.95, f"Unmanaged should fill: peak={peak_u:.1f} (expected >17.2)"
+    assert peak_m < 18.08 * 0.95, f"Managed should NOT fill: peak={peak_m:.1f} (expected <17.2)"
+    print(f"  test_trajectory_unmanaged_vs_managed: PASSED (unmanaged={peak_u:.1f}, managed={peak_m:.1f})")
+
+
+def test_trajectory_mar31_scenario():
+    """Replay Mar 31 conditions: 35% start, high PV, moderate load.
+
+    This day caused 2 SIG faults because curtailment didn't activate.
+    v8 must activate (unmanaged fills) and set a floor that keeps peak < 100%.
+    """
+    # Mar 31 pattern: 6h of 6kW average PV, 1kW average load
+    pv, load = _make_trajectory_pv(peak_kw=7.0, load_kw=1.0, hours=8)
+
+    start = 18.08 * 0.35  # 35% morning SOC
+
+    # Activation check (unmanaged)
+    peak_u, _, _ = simulate_soc_trajectory(pv, load, start, 18.08, 4.0, unmanaged=True)
+    assert peak_u > 18.08 * 0.95, f"Must activate: unmanaged peak={peak_u:.1f}"
+
+    # Floor check (managed)
+    _, net_charge, _ = simulate_soc_trajectory(pv, load, start, 18.08, 4.0, unmanaged=False)
+    floor = max(0, 18.08 * 0.95 - net_charge)
+
+    # Battery peaks at floor + net_charge — must stay below 100%
+    peak_with_curtailment = floor + net_charge
+    assert peak_with_curtailment <= 18.08, f"Peak with curtailment should be ≤100%: {peak_with_curtailment:.1f}"
+
+    print(f"  test_trajectory_mar31_scenario: PASSED (activates, floor={floor/18.08*100:.0f}%, peak={peak_with_curtailment/18.08*100:.0f}%)")
+
+
+def test_trajectory_low_pv_no_activation():
+    """Low PV day: neither managed nor unmanaged fills battery. No activation."""
+    pv, load = _make_trajectory_pv(peak_kw=3.0, load_kw=1.0, hours=6)
+
+    start = 18.08 * 0.40
+    peak_u, _, _ = simulate_soc_trajectory(pv, load, start, 18.08, 4.0, unmanaged=True)
+    peak_m, _, _ = simulate_soc_trajectory(pv, load, start, 18.08, 4.0, unmanaged=False)
+
+    assert peak_u < 18.08 * 0.95, f"Unmanaged should NOT fill: peak={peak_u:.1f}"
+    assert peak_m < 18.08 * 0.95, f"Managed should NOT fill: peak={peak_m:.1f}"
+    print(f"  test_trajectory_low_pv_no_activation: PASSED (unmanaged={peak_u:.1f}, managed={peak_m:.1f})")
+
+
+def test_trajectory_load_ratio_reduces_excess():
+    """Load ratio < 1 means actual load lower → more excess → lower floor."""
+    pv, load = _make_trajectory_pv(peak_kw=7.0, load_kw=1.5, hours=6)
+
+    _, net_10, _ = simulate_soc_trajectory(pv, load, 9.0, 18.08, 4.0, load_ratio=1.0)
+    _, net_06, _ = simulate_soc_trajectory(pv, load, 9.0, 18.08, 4.0, load_ratio=0.6)
+
+    # Lower load ratio → less load consumed → more excess → more overflow → more net_charge
+    assert net_06 > net_10, f"Lower load ratio should increase net charge: {net_06:.1f} vs {net_10:.1f}"
+    print(f"  test_trajectory_load_ratio_reduces_excess: PASSED (ratio 1.0: {net_10:.1f}, ratio 0.6: {net_06:.1f})")
+
+
 # ============================================================================
 # Test runner
 # ============================================================================
@@ -2288,6 +2360,10 @@ def run_curtailment_tests(my_predbat=None):
         test_trajectory_energy_ratio_increases_overflow,
         test_trajectory_energy_ratio_decreases_overflow,
         test_v8_floor_bidirectional,
+        test_trajectory_unmanaged_vs_managed,
+        test_trajectory_mar31_scenario,
+        test_trajectory_low_pv_no_activation,
+        test_trajectory_load_ratio_reduces_excess,
     ]
     print("  --- v8 trajectory tests ---")
     for test_fn in v8_tests:
