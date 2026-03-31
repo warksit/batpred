@@ -205,18 +205,20 @@ def compute_post_overflow_energy(pv_forecast, load_forecast, after_minute, end_m
     return total
 
 
-def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, load_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
+def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, load_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, unmanaged=False):
     """
     Simulate battery SOC trajectory with curtailment active (export at DNO).
 
     Runs from start_minute until PV is exhausted (evening load irrelevant).
     PV is scaled by energy_ratio, load is scaled by load_ratio.
 
-    For each slot:
-      - excess = PV*energy_ratio - load*load_ratio
-      - If excess > DNO: export DNO, battery absorbs (excess - DNO)
-      - If 0 < excess <= DNO: export excess, battery unchanged
-      - If excess < 0: battery covers deficit
+    Two modes:
+      unmanaged=False (default): curtailment active, export at DNO
+        - excess > DNO: export DNO, battery absorbs (excess - DNO)
+        - 0 < excess <= DNO: export excess, battery unchanged
+      unmanaged=True: MSC mode, battery absorbs ALL excess
+        - excess > 0: battery absorbs all excess
+        - Used for activation check: "will battery fill without intervention?"
 
     Args:
         pv_forecast: dict {minute: value}
@@ -226,6 +228,7 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
         dno_limit: float kW — max grid export
         energy_ratio: float — PV scaling (1.0 = forecast, >1 = PV ahead)
         load_ratio: float — load scaling (1.0 = forecast, <1 = load lower than predicted)
+        unmanaged: bool — if True, simulate MSC mode (battery absorbs all excess)
         start_minute: int — first minute (default 0)
         end_minute: int — last minute (default 1440)
         step_minutes: int — step size
@@ -261,16 +264,24 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
 
         excess = pv_kw - load_kw
 
-        if excess > dno_limit:
-            # Overflow: export at DNO, battery absorbs the rest
-            charge = (excess - dno_limit) * step_hours
-            soc += charge
-            net_charge += charge
-        elif excess < 0:
-            # Deficit: battery covers load
-            drain = excess * step_hours  # negative
-            soc += drain
-            net_charge += drain
+        if unmanaged:
+            # MSC mode: battery absorbs ALL excess (for activation check)
+            if excess > 0:
+                charge = excess * step_hours
+                soc += charge
+                net_charge += charge
+            elif excess < 0:
+                soc += excess * step_hours
+                net_charge += excess * step_hours
+        else:
+            # D-ESS mode: export at DNO, battery absorbs overflow only
+            if excess > dno_limit:
+                charge = (excess - dno_limit) * step_hours
+                soc += charge
+                net_charge += charge
+            elif excess < 0:
+                soc += excess * step_hours
+                net_charge += excess * step_hours
 
         # Clamp SOC
         soc = max(0.0, min(soc_max, soc))

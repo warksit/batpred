@@ -310,8 +310,9 @@ class CurtailmentPlugin(PredBatPlugin):
         load_ratio = self._get_load_ratio()
         self._load_ratio = load_ratio
 
-        # --- SOC trajectory simulation ---
-        peak_soc, net_charge, last_danger = simulate_soc_trajectory(
+        # --- SOC trajectory: unmanaged (MSC) for activation check ---
+        # "Will battery fill if we DON'T manage?" — battery absorbs ALL excess
+        peak_unmanaged, _, last_danger = simulate_soc_trajectory(
             pv_step,
             load_step,
             soc_kw,
@@ -323,10 +324,28 @@ class CurtailmentPlugin(PredBatPlugin):
             end_minute=solar_end,
             step_minutes=PREDICT_STEP,
             values_are_kwh=True,
+            unmanaged=True,
+        )
+
+        # --- SOC trajectory: managed (D-ESS) for floor calculation ---
+        # "How much overflow will battery absorb if we export at DNO?"
+        peak_soc, net_charge, _ = simulate_soc_trajectory(
+            pv_step,
+            load_step,
+            soc_kw,
+            soc_max,
+            dno_limit_kw,
+            energy_ratio=energy_ratio,
+            load_ratio=load_ratio,
+            start_minute=PREDICT_STEP,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+            unmanaged=False,
         )
 
         soc_cap = soc_max * 0.95
-        will_fill = peak_soc > soc_cap
+        will_fill = peak_unmanaged > soc_cap
 
         # Check for danger slots (PV > 2kW in remaining forecast)
         step_to_kw = 60.0 / PREDICT_STEP
