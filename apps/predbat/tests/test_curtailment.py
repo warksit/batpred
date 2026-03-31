@@ -2196,6 +2196,319 @@ def test_trajectory_load_ratio_reduces_excess():
 
 
 # ============================================================================
+# v8 plugin integration tests — full on_update / trajectory-based activation
+# ============================================================================
+
+
+def test_plugin_activates_from_unmanaged_trajectory():
+    """Plugin must use unmanaged (MSC) trajectory for activation, not managed (D-ESS).
+
+    A day with 5kW PV and 1kW load: excess = 4kW = DNO limit.
+    Managed: no overflow (excess == DNO exactly) → battery stays flat.
+    Unmanaged: all 4kW excess charges battery → fills from 40%.
+    Plugin MUST activate because unmanaged shows battery fills.
+    """
+    # 5kW PV, 1kW load — excess exactly equals DNO limit (no managed overflow)
+    pv, load = _make_trajectory_pv(peak_kw=5.0, load_kw=1.0, hours=8)
+
+    # Verify the premise: managed won't fill, unmanaged will
+    start = BATTERY_KWH * 0.40
+    peak_u, _, _ = simulate_soc_trajectory(pv, load, start, BATTERY_KWH, DNO_LIMIT, unmanaged=True)
+    peak_m, _, _ = simulate_soc_trajectory(pv, load, start, BATTERY_KWH, DNO_LIMIT, unmanaged=False)
+    assert peak_u > BATTERY_KWH * 0.95, f"Premise: unmanaged should fill from 40%, got peak={peak_u:.1f}"
+    assert peak_m < BATTERY_KWH * 0.95, f"Premise: managed should NOT fill, got peak={peak_m:.1f}"
+
+    # Pass raw kW values to MockBase — it converts to kWh/step internally
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        soc_max=BATTERY_KWH,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 5.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    phase = phase_sensor.get("value", "Off")
+    assert phase != "Off", f"Plugin should activate (unmanaged fills), got phase='{phase}'"
+    assert base.set_read_only is True, "read_only should be True when plugin activates"
+    print(f"  test_plugin_activates_from_unmanaged_trajectory: PASSED (phase={phase})")
+
+
+def test_floor_rises_as_overflow_shrinks():
+    """Floor should rise through the afternoon as future overflow decreases.
+
+    Two plugin calculations with different amounts of remaining PV:
+    - Many remaining high-PV slots → large net_charge → low floor.
+    - Few remaining high-PV slots → small net_charge → high floor.
+    """
+    # "10:00": many high-PV slots remaining (8kW peak, 8h window)
+    pv_long, load_long = _make_trajectory_pv(peak_kw=8.0, load_kw=1.0, hours=8)
+
+    # Pass raw kW values to MockBase (MockBase converts to kWh/step internally)
+    base_10 = MockBase(
+        pv_step=pv_long,
+        load_step=load_long,
+        soc_kw=BATTERY_KWH * 0.40,
+        soc_max=BATTERY_KWH,
+        minutes_now=600,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 6.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin_10 = CurtailmentPlugin(base_10)
+    target_10, nc_10, phase_10, _ = plugin_10.calculate(dno_limit_kw=DNO_LIMIT)
+
+    # "15:00": only a small tail of PV remaining (8kW peak but only 2h window)
+    pv_short, load_short = _make_trajectory_pv(peak_kw=8.0, load_kw=1.0, hours=2)
+
+    base_15 = MockBase(
+        pv_step=pv_short,
+        load_step=load_short,
+        soc_kw=BATTERY_KWH * 0.40,
+        soc_max=BATTERY_KWH,
+        minutes_now=900,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 4.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin_15 = CurtailmentPlugin(base_15)
+    target_15, nc_15, phase_15, _ = plugin_15.calculate(dno_limit_kw=DNO_LIMIT)
+
+    # More remaining PV → more net_charge → lower floor.
+    # Less remaining PV → less net_charge → higher floor.
+    assert nc_10 > nc_15, f"Premise: more PV remaining at 10:00 should give more net_charge " f"(nc_10={nc_10:.2f} nc_15={nc_15:.2f})"
+    assert target_15 > target_10, f"Floor at 15:00 ({target_15:.2f} kWh = {target_15/BATTERY_KWH*100:.0f}%) " f"should be > floor at 10:00 ({target_10:.2f} kWh = {target_10/BATTERY_KWH*100:.0f}%)"
+    print(f"  test_floor_rises_as_overflow_shrinks: PASSED " f"(10:00={target_10/BATTERY_KWH*100:.0f}% nc={nc_10:.1f}, " f"15:00={target_15/BATTERY_KWH*100:.0f}% nc={nc_15:.1f})")
+
+
+def test_release_when_pv_below_threshold():
+    """When all remaining PV < SAFE_PV_THRESHOLD_KW (2kW), floor rises to soc_max (release)."""
+    # Build a forecast where all slots have PV well below 2kW
+    # Pass raw kW values to MockBase (MockBase converts to kWh/step internally)
+    pv_step = {m: 1.0 for m in range(0, 600, PLUGIN_STEP)}  # 1kW — below SAFE_PV_THRESHOLD_KW
+    load_step = {m: 0.5 for m in range(0, 600, PLUGIN_STEP)}
+
+    base = MockBase(
+        pv_step=pv_step,
+        load_step=load_step,
+        soc_kw=BATTERY_KWH * 0.80,
+        soc_max=BATTERY_KWH,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 1.0,  # actual PV also below threshold
+            "sensor.sigen_plant_consumed_power": 0.5,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    # Simulate that overflow was seen earlier today — plugin is sticky
+    plugin._seen_overflow_today = True
+
+    target_soc_kwh, net_charge, phase, _ = plugin.calculate(dno_limit_kw=DNO_LIMIT)
+
+    assert target_soc_kwh == BATTERY_KWH, f"When all remaining PV < {SAFE_PV_THRESHOLD_KW}kW, floor should be soc_max " f"({BATTERY_KWH} kWh), got {target_soc_kwh:.2f} kWh"
+    print(f"  test_release_when_pv_below_threshold: PASSED " f"(floor={target_soc_kwh:.2f} kWh = soc_max, phase={phase})")
+
+
+def test_sticky_keeps_active_when_trajectory_clears():
+    """Once overflow seen, plugin stays active even if trajectory no longer shows filling.
+
+    Cycle 1: overflow currently happening → sticky flag set, plugin activates.
+    Cycle 2: PV drops, trajectory shows battery won't fill — but sticky keeps plugin on.
+    """
+    # Cycle 1: high PV — trajectory fills (raw kW, MockBase converts to kWh/step)
+    pv_high = {m: 8.0 for m in range(0, 600, PLUGIN_STEP)}
+    load_high = {m: 1.0 for m in range(0, 600, PLUGIN_STEP)}
+
+    base1 = MockBase(
+        pv_step=pv_high,
+        load_step=load_high,
+        soc_kw=BATTERY_KWH * 0.50,
+        soc_max=BATTERY_KWH,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,  # currently overflowing
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base1)
+    plugin.calculate(dno_limit_kw=DNO_LIMIT)
+
+    # Manually confirm sticky flag is set (simulate currently_overflowing = True)
+    plugin._seen_overflow_today = True
+
+    # Cycle 2: PV drops to 1.5kW — below SAFE_PV_THRESHOLD_KW, trajectory won't fill
+    # Use raw kW values (MockBase converts to kWh/step)
+    pv_low = {m: 1.5 for m in range(0, 600, PLUGIN_STEP)}
+    load_low = {m: 1.0 for m in range(0, 600, PLUGIN_STEP)}
+
+    # Verify premise: 1.5kW PV won't fill battery
+    peak_u, _, _ = simulate_soc_trajectory(pv_low, load_low, BATTERY_KWH * 0.50, BATTERY_KWH, DNO_LIMIT, unmanaged=True)
+    assert peak_u < BATTERY_KWH * 0.95, f"Premise: 1.5kW PV should not fill battery, peak={peak_u:.1f}"
+
+    base2 = MockBase(
+        pv_step=pv_low,
+        load_step=load_low,
+        soc_kw=BATTERY_KWH * 0.50,
+        soc_max=BATTERY_KWH,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 1.5,  # low, not overflowing
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    # Transfer sticky state to new plugin instance (simulates persistent state across cycles)
+    plugin.base = base2
+
+    target, nc, phase, _ = plugin.calculate(dno_limit_kw=DNO_LIMIT)
+
+    assert phase != "off", f"Sticky: plugin should stay active even when trajectory clears, got phase='{phase}'"
+    print(f"  test_sticky_keeps_active_when_trajectory_clears: PASSED (phase={phase})")
+
+
+def test_on_update_full_flow_activates():
+    """Full on_update flow: trajectory fills → activate → D-ESS set → read_only → phase published."""
+    # High PV day — unmanaged trajectory definitely fills from 40%
+    # Pass raw kW values to MockBase (MockBase converts to kWh/step internally)
+    pv, load = _make_trajectory_pv(peak_kw=8.0, load_kw=1.0, hours=8)
+
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        soc_max=BATTERY_KWH,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    # Phase sensor published and not "Off"
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    phase = phase_sensor.get("value", "Off")
+    assert phase != "Off", f"Expected active phase (high PV, trajectory fills), got '{phase}'"
+
+    # read_only must be True
+    assert base.set_read_only is True, "set_read_only should be True when plugin activates"
+
+    # Services called (D-ESS mode + charge limit written)
+    service_names = [s[0] for s in base.services]
+    assert any("select" in svc for svc in service_names), f"Expected select/select_option (EMS mode) service call, got {service_names}"
+    assert any("number" in svc for svc in service_names), f"Expected number/set_value (charge limit) service call, got {service_names}"
+
+    # Target SOC sensor published with a floor value (not None)
+    target_sensor = base.published.get("sensor.predbat_curtailment_target_soc", {})
+    assert target_sensor.get("value") is not None, "Target SOC sensor should be published"
+    target_pct = target_sensor.get("value")
+    assert isinstance(target_pct, (int, float)), f"Target SOC should be numeric, got {type(target_pct)}"
+
+    print(f"  test_on_update_full_flow_activates: PASSED " f"(phase={phase}, target={target_pct:.0f}%, services={service_names})")
+
+
+def test_before_plan_trajectory_reduces_keep():
+    """on_before_plan should reduce best_soc_keep when trajectory shows battery will fill.
+
+    on_before_plan uses simulate_soc_trajectory starting from soc_max.
+    will_fill = True when the solar creates overflow even from 100% start (net_charge > 0).
+    With big PV (8kW), overflow charges the battery → will_fill → keep is reduced.
+    Without big PV (2kW, no overflow) → no fill → keep is unchanged.
+    """
+    # High PV: 8kW creates overflow even starting at 100% (excess - DNO = 8-1-4 = 3kW overflow)
+    # Pass raw kW to MockBase (MockBase converts to kWh/step)
+    pv_high = {m: 8.0 for m in range(0, 660, PLUGIN_STEP)}
+    load_high = {m: 1.0 for m in range(0, 660, PLUGIN_STEP)}
+
+    base_high = MockBase(
+        pv_step=pv_high,
+        load_step=load_high,
+        soc_kw=BATTERY_KWH * 0.40,
+        soc_max=BATTERY_KWH,
+        minutes_now=600,  # 10:00 — morning window where on_before_plan recomputes
+    )
+    plugin_high = CurtailmentPlugin(base_high)
+
+    original_keep = 6.0
+    context_high = {"best_soc_keep": original_keep}
+    result_high = plugin_high.on_before_plan(context_high)
+
+    # Low PV: 2kW, load 3kW — PV never exceeds load, no overflow from 100% start,
+    # morning_gap is large (load > PV all day) → solar_adjusted_keep > original_keep → no reduction
+    pv_low = {m: 2.0 for m in range(0, 660, PLUGIN_STEP)}
+    load_low = {m: 3.0 for m in range(0, 660, PLUGIN_STEP)}
+
+    base_low = MockBase(
+        pv_step=pv_low,
+        load_step=load_low,
+        soc_kw=BATTERY_KWH * 0.40,
+        soc_max=BATTERY_KWH,
+        minutes_now=600,
+    )
+    plugin_low = CurtailmentPlugin(base_low)
+
+    context_low = {"best_soc_keep": original_keep}
+    result_low = plugin_low.on_before_plan(context_low)
+
+    # High PV: keep should be reduced (solar will fill battery → only need morning gap worth)
+    assert result_high["best_soc_keep"] < original_keep, f"High PV: expected keep < {original_keep}, got {result_high['best_soc_keep']:.2f}"
+
+    # Low PV (load > PV): keep should not be reduced
+    assert result_low["best_soc_keep"] == original_keep, f"Low PV (load > PV): expected keep unchanged at {original_keep}, " f"got {result_low['best_soc_keep']:.2f}"
+
+    print(f"  test_before_plan_trajectory_reduces_keep: PASSED " f"(high_PV keep={result_high['best_soc_keep']:.2f}, low_PV keep={result_low['best_soc_keep']:.2f})")
+
+
+def test_on_update_stays_off_low_pv():
+    """Low PV day: on_update should stay off, not set read_only, not call D-ESS services.
+
+    1.5kW peak PV (below SAFE_PV_THRESHOLD_KW=2kW), 1kW load — unmanaged battery
+    accumulates only ~1.2kWh from 50%, far below soc_max. Plugin should stay off.
+    """
+    # 1.5kW peak PV (bell curve) — below SAFE_PV_THRESHOLD_KW so no danger slots
+    pv, load = _make_trajectory_pv(peak_kw=1.5, load_kw=1.0, hours=8)
+
+    # Verify premise: unmanaged doesn't fill battery from 50%
+    start_soc = BATTERY_KWH * 0.50
+    peak_u, _, _ = simulate_soc_trajectory(pv, load, start_soc, BATTERY_KWH, DNO_LIMIT, unmanaged=True)
+    assert peak_u < BATTERY_KWH * 0.95, f"Premise: 1.5kW peak PV should not fill battery, got peak={peak_u:.1f}"
+
+    # Pass raw kW values to MockBase (MockBase converts to kWh/step)
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=start_soc,
+        soc_max=BATTERY_KWH,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 1.5,  # low actual PV too
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
+    phase = phase_sensor.get("value", "Off")
+    assert phase == "Off", f"Low PV: expected phase='Off', got '{phase}'"
+    assert base.set_read_only is False, "read_only should be False when plugin stays off"
+
+    # No D-ESS mode service calls expected (select/select_option)
+    ems_calls = [s for s in base.services if "select" in s[0]]
+    assert len(ems_calls) == 0, f"Should not call EMS mode service on low PV day, got {ems_calls}"
+
+    print(f"  test_on_update_stays_off_low_pv: PASSED (peak_u={peak_u:.1f}kWh, phase={phase}, services={[s[0] for s in base.services]})")
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -2364,6 +2677,14 @@ def run_curtailment_tests(my_predbat=None):
         test_trajectory_mar31_scenario,
         test_trajectory_low_pv_no_activation,
         test_trajectory_load_ratio_reduces_excess,
+        # v8 plugin integration tests
+        test_plugin_activates_from_unmanaged_trajectory,
+        test_floor_rises_as_overflow_shrinks,
+        test_release_when_pv_below_threshold,
+        test_sticky_keeps_active_when_trajectory_clears,
+        test_on_update_full_flow_activates,
+        test_before_plan_trajectory_reduces_keep,
+        test_on_update_stays_off_low_pv,
     ]
     print("  --- v8 trajectory tests ---")
     for test_fn in v8_tests:
