@@ -77,6 +77,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self.last_phase = None
         self._overflow_history = []  # track recent overflow state for 95% cap
         self._energy_ratio = 1.0  # last computed energy ratio (for publish)
+        self._seen_overflow_today = False  # sticky: once overflow seen, stay active until PV done
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0  # minutes_now when last computed
@@ -275,8 +276,18 @@ class CurtailmentPlugin(PredBatPlugin):
         # --- Remaining overflow from FORECAST (unscaled) ---
         remaining_overflow = compute_remaining_overflow(pv_step, load_step, dno_limit_kw, start_minute=PREDICT_STEP, end_minute=solar_end_minute, step_minutes=PREDICT_STEP, values_are_kwh=True)
 
+        # --- Sticky activation: once overflow is seen, stay active until PV is done ---
+        if currently_overflowing:
+            if not self._seen_overflow_today:
+                self.log("Curtailment: overflow detected (excess {:.1f}kW > DNO {:.1f}kW) — activating for the day".format(actual_excess, dno_limit_kw))
+            self._seen_overflow_today = True
+
+        # Reset sticky flag when PV drops to negligible (evening)
+        if actual_pv < 0.1:
+            self._seen_overflow_today = False
+
         # --- Activation check ---
-        if not should_activate(remaining_overflow) and not currently_overflowing:
+        if not should_activate(remaining_overflow) and not currently_overflowing and not self._seen_overflow_today:
             self._overflow_history.clear()
             return soc_max, 0, "off", -2
 
@@ -526,13 +537,14 @@ class CurtailmentPlugin(PredBatPlugin):
                     phase = "off"
                     export_target_kw = -1
 
-            # Defer to Predbat during planned grid charge windows — but only
-            # when the battery actually needs charging. If SOC > 50%, the battery
-            # is full enough that curtailment management takes priority over a
-            # charge window (no point grid-importing when PV is overflowing).
+            # Defer to Predbat charge windows ONLY when SOC is below the
+            # effective keep floor (battery genuinely needs grid charging,
+            # e.g. morning cheap rate before GSHP drains it). Once SOC is
+            # at or above keep, curtailment manages — ignore charge windows.
             soc_kw = getattr(self.base, "soc_kw", 0)
             soc_max = getattr(self.base, "soc_max", 10)
-            if phase != "off" and soc_kw / max(soc_max, 0.1) < 0.5:
+            effective_keep = getattr(self.base, "best_soc_keep", 0)
+            if phase != "off" and soc_kw < effective_keep:
                 charge_window_best = getattr(self.base, "charge_window_best", [])
                 minutes_now = getattr(self.base, "minutes_now", 0)
                 charge_window_n = self.base.in_charge_window(charge_window_best, minutes_now)
@@ -542,7 +554,7 @@ class CurtailmentPlugin(PredBatPlugin):
                         charge_limit = charge_limit_best[charge_window_n]
                         if not self.base.is_freeze_charge(charge_limit):
                             if self.last_phase != "off":
-                                self.log("Curtailment: deferring to Predbat charge window (SOC < 50%)")
+                                self.log("Curtailment: deferring to charge window (SOC {:.1f} < keep {:.1f})".format(soc_kw, effective_keep))
                             phase = "off"
                             export_target_kw = -1
 

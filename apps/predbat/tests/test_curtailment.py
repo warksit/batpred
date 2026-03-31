@@ -1144,9 +1144,12 @@ class MockBase:
     def log(self, msg, *args, **kwargs):
         self.logs.append(msg)
 
-    def get_state_wrapper(self, entity, default=None):
+    def get_state_wrapper(self, entity, default=None, attribute=None):
         if entity in self._sensor_overrides:
-            return self._sensor_overrides[entity]
+            val = self._sensor_overrides[entity]
+            if attribute and isinstance(val, dict):
+                return val.get(attribute, default)
+            return val
         if entity == "input_boolean.curtailment_manager_enable":
             return "on"
         return default
@@ -1225,25 +1228,26 @@ def test_plugin_pv_above_threshold_allows_activation():
 
 
 def test_plugin_defers_to_charge_window():
-    """Plugin should defer to Predbat during a planned grid charge window."""
+    """Plugin should defer to Predbat during a charge window when SOC < best_soc_keep."""
     pv, load = _make_overflow_pv(minutes_now=300)
     # PV is generating (above threshold)
     pv[0] = 2.0
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=5.0,
+        soc_kw=3.0,  # Below best_soc_keep (4.0) — battery needs charging
         minutes_now=300,
         # Charge window active right now: 4am-7am (240-420)
         charge_window_best=[{"start": 240, "end": 420}],
         charge_limit_best=[10.0],  # 10kWh target — real charge, not freeze
+        best_soc_keep=4.0,
     )
     plugin = CurtailmentPlugin(base)
 
     plugin.on_update()
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
-    assert phase_sensor.get("value") == "Off", f"Expected phase='Off' during charge window, got '{phase_sensor.get('value')}'"
+    assert phase_sensor.get("value") == "Off", f"Expected phase='Off' during charge window (SOC < keep), got '{phase_sensor.get('value')}'"
     assert base.set_read_only is False, "read_only should be False when deferring to charge window"
     print("  test_plugin_defers_to_charge_window: PASSED")
 
@@ -1290,6 +1294,52 @@ def test_plugin_no_charge_window_activates_normally():
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
     assert phase_sensor.get("value") != "off", f"Expected active phase outside charge window, got '{phase_sensor.get('value')}'"
     print("  test_plugin_no_charge_window_activates_normally: PASSED")
+
+
+# ============================================================================
+# Sticky activation tests
+# ============================================================================
+
+
+def test_plugin_sticky_activation_oscillating_pv():
+    """Once overflow is detected, plugin stays active even when PV dips below DNO.
+
+    Simulates volatile cloud day: PV oscillates above and below DNO+load.
+    Plugin should activate on first overflow and NOT deactivate on dips.
+    """
+    pv, load = _make_overflow_pv(minutes_now=720)
+
+    # First cycle: PV high (overflow) — 8kW PV, 1kW load = 7kW excess > DNO
+    overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=overrides)
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    phase1 = base.published.get("sensor.predbat_curtailment_phase", {}).get("value")
+    assert phase1 != "Off", f"Expected active phase on overflow, got '{phase1}'"
+    assert plugin._seen_overflow_today is True, "Should have seen overflow"
+
+    # Second cycle: PV drops below DNO (cloud) — 3kW PV, 1kW load = 2kW excess < DNO
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 3.0
+    plugin.on_update()
+
+    phase2 = base.published.get("sensor.predbat_curtailment_phase", {}).get("value")
+    assert phase2 != "Off", f"Expected plugin to stay active after PV dip, got '{phase2}'"
+    assert plugin._seen_overflow_today is True, "Sticky flag should persist through PV dip"
+
+    # Third cycle: PV recovers (sun back) — 7kW PV
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 7.0
+    plugin.on_update()
+
+    phase3 = base.published.get("sensor.predbat_curtailment_phase", {}).get("value")
+    assert phase3 != "Off", f"Expected active phase on PV recovery, got '{phase3}'"
+
+    # Fourth cycle: PV gone (evening) — 0kW
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.0
+    plugin.on_update()
+
+    assert plugin._seen_overflow_today is False, "Sticky flag should reset when PV is gone"
+    print("  test_plugin_sticky_activation_oscillating_pv: PASSED")
 
 
 # ============================================================================
@@ -1966,6 +2016,8 @@ def run_curtailment_tests(my_predbat=None):
         test_plugin_defers_to_charge_window,
         test_plugin_ignores_freeze_charge_window,
         test_plugin_no_charge_window_activates_normally,
+        # Sticky activation tests
+        test_plugin_sticky_activation_oscillating_pv,
         # SOC floor tests
         test_target_soc_clamped_above_soc_keep,
         test_target_soc_clamped_above_reserve,
