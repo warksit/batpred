@@ -429,7 +429,13 @@ class ColdWeatherPlugin(PredBatPlugin):
         keep_pct = min(keep_kwh / soc_max * 100.0, 100.0)
 
         # Determine next GSHP morning window in absolute minutes (from midnight today)
+        # After cheap rate ends (07:00), stop boosting best_soc_keep — the overnight
+        # charge has happened and continuing to boost would cause expensive grid
+        # imports to maintain the floor at standard rate.
         minutes_now = getattr(self.base, "minutes_now", 0)
+        morning_boost_cutoff = CHEAP_RATE_END_HOUR * 60
+        after_morning_cheap = morning_boost_cutoff <= minutes_now < 12 * 60
+
         if minutes_now < 12 * 60:
             gshp_start = GSHP_START_HOUR * 60
             gshp_end = GSHP_END_HOUR * 60
@@ -454,25 +460,29 @@ class ColdWeatherPlugin(PredBatPlugin):
                 all_active_keep[minute] = tapered_pct
             end_pct = tapered_pct
 
-        # Boost best_soc_keep — covers GSHP uncertainty beyond LoadML's average.
-        # best_soc_keep is a planning floor (buffer for forecast error), not the
-        # load itself. Predbat already accounts for load in charge targets.
+        # Boost best_soc_keep — but only while cheap rate is still available for
+        # charging. After 07:00 the boost has served its purpose; keeping it active
+        # would cause expensive standard-rate imports to maintain the floor.
         base_keep = context.get("best_soc_keep", 0)
-        keep_boost = prediction * 0.5
-        context["best_soc_keep"] = base_keep + keep_boost
-
-        # Boost weight so penalty exceeds cheap rate cost, forcing the optimizer
-        # to actually charge enough during cheap windows.
         base_weight = context.get("best_soc_keep_weight", 0.5)
-        weight_boost = prediction / DEFAULT_KEEP_KWH * 2.0
-        new_weight = min(base_weight + weight_boost, 5.0)
-        context["best_soc_keep_weight"] = new_weight
+
+        if after_morning_cheap:
+            keep_boost = 0.0
+            new_weight = base_weight
+            self._publish_boost(0.0, context, reason="after_cheap_rate", prediction=prediction)
+        else:
+            keep_boost = prediction * 0.5
+            context["best_soc_keep"] = base_keep + keep_boost
+
+            weight_boost = prediction / DEFAULT_KEEP_KWH * 2.0
+            new_weight = min(base_weight + weight_boost, 5.0)
+            context["best_soc_keep_weight"] = new_weight
+
+            self._publish_boost(round(keep_boost, 2), context, base_keep=base_keep, weight=new_weight, prediction=prediction)
 
         self._keep_pct = round(keep_pct, 1)
         self._keep_kwh = round(keep_kwh, 1)
         self._keep_weight = round(new_weight, 1)
-
-        self._publish_boost(round(keep_boost, 2), context, base_keep=base_keep, weight=new_weight, prediction=prediction)
 
         self.log(
             "Cold weather: alert_keep={:.1f}%->{:.1f}% for {:02d}:00-{:02d}:00, "
