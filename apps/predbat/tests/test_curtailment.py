@@ -13,7 +13,7 @@ import sys
 # Ensure apps/predbat is on the path when run standalone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate, compute_overflow_window, compute_post_overflow_energy
+from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate, compute_overflow_window, compute_post_overflow_energy, simulate_soc_trajectory
 
 # Battery constants (Mum's SIG system)
 BATTERY_KWH = 18.08
@@ -1577,11 +1577,12 @@ def test_before_plan_never_increases():
 def test_realtime_pv_correction_raises_overflow():
     """When actual PV greatly exceeds forecast, plugin activates via currently_overflowing.
 
-    V7 behavior (differs from v6):
-    - Forecast overflow stays unscaled (4.5-1.0=3.5kW < DNO → overflow≈0)
-    - Plugin activates because actual excess (7.8-0.7=7.1kW) > DNO (4.0kW)
+    V8 behavior (trajectory-based floor):
+    - Forecast excess = 4.5-1.0 = 3.5kW < DNO → no trajectory overflow → net_charge≈0
+    - Plugin activates because actual excess (7.8-0.7=7.1kW) > DNO (4.0kW) → sticky
     - Phase = "export" (currently overflowing, regardless of forecast)
-    - Energy ratio > 1.0 (actual > forecast), which lowers the floor for absorption headroom
+    - Floor = soc_cap (95%) since trajectory shows no overflow to absorb
+    - Energy ratio > 1.0 but does not directly affect floor (trajectory handles it)
     """
     # Forecast: modest PV (4.5kW), barely below DNO with 1kW load → ~0 forecast overflow
     pv = {}
@@ -1603,17 +1604,17 @@ def test_realtime_pv_correction_raises_overflow():
         },
     )
     plugin = CurtailmentPlugin(base)
-    target_soc, overflow, phase, export_target = plugin.calculate(4.0)
+    target_soc, net_charge, phase, export_target = plugin.calculate(4.0)
 
-    # V7: forecast overflow is unscaled (≈0), but plugin activates via currently_overflowing
-    # The energy ratio > 1.0 lowers the floor to provide absorption headroom
+    # V8: plugin activates via currently_overflowing (sticky), phase=export
     assert phase == "export", f"Expected export phase (currently overflowing), got {phase}"
     target_pct = target_soc / 18.08 * 100
-    # SOC 16.0 (88.5%) is above floor — with energy ratio > 1.0, floor should be lowered
-    assert target_pct < 88, f"Floor should be lowered by energy ratio, got {target_pct:.1f}%"
+    # V8: floor = soc_cap (95%) since trajectory forecast shows no overflow to absorb
+    # (forecast PV 4.5kW < DNO 4.0kW + 1kW load — no overflow slots in trajectory)
+    assert 94 <= target_pct <= 96, f"Floor should be at soc_cap (~95%), got {target_pct:.1f}%"
     # Energy ratio > 1.0 because actual PV (7.8) > forecast PV (4.5)
     assert plugin._energy_ratio >= 1.0, f"Energy ratio should be >= 1.0 when actual > forecast, got {plugin._energy_ratio:.2f}"
-    print(f"  test_realtime_pv_correction_raises_overflow: PASSED (overflow={overflow:.2f}, target={target_pct:.0f}%)")
+    print(f"  test_realtime_pv_correction_raises_overflow: PASSED (net_charge={net_charge:.2f}, target={target_pct:.0f}%)")
 
 
 def test_realtime_pv_correction_no_effect_when_forecast_higher():
@@ -1987,6 +1988,142 @@ def test_v7_overforecast_sunset_soc():
 
 
 # ============================================================================
+# v8 trajectory tests — simulate_soc_trajectory pure function
+# ============================================================================
+
+
+def _make_trajectory_pv(peak_kw, load_kw, hours=6, step_minutes=5):
+    """
+    Create PV/load dicts for simulate_soc_trajectory, keyed from minute 0.
+
+    Simulates a mid-day window (current time = now, PV is already generating).
+    Returns raw kW values (values_are_kwh=False, the function default).
+    """
+    pv = {}
+    load = {}
+    total_slots = hours * 60 // step_minutes
+    mid = total_slots / 2
+    for i in range(total_slots):
+        m = i * step_minutes
+        x = (i - mid) / (mid if mid else 1)
+        pv[m] = peak_kw * max(0, 1 - x * x)
+        load[m] = load_kw
+    return pv, load
+
+
+def test_trajectory_battery_fills():
+    """Trajectory detects battery will fill on a big PV day.
+
+    Starting at 66% (12kWh) with 8kW PV and 7.35kWh overflow in 6h window —
+    overflow > remaining capacity (6.08kWh) so battery fills to soc_max.
+    """
+    # 6h window, 8kW peak, 1kW load — plenty of overflow (7.35kWh total)
+    pv, load = _make_trajectory_pv(peak_kw=8.0, load_kw=1.0, hours=6)
+    peak, net_charge, last_danger = simulate_soc_trajectory(pv, load, current_soc=12.0, soc_max=18.08, dno_limit=4.0)
+    assert peak > 18.08 * 0.95, f"Expected battery to fill, peak={peak:.1f}"
+    assert net_charge > 5.0, f"Expected significant overflow charge, got {net_charge:.1f}"
+    assert last_danger > 0, "Should have danger slots"
+    print(f"  test_trajectory_battery_fills: PASSED (peak={peak:.1f}kWh net_charge={net_charge:.1f}kWh)")
+
+
+def test_trajectory_battery_wont_fill():
+    """Low PV day — battery won't fill."""
+    # 3kW peak, 1kW load → max excess = 2kW < DNO 4kW → no overflow → battery stays flat
+    pv, load = _make_trajectory_pv(peak_kw=3.0, load_kw=1.0, hours=6)
+    peak, net_charge, last_danger = simulate_soc_trajectory(pv, load, current_soc=9.0, soc_max=18.08, dno_limit=4.0)
+    assert peak < 18.08 * 0.95, f"Battery shouldn't fill, peak={peak:.1f}"
+    print(f"  test_trajectory_battery_wont_fill: PASSED (peak={peak:.1f}kWh)")
+
+
+def test_trajectory_high_soc_fills():
+    """Moderate PV + high starting SOC = fills.
+
+    Starting at 83% (15kWh) with 7kW PV — 4.28kWh overflow covers remaining 3.08kWh capacity.
+    """
+    # 7kW peak, 1kW load → 4.28kWh overflow in 6h window > remaining 3.08kWh
+    pv, load = _make_trajectory_pv(peak_kw=7.0, load_kw=1.0, hours=6)
+    peak, net_charge, last_danger = simulate_soc_trajectory(pv, load, current_soc=15.0, soc_max=18.08, dno_limit=4.0)  # 83% start
+    assert peak > 18.08 * 0.95, f"Should fill from 83% start with 7kW PV, peak={peak:.1f}"
+    print(f"  test_trajectory_high_soc_fills: PASSED (peak={peak:.1f}kWh)")
+
+
+def test_trajectory_energy_ratio_increases_overflow():
+    """Energy ratio > 1 should increase peak SOC (more PV than forecast)."""
+    # 6kW barely-overflowing scenario — ratio 1.5 should push peak higher
+    pv, load = _make_trajectory_pv(peak_kw=6.0, load_kw=1.0, hours=6)
+    peak_1x, _, _ = simulate_soc_trajectory(pv, load, 9.0, 18.08, 4.0, energy_ratio=1.0)
+    peak_15x, _, _ = simulate_soc_trajectory(pv, load, 9.0, 18.08, 4.0, energy_ratio=1.5)
+    assert peak_15x > peak_1x, f"Higher ratio should increase peak: {peak_15x:.1f} vs {peak_1x:.1f}"
+    print(f"  test_trajectory_energy_ratio_increases_overflow: PASSED ({peak_1x:.1f} -> {peak_15x:.1f}kWh)")
+
+
+def test_trajectory_energy_ratio_decreases_overflow():
+    """Energy ratio < 1 should decrease peak SOC (less PV than forecast)."""
+    # 8kW big overflow day — ratio 0.6 should significantly reduce peak
+    pv, load = _make_trajectory_pv(peak_kw=8.0, load_kw=1.0, hours=6)
+    peak_1x, _, _ = simulate_soc_trajectory(pv, load, 9.0, 18.08, 4.0, energy_ratio=1.0)
+    peak_06x, _, _ = simulate_soc_trajectory(pv, load, 9.0, 18.08, 4.0, energy_ratio=0.6)
+    assert peak_06x < peak_1x, f"Lower ratio should decrease peak: {peak_06x:.1f} vs {peak_1x:.1f}"
+    print(f"  test_trajectory_energy_ratio_decreases_overflow: PASSED ({peak_1x:.1f} -> {peak_06x:.1f}kWh)")
+
+
+def test_v8_floor_bidirectional():
+    """v8 floor drops when forecast overflow increases (more PV predicted).
+
+    The adaptive floor = soc_cap - net_charge. When the forecast shows more
+    overflow (higher PV), net_charge increases and the floor decreases.
+
+    Uses moderate PV (6kW vs 9kW) so that floor is not clamped to 0 in both
+    cases. 6kW gives ~11kWh overflow → floor≈34%. 9kW gives ~44kWh → floor=0%.
+    """
+    # 6kW forecast: moderate overflow, floor should be > 0
+    pv_moderate = {}
+    load_moderate = {}
+    for m in range(0, 660, PLUGIN_STEP):
+        pv_moderate[m] = 6.0  # kW
+        load_moderate[m] = 1.0  # kW
+
+    base1 = MockBase(
+        pv_step=pv_moderate,
+        load_step=load_moderate,
+        soc_kw=10.0,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 6.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin1 = CurtailmentPlugin(base1)
+    target1, nc1, phase1, _ = plugin1.calculate(dno_limit_kw=4.0)
+    floor_moderate = target1 / 18.08 * 100
+
+    # 9kW forecast: larger overflow, floor should be lower
+    pv_high = {}
+    for m in range(0, 660, PLUGIN_STEP):
+        pv_high[m] = 9.0  # kW
+
+    base2 = MockBase(
+        pv_step=pv_high,
+        load_step=load_moderate,
+        soc_kw=10.0,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 9.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+        },
+    )
+    plugin2 = CurtailmentPlugin(base2)
+    target2, nc2, phase2, _ = plugin2.calculate(dno_limit_kw=4.0)
+    floor_high = target2 / 18.08 * 100
+
+    # More overflow → lower floor (need less headroom because overflow does the charging)
+    assert floor_high < floor_moderate, f"Higher forecast overflow should give lower floor: " f"{floor_high:.1f}% vs {floor_moderate:.1f}% (nc1={nc1:.1f}, nc2={nc2:.1f})"
+    # Also verify that the moderate case has a non-trivial floor (not clamped to 0)
+    assert floor_moderate > 10, f"Moderate PV floor should be > 10%, got {floor_moderate:.1f}%"
+    print(f"  test_v8_floor_bidirectional: PASSED (6kW floor={floor_moderate:.1f}%, 9kW floor={floor_high:.1f}%)")
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -2142,6 +2279,23 @@ def run_curtailment_tests(my_predbat=None):
                 day_failed = _run_csv_day_v7_test(label, filename, watts, forecast_scale=1.0, start_soc_pct=0.25)
                 if day_failed:
                     failed = True
+
+    # v8 trajectory tests
+    v8_tests = [
+        test_trajectory_battery_fills,
+        test_trajectory_battery_wont_fill,
+        test_trajectory_high_soc_fills,
+        test_trajectory_energy_ratio_increases_overflow,
+        test_trajectory_energy_ratio_decreases_overflow,
+        test_v8_floor_bidirectional,
+    ]
+    print("  --- v8 trajectory tests ---")
+    for test_fn in v8_tests:
+        try:
+            test_fn()
+        except AssertionError as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
 
     if not failed:
         print("**** All curtailment tests PASSED ****")

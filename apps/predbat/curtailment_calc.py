@@ -1,8 +1,13 @@
 # -----------------------------------------------------------------------------
 # Predbat Home Battery System - Curtailment Calculator
-# Pure algorithm functions for curtailment management (v5 iterative target SOC)
+# Pure algorithm functions for curtailment management
 # No HA or Predbat dependencies — testable in isolation
 # -----------------------------------------------------------------------------
+
+# Validated from Mar 28 real data (120 five-minute slots):
+# Mean PV < 2.0kW: zero spikes above 4.5kW (safe to release)
+# Mean PV 2-4kW: spikes to 6-10kW common (overflow risk)
+SAFE_PV_THRESHOLD_KW = 2.0
 
 
 def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
@@ -198,3 +203,76 @@ def compute_post_overflow_energy(pv_forecast, load_forecast, after_minute, end_m
             excess_kw = min(excess_kw, dno_limit)
         total += excess_kw * step_hours
     return total
+
+
+def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
+    """
+    Simulate battery SOC trajectory with curtailment active (export at DNO).
+
+    Runs from start_minute until PV is exhausted (evening load irrelevant).
+    PV is scaled by energy_ratio (actual/forecast cumulative tracking).
+
+    For each slot:
+      - excess = PV*ratio - load
+      - If excess > DNO: export DNO, battery absorbs (excess - DNO)
+      - If 0 < excess <= DNO: export excess, battery unchanged
+      - If excess < 0: battery covers deficit
+
+    Args:
+        pv_forecast: dict {minute: value}
+        load_forecast: dict {minute: value}
+        current_soc: float kWh — starting SOC
+        soc_max: float kWh — battery capacity
+        dno_limit: float kW — max grid export
+        energy_ratio: float — PV scaling factor (1.0 = forecast, >1 = ahead)
+        start_minute: int — first minute (default 0)
+        end_minute: int — last minute (default 1440)
+        step_minutes: int — step size
+        values_are_kwh: bool — if True, forecast values are kWh per step
+
+    Returns:
+        (peak_soc, net_battery_charge, last_danger_slot)
+        - peak_soc: float kWh — highest SOC reached
+        - net_battery_charge: float kWh — total energy battery absorbs minus deficits
+        - last_danger_slot: int — last minute with PV > SAFE_PV_THRESHOLD_KW (0 if none)
+    """
+    step_hours = step_minutes / 60.0
+    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
+
+    soc = current_soc
+    peak_soc = current_soc
+    net_charge = 0.0
+    last_danger = 0
+    last_pv_slot = 0
+
+    for m in range(start_minute, end_minute, step_minutes):
+        pv_kw = pv_forecast.get(m, 0.0) * to_kw * energy_ratio
+        load_kw = load_forecast.get(m, 0.0) * to_kw
+
+        if pv_kw > 0.1:
+            last_pv_slot = m
+        elif m > last_pv_slot + 60:
+            break  # PV done for the day, evening load irrelevant
+
+        if pv_kw > SAFE_PV_THRESHOLD_KW:
+            last_danger = m
+
+        excess = pv_kw - load_kw
+
+        if excess > dno_limit:
+            # Overflow: export at DNO, battery absorbs the rest
+            charge = (excess - dno_limit) * step_hours
+            soc += charge
+            net_charge += charge
+        elif excess < 0:
+            # Deficit: battery covers load
+            drain = excess * step_hours  # negative
+            soc += drain
+            net_charge += drain
+
+        # Clamp SOC
+        soc = max(0.0, min(soc_max, soc))
+        if soc > peak_soc:
+            peak_soc = soc
+
+    return peak_soc, net_charge, last_danger
