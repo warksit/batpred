@@ -71,6 +71,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._dno_limit = 4.0
         self.last_phase = None
         self._energy_ratio = 1.0  # last computed energy ratio (for publish)
+        self._load_ratio = 1.0  # last computed load ratio (for publish)
         self._seen_overflow_today = False  # sticky: once overflow seen, stay active until PV done
         # Caching for on_before_plan
         self._cached_keep = None
@@ -245,6 +246,38 @@ class CurtailmentPlugin(PredBatPlugin):
 
         return actual_pv, actual_load, energy_ratio
 
+    def _get_load_ratio(self):
+        """Compute load ratio: actual cumulative load / predicted cumulative load.
+
+        Uses predbat.load_energy_adjusted (today_so_far) as the predicted load
+        consumed so far, and sigen daily load as actual.
+
+        Returns load_ratio with same 10% blend as PV ratio for early stability.
+        Ratio > 1 means actual load higher than predicted (less overflow risk).
+        Ratio < 1 means actual load lower than predicted (more overflow risk).
+        """
+        try:
+            actual_load_total = float(self.base.get_state_wrapper("sensor.sigen_plant_daily_load_consumption", default=0))
+        except (ValueError, TypeError):
+            return 1.0
+
+        try:
+            predicted_so_far = float(self.base.get_state_wrapper("predbat.load_energy_adjusted", attribute="today_so_far", default=0))
+            predicted_today = float(self.base.get_state_wrapper("predbat.load_energy_adjusted", attribute="today", default=0))
+        except (ValueError, TypeError):
+            return 1.0
+
+        if predicted_so_far < 2.0 or predicted_today < 5.0:
+            return 1.0  # too early for meaningful ratio
+
+        # 10% blend: stable early, responsive by mid-morning
+        threshold = predicted_today * 0.10
+        blend = min(1.0, predicted_so_far / max(threshold, 0.5))
+        raw_ratio = actual_load_total / max(predicted_so_far, 0.5)
+        load_ratio = 1.0 + (raw_ratio - 1.0) * blend
+
+        return load_ratio
+
     def calculate(self, dno_limit_kw):
         """Compute curtailment phase using v8 SOC trajectory algorithm."""
         pv_step = getattr(self.base, "pv_forecast_minute_step", {})
@@ -273,6 +306,10 @@ class CurtailmentPlugin(PredBatPlugin):
         if actual_pv < 0.1:
             self._seen_overflow_today = False
 
+        # --- Load ratio ---
+        load_ratio = self._get_load_ratio()
+        self._load_ratio = load_ratio
+
         # --- SOC trajectory simulation ---
         peak_soc, net_charge, last_danger = simulate_soc_trajectory(
             pv_step,
@@ -281,6 +318,7 @@ class CurtailmentPlugin(PredBatPlugin):
             soc_max,
             dno_limit_kw,
             energy_ratio=energy_ratio,
+            load_ratio=load_ratio,
             start_minute=PREDICT_STEP,
             end_minute=solar_end,
             step_minutes=PREDICT_STEP,
@@ -353,6 +391,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "friendly_name": "Curtailment Phase",
                 "icon": "mdi:solar-power-variant",
                 "energy_ratio": round(self._energy_ratio, 2),
+                "load_ratio": round(getattr(self, "_load_ratio", 1.0), 2),
                 "trajectory_peak_soc": round(getattr(self, "_trajectory_peak", 0), 2),
                 "net_charge": round(getattr(self, "_net_charge", 0), 2),
                 "floor": round(target_soc_kwh, 2),

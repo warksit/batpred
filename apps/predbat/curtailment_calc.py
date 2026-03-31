@@ -205,15 +205,15 @@ def compute_post_overflow_energy(pv_forecast, load_forecast, after_minute, end_m
     return total
 
 
-def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
+def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, load_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """
     Simulate battery SOC trajectory with curtailment active (export at DNO).
 
     Runs from start_minute until PV is exhausted (evening load irrelevant).
-    PV is scaled by energy_ratio (actual/forecast cumulative tracking).
+    PV is scaled by energy_ratio, load is scaled by load_ratio.
 
     For each slot:
-      - excess = PV*ratio - load
+      - excess = PV*energy_ratio - load*load_ratio
       - If excess > DNO: export DNO, battery absorbs (excess - DNO)
       - If 0 < excess <= DNO: export excess, battery unchanged
       - If excess < 0: battery covers deficit
@@ -224,7 +224,8 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
         current_soc: float kWh — starting SOC
         soc_max: float kWh — battery capacity
         dno_limit: float kW — max grid export
-        energy_ratio: float — PV scaling factor (1.0 = forecast, >1 = ahead)
+        energy_ratio: float — PV scaling (1.0 = forecast, >1 = PV ahead)
+        load_ratio: float — load scaling (1.0 = forecast, <1 = load lower than predicted)
         start_minute: int — first minute (default 0)
         end_minute: int — last minute (default 1440)
         step_minutes: int — step size
@@ -247,7 +248,7 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
 
     for m in range(start_minute, end_minute, step_minutes):
         pv_kw = pv_forecast.get(m, 0.0) * to_kw * energy_ratio
-        load_kw = load_forecast.get(m, 0.0) * to_kw
+        load_kw = load_forecast.get(m, 0.0) * to_kw * load_ratio
 
         if pv_kw > 0.1:
             last_pv_slot = m
