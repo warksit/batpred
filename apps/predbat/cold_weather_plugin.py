@@ -474,7 +474,8 @@ class ColdWeatherPlugin(PredBatPlugin):
             new_weight = base_weight
             self._publish_boost(0.0, context, reason="after_cheap_rate", prediction=prediction)
         else:
-            keep_boost = prediction * 0.5
+            rolling_avg = self._rolling_avg()
+            keep_boost = max(0.0, prediction - rolling_avg)
             context["best_soc_keep"] = base_keep + keep_boost
 
             weight_boost = prediction / DEFAULT_KEEP_KWH * 2.0
