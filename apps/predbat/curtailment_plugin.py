@@ -612,6 +612,7 @@ class CurtailmentPlugin(PredBatPlugin):
                         self.log("Curtailment: waiting for PV (forecast {:.2f}kW, actual {:.1f}kW)".format(pv_now_kw, actual_pv))
                     phase = "off"
                     export_target_kw = -1
+                    target_soc_kwh = soc_max
 
             # Defer to Predbat charge windows ONLY when SOC is below the
             # effective keep floor (battery genuinely needs grid charging,
@@ -633,6 +634,7 @@ class CurtailmentPlugin(PredBatPlugin):
                                 self.log("Curtailment: deferring to charge window (SOC {:.1f} < keep {:.1f})".format(soc_kw, effective_keep))
                             phase = "off"
                             export_target_kw = -1
+                            target_soc_kwh = soc_max
 
             target_pct = target_soc_kwh / max(soc_max, 0.1) * 100
             soc_pct = soc_kw / max(soc_max, 0.1) * 100
