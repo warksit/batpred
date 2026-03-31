@@ -244,15 +244,16 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
     peak_soc = current_soc
     net_charge = 0.0
     last_danger = 0
-    last_pv_slot = 0
+    seen_pv = False
 
     for m in range(start_minute, end_minute, step_minutes):
         pv_kw = pv_forecast.get(m, 0.0) * to_kw * energy_ratio
         load_kw = load_forecast.get(m, 0.0) * to_kw * load_ratio
 
         if pv_kw > 0.1:
-            last_pv_slot = m
-        elif m > last_pv_slot + 60:
+            seen_pv = True
+            last_pv_minute = m
+        elif seen_pv and m > last_pv_minute + 60:
             break  # PV done for the day, evening load irrelevant
 
         if pv_kw > SAFE_PV_THRESHOLD_KW:
