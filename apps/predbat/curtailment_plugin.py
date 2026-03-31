@@ -526,8 +526,13 @@ class CurtailmentPlugin(PredBatPlugin):
                     phase = "off"
                     export_target_kw = -1
 
-            # Defer to Predbat during planned grid charge windows
-            if phase != "off":
+            # Defer to Predbat during planned grid charge windows — but only
+            # when the battery actually needs charging. If SOC > 50%, the battery
+            # is full enough that curtailment management takes priority over a
+            # charge window (no point grid-importing when PV is overflowing).
+            soc_kw = getattr(self.base, "soc_kw", 0)
+            soc_max = getattr(self.base, "soc_max", 10)
+            if phase != "off" and soc_kw / max(soc_max, 0.1) < 0.5:
                 charge_window_best = getattr(self.base, "charge_window_best", [])
                 minutes_now = getattr(self.base, "minutes_now", 0)
                 charge_window_n = self.base.in_charge_window(charge_window_best, minutes_now)
@@ -537,12 +542,10 @@ class CurtailmentPlugin(PredBatPlugin):
                         charge_limit = charge_limit_best[charge_window_n]
                         if not self.base.is_freeze_charge(charge_limit):
                             if self.last_phase != "off":
-                                self.log("Curtailment: deferring to Predbat charge window")
+                                self.log("Curtailment: deferring to Predbat charge window (SOC < 50%)")
                             phase = "off"
                             export_target_kw = -1
 
-            soc_kw = getattr(self.base, "soc_kw", 0)
-            soc_max = getattr(self.base, "soc_max", 10)
             target_pct = target_soc_kwh / max(soc_max, 0.1) * 100
             soc_pct = soc_kw / max(soc_max, 0.1) * 100
 
