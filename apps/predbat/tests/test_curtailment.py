@@ -2508,6 +2508,43 @@ def test_on_update_stays_off_low_pv():
     print(f"  test_on_update_stays_off_low_pv: PASSED (peak_u={peak_u:.1f}kWh, phase={phase}, services={[s[0] for s in base.services]})")
 
 
+def test_floor_clamped_to_soc_max():
+    """Floor must never exceed soc_max. Negative net_charge caused 150% target SOC."""
+    pv, load = _make_trajectory_pv(peak_kw=3.0, load_kw=2.0, hours=6)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides={"sensor.sigen_plant_pv_power": 3.0, "sensor.sigen_plant_consumed_power": 2.0})
+    plugin = CurtailmentPlugin(base)
+    plugin._seen_overflow_today = True
+    target, net_charge, phase, _ = plugin.calculate(4.0)
+    assert target <= 18.08, f"Floor must be <= soc_max: got {target:.1f} kWh ({target / 18.08 * 100:.0f}%)"
+    assert target >= 0, f"Floor must be >= 0: got {target:.1f}"
+    print(f"  test_floor_clamped_to_soc_max: PASSED (net_charge={net_charge:.1f}, floor={target / 18.08 * 100:.0f}%)")
+
+
+def test_overflow_sensor_never_negative():
+    """Published overflow kWh must never be negative. Was showing -9.94 kWh."""
+    pv, load = _make_trajectory_pv(peak_kw=3.0, load_kw=2.0, hours=6)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides={"sensor.sigen_plant_pv_power": 3.0, "sensor.sigen_plant_consumed_power": 2.0})
+    plugin = CurtailmentPlugin(base)
+    plugin._seen_overflow_today = True
+    plugin.on_update()
+    overflow = base.published.get("sensor.predbat_curtailment_overflow_kwh", {}).get("value", 0)
+    assert float(overflow) >= 0, f"Overflow must be >= 0: got {overflow}"
+    print(f"  test_overflow_sensor_never_negative: PASSED (overflow={overflow})")
+
+
+def test_target_soc_sensor_max_100pct():
+    """Published target SOC % must never exceed 100%. Was showing 150%."""
+    pv, load = _make_trajectory_pv(peak_kw=3.0, load_kw=2.0, hours=6)
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides={"sensor.sigen_plant_pv_power": 3.0, "sensor.sigen_plant_consumed_power": 2.0})
+    plugin = CurtailmentPlugin(base)
+    plugin._seen_overflow_today = True
+    plugin.on_update()
+    target_pct = base.published.get("sensor.predbat_curtailment_target_soc", {}).get("value", 0)
+    assert float(target_pct) <= 100.0, f"Target SOC must be <= 100%: got {target_pct}%"
+    assert float(target_pct) >= 0, f"Target SOC must be >= 0%: got {target_pct}%"
+    print(f"  test_target_soc_sensor_max_100pct: PASSED (target={target_pct}%)")
+
+
 # ============================================================================
 # Test runner
 # ============================================================================
@@ -2685,6 +2722,9 @@ def run_curtailment_tests(my_predbat=None):
         test_on_update_full_flow_activates,
         test_before_plan_trajectory_reduces_keep,
         test_on_update_stays_off_low_pv,
+        test_floor_clamped_to_soc_max,
+        test_overflow_sensor_never_negative,
+        test_target_soc_sensor_max_100pct,
     ]
     print("  --- v8 trajectory tests ---")
     for test_fn in v8_tests:

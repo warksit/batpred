@@ -373,8 +373,9 @@ class CurtailmentPlugin(PredBatPlugin):
         soc_keep = getattr(self.base, "best_soc_keep", 0)
         reserve = getattr(self.base, "reserve", 0)
 
-        floor = soc_cap - net_charge
+        floor = soc_cap - max(0, net_charge)
         floor = max(floor, soc_keep, reserve)
+        floor = min(floor, soc_max)  # never above 100%
 
         # Release: when all remaining PV < 2kW, floor = 100%
         remaining_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
@@ -444,7 +445,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_overflow_kwh".format(prefix),
-            round(remaining_overflow_kwh, 2),
+            round(max(0, remaining_overflow_kwh), 2),
             {
                 "friendly_name": "Curtailment Remaining Overflow",
                 "unit_of_measurement": "kWh",
