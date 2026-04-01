@@ -346,6 +346,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         soc_cap = soc_max * 0.95
         will_fill = peak_unmanaged > soc_cap
+        self._unmanaged_peak = peak_unmanaged
 
         # Check for danger slots (PV > 2kW in remaining forecast)
         step_to_kw = 60.0 / PREDICT_STEP
@@ -412,7 +413,8 @@ class CurtailmentPlugin(PredBatPlugin):
                 "icon": "mdi:solar-power-variant",
                 "energy_ratio": round(self._energy_ratio, 2),
                 "load_ratio": round(getattr(self, "_load_ratio", 1.0), 2),
-                "trajectory_peak_soc": round(getattr(self, "_trajectory_peak", 0), 2),
+                "unmanaged_peak_soc": round(getattr(self, "_unmanaged_peak", 0), 2),
+                "managed_peak_soc": round(getattr(self, "_trajectory_peak", 0), 2),
                 "net_charge": round(getattr(self, "_net_charge", 0), 2),
                 "floor": round(target_soc_kwh, 2),
                 "will_fill": getattr(self, "_will_fill", False),
@@ -440,16 +442,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 "unit_of_measurement": "%",
                 "icon": "mdi:battery-charging-medium",
                 "target_kwh": round(target_soc_kwh, 2),
-            },
-        )
-
-        self.base.dashboard_item(
-            "sensor.{}_curtailment_overflow_kwh".format(prefix),
-            round(max(0, remaining_overflow_kwh), 2),
-            {
-                "friendly_name": "Curtailment Remaining Overflow",
-                "unit_of_measurement": "kWh",
-                "icon": "mdi:flash-alert",
             },
         )
 
