@@ -2545,6 +2545,117 @@ def test_target_soc_sensor_max_100pct():
     print(f"  test_target_soc_sensor_max_100pct: PASSED (target={target_pct}%)")
 
 
+def test_deactivation_restores_msc_during_pv():
+    """When will_fill becomes false, plugin must restore MSC even with PV generating.
+
+    The PV guard previously kept D-ESS active when deactivating during daylight.
+    This blocked Predbat's charge windows on moderate PV days. Since will_fill=false
+    means the battery won't fill, MSC is safe regardless of PV level.
+    """
+    # First: activate with high PV (will fill from 50%)
+    pv = {}
+    load = {}
+    for m in range(0, 360, PLUGIN_STEP):  # 6 hours only
+        pv[m] = 8.0
+        load[m] = 1.0
+
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=9.0, minutes_now=600, sensor_overrides={"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0})
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+    assert base.set_read_only is True, "Should be active (will fill)"
+
+    # Second: switch to low PV — won't fill. Reset sticky. PV still generating (1.5kW).
+    pv_low = {}
+    load_low = {}
+    for m in range(0, 360, PLUGIN_STEP):
+        pv_low[m] = 1.5
+        load_low[m] = 1.0
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_low.items()}
+    base.load_minutes_step = {k: v * PLUGIN_STEP / 60.0 for k, v in load_low.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.5
+    plugin._seen_overflow_today = False  # cloud passed, no more overflow
+
+    plugin.on_update()
+
+    assert base.set_read_only is False, "Should deactivate when will_fill=false (MSC safe)"
+    msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
+    assert msc_called, "Should restore MSC on deactivation"
+    print("  test_deactivation_restores_msc_during_pv: PASSED")
+
+
+def test_activation_sets_dess_and_read_only():
+    """ON transition: sets D-ESS, read_only=True, blocks Predbat."""
+    pv = {}
+    load = {}
+    for m in range(0, 660, PLUGIN_STEP):
+        pv[m] = 8.0
+        load[m] = 1.0
+
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=7.0, minutes_now=600, sensor_overrides={"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0})
+    plugin = CurtailmentPlugin(base)
+
+    assert base.set_read_only is False, "Starts inactive"
+    plugin.on_update()
+    assert base.set_read_only is True, "Should activate"
+
+    dess_called = any(s[1].get("option") == "Command Discharging (ESS First)" for s in base.services if s[0] == "select/select_option")
+    assert dess_called, "Should set D-ESS on activation"
+    print("  test_activation_sets_dess_and_read_only: PASSED")
+
+
+def test_sticky_prevents_deactivation():
+    """Sticky flag keeps plugin active even when trajectory says won't fill."""
+    pv = {}
+    load = {}
+    for m in range(0, 660, PLUGIN_STEP):
+        pv[m] = 3.0  # won't fill
+        load[m] = 1.0
+
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=7.0, minutes_now=600, sensor_overrides={"sensor.sigen_plant_pv_power": 3.0, "sensor.sigen_plant_consumed_power": 1.0})
+    plugin = CurtailmentPlugin(base)
+    plugin._seen_overflow_today = True  # sticky from earlier overflow
+
+    plugin.on_update()
+
+    phase = base.published.get("sensor.predbat_curtailment_phase", {}).get("value")
+    assert phase != "Off", f"Sticky should keep active, got phase={phase}"
+    assert base.set_read_only is True, "read_only should stay True with sticky"
+    print("  test_sticky_prevents_deactivation: PASSED")
+
+
+def test_no_oscillation_msc_safe():
+    """Rapid on→off→on transitions: each off restores MSC cleanly."""
+    pv_on = {}
+    pv_off = {}
+    load = {}
+    for m in range(0, 360, PLUGIN_STEP):  # 6 hours
+        pv_on[m] = 8.0  # fills from 50%
+        pv_off[m] = 1.5  # won't fill
+        load[m] = 1.0
+
+    base = MockBase(pv_step=pv_on, load_step=load, soc_kw=9.0, minutes_now=600, sensor_overrides={"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0})
+    plugin = CurtailmentPlugin(base)
+
+    # Cycle 1: activate
+    plugin.on_update()
+    assert base.set_read_only is True, "Cycle 1: should activate"
+
+    # Cycle 2: low PV, deactivate. Reset sticky.
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_off.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.5
+    plugin._seen_overflow_today = False
+    plugin.on_update()
+    assert base.set_read_only is False, "Cycle 2: should deactivate (MSC)"
+
+    # Cycle 3: high PV, reactivate
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_on.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 8.0
+    plugin.on_update()
+    assert base.set_read_only is True, "Cycle 3: should reactivate"
+
+    print("  test_no_oscillation_msc_safe: PASSED (on→off→on, MSC restored each off)")
+
+
 # ============================================================================
 # Test runner
 # ============================================================================
@@ -2725,6 +2836,10 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_clamped_to_soc_max,
         test_overflow_sensor_never_negative,
         test_target_soc_sensor_max_100pct,
+        test_deactivation_restores_msc_during_pv,
+        test_activation_sets_dess_and_read_only,
+        test_sticky_prevents_deactivation,
+        test_no_oscillation_msc_safe,
     ]
     print("  --- v8 trajectory tests ---")
     for test_fn in v8_tests:

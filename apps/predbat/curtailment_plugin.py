@@ -527,47 +527,27 @@ class CurtailmentPlugin(PredBatPlugin):
             self.was_active = True
 
         elif self.was_active:
-            # Check if PV is still significant before deactivating D-ESS.
-            # Switching Off→MSC while PV is generating caused SIG faults on
-            # Mar 25/26. Only restore MSC once PV is negligible (evening/night).
-            actual_pv_now = 0.0
-            try:
-                actual_pv_now = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0))
-            except (ValueError, TypeError):
-                pass
+            # Deactivating: will_fill=false means battery won't fill, MSC is safe.
+            # Sticky activation prevents reaching here on real overflow days.
+            # No PV guard needed — trust the trajectory.
+            self.log("Curtailment deactivating, restoring MSC")
+            self.write_sig(
+                ems_mode="Maximum Self Consumption",
+                charge_limit=100,
+            )
+            self.base.call_service_wrapper(
+                "number/set_value",
+                entity_id=SIG_EXPORT_LIMIT,
+                value=self._dno_limit,
+            )
 
-            if actual_pv_now >= 0.5:
-                # PV still generating — keep D-ESS active even though phase is "off"
-                self.log("Curtailment: phase off but PV={:.1f}kW — keeping D-ESS".format(actual_pv_now))
-                self.write_sig(
-                    ems_mode="Command Discharging (ESS First)",
-                    charge_limit=100,
-                    export_limit=self._dno_limit,
-                )
-                self._set_read_only(True)
-            else:
-                # PV negligible — safe to restore MSC
-                self.log("Curtailment deactivating, restoring MSC and read_only")
-                self.write_sig(
-                    ems_mode="Maximum Self Consumption",
-                    charge_limit=100,
-                )
-                # Restore export limit to DNO limit (HA automation leaves it at last value)
-                self.base.call_service_wrapper(
-                    "number/set_value",
-                    entity_id=SIG_EXPORT_LIMIT,
-                    value=self._dno_limit,
-                )
-                self.log("Curtailment: Restored export limit -> {}kW".format(self._dno_limit))
+            self._set_read_only(False)
 
-                # Hand back to Predbat
-                self._set_read_only(False)
-
-                # Reset tracked values so next activation re-writes everything
-                self.last_ems_mode = None
-                self.last_charge_limit = None
-                self.last_export_limit = None
-                self.was_active = False
+            # Reset tracked values so next activation re-writes everything
+            self.last_ems_mode = None
+            self.last_charge_limit = None
+            self.last_export_limit = None
+            self.was_active = False
 
     def _cleanup_read_only(self):
         """Clear stale read_only left by a previous plugin run (e.g. after restart)."""
