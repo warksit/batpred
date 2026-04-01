@@ -36,8 +36,6 @@ HA_ENABLE = "input_boolean.curtailment_manager_enable"
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
-# Sustained sub-DNO slots to confirm overflow window has ended (not just a cloud gap)
-OVERFLOW_END_SUSTAINED_SLOTS = 6  # 30 min
 
 # SIG/Solcast sensor entities for energy ratio
 SIG_DAILY_PV = "sensor.sigen_plant_daily_third_party_inverter_energy"
@@ -290,6 +288,7 @@ class CurtailmentPlugin(PredBatPlugin):
             return soc_max, 0, "off", -2
 
         minutes_now = getattr(self.base, "minutes_now", 720)
+        self._minutes_now_cached = minutes_now
         solar_end = min(forecast_minutes, max(PREDICT_STEP, 23 * 60 - minutes_now))
 
         # --- Energy ratio ---
@@ -399,11 +398,22 @@ class CurtailmentPlugin(PredBatPlugin):
 
         return target_soc_kwh, net_charge, phase, -2
 
-    def publish(self, phase, target_soc_kwh, remaining_overflow_kwh, export_target_kw, dno_limit_kw):
+    def publish(self, phase, target_soc_kwh, _unused, _unused2, dno_limit_kw):
         """Publish curtailment sensors via dashboard_item."""
         prefix = self.base.prefix
         soc_max = getattr(self.base, "soc_max", 10)
         target_pct = round(target_soc_kwh / soc_max * 100, 1) if soc_max > 0 else 100
+
+        # Convert last_danger_slot (minutes from now) to time of day
+        minutes_now = getattr(self, "_minutes_now_cached", getattr(self.base, "minutes_now", 0))
+        last_danger_min = getattr(self, "_last_danger", 0)
+        if last_danger_min > 0:
+            release_minutes = minutes_now + last_danger_min
+            release_h = (release_minutes // 60) % 24
+            release_m = release_minutes % 60
+            release_time = "{:02d}:{:02d}".format(release_h, release_m)
+        else:
+            release_time = "none"
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
@@ -419,18 +429,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "floor": round(target_soc_kwh, 2),
                 "will_fill": getattr(self, "_will_fill", False),
                 "activation_reason": getattr(self, "_activation_reason", "off"),
-                "last_danger_slot": getattr(self, "_last_danger", 0),
-            },
-        )
-
-        self.base.dashboard_item(
-            "sensor.{}_curtailment_export_target".format(prefix),
-            round(export_target_kw, 2),
-            {
-                "friendly_name": "Curtailment Export Target",
-                "unit_of_measurement": "kW",
-                "icon": "mdi:transmission-tower-export",
-                "dno_limit": round(dno_limit_kw, 2),
+                "release_time": release_time,
             },
         )
 
