@@ -366,7 +366,11 @@ class CurtailmentPlugin(PredBatPlugin):
             self._activation_reason = "off"
 
         # --- Activation ---
-        if not will_fill and not has_danger and not self._seen_overflow_today:
+        # Only activate if trajectory shows battery will fill OR overflow already seen.
+        # Danger slots (PV > 2kW) alone are not enough — moderate PV days have
+        # danger slots but the battery won't fill, so curtailment is unnecessary
+        # and would block Predbat's charge windows.
+        if not will_fill and not self._seen_overflow_today:
             return soc_max, 0, "off", -2
 
         # --- Floor (bidirectional, recomputed each cycle) ---
