@@ -389,14 +389,18 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # --- SOC trajectory: unmanaged (MSC) for activation check ---
         # "Will battery fill if we DON'T manage?" — battery absorbs ALL excess
+        # Uses energy_ratio=1.0 (raw forecast) for STABLE activation decisions.
+        # The energy_ratio is noisy during PV ramp-up (morning), causing
+        # will_fill to toggle and phases to flap. Activation should depend on
+        # the forecast; the floor calculation uses the real ratio to adapt.
         peak_unmanaged, _, last_danger = simulate_soc_trajectory(
             pv_step,
             load_step,
             soc_kw,
             soc_max,
             dno_limit_kw,
-            energy_ratio=energy_ratio,
-            load_ratio=load_ratio,
+            energy_ratio=1.0,
+            load_ratio=1.0,
             start_minute=PREDICT_STEP,
             end_minute=solar_end,
             step_minutes=PREDICT_STEP,
