@@ -1489,12 +1489,17 @@ def _make_phase_test_plugin(pv_kw, load_kw, soc_pct, target_pct):
 
 
 def test_phase_overflow_any_soc():
-    """When PV-load > DNO: phase is always export (overflow)."""
-    for label, soc_pct in [("below", 5), ("above", 80)]:
-        plugin, base = _make_phase_test_plugin(pv_kw=8.0, load_kw=0.5, soc_pct=soc_pct, target_pct=45)
-        target, overflow, phase, export = plugin.calculate(PHASE_TEST_DNO)
-        assert phase == "export", f"Overflow SOC {label}: expected export phase, got {phase}"
-    print("  test_phase_overflow_any_soc: PASSED (export phase at all SOC levels)")
+    """SOC below floor → Charge even during overflow. SOC above floor → Export."""
+    # SOC below floor: Charge wins (absorb all PV, charge fast)
+    plugin_low, _ = _make_phase_test_plugin(pv_kw=8.0, load_kw=0.5, soc_pct=5, target_pct=45)
+    _, _, phase_low, _ = plugin_low.calculate(PHASE_TEST_DNO)
+    assert phase_low == "charge", f"Overflow SOC below floor: expected charge, got {phase_low}"
+
+    # SOC above floor: Export (overflow management)
+    plugin_high, _ = _make_phase_test_plugin(pv_kw=8.0, load_kw=0.5, soc_pct=80, target_pct=45)
+    _, _, phase_high, _ = plugin_high.calculate(PHASE_TEST_DNO)
+    assert phase_high == "export", f"Overflow SOC above floor: expected export, got {phase_high}"
+    print("  test_phase_overflow_any_soc: PASSED (below=charge, above=export)")
 
 
 def test_phase_excess_soc_below_target():
@@ -1606,8 +1611,8 @@ def test_realtime_pv_correction_raises_overflow():
     plugin = CurtailmentPlugin(base)
     target_soc, net_charge, phase, export_target = plugin.calculate(4.0)
 
-    # V8: plugin activates via currently_overflowing (sticky), phase=export
-    assert phase == "export", f"Expected export phase (currently overflowing), got {phase}"
+    # V8: SOC (88%) < floor (95%) → Charge wins even though currently overflowing
+    assert phase == "charge", f"Expected charge phase (SOC below floor), got {phase}"
     target_pct = target_soc / 18.08 * 100
     # V8: floor = soc_cap (95%) since trajectory forecast shows no overflow to absorb
     # (forecast PV 4.5kW < DNO 4.0kW + 1kW load — no overflow slots in trajectory)
