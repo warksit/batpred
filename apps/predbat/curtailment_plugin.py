@@ -389,17 +389,24 @@ class CurtailmentPlugin(PredBatPlugin):
 
         target_soc_kwh = floor
 
-        # --- Reactive phase (SOC check FIRST — below floor always charges) ---
-        if soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
-            phase = "charge"  # SOC below floor: absorb ALL PV, charge fast
-        elif currently_overflowing:
-            phase = "export"  # at/above floor: export at DNO, absorb overflow
-        elif soc_kw > target_soc_kwh + 1.0 and actual_excess > 0:
-            phase = "export"  # drain toward floor
-        elif actual_excess > 0:
-            phase = "hold"
+        # --- Target charge rate: how fast to reach floor ---
+        energy_to_floor = max(0, target_soc_kwh - soc_kw)
+        time_remaining_hours = max(last_danger / 60.0, 0.5)  # min 30 min
+        if energy_to_floor > 0:
+            target_charge_rate = energy_to_floor / time_remaining_hours
         else:
-            phase = "hold"  # D-ESS stays on, battery covers deficit
+            target_charge_rate = 0.0  # at/above floor, no charging needed
+        self._target_charge_rate = round(target_charge_rate, 2)
+
+        # --- Phase (informational — export limit is now rate-based) ---
+        if soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
+            phase = "charge"  # below floor, charging at controlled rate
+        elif soc_kw > target_soc_kwh + 1.0 and actual_excess > 0:
+            phase = "export"  # above floor, draining
+        elif actual_excess > 0:
+            phase = "hold"  # at floor, exporting excess
+        else:
+            phase = "hold"  # D-ESS on, battery covers deficit
 
         return target_soc_kwh, net_charge, phase, -2
 
@@ -432,6 +439,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "floor_pct": target_pct,
                 "will_fill": getattr(self, "_will_fill", False),
                 "activation_reason": getattr(self, "_activation_reason", "off"),
+                "target_charge_rate": getattr(self, "_target_charge_rate", 0),
                 "release_time": release_time,
             },
         )
