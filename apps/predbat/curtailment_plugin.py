@@ -36,6 +36,7 @@ HA_ENABLE = "input_boolean.curtailment_manager_enable"
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
+SOC_CAP_FACTOR = 0.90  # Target 90% max during overflow — 10% headroom for spikes
 
 # SIG/Solcast sensor entities for energy ratio
 SIG_DAILY_PV = "sensor.sigen_plant_daily_third_party_inverter_energy"
@@ -139,7 +140,7 @@ class CurtailmentPlugin(PredBatPlugin):
             values_are_kwh=True,
         )
 
-        soc_cap = soc_max * 0.95
+        soc_cap = soc_max * SOC_CAP_FACTOR
         will_fill = peak_soc > soc_cap
 
         if not will_fill:
@@ -343,7 +344,7 @@ class CurtailmentPlugin(PredBatPlugin):
             unmanaged=False,
         )
 
-        soc_cap = soc_max * 0.95
+        soc_cap = soc_max * SOC_CAP_FACTOR
         will_fill = peak_unmanaged > soc_cap
         self._unmanaged_peak = peak_unmanaged
 
