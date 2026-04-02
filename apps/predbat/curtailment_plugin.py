@@ -388,11 +388,11 @@ class CurtailmentPlugin(PredBatPlugin):
 
         target_soc_kwh = floor
 
-        # --- Reactive phase ---
-        if currently_overflowing:
-            phase = "export"
-        elif soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
-            phase = "charge"
+        # --- Reactive phase (SOC check FIRST — below floor always charges) ---
+        if soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
+            phase = "charge"  # SOC below floor: absorb ALL PV, charge fast
+        elif currently_overflowing:
+            phase = "export"  # at/above floor: export at DNO, absorb overflow
         elif soc_kw > target_soc_kwh + 1.0 and actual_excess > 0:
             phase = "export"  # drain toward floor
         elif actual_excess > 0:
