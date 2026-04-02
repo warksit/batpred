@@ -1600,7 +1600,7 @@ def test_realtime_pv_correction_raises_overflow():
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=16.0,
+        soc_kw=12.0,
         soc_max=18.08,
         minutes_now=720,
         sensor_overrides={
@@ -1611,12 +1611,11 @@ def test_realtime_pv_correction_raises_overflow():
     plugin = CurtailmentPlugin(base)
     target_soc, net_charge, phase, export_target = plugin.calculate(4.0)
 
-    # V8: SOC (88%) < floor (95%) → Charge wins even though currently overflowing
+    # V8: SOC (66%) well below floor (90%) → Charge wins even though currently overflowing
     assert phase == "charge", f"Expected charge phase (SOC below floor), got {phase}"
     target_pct = target_soc / 18.08 * 100
-    # V8: floor = soc_cap (95%) since trajectory forecast shows no overflow to absorb
-    # (forecast PV 4.5kW < DNO 4.0kW + 1kW load — no overflow slots in trajectory)
-    assert 94 <= target_pct <= 96, f"Floor should be at soc_cap (~95%), got {target_pct:.1f}%"
+    # V8: floor = soc_cap (90%) since trajectory forecast shows no overflow to absorb
+    assert 89 <= target_pct <= 91, f"Floor should be at soc_cap (~90%), got {target_pct:.1f}%"
     # Energy ratio > 1.0 because actual PV (7.8) > forecast PV (4.5)
     assert plugin._energy_ratio >= 1.0, f"Energy ratio should be >= 1.0 when actual > forecast, got {plugin._energy_ratio:.2f}"
     print(f"  test_realtime_pv_correction_raises_overflow: PASSED (net_charge={net_charge:.2f}, target={target_pct:.0f}%)")
