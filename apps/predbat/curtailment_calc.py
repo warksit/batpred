@@ -4,10 +4,14 @@
 # No HA or Predbat dependencies — testable in isolation
 # -----------------------------------------------------------------------------
 
+import math
+
 # Validated from Mar 28 real data (120 five-minute slots):
 # Mean PV < 2.0kW: zero spikes above 4.5kW (safe to release)
 # Mean PV 2-4kW: spikes to 6-10kW common (overflow risk)
 SAFE_PV_THRESHOLD_KW = 2.0
+
+MIN_BASE_LOAD_KW = 0.5
 
 
 def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
@@ -289,3 +293,86 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
             peak_soc = soc
 
     return peak_soc, net_charge, last_danger
+
+
+def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
+    """
+    Solar elevation angle in degrees.
+
+    Simplified solar position algorithm — accurate to ~1 degree.
+    Uses Spencer (1971) declination and equation of time.
+
+    Args:
+        lat_deg: latitude in degrees (positive north)
+        lon_deg: longitude in degrees (positive east)
+        utc_hours: decimal UTC hours (e.g. 14.5 = 14:30 UTC)
+        day_of_year: 1-366
+
+    Returns:
+        float — elevation angle in degrees (negative = below horizon)
+    """
+    lat = math.radians(lat_deg)
+    B = math.radians((360.0 / 365.0) * (day_of_year - 81))
+    decl = math.radians(23.45) * math.sin(B)
+    B2 = math.radians((360.0 / 364.0) * (day_of_year - 81))
+    eot = 9.87 * math.sin(2 * B2) - 7.53 * math.cos(B2) - 1.5 * math.sin(B2)
+    solar_noon_utc = 12.0 - lon_deg / 15.0 - eot / 60.0
+    hour_angle = math.radians(15.0 * (utc_hours - solar_noon_utc))
+    sin_elev = math.sin(lat) * math.sin(decl) + math.cos(lat) * math.cos(decl) * math.cos(hour_angle)
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+
+def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, current_utc_hours, headroom_kwh=1.8):
+    """
+    Compute minutes from now until solar geometry release.
+
+    Models clear-sky PV as scale * sin(elevation). Finds when this drops
+    below threshold_kw on the declining side of the solar curve.
+    Lead time is computed dynamically: headroom_kwh / charge_rate_at_crossing.
+
+    Args:
+        scale: float kW — clear-sky scale (max_pv / sin(elevation_at_peak))
+        lat_deg, lon_deg: location
+        day_of_year: 1-366
+        threshold_kw: PV level below which it's safe (DNO + min_base_load)
+        current_utc_hours: decimal UTC hours now
+        headroom_kwh: float — battery headroom above floor (soc_max - soc_cap)
+
+    Returns:
+        (minutes_until_release, crossing_utc_hours) or (None, None) if
+        cannot compute (scale too low, sun below horizon, etc.)
+    """
+    # Find solar noon
+    B2 = math.radians((360.0 / 364.0) * (day_of_year - 81))
+    eot = 9.87 * math.sin(2 * B2) - 7.53 * math.cos(B2) - 1.5 * math.sin(B2)
+    solar_noon_utc = 12.0 - lon_deg / 15.0 - eot / 60.0
+
+    # Check if peak PV (at solar noon) is below threshold
+    noon_elev = solar_elevation(lat_deg, lon_deg, solar_noon_utc, day_of_year)
+    peak_pv = scale * max(0.0, math.sin(math.radians(noon_elev)))
+    if peak_pv < threshold_kw:
+        return 0, current_utc_hours  # peak can't reach threshold — release now
+
+    # Start scanning from the later of (now, solar noon)
+    scan_start = max(current_utc_hours, solar_noon_utc)
+
+    # Scan forward in 1-minute steps
+    crossing_utc = None
+    for minute_offset in range(0, 720):  # up to 12 hours
+        t = scan_start + minute_offset / 60.0
+        elev = solar_elevation(lat_deg, lon_deg, t, day_of_year)
+        predicted = scale * max(0.0, math.sin(math.radians(elev)))
+        if predicted < threshold_kw:
+            crossing_utc = t
+            break
+
+    if crossing_utc is None:
+        return None, None
+
+    # Dynamic lead time: how long to fill headroom at the charge rate near crossing
+    # At crossing, PV ≈ threshold, so charge rate ≈ threshold - min_base_load
+    charge_rate_at_crossing = max(threshold_kw - MIN_BASE_LOAD_KW, 0.5)
+    lead_hours = headroom_kwh / charge_rate_at_crossing
+    release_utc = crossing_utc - lead_hours
+    minutes_until = (release_utc - current_utc_hours) * 60.0
+    return minutes_until, crossing_utc

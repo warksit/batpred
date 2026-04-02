@@ -17,10 +17,16 @@
 #   off:     No overflow expected, PV negligible → hand to Predbat
 # -----------------------------------------------------------------------------
 
+import math
+
 from curtailment_calc import (
     compute_morning_gap,
+    compute_remaining_overflow,
     simulate_soc_trajectory,
+    solar_elevation,
+    compute_release_time,
     SAFE_PV_THRESHOLD_KW,
+    MIN_BASE_LOAD_KW,
 )
 from plugin_system import PredBatPlugin
 
@@ -72,6 +78,10 @@ class CurtailmentPlugin(PredBatPlugin):
         self._energy_ratio = 1.0  # last computed energy ratio (for publish)
         self._load_ratio = 1.0  # last computed load ratio (for publish)
         self._seen_overflow_today = False  # sticky: once overflow seen, stay active until PV done
+        # Rolling PV max for solar geometry release
+        self._pv_history = []  # list of (minutes_now, actual_pv_kw)
+        self._release_scale = 0
+        self._release_crossing = "none"
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0  # minutes_now when last computed
@@ -277,6 +287,73 @@ class CurtailmentPlugin(PredBatPlugin):
 
         return load_ratio
 
+    def _get_rolling_pv_max(self, minutes_now, actual_pv_kw, window_minutes=30):
+        """Track rolling max PV over last window_minutes.
+
+        Called each cycle (~5 min). Returns max PV in window — the clear-sky
+        envelope value at this time of day.
+        """
+        self._pv_history.append((minutes_now, actual_pv_kw))
+        cutoff = minutes_now - window_minutes
+        self._pv_history = [(t, v) for t, v in self._pv_history if t >= cutoff]
+        return max(v for _, v in self._pv_history) if self._pv_history else 0.0
+
+    def _compute_solar_release(self, minutes_now, actual_pv_kw, dno_limit_kw):
+        """Compute minutes until solar geometry release.
+
+        Uses the rolling 30-min max PV and current solar elevation to calibrate
+        a clear-sky PV model: pv = scale * sin(elevation). Finds when this
+        drops below DNO + min_base_load, then subtracts lead time for battery
+        fill (headroom at 90% floor ≈ 1.8kWh, ~30 min).
+
+        Returns (minutes_until_release, scale, crossing_time_str).
+        Returns (None, 0, "none") if cannot compute.
+        """
+        try:
+            lat = float(self.base.get_state_wrapper("zone.home", attribute="latitude", default=0))
+            lon = float(self.base.get_state_wrapper("zone.home", attribute="longitude", default=0))
+        except (ValueError, TypeError):
+            return None, 0, "none"
+
+        if lat == 0 and lon == 0:
+            return None, 0, "none"
+
+        now_utc = getattr(self.base, "now_utc", None)
+        if now_utc is None:
+            return None, 0, "none"
+
+        utc_hours = now_utc.hour + now_utc.minute / 60.0 + now_utc.second / 3600.0
+        doy = now_utc.timetuple().tm_yday
+
+        max_pv = self._get_rolling_pv_max(minutes_now, actual_pv_kw)
+        if max_pv < 1.0:
+            return None, 0, "none"
+
+        elev = solar_elevation(lat, lon, utc_hours, doy)
+        sin_elev = math.sin(math.radians(elev))
+        if sin_elev < 0.05:
+            return 0, 0, "low_sun"
+
+        scale = max_pv / sin_elev
+        threshold = dno_limit_kw + MIN_BASE_LOAD_KW
+
+        # Headroom: space from soc_cap to soc_max
+        soc_max = getattr(self.base, "soc_max", 10)
+        headroom = soc_max * (1.0 - SOC_CAP_FACTOR)
+
+        release_mins, crossing_utc = compute_release_time(scale, lat, lon, doy, threshold, utc_hours, headroom_kwh=headroom)
+
+        if release_mins is None:
+            return None, scale, "none"
+
+        # Format crossing time for diagnostics (local time = UTC + tz offset)
+        # Use minutes_now to infer local offset: minutes_now is local minutes from midnight
+        local_offset_hours = (minutes_now / 60.0) - utc_hours
+        crossing_local = crossing_utc + local_offset_hours
+        crossing_str = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
+
+        return release_mins, scale, crossing_str
+
     def calculate(self, dno_limit_kw):
         """Compute curtailment phase using v8 SOC trajectory algorithm."""
         pv_step = getattr(self.base, "pv_forecast_minute_step", {})
@@ -374,18 +451,52 @@ class CurtailmentPlugin(PredBatPlugin):
         if not will_fill and not self._seen_overflow_today:
             return soc_max, 0, "off", -2
 
-        # --- Floor (bidirectional, recomputed each cycle) ---
+        # --- Pre-overflow drain ---
+        # If overflow is coming (will_fill) but hasn't started yet (no overflow seen),
+        # drain battery to make room. Target: SOC where remaining overflow fills to
+        # soc_cap, leaving headroom. This maximizes export AND prevents filling
+        # during the overflow period.
         soc_keep = getattr(self.base, "best_soc_keep", 0)
         reserve = getattr(self.base, "reserve", 0)
 
+        remaining_overflow = compute_remaining_overflow(
+            pv_step,
+            load_step,
+            dno_limit_kw,
+            start_minute=PREDICT_STEP,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+        drain_target = max(soc_cap - remaining_overflow, soc_keep, reserve)
+        self._drain_target = drain_target
+
+        if will_fill and not self._seen_overflow_today and not currently_overflowing and actual_excess > 0:
+            if soc_kw > drain_target + SOC_MARGIN_KWH:
+                # Drain phase: export PV + discharge battery toward drain target
+                self._target_charge_rate = 0
+                self._activation_reason = "drain"
+                return drain_target, net_charge, "export", -2
+
+        # --- Floor (bidirectional, recomputed each cycle) ---
         floor = soc_cap - max(0, net_charge)
         floor = max(floor, soc_keep, reserve)
         floor = min(floor, soc_max)  # never above 100%
 
-        # Release: when all remaining PV < 2kW, floor = 100%
-        remaining_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
-        if not remaining_danger and actual_pv < SAFE_PV_THRESHOLD_KW:
-            floor = soc_max  # safe to charge to 100%
+        # Release: solar geometry predicts PV will drop below overflow threshold
+        try:
+            release_mins, release_scale, crossing_str = self._compute_solar_release(minutes_now, actual_pv, dno_limit_kw)
+            self._release_scale = release_scale
+            self._release_crossing = crossing_str
+            if release_mins is not None and release_mins <= 0:
+                floor = soc_max  # safe to charge to 100%
+        except Exception:
+            # Fallback: old threshold-based release
+            remaining_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
+            if not remaining_danger and actual_pv < SAFE_PV_THRESHOLD_KW:
+                floor = soc_max
+            self._release_scale = 0
+            self._release_crossing = "fallback"
 
         target_soc_kwh = floor
 
@@ -416,16 +527,9 @@ class CurtailmentPlugin(PredBatPlugin):
         soc_max = getattr(self.base, "soc_max", 10)
         target_pct = round(target_soc_kwh / soc_max * 100, 1) if soc_max > 0 else 100
 
-        # Convert last_danger_slot (minutes from now) to time of day
-        minutes_now = getattr(self, "_minutes_now_cached", getattr(self.base, "minutes_now", 0))
-        last_danger_min = getattr(self, "_last_danger", 0)
-        if last_danger_min > 0:
-            release_minutes = minutes_now + last_danger_min
-            release_h = (release_minutes // 60) % 24
-            release_m = release_minutes % 60
-            release_time = "{:02d}:{:02d}".format(release_h, release_m)
-        else:
-            release_time = "none"
+        # Release time from solar geometry
+        release_crossing = getattr(self, "_release_crossing", "none")
+        release_scale = getattr(self, "_release_scale", 0)
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
@@ -440,7 +544,9 @@ class CurtailmentPlugin(PredBatPlugin):
                 "will_fill": getattr(self, "_will_fill", False),
                 "activation_reason": getattr(self, "_activation_reason", "off"),
                 "target_charge_rate": getattr(self, "_target_charge_rate", 0),
-                "release_time": release_time,
+                "drain_target_pct": round(getattr(self, "_drain_target", 0) / max(soc_max, 0.1) * 100, 1),
+                "release_time": release_crossing,
+                "release_scale": round(release_scale, 1),
             },
         )
 

@@ -13,7 +13,7 @@ import sys
 # Ensure apps/predbat is on the path when run standalone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate, compute_overflow_window, compute_post_overflow_energy, simulate_soc_trajectory
+from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate, compute_overflow_window, compute_post_overflow_energy, simulate_soc_trajectory, solar_elevation, compute_release_time
 
 # Battery constants (Mum's SIG system)
 BATTERY_KWH = 18.08
@@ -1119,7 +1119,10 @@ class MockBase:
         best_soc_keep=0,
         reserve=0,
         sensor_overrides=None,
+        now_utc=None,
     ):
+        from datetime import datetime, timezone
+
         step_kwh_factor = PLUGIN_STEP / 60.0  # kW→kWh per step
         # Store as kWh per step (matching Predbat convention)
         self.pv_forecast_minute_step = {k: v * step_kwh_factor for k, v in (pv_step or {}).items()}
@@ -1140,6 +1143,7 @@ class MockBase:
         self.published = {}
         self.services = []
         self._sensor_overrides = sensor_overrides or {}
+        self.now_utc = now_utc or datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc)
 
     def log(self, msg, *args, **kwargs):
         self.logs.append(msg)
@@ -1152,6 +1156,12 @@ class MockBase:
             return val
         if entity == "input_boolean.curtailment_manager_enable":
             return "on"
+        if entity == "zone.home":
+            if attribute == "latitude":
+                return 55.86
+            elif attribute == "longitude":
+                return -3.2
+            return default
         return default
 
     def get_arg(self, key, default=None, index=None):
@@ -1459,6 +1469,8 @@ PHASE_TEST_STEP = PLUGIN_STEP
 
 def _make_phase_test_plugin(pv_kw, load_kw, soc_pct, target_pct):
     """Create a plugin with specific PV, load, SOC, and a pre-set smoothed floor."""
+    from datetime import datetime, timezone
+
     # Create forecast with overflow so curtailment activates
     pv = {}
     load = {}
@@ -1475,14 +1487,16 @@ def _make_phase_test_plugin(pv_kw, load_kw, soc_pct, target_pct):
         soc_kw=soc_kwh,
         soc_max=PHASE_TEST_SOC_MAX,
         minutes_now=720,
+        now_utc=datetime(2025, 7, 12, 11, 0, tzinfo=timezone.utc),  # noon BST
         sensor_overrides={
             "sensor.sigen_plant_pv_power": pv_kw,
             "sensor.sigen_plant_consumed_power": load_kw,
         },
     )
     plugin = CurtailmentPlugin(base)
-    # Pre-set the smoothed floor to the desired target
-    # floor is raw now, no smoothing
+    # Pre-seed PV history with realistic values so solar release doesn't
+    # trigger early from low actual_pv readings (the forecast PV is 6kW)
+    plugin._pv_history = [(715, 6.0), (710, 6.0), (705, 6.0)]
     # Mark as having seen overflow (so post-overflow detection works)
     plugin._was_overflowing = True
     return plugin, base
@@ -2294,10 +2308,12 @@ def test_floor_rises_as_overflow_shrinks():
 
 
 def test_release_when_pv_below_threshold():
-    """When all remaining PV < SAFE_PV_THRESHOLD_KW (2kW), floor rises to soc_max (release)."""
-    # Build a forecast where all slots have PV well below 2kW
-    # Pass raw kW values to MockBase (MockBase converts to kWh/step internally)
-    pv_step = {m: 1.0 for m in range(0, 600, PLUGIN_STEP)}  # 1kW — below SAFE_PV_THRESHOLD_KW
+    """Solar geometry release: when scale is low (PV can't exceed threshold), floor = soc_max."""
+    from datetime import datetime, timezone
+
+    # Low PV (1kW) at noon in July — scale will be very low (~1.2kW),
+    # well below DNO+base_load (4.5kW), so release should trigger immediately
+    pv_step = {m: 1.0 for m in range(0, 600, PLUGIN_STEP)}
     load_step = {m: 0.5 for m in range(0, 600, PLUGIN_STEP)}
 
     base = MockBase(
@@ -2306,18 +2322,18 @@ def test_release_when_pv_below_threshold():
         soc_kw=BATTERY_KWH * 0.80,
         soc_max=BATTERY_KWH,
         minutes_now=720,
+        now_utc=datetime(2025, 7, 12, 11, 0, tzinfo=timezone.utc),  # noon BST
         sensor_overrides={
-            "sensor.sigen_plant_pv_power": 1.0,  # actual PV also below threshold
+            "sensor.sigen_plant_pv_power": 1.0,
             "sensor.sigen_plant_consumed_power": 0.5,
         },
     )
     plugin = CurtailmentPlugin(base)
-    # Simulate that overflow was seen earlier today — plugin is sticky
     plugin._seen_overflow_today = True
 
     target_soc_kwh, net_charge, phase, _ = plugin.calculate(dno_limit_kw=DNO_LIMIT)
 
-    assert target_soc_kwh == BATTERY_KWH, f"When all remaining PV < {SAFE_PV_THRESHOLD_KW}kW, floor should be soc_max " f"({BATTERY_KWH} kWh), got {target_soc_kwh:.2f} kWh"
+    assert target_soc_kwh == BATTERY_KWH, f"When PV scale is below threshold, floor should be soc_max " f"({BATTERY_KWH} kWh), got {target_soc_kwh:.2f} kWh"
     print(f"  test_release_when_pv_below_threshold: PASSED " f"(floor={target_soc_kwh:.2f} kWh = soc_max, phase={phase})")
 
 
@@ -2661,6 +2677,95 @@ def test_no_oscillation_msc_safe():
 
 
 # ============================================================================
+# ============================================================================
+# Solar geometry tests
+# ============================================================================
+
+
+def test_solar_elevation_known_values():
+    """Solar elevation against known astronomical values."""
+
+    # Summer solstice noon at 56N, ~0W — max elevation ≈ 57.5°
+    elev = solar_elevation(56.0, -3.2, 12.2, 172)  # approx solar noon UTC
+    assert 55 < elev < 60, f"Summer solstice noon 56N: expected ~57.5°, got {elev:.1f}°"
+
+    # Winter solstice noon at 56N — max elevation ≈ 10.5°
+    elev_w = solar_elevation(56.0, -3.2, 12.2, 355)
+    assert 8 < elev_w < 13, f"Winter solstice noon 56N: expected ~10.5°, got {elev_w:.1f}°"
+
+    # Night time — should be negative
+    elev_n = solar_elevation(56.0, -3.2, 0.0, 172)
+    assert elev_n < 0, f"Midnight should be negative elevation, got {elev_n:.1f}°"
+
+    # Equator equinox noon — should be ~90°
+    elev_eq = solar_elevation(0.0, 0.0, 12.0, 80)
+    assert 85 < elev_eq < 92, f"Equator equinox noon: expected ~90°, got {elev_eq:.1f}°"
+
+    print(f"  test_solar_elevation_known_values: PASSED " f"(summer={elev:.1f}°, winter={elev_w:.1f}°, night={elev_n:.1f}°, equator={elev_eq:.1f}°)")
+
+
+def test_compute_release_time_scenarios():
+    """Release time computation for various scenarios."""
+    # High scale, early afternoon July — crossing should be several hours away
+    mins, crossing = compute_release_time(scale=14.0, lat_deg=56.0, lon_deg=-3.2, day_of_year=193, threshold_kw=4.5, current_utc_hours=13.0)
+    assert mins is not None, "Should find a crossing"
+    assert mins > 60, f"Early afternoon July: expected >60 min until release, got {mins:.0f}"
+    assert mins < 480, f"Early afternoon July: expected <480 min, got {mins:.0f}"
+
+    # Low scale (already below threshold) — should release immediately
+    mins_low, _ = compute_release_time(scale=3.0, lat_deg=56.0, lon_deg=-3.2, day_of_year=193, threshold_kw=4.5, current_utc_hours=16.0)
+    assert mins_low == 0, f"Low scale: expected 0 (release now), got {mins_low}"
+
+    # Late afternoon — crossing should be soon
+    mins_late, _ = compute_release_time(scale=10.0, lat_deg=56.0, lon_deg=-3.2, day_of_year=193, threshold_kw=4.5, current_utc_hours=17.0)
+    assert mins_late is not None, "Should find a crossing"
+    assert mins_late < 120, f"Late afternoon: expected <120 min, got {mins_late:.0f}"
+
+    # Winter day — crossing should be much earlier (low sun)
+    mins_winter, _ = compute_release_time(scale=14.0, lat_deg=56.0, lon_deg=-3.2, day_of_year=355, threshold_kw=4.5, current_utc_hours=10.0)
+    # In winter, even scale=14 gives peak of 14*sin(10.5°)=2.6kW — below threshold
+    assert mins_winter == 0, f"Winter: peak below threshold, expected 0, got {mins_winter}"
+
+    print(f"  test_compute_release_time_scenarios: PASSED " f"(summer_early={mins:.0f}min, low_scale={mins_low}, " f"late={mins_late:.0f}min, winter={mins_winter})")
+
+
+def test_pre_overflow_drain():
+    """Pre-overflow drain: when will_fill=true and SOC is high, drain before overflow starts."""
+    from datetime import datetime, timezone
+
+    # Morning scenario: PV generating below DNO (3kW), load 0.5kW, excess 2.5kW
+    # Forecast shows overflow coming later (8kW PV in forecast)
+    # SOC at 40% — should drain toward target to make room
+    pv_step = {}
+    load_step = {}
+    for m in range(0, 720, PLUGIN_STEP):
+        pv_step[m] = 8.0  # forecast: overflow will happen
+        load_step[m] = 0.5
+
+    base = MockBase(
+        pv_step=pv_step,
+        load_step=load_step,
+        soc_kw=BATTERY_KWH * 0.40,  # 40% — above drain target
+        soc_max=BATTERY_KWH,
+        minutes_now=480,  # 08:00 — morning, before overflow
+        now_utc=datetime(2025, 7, 12, 7, 0, tzinfo=timezone.utc),
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 3.0,  # actual PV below DNO
+            "sensor.sigen_plant_consumed_power": 0.5,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    # Pre-seed PV history with realistic value
+    plugin._pv_history = [(475, 3.0), (470, 2.8)]
+
+    target_soc_kwh, net_charge, phase, _ = plugin.calculate(dno_limit_kw=DNO_LIMIT)
+
+    # Should be draining: phase=export, target well below current SOC
+    assert phase == "export", f"Expected export (drain) phase, got {phase}"
+    assert target_soc_kwh < BATTERY_KWH * 0.35, f"Drain target should be well below 40%, got {target_soc_kwh/BATTERY_KWH*100:.0f}%"
+    print(f"  test_pre_overflow_drain: PASSED " f"(phase={phase}, drain_target={target_soc_kwh/BATTERY_KWH*100:.0f}%, SOC=40%)")
+
+
 # Test runner
 # ============================================================================
 
@@ -2816,6 +2921,20 @@ def run_curtailment_tests(my_predbat=None):
                 day_failed = _run_csv_day_v7_test(label, filename, watts, forecast_scale=1.0, start_soc_pct=0.25)
                 if day_failed:
                     failed = True
+
+    # Solar geometry tests
+    solar_tests = [
+        test_solar_elevation_known_values,
+        test_compute_release_time_scenarios,
+        test_pre_overflow_drain,
+    ]
+    print("  --- solar geometry tests ---")
+    for test_fn in solar_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
 
     # v8 trajectory tests
     v8_tests = [
