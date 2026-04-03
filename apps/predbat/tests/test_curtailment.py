@@ -2330,6 +2330,8 @@ def test_release_when_pv_below_threshold():
     )
     plugin = CurtailmentPlugin(base)
     plugin._seen_overflow_today = True
+    # Seed PV history with a past reading so we're "after the peak"
+    plugin._pv_history = [(870, 1.5), (880, 1.0)]
 
     target_soc_kwh, net_charge, phase, _ = plugin.calculate(dno_limit_kw=DNO_LIMIT)
 

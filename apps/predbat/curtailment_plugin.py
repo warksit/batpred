@@ -290,13 +290,16 @@ class CurtailmentPlugin(PredBatPlugin):
     def _get_rolling_pv_max(self, minutes_now, actual_pv_kw, window_minutes=30):
         """Track rolling max PV over last window_minutes.
 
-        Called each cycle (~5 min). Returns max PV in window — the clear-sky
-        envelope value at this time of day.
+        Called each cycle (~5 min). Returns (max_pv, time_of_max) — the
+        clear-sky envelope value and when it was recorded.
         """
         self._pv_history.append((minutes_now, actual_pv_kw))
         cutoff = minutes_now - window_minutes
         self._pv_history = [(t, v) for t, v in self._pv_history if t >= cutoff]
-        return max(v for _, v in self._pv_history) if self._pv_history else 0.0
+        if not self._pv_history:
+            return 0.0, minutes_now
+        best = max(self._pv_history, key=lambda x: x[1])
+        return best[1], best[0]
 
     def _compute_solar_release(self, minutes_now, actual_pv_kw, dno_limit_kw):
         """Compute minutes until solar geometry release.
@@ -325,7 +328,7 @@ class CurtailmentPlugin(PredBatPlugin):
         utc_hours = now_utc.hour + now_utc.minute / 60.0 + now_utc.second / 3600.0
         doy = now_utc.timetuple().tm_yday
 
-        max_pv = self._get_rolling_pv_max(minutes_now, actual_pv_kw)
+        max_pv, max_pv_time = self._get_rolling_pv_max(minutes_now, actual_pv_kw)
         if max_pv < 1.0:
             return None, 0, "none"
 
@@ -334,14 +337,15 @@ class CurtailmentPlugin(PredBatPlugin):
         if sin_elev < 0.05:
             return 0, 0, "low_sun"
 
-        # Only compute release on the DECLINING side (after solar noon).
-        # Before noon, PV is still rising — a cloud dip gives a low scale
-        # that falsely triggers release.
-        B2 = math.radians((360.0 / 364.0) * (doy - 81))
-        eot = 9.87 * math.sin(2 * B2) - 7.53 * math.cos(B2) - 1.5 * math.sin(B2)
-        solar_noon_utc = 12.0 - lon / 15.0 - eot / 60.0
-        if utc_hours < solar_noon_utc:
-            return None, 0, "before_noon"
+        # Only release AFTER the time that produced the rolling max.
+        # Before that, PV may still be rising — a cloud dip would give a
+        # low scale that falsely triggers release. Once we're past the peak
+        # time, the scale is calibrated from real peak data and declining
+        # PV is genuine. This allows morning release on a day that goes
+        # cloudy (peak was at 09:00, now 10:00 and dying), while preventing
+        # false release on a clear morning where PV is still ramping.
+        if minutes_now <= max_pv_time:
+            return None, 0, "before_peak"
 
         scale = max_pv / sin_elev
         threshold = dno_limit_kw + MIN_BASE_LOAD_KW
