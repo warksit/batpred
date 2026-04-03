@@ -22,6 +22,7 @@ import math
 from curtailment_calc import (
     compute_morning_gap,
     compute_remaining_overflow,
+    compute_tomorrow_forecast,
     simulate_soc_trajectory,
     solar_elevation,
     compute_release_time,
@@ -85,6 +86,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._cached_keep = None
         self._cached_at = 0  # minutes_now when last computed
         self._cached_offset = None  # (value, attrs) for republishing on cache hit
+        # Caching for tomorrow forecast
+        self._tomorrow_cache = None
+        self._tomorrow_cache_at = 0
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update, plugin=self)
@@ -382,6 +386,112 @@ class CurtailmentPlugin(PredBatPlugin):
         crossing_str = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
 
         return release_mins, scale, crossing_str
+
+    def _compute_tomorrow_forecast(self):
+        """Compute curtailment forecast for tomorrow. Cached for 30 minutes."""
+        minutes_now = getattr(self.base, "minutes_now", 720)
+
+        # Cache check
+        if self._tomorrow_cache is not None:
+            since = minutes_now - self._tomorrow_cache_at
+            if since < 0:
+                since += 1440
+            if since < 30:
+                return self._tomorrow_cache
+
+        pv_step = getattr(self.base, "pv_forecast_minute_step", {})
+        load_step = getattr(self.base, "load_minutes_step", {})
+        soc_max = getattr(self.base, "soc_max", 10)
+        forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
+        dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
+
+        # Tomorrow's solar window in minutes-from-now
+        tomorrow_start = 1440 - minutes_now + 5 * 60  # tomorrow 05:00
+        tomorrow_end = 1440 - minutes_now + 23 * 60  # tomorrow 23:00
+        tomorrow_end = min(tomorrow_end, forecast_minutes)
+
+        if tomorrow_end <= tomorrow_start or tomorrow_start < 0:
+            self._tomorrow_cache = None
+            self._tomorrow_cache_at = minutes_now
+            return None
+
+        # Check we have forecast data in that range
+        has_pv = any(pv_step.get(m, 0) > 0 for m in range(tomorrow_start, min(tomorrow_start + 120, tomorrow_end), PREDICT_STEP))
+        if not has_pv:
+            self._tomorrow_cache = None
+            self._tomorrow_cache_at = minutes_now
+            return None
+
+        forecast = compute_tomorrow_forecast(
+            pv_step,
+            load_step,
+            soc_max,
+            dno_limit,
+            start_minute=tomorrow_start,
+            end_minute=tomorrow_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+
+        # Compute release time from solar geometry using forecast peak PV
+        step_to_kw = 60.0 / PREDICT_STEP
+        try:
+            lat = float(self.base.get_state_wrapper("zone.home", attribute="latitude", default=0))
+            lon = float(self.base.get_state_wrapper("zone.home", attribute="longitude", default=0))
+            now_utc = getattr(self.base, "now_utc", None)
+            if lat and lon and now_utc:
+                tomorrow_doy = (now_utc.timetuple().tm_yday % 365) + 1
+
+                # Find forecast peak PV and its time
+                peak_pv_kw = 0
+                peak_offset = tomorrow_start
+                for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP):
+                    pv_kw = pv_step.get(m, 0) * step_to_kw
+                    if pv_kw > peak_pv_kw:
+                        peak_pv_kw = pv_kw
+                        peak_offset = m
+
+                if peak_pv_kw > 1.0:
+                    utc_now = now_utc.hour + now_utc.minute / 60.0
+                    peak_utc = utc_now + peak_offset / 60.0
+                    peak_elev = solar_elevation(lat, lon, peak_utc, tomorrow_doy)
+                    sin_elev = math.sin(math.radians(peak_elev))
+                    if sin_elev > 0.05:
+                        scale = peak_pv_kw / sin_elev
+                        threshold = dno_limit + MIN_BASE_LOAD_KW
+                        headroom = soc_max * 0.10
+                        # Scan from early morning tomorrow
+                        scan_utc = utc_now + tomorrow_start / 60.0
+                        rel_mins, crossing_utc = compute_release_time(scale, lat, lon, tomorrow_doy, threshold, scan_utc, headroom)
+                        if crossing_utc:
+                            local_offset = (minutes_now / 60.0) - utc_now
+                            crossing_local = crossing_utc + local_offset
+                            forecast["release_time"] = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
+        except Exception:
+            pass
+
+        if "release_time" not in forecast:
+            forecast["release_time"] = "unknown"
+
+        # Compute expected soc_keep
+        reserve = getattr(self.base, "reserve", 0)
+        if forecast["total_overflow_kwh"] > forecast["morning_gap_kwh"]:
+            forecast["soc_keep_kwh"] = round(reserve, 2)
+        else:
+            forecast["soc_keep_kwh"] = round(max(forecast["morning_gap_kwh"] + 0.5, reserve), 2)
+
+        self._tomorrow_cache = forecast
+        self._tomorrow_cache_at = minutes_now
+        return forecast
+
+    def _publish_tomorrow_forecast(self, forecast):
+        """Publish tomorrow's curtailment forecast as a sensor."""
+        prefix = self.base.prefix
+        state = "Active" if forecast["will_activate"] else "Inactive"
+        attrs = dict(forecast)
+        attrs["friendly_name"] = "Curtailment Tomorrow Forecast"
+        attrs["icon"] = "mdi:solar-power-variant-outline"
+        self.base.dashboard_item("sensor.{}_curtailment_tomorrow".format(prefix), state, attrs)
 
     def calculate(self, dno_limit_kw):
         """Compute curtailment phase using v8 SOC trajectory algorithm."""
@@ -787,6 +897,14 @@ class CurtailmentPlugin(PredBatPlugin):
             # triggers the HA automation (which requires D-ESS as a condition)
             self.apply(phase, export_target_kw)
             self.publish(phase, target_soc_kwh, net_charge, export_target_kw, dno_limit)
+
+            # Tomorrow forecast (separate try/except — don't break today's control)
+            try:
+                tomorrow = self._compute_tomorrow_forecast()
+                if tomorrow:
+                    self._publish_tomorrow_forecast(tomorrow)
+            except Exception as e:
+                self.log("Curtailment: tomorrow forecast error: {}".format(e))
 
         except Exception as e:
             self.log("Curtailment plugin error: {}".format(e))

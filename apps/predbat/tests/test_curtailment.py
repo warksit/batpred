@@ -13,7 +13,18 @@ import sys
 # Ensure apps/predbat is on the path when run standalone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from curtailment_calc import compute_remaining_overflow, compute_morning_gap, compute_target_soc, should_activate, compute_overflow_window, compute_post_overflow_energy, simulate_soc_trajectory, solar_elevation, compute_release_time
+from curtailment_calc import (
+    compute_remaining_overflow,
+    compute_morning_gap,
+    compute_target_soc,
+    should_activate,
+    compute_overflow_window,
+    compute_post_overflow_energy,
+    simulate_soc_trajectory,
+    solar_elevation,
+    compute_release_time,
+    compute_tomorrow_forecast,
+)
 
 # Battery constants (Mum's SIG system)
 BATTERY_KWH = 18.08
@@ -2768,6 +2779,76 @@ def test_pre_overflow_drain():
     print(f"  test_pre_overflow_drain: PASSED " f"(phase={phase}, drain_target={target_soc_kwh/BATTERY_KWH*100:.0f}%, SOC=40%)")
 
 
+def test_tomorrow_forecast_overflow_day():
+    """Tomorrow forecast: high PV day should show overflow and low floor."""
+    # 48h forecast: tomorrow has 8kW PV, 1kW load → overflow
+    pv = {}
+    load = {}
+    # Fill tomorrow's window (minutes 720-2160 from now, i.e. 12h-36h ahead)
+    for m in range(0, 2880, PLUGIN_STEP):
+        if 720 <= m <= 2160:
+            pv[m] = 8.0  # kW, will be converted to kWh/step by forecast
+            load[m] = 1.0
+        else:
+            pv[m] = 0
+            load[m] = 0.5
+
+    # values_are_kwh=True in the pure function, so convert
+    step_kwh = PLUGIN_STEP / 60.0
+    pv_kwh = {k: v * step_kwh for k, v in pv.items()}
+    load_kwh = {k: v * step_kwh for k, v in load.items()}
+
+    result = compute_tomorrow_forecast(
+        pv_kwh,
+        load_kwh,
+        BATTERY_KWH,
+        DNO_LIMIT,
+        start_minute=720,
+        end_minute=2160,
+        step_minutes=PLUGIN_STEP,
+        values_are_kwh=True,
+    )
+
+    assert result["will_activate"], "High PV day should activate"
+    assert result["total_overflow_kwh"] > 5, f"Expected >5kWh overflow, got {result['total_overflow_kwh']}"
+    assert result["floor_pct"] < 50, f"Floor should be low on overflow day, got {result['floor_pct']}"
+    assert result["peak_soc_pct"] > 95, f"Unmanaged peak should be near 100%, got {result['peak_soc_pct']}"
+    print(f"  test_tomorrow_forecast_overflow_day: PASSED " f"(overflow={result['total_overflow_kwh']}kWh, floor={result['floor_pct']}%, peak={result['peak_soc_pct']}%)")
+
+
+def test_tomorrow_forecast_no_overflow():
+    """Tomorrow forecast: moderate PV should show no overflow."""
+    pv = {}
+    load = {}
+    for m in range(0, 2880, PLUGIN_STEP):
+        if 720 <= m <= 2160:
+            pv[m] = 3.0  # below DNO with any load
+            load[m] = 1.0
+        else:
+            pv[m] = 0
+            load[m] = 0.5
+
+    step_kwh = PLUGIN_STEP / 60.0
+    pv_kwh = {k: v * step_kwh for k, v in pv.items()}
+    load_kwh = {k: v * step_kwh for k, v in load.items()}
+
+    result = compute_tomorrow_forecast(
+        pv_kwh,
+        load_kwh,
+        BATTERY_KWH,
+        DNO_LIMIT,
+        start_minute=720,
+        end_minute=2160,
+        step_minutes=PLUGIN_STEP,
+        values_are_kwh=True,
+    )
+
+    assert not result["will_activate"], "Moderate PV should not activate"
+    assert result["total_overflow_kwh"] == 0, f"Expected 0 overflow, got {result['total_overflow_kwh']}"
+    assert result["floor_pct"] == 100, f"Floor should be 100% with no overflow, got {result['floor_pct']}"
+    print(f"  test_tomorrow_forecast_no_overflow: PASSED (overflow=0, floor=100%)")
+
+
 # Test runner
 # ============================================================================
 
@@ -2929,8 +3010,10 @@ def run_curtailment_tests(my_predbat=None):
         test_solar_elevation_known_values,
         test_compute_release_time_scenarios,
         test_pre_overflow_drain,
+        test_tomorrow_forecast_overflow_day,
+        test_tomorrow_forecast_no_overflow,
     ]
-    print("  --- solar geometry tests ---")
+    print("  --- solar geometry + tomorrow forecast tests ---")
     for test_fn in solar_tests:
         try:
             test_fn()

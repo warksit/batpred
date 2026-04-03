@@ -295,6 +295,71 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
     return peak_soc, net_charge, last_danger
 
 
+def compute_tomorrow_forecast(pv_forecast, load_forecast, soc_max, dno_limit, start_minute, end_minute, step_minutes=5, values_are_kwh=True):
+    """
+    Compute curtailment forecast for a future solar day.
+
+    Uses the same pure functions as real-time control but applied to a
+    future window (typically tomorrow). Returns a dict of forecast metrics.
+
+    Args:
+        pv_forecast: dict {minute_from_now: value}
+        load_forecast: dict {minute_from_now: value}
+        soc_max: float kWh — battery capacity
+        dno_limit: float kW — max grid export
+        start_minute: int — start of tomorrow's solar window (minutes from now)
+        end_minute: int — end of tomorrow's solar window (minutes from now)
+        step_minutes: int — forecast step size
+        values_are_kwh: bool — Predbat format (kWh per step)
+
+    Returns:
+        dict with: total_overflow_kwh, floor_pct, will_activate,
+                   peak_soc_pct, morning_gap_kwh
+    """
+    total_overflow = compute_remaining_overflow(
+        pv_forecast,
+        load_forecast,
+        dno_limit,
+        start_minute=start_minute,
+        end_minute=end_minute,
+        step_minutes=step_minutes,
+        values_are_kwh=values_are_kwh,
+    )
+
+    peak_soc, _, _ = simulate_soc_trajectory(
+        pv_forecast,
+        load_forecast,
+        soc_max,
+        soc_max,
+        dno_limit,
+        start_minute=start_minute,
+        end_minute=end_minute,
+        step_minutes=step_minutes,
+        values_are_kwh=values_are_kwh,
+        unmanaged=True,
+    )
+
+    morning_gap = compute_morning_gap(
+        pv_forecast,
+        load_forecast,
+        start_minute=start_minute,
+        end_minute=end_minute,
+        step_minutes=step_minutes,
+        values_are_kwh=values_are_kwh,
+    )
+
+    floor = max(0.0, soc_max - total_overflow)
+    floor_pct = floor / soc_max * 100 if soc_max > 0 else 100
+
+    return {
+        "total_overflow_kwh": round(total_overflow, 2),
+        "floor_pct": round(floor_pct, 1),
+        "will_activate": total_overflow > 0,
+        "peak_soc_pct": round(peak_soc / soc_max * 100, 1) if soc_max > 0 else 0,
+        "morning_gap_kwh": round(morning_gap, 2),
+    }
+
+
 def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     """
     Solar elevation angle in degrees.
