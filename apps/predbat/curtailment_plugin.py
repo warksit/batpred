@@ -169,6 +169,20 @@ class CurtailmentPlugin(PredBatPlugin):
 
         margin = 0.5
         solar_adjusted_keep = max(morning_gap + margin, reserve)
+
+        # On extreme overflow days, the battery will refill from overflow
+        # long before morning gap matters. Don't let soc_keep waste headroom.
+        remaining_overflow_total = compute_remaining_overflow(
+            pv_step,
+            load_step,
+            dno_limit,
+            start_minute=PREDICT_STEP,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+        if remaining_overflow_total > morning_gap:
+            solar_adjusted_keep = reserve
         current_keep = context["best_soc_keep"]
 
         if solar_adjusted_keep < current_keep:

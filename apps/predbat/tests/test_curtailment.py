@@ -1589,7 +1589,7 @@ def test_before_plan_never_increases():
 
     context = {"best_soc_keep": 0.5}  # already very low
     result = plugin.on_before_plan(context)
-    assert result["best_soc_keep"] == 0.5, f"Expected keep unchanged at 0.5 (not increased), got {result['best_soc_keep']:.2f}"
+    assert result["best_soc_keep"] <= 0.5, f"Expected keep not increased above 0.5, got {result['best_soc_keep']:.2f}"
     print("  test_before_plan_never_increases: PASSED")
 
 
