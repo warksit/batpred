@@ -42,7 +42,6 @@ HA_ENABLE = "input_boolean.curtailment_manager_enable"
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
-SOC_CAP_FACTOR = 0.90  # Target 90% max during overflow — 10% headroom for spikes
 
 # SIG/Solcast sensor entities for energy ratio
 SIG_DAILY_PV = "sensor.sigen_plant_daily_third_party_inverter_energy"
@@ -150,8 +149,8 @@ class CurtailmentPlugin(PredBatPlugin):
             values_are_kwh=True,
         )
 
-        soc_cap = soc_max * SOC_CAP_FACTOR
-        will_fill = peak_soc > soc_cap
+        # Will battery fill? Use 90% as activation threshold for planning
+        will_fill = peak_soc > soc_max * 0.90
 
         if not will_fill:
             self._publish_offset(0.0, {"original_keep": round(context["best_soc_keep"], 2), "will_fill": False})
@@ -350,9 +349,12 @@ class CurtailmentPlugin(PredBatPlugin):
         scale = max_pv / sin_elev
         threshold = dno_limit_kw + MIN_BASE_LOAD_KW
 
-        # Headroom: space from soc_cap to soc_max
+        # Headroom: gap between current floor and 100%. As overflow gets
+        # absorbed through the day, floor rises toward soc_max. By release
+        # time, the gap is typically small (1-3 kWh).
         soc_max = getattr(self.base, "soc_max", 10)
-        headroom = soc_max * (1.0 - SOC_CAP_FACTOR)
+        soc_kw = getattr(self.base, "soc_kw", 0)
+        headroom = max(0, soc_max - soc_kw)
 
         release_mins, crossing_utc = compute_release_time(scale, lat, lon, doy, threshold, utc_hours, headroom_kwh=headroom)
 
@@ -438,12 +440,11 @@ class CurtailmentPlugin(PredBatPlugin):
             unmanaged=False,
         )
 
-        soc_cap = soc_max * SOC_CAP_FACTOR
-        # Hysteresis: once will_fill is true, require peak to drop well below
-        # threshold to deactivate. Prevents toggling on borderline days where
-        # the forecast updates around the 90% threshold each cycle.
-        DEACTIVATE_THRESHOLD = 0.80  # must drop below 80% to deactivate
-        if peak_unmanaged > soc_cap:
+        # Hysteresis on activation: once will_fill is true, require peak to
+        # drop well below threshold to deactivate.
+        ACTIVATE_THRESHOLD = 0.90
+        DEACTIVATE_THRESHOLD = 0.80
+        if peak_unmanaged > soc_max * ACTIVATE_THRESHOLD:
             will_fill = True
         elif getattr(self, "_will_fill", False) and peak_unmanaged > soc_max * DEACTIVATE_THRESHOLD:
             will_fill = True  # stay active — hasn't dropped enough
@@ -470,59 +471,56 @@ class CurtailmentPlugin(PredBatPlugin):
             self._activation_reason = "off"
 
         # --- Activation ---
-        # Only activate if trajectory shows battery will fill OR overflow already seen.
-        # Danger slots (PV > 2kW) alone are not enough — moderate PV days have
-        # danger slots but the battery won't fill, so curtailment is unnecessary
-        # and would block Predbat's charge windows.
         if not will_fill and not self._seen_overflow_today:
             return soc_max, 0, "off", -2
 
-        # --- Pre-overflow drain ---
-        # If overflow is coming (will_fill) but hasn't started yet (no overflow seen),
-        # drain battery to make room. Target: SOC where remaining overflow fills to
-        # soc_cap, leaving headroom. This maximizes export AND prevents filling
-        # during the overflow period.
+        # --- Dynamic floor: leave room for remaining overflow until release ---
+        # One formula replaces fixed SOC_CAP, separate drain, and net_charge floor.
+        # floor = soc_max - remaining_overflow_until_release
+        # Before release: floor is low (headroom for overflow), PV exports, battery holds
+        # As overflow absorbed: remaining shrinks, floor rises, battery charges naturally
+        # At release: floor = soc_max (100%), battery fills from remaining PV
         soc_keep = getattr(self.base, "best_soc_keep", 0)
         reserve = getattr(self.base, "reserve", 0)
 
-        remaining_overflow = compute_remaining_overflow(
-            pv_step,
-            load_step,
-            dno_limit_kw,
-            start_minute=PREDICT_STEP,
-            end_minute=solar_end,
-            step_minutes=PREDICT_STEP,
-            values_are_kwh=True,
-        )
-        drain_target = max(soc_cap - remaining_overflow, soc_keep, reserve)
-        self._drain_target = drain_target
-
-        if will_fill and not self._seen_overflow_today and not currently_overflowing and actual_excess > 0:
-            if soc_kw > drain_target + SOC_MARGIN_KWH:
-                # Drain phase: export PV + discharge battery toward drain target
-                self._target_charge_rate = 0
-                self._activation_reason = "drain"
-                return drain_target, net_charge, "export", -2
-
-        # --- Floor (bidirectional, recomputed each cycle) ---
-        floor = soc_cap - max(0, net_charge)
-        floor = max(floor, soc_keep, reserve)
-        floor = min(floor, soc_max)  # never above 100%
-
-        # Release: solar geometry predicts PV will drop below overflow threshold
+        # Compute release time for the overflow end_minute
+        release_end = solar_end  # default: count overflow until end of solar day
         try:
             release_mins, release_scale, crossing_str = self._compute_solar_release(minutes_now, actual_pv, dno_limit_kw)
             self._release_scale = release_scale
             self._release_crossing = crossing_str
-            if release_mins is not None and release_mins <= 0:
-                floor = soc_max  # safe to charge to 100%
+            released = release_mins is not None and release_mins <= 0
+            if release_mins is not None and release_mins > 0:
+                # Convert release_mins to forecast minute offset
+                release_end = min(solar_end, int(release_mins))
         except Exception:
-            # Fallback: old threshold-based release
-            remaining_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
-            if not remaining_danger and actual_pv < SAFE_PV_THRESHOLD_KW:
-                floor = soc_max
+            released = False
             self._release_scale = 0
             self._release_crossing = "fallback"
+            # Fallback: check if all remaining PV < 2kW
+            remaining_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
+            if not remaining_danger and actual_pv < SAFE_PV_THRESHOLD_KW:
+                released = True
+
+        if released:
+            floor = soc_max  # safe to charge to 100%
+        else:
+            remaining_overflow = compute_remaining_overflow(
+                pv_step,
+                load_step,
+                dno_limit_kw,
+                start_minute=PREDICT_STEP,
+                end_minute=release_end,
+                step_minutes=PREDICT_STEP,
+                values_are_kwh=True,
+            )
+            # Scale by energy ratio: if PV is running hot, expect more overflow
+            remaining_overflow *= energy_ratio
+            floor = soc_max - remaining_overflow
+            floor = max(floor, soc_keep, reserve)
+            floor = min(floor, soc_max)
+
+        self._drain_target = floor  # for diagnostics
 
         target_soc_kwh = floor
 
@@ -535,13 +533,13 @@ class CurtailmentPlugin(PredBatPlugin):
             target_charge_rate = 0.0  # at/above floor, no charging needed
         self._target_charge_rate = round(target_charge_rate, 2)
 
-        # --- Phase (informational — export limit is now rate-based) ---
+        # --- Phase ---
         if soc_kw < target_soc_kwh - SOC_MARGIN_KWH:
             phase = "charge"  # below floor, charging at controlled rate
         elif soc_kw > target_soc_kwh + 1.0 and actual_excess > 0:
-            phase = "export"  # above floor, draining
+            phase = "export"  # above floor, draining toward floor
         elif actual_excess > 0:
-            phase = "hold"  # at floor, exporting excess
+            phase = "hold"  # at floor, exporting excess up to DNO
         else:
             phase = "hold"  # D-ESS on, battery covers deficit
 
