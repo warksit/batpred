@@ -334,6 +334,15 @@ class CurtailmentPlugin(PredBatPlugin):
         if sin_elev < 0.05:
             return 0, 0, "low_sun"
 
+        # Only compute release on the DECLINING side (after solar noon).
+        # Before noon, PV is still rising — a cloud dip gives a low scale
+        # that falsely triggers release.
+        B2 = math.radians((360.0 / 364.0) * (doy - 81))
+        eot = 9.87 * math.sin(2 * B2) - 7.53 * math.cos(B2) - 1.5 * math.sin(B2)
+        solar_noon_utc = 12.0 - lon / 15.0 - eot / 60.0
+        if utc_hours < solar_noon_utc:
+            return None, 0, "before_noon"
+
         scale = max_pv / sin_elev
         threshold = dno_limit_kw + MIN_BASE_LOAD_KW
 
@@ -426,7 +435,16 @@ class CurtailmentPlugin(PredBatPlugin):
         )
 
         soc_cap = soc_max * SOC_CAP_FACTOR
-        will_fill = peak_unmanaged > soc_cap
+        # Hysteresis: once will_fill is true, require peak to drop well below
+        # threshold to deactivate. Prevents toggling on borderline days where
+        # the forecast updates around the 90% threshold each cycle.
+        DEACTIVATE_THRESHOLD = 0.80  # must drop below 80% to deactivate
+        if peak_unmanaged > soc_cap:
+            will_fill = True
+        elif getattr(self, "_will_fill", False) and peak_unmanaged > soc_max * DEACTIVATE_THRESHOLD:
+            will_fill = True  # stay active — hasn't dropped enough
+        else:
+            will_fill = False
         self._unmanaged_peak = peak_unmanaged
 
         # Check for danger slots (PV > 2kW in remaining forecast)

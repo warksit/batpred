@@ -2311,7 +2311,7 @@ def test_release_when_pv_below_threshold():
     """Solar geometry release: when scale is low (PV can't exceed threshold), floor = soc_max."""
     from datetime import datetime, timezone
 
-    # Low PV (1kW) at noon in July — scale will be very low (~1.2kW),
+    # Low PV (1kW) in afternoon July — scale will be very low,
     # well below DNO+base_load (4.5kW), so release should trigger immediately
     pv_step = {m: 1.0 for m in range(0, 600, PLUGIN_STEP)}
     load_step = {m: 0.5 for m in range(0, 600, PLUGIN_STEP)}
@@ -2321,8 +2321,8 @@ def test_release_when_pv_below_threshold():
         load_step=load_step,
         soc_kw=BATTERY_KWH * 0.80,
         soc_max=BATTERY_KWH,
-        minutes_now=720,
-        now_utc=datetime(2025, 7, 12, 11, 0, tzinfo=timezone.utc),  # noon BST
+        minutes_now=900,  # 15:00 BST
+        now_utc=datetime(2025, 7, 12, 14, 0, tzinfo=timezone.utc),  # 15:00 BST (after solar noon)
         sensor_overrides={
             "sensor.sigen_plant_pv_power": 1.0,
             "sensor.sigen_plant_consumed_power": 0.5,
