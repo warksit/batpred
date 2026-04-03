@@ -453,18 +453,18 @@ class CurtailmentPlugin(PredBatPlugin):
 
                 if peak_pv_kw > 1.0:
                     utc_now = now_utc.hour + now_utc.minute / 60.0
-                    peak_utc = utc_now + peak_offset / 60.0
-                    peak_elev = solar_elevation(lat, lon, peak_utc, tomorrow_doy)
+                    local_offset = (minutes_now / 60.0) - utc_now
+                    # Convert offsets to absolute UTC hour-of-day (0-24)
+                    peak_abs_utc = (utc_now + peak_offset / 60.0) % 24
+                    peak_elev = solar_elevation(lat, lon, peak_abs_utc, tomorrow_doy)
                     sin_elev = math.sin(math.radians(peak_elev))
                     if sin_elev > 0.05:
                         scale = peak_pv_kw / sin_elev
                         threshold = dno_limit + MIN_BASE_LOAD_KW
                         headroom = soc_max * 0.10
-                        # Scan from early morning tomorrow
-                        scan_utc = utc_now + tomorrow_start / 60.0
-                        rel_mins, crossing_utc = compute_release_time(scale, lat, lon, tomorrow_doy, threshold, scan_utc, headroom)
+                        scan_abs_utc = (utc_now + tomorrow_start / 60.0) % 24
+                        rel_mins, crossing_utc = compute_release_time(scale, lat, lon, tomorrow_doy, threshold, scan_abs_utc, headroom)
                         if crossing_utc:
-                            local_offset = (minutes_now / 60.0) - utc_now
                             crossing_local = crossing_utc + local_offset
                             forecast["release_time"] = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
         except Exception:
@@ -644,6 +644,7 @@ class CurtailmentPlugin(PredBatPlugin):
             floor = max(floor, soc_keep, reserve)
             floor = min(floor, soc_max)
 
+        self._remaining_overflow = remaining_overflow if not released else 0
         self._drain_target = floor  # for diagnostics
 
         target_soc_kwh = floor
@@ -692,7 +693,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "will_fill": getattr(self, "_will_fill", False),
                 "activation_reason": getattr(self, "_activation_reason", "off"),
                 "target_charge_rate": getattr(self, "_target_charge_rate", 0),
-                "drain_target_pct": round(getattr(self, "_drain_target", 0) / max(soc_max, 0.1) * 100, 1),
+                "remaining_overflow_kwh": round(getattr(self, "_remaining_overflow", 0), 2),
                 "release_time": release_crossing,
                 "release_scale": round(release_scale, 1),
             },
