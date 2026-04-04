@@ -613,7 +613,11 @@ class CurtailmentPlugin(PredBatPlugin):
             release_mins, release_scale, crossing_str = self._compute_solar_release(minutes_now, actual_pv, dno_limit_kw)
             self._release_scale = release_scale
             self._release_crossing = crossing_str
-            released = release_mins is not None and release_mins <= 0
+            # Only release if solar geometry says safe AND forecast agrees
+            # (no overflow expected). If will_fill=true, the forecast predicts
+            # overflow — trust it over the solar scale which is unreliable
+            # on cloudy mornings when the rolling max is unrepresentative.
+            released = release_mins is not None and release_mins <= 0 and not will_fill
             if release_mins is not None and release_mins > 0:
                 # Convert release_mins to forecast minute offset
                 release_end = min(solar_end, int(release_mins))
