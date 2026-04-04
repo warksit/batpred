@@ -526,12 +526,39 @@ class CurtailmentPlugin(PredBatPlugin):
         load_ratio = self._get_load_ratio()
         self._load_ratio = load_ratio
 
-        # --- SOC trajectory: unmanaged (MSC) for activation check ---
-        # "Will battery fill if we DON'T manage?" — battery absorbs ALL excess
-        # Uses energy_ratio=1.0 (raw forecast) for STABLE activation decisions.
-        # The energy_ratio is noisy during PV ramp-up (morning), causing
-        # will_fill to toggle and phases to flap. Activation should depend on
-        # the forecast; the floor calculation uses the real ratio to adapt.
+        # --- Compute release time first (needed for activation check) ---
+        step_to_kw = 60.0 / PREDICT_STEP
+        try:
+            release_mins, release_scale, crossing_str = self._compute_solar_release(minutes_now, actual_pv, dno_limit_kw)
+            self._release_scale = release_scale
+            self._release_crossing = crossing_str
+        except Exception:
+            release_mins = None
+            self._release_scale = 0
+            self._release_crossing = "none"
+
+        # Crossing end in forecast minutes: when does PV drop below safe level?
+        # Use crossing time (not release time) for activation — release subtracts
+        # fill time which defeats the "will battery fill?" check at low SOC.
+        if release_mins is not None and release_mins > 0:
+            # release_mins already has headroom subtracted; add it back for crossing
+            soc_headroom = max(0, soc_max - soc_kw)
+            headroom_mins = (soc_headroom / max(dno_limit_kw, 1)) * 60
+            crossing_end = min(solar_end, int(release_mins + headroom_mins))
+        else:
+            # Fallback: use last forecast slot with excess near DNO
+            crossing_end = solar_end
+            for m in range(solar_end - PREDICT_STEP, 0, -PREDICT_STEP):
+                pv_kw = pv_step.get(m, 0) * step_to_kw
+                load_kw = load_step.get(m, 0) * step_to_kw
+                if pv_kw - load_kw > dno_limit_kw - 1.0:
+                    crossing_end = m + PREDICT_STEP
+                    break
+
+        # --- Activation: will battery reach 90% BEFORE release? ---
+        # Run unmanaged trajectory only to release time. If battery fills
+        # before PV drops to safe levels, curtailment is needed.
+        # Uses energy_ratio=1.0 (raw forecast) for stable decisions.
         peak_unmanaged, _, last_danger = simulate_soc_trajectory(
             pv_step,
             load_step,
@@ -541,14 +568,13 @@ class CurtailmentPlugin(PredBatPlugin):
             energy_ratio=1.0,
             load_ratio=1.0,
             start_minute=PREDICT_STEP,
-            end_minute=solar_end,
+            end_minute=crossing_end,
             step_minutes=PREDICT_STEP,
             values_are_kwh=True,
             unmanaged=True,
         )
 
         # --- SOC trajectory: managed (D-ESS) for floor calculation ---
-        # "How much overflow will battery absorb if we export at DNO?"
         peak_soc, net_charge, _ = simulate_soc_trajectory(
             pv_step,
             load_step,
@@ -564,20 +590,17 @@ class CurtailmentPlugin(PredBatPlugin):
             unmanaged=False,
         )
 
-        # Hysteresis on activation: once will_fill is true, require peak to
-        # drop well below threshold to deactivate.
+        # Hysteresis on activation
         ACTIVATE_THRESHOLD = 0.90
         DEACTIVATE_THRESHOLD = 0.80
         if peak_unmanaged > soc_max * ACTIVATE_THRESHOLD:
             will_fill = True
         elif getattr(self, "_will_fill", False) and peak_unmanaged > soc_max * DEACTIVATE_THRESHOLD:
-            will_fill = True  # stay active — hasn't dropped enough
+            will_fill = True
         else:
             will_fill = False
         self._unmanaged_peak = peak_unmanaged
 
-        # Check for danger slots (PV > 2kW in remaining forecast)
-        step_to_kw = 60.0 / PREDICT_STEP
         has_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
 
         # Store diagnostic info
@@ -589,87 +612,38 @@ class CurtailmentPlugin(PredBatPlugin):
             self._activation_reason = "trajectory"
         elif self._seen_overflow_today:
             self._activation_reason = "sticky"
-        elif has_danger:
-            self._activation_reason = "danger_slots"
         else:
             self._activation_reason = "off"
 
         # --- Activation ---
-        # Need both: trajectory says battery will fill AND forecast shows
-        # meaningful overflow. will_fill alone triggers on moderate days where
-        # the battery fills but excess never exceeds DNO — no curtailment needed.
-        # Use DNO-1kW margin: excess near DNO will spike above in reality.
-        forecast_overflow = compute_remaining_overflow(
-            pv_step,
-            load_step,
-            max(0, dno_limit_kw - 1.0),
-            start_minute=PREDICT_STEP,
-            end_minute=solar_end,
-            step_minutes=PREDICT_STEP,
-            values_are_kwh=True,
-        )
-        if not self._seen_overflow_today and not will_fill and forecast_overflow < 0.5:
-            return soc_max, 0, "off", -2
+        # Only activate if battery fills before release (overflow risk)
+        # or overflow already seen today (sticky).
         if not will_fill and not self._seen_overflow_today:
             return soc_max, 0, "off", -2
 
         # --- Dynamic floor: leave room for remaining overflow until release ---
-        # One formula replaces fixed SOC_CAP, separate drain, and net_charge floor.
-        # floor = soc_max - remaining_overflow_until_release
-        # Before release: floor is low (headroom for overflow), PV exports, battery holds
-        # As overflow absorbed: remaining shrinks, floor rises, battery charges naturally
-        # At release: floor = soc_max (100%), battery fills from remaining PV
         soc_keep = getattr(self.base, "best_soc_keep", 0)
         reserve = getattr(self.base, "reserve", 0)
 
-        # Compute release time for the overflow end_minute
-        release_end = solar_end  # default: count overflow until end of solar day
-        try:
-            release_mins, release_scale, crossing_str = self._compute_solar_release(minutes_now, actual_pv, dno_limit_kw)
-            self._release_scale = release_scale
-            self._release_crossing = crossing_str
-            # Only release if solar geometry says safe AND forecast agrees
-            # (no overflow expected). If will_fill=true, the forecast predicts
-            # overflow — trust it over the solar scale which is unreliable
-            # on cloudy mornings when the rolling max is unrepresentative.
-            released = release_mins is not None and release_mins <= 0 and not will_fill
-            if will_fill and (release_mins is None or release_mins <= 0):
-                # Solar geometry unreliable (scale too low) but forecast predicts overflow.
-                # Compute release time from FORECAST: last slot with excess > DNO
-                last_overflow_offset = 0
-                for m in range(PREDICT_STEP, solar_end, PREDICT_STEP):
-                    pv_kw = pv_step.get(m, 0) * step_to_kw * energy_ratio
-                    load_kw = load_step.get(m, 0) * step_to_kw * load_ratio
-                    if pv_kw - load_kw > dno_limit_kw:
-                        last_overflow_offset = m
-                if last_overflow_offset > 0:
-                    headroom_h = max(0, soc_max - soc_kw) / max(dno_limit_kw, 1)
-                    release_offset = last_overflow_offset - int(headroom_h * 60)
-                    release_local = minutes_now + max(0, release_offset)
-                    self._release_crossing = "{:02d}:{:02d}".format((release_local // 60) % 24, release_local % 60)
-                else:
-                    self._release_crossing = "none"
-            if release_mins is not None and release_mins > 0:
-                # Convert release_mins to forecast minute offset
-                release_end = min(solar_end, int(release_mins))
-        except Exception:
-            released = False
-            self._release_scale = 0
-            self._release_crossing = "fallback"
-            # Fallback: check if all remaining PV < 2kW
+        # Release: solar geometry says safe AND forecast agrees
+        released = release_mins is not None and release_mins <= 0 and not will_fill
+        if not released:
+            # Fallback: all remaining PV < 2kW
             remaining_danger = any(pv_step.get(m, 0) * step_to_kw > SAFE_PV_THRESHOLD_KW for m in range(PREDICT_STEP, solar_end, PREDICT_STEP))
             if not remaining_danger and actual_pv < SAFE_PV_THRESHOLD_KW:
                 released = True
 
         if released:
-            floor = soc_max  # safe to charge to 100%
+            floor = soc_max
         else:
+            # Use release time (crossing minus headroom) for overflow window
+            overflow_end = min(solar_end, int(release_mins)) if release_mins is not None and release_mins > 0 else solar_end
             remaining_overflow = compute_remaining_overflow(
                 pv_step,
                 load_step,
                 dno_limit_kw,
                 start_minute=PREDICT_STEP,
-                end_minute=release_end,
+                end_minute=overflow_end,
                 step_minutes=PREDICT_STEP,
                 values_are_kwh=True,
             )
@@ -681,12 +655,6 @@ class CurtailmentPlugin(PredBatPlugin):
 
         self._remaining_overflow = remaining_overflow if not released else 0
         self._drain_target = floor  # for diagnostics
-
-        # If floor is 100%, no overflow to manage, and forecast agrees
-        # (no overflow even with margin), hand back to Predbat. The plugin
-        # has no reason to throttle charging — Predbat should absorb all PV.
-        if floor >= soc_max and not self._seen_overflow_today and forecast_overflow < 0.5:
-            return soc_max, 0, "off", -2
 
         target_soc_kwh = floor
 
@@ -854,11 +822,23 @@ class CurtailmentPlugin(PredBatPlugin):
             self.last_export_limit = None
             self.was_active = False
 
+    HA_AUTOMATION = "automation.curtailment_manager_dynamic_export_limit"
+
     def _cleanup_read_only(self):
-        """Clear stale read_only left by a previous plugin run (e.g. after restart)."""
+        """Clear stale state left by a previous plugin run (e.g. after restart)."""
         if not self.was_active and self.base.set_read_only:
             self.log("Curtailment: clearing stale read_only from previous run")
             self._set_read_only(False)
+        # Re-enable HA automation on restart (may have been manually disabled)
+        if not getattr(self, "_automation_checked", False):
+            self._automation_checked = True
+            try:
+                state = str(self.base.get_state_wrapper(self.HA_AUTOMATION, default="on")).lower()
+                if state == "off":
+                    self.log("Curtailment: re-enabling HA automation after restart")
+                    self.base.call_service_wrapper("automation/turn_on", entity_id=self.HA_AUTOMATION)
+            except Exception:
+                pass
 
     def on_update(self):
         """Main entry point, called every Predbat cycle."""
