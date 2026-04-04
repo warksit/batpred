@@ -618,9 +618,22 @@ class CurtailmentPlugin(PredBatPlugin):
             # overflow — trust it over the solar scale which is unreliable
             # on cloudy mornings when the rolling max is unrepresentative.
             released = release_mins is not None and release_mins <= 0 and not will_fill
-            if will_fill:
-                # Geometry says release but forecast disagrees — don't show misleading time
-                self._release_crossing = "blocked"
+            if will_fill and (release_mins is None or release_mins <= 0):
+                # Solar geometry unreliable (scale too low) but forecast predicts overflow.
+                # Compute release time from FORECAST: last slot with excess > DNO
+                last_overflow_offset = 0
+                for m in range(PREDICT_STEP, solar_end, PREDICT_STEP):
+                    pv_kw = pv_step.get(m, 0) * step_to_kw * energy_ratio
+                    load_kw = load_step.get(m, 0) * step_to_kw * load_ratio
+                    if pv_kw - load_kw > dno_limit_kw:
+                        last_overflow_offset = m
+                if last_overflow_offset > 0:
+                    headroom_h = max(0, soc_max - soc_kw) / max(dno_limit_kw, 1)
+                    release_offset = last_overflow_offset - int(headroom_h * 60)
+                    release_local = minutes_now + max(0, release_offset)
+                    self._release_crossing = "{:02d}:{:02d}".format((release_local // 60) % 24, release_local % 60)
+                else:
+                    self._release_crossing = "none"
             if release_mins is not None and release_mins > 0:
                 # Convert release_mins to forecast minute offset
                 release_end = min(solar_end, int(release_mins))
