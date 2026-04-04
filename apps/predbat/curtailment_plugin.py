@@ -682,6 +682,12 @@ class CurtailmentPlugin(PredBatPlugin):
         self._remaining_overflow = remaining_overflow if not released else 0
         self._drain_target = floor  # for diagnostics
 
+        # If floor is 100%, no overflow to manage, and forecast agrees
+        # (no overflow even with margin), hand back to Predbat. The plugin
+        # has no reason to throttle charging — Predbat should absorb all PV.
+        if floor >= soc_max and not self._seen_overflow_today and forecast_overflow < 0.5:
+            return soc_max, 0, "off", -2
+
         target_soc_kwh = floor
 
         # --- Target charge rate: how fast to reach floor ---
