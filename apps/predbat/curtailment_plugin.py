@@ -618,6 +618,9 @@ class CurtailmentPlugin(PredBatPlugin):
             # overflow — trust it over the solar scale which is unreliable
             # on cloudy mornings when the rolling max is unrepresentative.
             released = release_mins is not None and release_mins <= 0 and not will_fill
+            if will_fill:
+                # Geometry says release but forecast disagrees — don't show misleading time
+                self._release_crossing = "blocked"
             if release_mins is not None and release_mins > 0:
                 # Convert release_mins to forecast minute offset
                 release_end = min(solar_end, int(release_mins))
