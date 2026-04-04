@@ -595,6 +595,21 @@ class CurtailmentPlugin(PredBatPlugin):
             self._activation_reason = "off"
 
         # --- Activation ---
+        # Need both: trajectory says battery will fill AND forecast shows
+        # meaningful overflow. will_fill alone triggers on moderate days where
+        # the battery fills but excess never exceeds DNO — no curtailment needed.
+        # Use DNO-1kW margin: excess near DNO will spike above in reality.
+        forecast_overflow = compute_remaining_overflow(
+            pv_step,
+            load_step,
+            max(0, dno_limit_kw - 1.0),
+            start_minute=PREDICT_STEP,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+        if not self._seen_overflow_today and not will_fill and forecast_overflow < 0.5:
+            return soc_max, 0, "off", -2
         if not will_fill and not self._seen_overflow_today:
             return soc_max, 0, "off", -2
 
