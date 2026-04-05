@@ -1,0 +1,87 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:claude.ai)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:springfall2008.github.io)",
+      "WebFetch(domain:api.github.com)",
+      "WebSearch",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_search_entities",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_call_service",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_states",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_state",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_logbook",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_deep_search",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_addon",
+      "mcp__MumsHA__ha_search_entities",
+      "mcp__MumsHA__ha_get_addon",
+      "mcp__PredbatMCP__get_status",
+      "mcp__PredbatMCP__get_plan",
+      "mcp__PredbatMCP__get_config",
+      "mcp__PredbatMCP__set_config",
+      "WebFetch(domain:middlemuir.warks.it)",
+      "mcp__MumsHA__ha_get_state",
+      "mcp__PredbatMCP__get_entities",
+      "mcp__MumsHA__ha_call_service",
+      "mcp__MumsHA__ha_get_history",
+      "mcp__MumsHA__ha_get_states",
+      "mcp__PredbatMCP__set_plan_override",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_history",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_statistics",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_remove_helper",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_get_automation",
+      "WebFetch(domain:pdf.tritec.info)",
+      "WebFetch(domain:www.sigenergy.com)",
+      "WebFetch(domain:device.report)",
+      "WebFetch(domain:www.scribd.com)",
+      "WebFetch(domain:forums.whirlpool.net.au)",
+      "WebFetch(domain:automation.baldacchino.net)",
+      "WebFetch(domain:sigenergy.annable.me)",
+      "WebFetch(domain:b2b.aprilice.com)",
+      "WebFetch(domain:community.home-assistant.io)",
+      "WebFetch(domain:support.sigenergy.com)",
+      "WebFetch(domain:www.sunlumo-energy.com)",
+      "WebFetch(domain:docs.eniris.io)",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_set_helper",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_set_automation",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_eval_template",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_get_dashboard",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_dashboard_find_card",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_set_dashboard",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_entity",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_rename_entity",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_set_entity",
+      "WebFetch(domain:www.degreedays.net)",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_get_zone",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_info",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_config_remove_automation",
+      "mcp__claude_ai_Middlemuir_Homeassistant_Mums__ha_list_services"
+    ],
+    "deny": [
+      "mcp__claude_ai_Homeassistant__*"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/mum-deploy-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__claude_ai_Homeassistant__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"decision\":\"deny\",\"reason\":\"Wrong HA instance! Use mcp__claude_ai_Middlemuir_Homeassistant_Mums__ tools instead.\"}'"
+          }
+        ]
+      }
+    ]
+  }
+}
