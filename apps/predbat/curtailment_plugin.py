@@ -568,7 +568,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # --- Release time from solar geometry ---
         release_time_str = "unknown"
-        release_offset = tomorrow_end  # fallback: whole window
+        release_end = tomorrow_end
         try:
             lat = float(self.base.get_state_wrapper("zone.home", attribute="latitude", default=0))
             lon = float(self.base.get_state_wrapper("zone.home", attribute="longitude", default=0))
@@ -597,11 +597,28 @@ class CurtailmentPlugin(PredBatPlugin):
                         if crossing_utc:
                             crossing_local = crossing_utc + local_offset
                             release_time_str = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
-                            release_offset = min(int(rel_mins), tomorrow_end - tomorrow_start)
+                            release_end = tomorrow_start + min(int(rel_mins), tomorrow_end - tomorrow_start)
         except Exception:
             pass
 
-        # --- Morning gap (per-slot — timing matters for this) ---
+        # --- First PV slot (when PV starts generating) ---
+        pv_start = tomorrow_start
+        for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP):
+            if pv_step.get(m, 0) > 0:
+                pv_start = m
+                break
+
+        # --- PV and load from PV start to release time ---
+        per_slot_to_release = sum(pv_step.get(m, 0) for m in range(pv_start, release_end, PREDICT_STEP))
+        per_slot_total = sum(pv_step.get(m, 0) for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP))
+        fraction = (per_slot_to_release / per_slot_total) if per_slot_total > 0 else 1.0
+
+        pv_to_release = solcast_tomorrow * fraction
+        pv_after_release = solcast_tomorrow * (1 - fraction)
+        load_to_release = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(pv_start, release_end, PREDICT_STEP))
+        excess = max(0, pv_to_release - load_to_release)
+
+        # --- Morning gap ---
         morning_gap = compute_morning_gap(
             pv_step,
             load_step,
@@ -611,41 +628,29 @@ class CurtailmentPlugin(PredBatPlugin):
             values_are_kwh=True,
         )
 
-        # --- Single shared curtailment calculation — same as live (R31) ---
+        # --- Activation: excess > headroom? ---
         estimated_morning_soc = morning_gap + 0.5
-        will_activate, floor_kwh, battery_must_absorb = self._compute_curtailment(
-            pv_step,
-            load_step,
-            solcast_tomorrow,
-            1.0,
-            1.0,
-            tomorrow_start,
-            tomorrow_end,
-            estimated_morning_soc,
-            soc_max,
-            dno_limit,
-        )
-
-        floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
-        floor_pct = max(0, min(100, floor_pct))
+        headroom = soc_max * SOC_CAP_FACTOR - estimated_morning_soc
+        will_activate = excess > headroom
 
         # --- Expected soc_keep ---
         reserve = getattr(self.base, "reserve", 0)
-        if battery_must_absorb > morning_gap:
+        if will_activate and excess > morning_gap:
             soc_keep = round(reserve, 2)
         else:
             soc_keep = round(max(morning_gap + 0.5, reserve), 2)
 
         forecast = {
-            "battery_absorb_kwh": round(battery_must_absorb, 2),
-            "floor_pct": floor_pct,
             "will_activate": will_activate,
+            "pv_to_release_kwh": round(pv_to_release, 1),
+            "pv_after_release_kwh": round(pv_after_release, 1),
+            "load_to_release_kwh": round(load_to_release, 1),
+            "excess_kwh": round(excess, 1),
+            "headroom_kwh": round(headroom, 1),
             "morning_gap_kwh": round(morning_gap, 2),
             "release_time": release_time_str,
             "soc_keep_kwh": soc_keep,
             "solcast_kwh": round(solcast_tomorrow, 1),
-            "headroom_kwh": round(soc_max * SOC_CAP_FACTOR - estimated_morning_soc, 1),
-            "debug": getattr(CurtailmentPlugin, "_last_debug", {}),
         }
 
         self._tomorrow_cache = forecast
@@ -664,11 +669,10 @@ class CurtailmentPlugin(PredBatPlugin):
         else:
             state = "Inactive"
             attrs = {
-                "battery_absorb_kwh": 0,
-                "floor_pct": 100,
                 "will_activate": False,
+                "excess_kwh": 0,
+                "solcast_kwh": round(forecast.get("solcast_kwh", 0), 1),
                 "morning_gap_kwh": round(forecast.get("morning_gap_kwh", 0), 2),
-                "release_time": "none",
                 "soc_keep_kwh": round(forecast.get("soc_keep_kwh", 0), 2),
             }
         attrs["friendly_name"] = "Curtailment Tomorrow Forecast"
