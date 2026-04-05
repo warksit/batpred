@@ -45,8 +45,8 @@ This is SEPARATE from the floor calculation (which computes the solution).
 No export capacity in the activation check — export is what management DOES, not an input.
 
 - **R5**: Activate when `total_excess > headroom` where:
-  - `total_excess = remaining_pv - remaining_load` (to safe_time, from Solcast + LoadML)
-  - `headroom = soc_max * 0.95 - soc_kw`
+    - `total_excess = remaining_pv - remaining_load` (to safe_time, from Solcast + LoadML)
+    - `headroom = soc_max * 0.95 - soc_kw`
 - **R6**: Deactivate when `total_excess < headroom * 0.9`. Hysteresis prevents toggling.
 - **R7**: Trust forecast + energy ratio for activation. No force-activate from actual excess.
 - **R8**: When inactive and no overflow forecast, stay off. Predbat manages normally.

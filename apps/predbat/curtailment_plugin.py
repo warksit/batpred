@@ -433,15 +433,19 @@ class CurtailmentPlugin(PredBatPlugin):
         to_kw = 1.0 / step_hours
         soc_cap = soc_max * SOC_CAP_FACTOR
 
-        # --- Balance end: last overflow slot (forecast shape for TIMING) ---
+        # --- Overflow window: first and last slot where PV-load > DNO ---
+        overflow_start = 0
         balance_end = 0
         for m in range(window_start, window_end, PREDICT_STEP):
             pv_kw = pv_step.get(m, 0) * to_kw
             load_kw = load_step.get(m, 0) * to_kw
             if pv_kw - load_kw > dno_limit:
+                if overflow_start == 0:
+                    overflow_start = m
                 balance_end = m + PREDICT_STEP
         if balance_end == 0:
             balance_end = window_end
+            overflow_start = window_start
 
         # --- PV: Solcast magnitude x forecast shape fraction ---
         per_slot_to_balance = sum(pv_step.get(m, 0) for m in range(window_start, balance_end, PREDICT_STEP))
@@ -462,9 +466,23 @@ class CurtailmentPlugin(PredBatPlugin):
         active = (remaining_pv - remaining_load) > headroom
 
         # --- Absorption: excess - export capacity (R9/R32) ---
-        hours_to_balance = max(0, (balance_end - window_start) / 60.0)
+        # Export hours = overflow window only (first to last overflow slot).
+        # Pre-overflow morning hours can't export at DNO without drain.
+        hours_to_balance = max(0, (balance_end - overflow_start) / 60.0)
         total_excess = max(0, remaining_pv - remaining_load)
         absorption = max(0, total_excess - dno_limit * hours_to_balance)
+
+        # Store debug for diagnostics
+        CurtailmentPlugin._last_debug = {
+            "remaining_pv": round(remaining_pv, 2),
+            "remaining_load": round(remaining_load, 2),
+            "fraction": round(fraction, 3),
+            "hours": round(hours_to_balance, 2),
+            "export_cap": round(dno_limit * hours_to_balance, 1),
+            "excess": round(total_excess, 2),
+            "overflow_start_offset": overflow_start,
+            "balance_end_offset": balance_end,
+        }
 
         if not active or absorption < 0.1:
             return False, soc_cap, 0
@@ -619,12 +637,15 @@ class CurtailmentPlugin(PredBatPlugin):
             soc_keep = round(max(morning_gap + 0.5, reserve), 2)
 
         forecast = {
-            "total_overflow_kwh": round(battery_must_absorb, 2),
+            "battery_absorb_kwh": round(battery_must_absorb, 2),
             "floor_pct": floor_pct,
             "will_activate": will_activate,
             "morning_gap_kwh": round(morning_gap, 2),
             "release_time": release_time_str,
             "soc_keep_kwh": soc_keep,
+            "solcast_kwh": round(solcast_tomorrow, 1),
+            "headroom_kwh": round(soc_max * SOC_CAP_FACTOR - estimated_morning_soc, 1),
+            "debug": getattr(CurtailmentPlugin, "_last_debug", {}),
         }
 
         self._tomorrow_cache = forecast
@@ -643,7 +664,7 @@ class CurtailmentPlugin(PredBatPlugin):
         else:
             state = "Inactive"
             attrs = {
-                "total_overflow_kwh": 0,
+                "battery_absorb_kwh": 0,
                 "floor_pct": 100,
                 "will_activate": False,
                 "morning_gap_kwh": round(forecast.get("morning_gap_kwh", 0), 2),
