@@ -48,23 +48,6 @@ def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minu
     return total
 
 
-def compute_target_soc(remaining_overflow, battery_max_kwh, margin_kwh=0.0):
-    """
-    Compute target SOC: leave room in battery to absorb remaining overflow.
-
-    target_soc = battery_max - remaining_overflow - margin, clamped to [0, battery_max]
-
-    Args:
-        remaining_overflow: float kWh — overflow still expected
-        battery_max_kwh: float kWh — battery capacity
-        margin_kwh: float kWh — extra buffer for forecast error
-
-    Returns:
-        float — target SOC in kWh
-    """
-    return max(0.0, min(battery_max_kwh, battery_max_kwh - remaining_overflow - margin_kwh))
-
-
 def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """
     Compute energy deficit from now until PV consistently covers load.
@@ -107,106 +90,6 @@ def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1
             gap_kwh += (load_kw - pv_kw) * step_hours
 
     return gap_kwh
-
-
-def should_activate(remaining_overflow):
-    """
-    Whether curtailment management should be active.
-
-    Active whenever any future slot has excess > DNO limit.
-
-    Args:
-        remaining_overflow: float kWh
-
-    Returns:
-        bool
-    """
-    return remaining_overflow > 0.0
-
-
-def compute_overflow_window(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, sustained_slots=6):
-    """
-    Find the time window where PV excess exceeds the DNO limit.
-
-    Returns the first and last minute of sustained overflow. Uses hysteresis
-    (sustained_slots) to avoid brief cloud gaps splitting the window.
-
-    Args:
-        pv_forecast: dict {minute: value}
-        load_forecast: dict {minute: value}
-        dno_limit: float kW
-        start_minute: int — first minute to consider
-        end_minute: int — last minute (exclusive)
-        step_minutes: int
-        values_are_kwh: bool
-        sustained_slots: int — consecutive sub-DNO slots to end the window
-
-    Returns:
-        (overflow_start, overflow_end) — minutes from start_minute.
-        overflow_start = first minute where PV-load > DNO.
-        overflow_end = last minute where PV-load > DNO, extended past brief dips.
-        Returns (None, None) if no overflow found.
-    """
-    step_hours = step_minutes / 60.0
-    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
-
-    overflow_start = None
-    overflow_end = None
-    consecutive_below = 0
-
-    for m in range(start_minute, end_minute, step_minutes):
-        pv_kw = pv_forecast.get(m, 0.0) * to_kw
-        load_kw = load_forecast.get(m, 0.0) * to_kw
-        excess_kw = pv_kw - load_kw
-
-        if excess_kw > dno_limit:
-            if overflow_start is None:
-                overflow_start = m
-            overflow_end = m
-            consecutive_below = 0
-        elif overflow_start is not None:
-            consecutive_below += 1
-            if consecutive_below >= sustained_slots:
-                break  # sustained dip — overflow window is closed
-
-    return overflow_start, overflow_end
-
-
-def compute_post_overflow_energy(pv_forecast, load_forecast, after_minute, end_minute=1440, step_minutes=5, dno_limit=None, values_are_kwh=False):
-    """
-    Compute energy available for battery charging after the overflow window.
-
-    Sums min(max(0, PV-load), dno_limit) for each slot after after_minute.
-    This is the solar excess that can charge the battery when overflow has ended
-    (PV-load is positive but below DNO, so all excess can go to battery if
-    export is set to 0).
-
-    If dno_limit is None, no cap is applied (all PV-load excess counts).
-
-    Args:
-        pv_forecast: dict {minute: value}
-        load_forecast: dict {minute: value}
-        after_minute: int — first minute to consider (typically overflow_end + step)
-        end_minute: int — last minute (exclusive)
-        step_minutes: int
-        dno_limit: float kW or None — cap per-slot charging rate
-        values_are_kwh: bool
-
-    Returns:
-        float — total chargeable energy in kWh
-    """
-    step_hours = step_minutes / 60.0
-    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
-
-    total = 0.0
-    for m in range(after_minute, end_minute, step_minutes):
-        pv_kw = pv_forecast.get(m, 0.0) * to_kw
-        load_kw = load_forecast.get(m, 0.0) * to_kw
-        excess_kw = max(0.0, pv_kw - load_kw)
-        if dno_limit is not None:
-            excess_kw = min(excess_kw, dno_limit)
-        total += excess_kw * step_hours
-    return total
 
 
 def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, load_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, unmanaged=False):
@@ -297,10 +180,10 @@ def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dn
 
 def compute_tomorrow_forecast(pv_forecast, load_forecast, soc_max, dno_limit, start_minute, end_minute, step_minutes=5, values_are_kwh=True):
     """
-    Compute curtailment forecast for a future solar day.
+    Compute curtailment forecast for a future solar day (v10 logic).
 
-    Uses the same pure functions as real-time control but applied to a
-    future window (typically tomorrow). Returns a dict of forecast metrics.
+    Uses overflow-vs-headroom activation (same as live calculate()) applied
+    to a future window (typically tomorrow).
 
     Args:
         pv_forecast: dict {minute_from_now: value}
@@ -313,8 +196,7 @@ def compute_tomorrow_forecast(pv_forecast, load_forecast, soc_max, dno_limit, st
         values_are_kwh: bool — Predbat format (kWh per step)
 
     Returns:
-        dict with: total_overflow_kwh, floor_pct, will_activate,
-                   peak_soc_pct, morning_gap_kwh
+        dict with: total_overflow_kwh, floor_pct, will_activate, morning_gap_kwh
     """
     total_overflow = compute_remaining_overflow(
         pv_forecast,
@@ -326,19 +208,6 @@ def compute_tomorrow_forecast(pv_forecast, load_forecast, soc_max, dno_limit, st
         values_are_kwh=values_are_kwh,
     )
 
-    peak_soc, _, _ = simulate_soc_trajectory(
-        pv_forecast,
-        load_forecast,
-        soc_max,
-        soc_max,
-        dno_limit,
-        start_minute=start_minute,
-        end_minute=end_minute,
-        step_minutes=step_minutes,
-        values_are_kwh=values_are_kwh,
-        unmanaged=True,
-    )
-
     morning_gap = compute_morning_gap(
         pv_forecast,
         load_forecast,
@@ -348,14 +217,20 @@ def compute_tomorrow_forecast(pv_forecast, load_forecast, soc_max, dno_limit, st
         values_are_kwh=values_are_kwh,
     )
 
+    # Estimated SOC when overflow starts: battery at keep level after bridging morning gap
+    margin = 0.5
+    estimated_start_soc = morning_gap + margin
+
+    # Activation: overflow exceeds total headroom from estimated start
+    will_activate = total_overflow > (soc_max - estimated_start_soc)
+
     floor = max(0.0, soc_max - total_overflow)
     floor_pct = floor / soc_max * 100 if soc_max > 0 else 100
 
     return {
         "total_overflow_kwh": round(total_overflow, 2),
         "floor_pct": round(floor_pct, 1),
-        "will_activate": total_overflow > 0,
-        "peak_soc_pct": round(peak_soc / soc_max * 100, 1) if soc_max > 0 else 0,
+        "will_activate": will_activate,
         "morning_gap_kwh": round(morning_gap, 2),
     }
 
@@ -387,24 +262,22 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 
-def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, current_utc_hours, headroom_kwh=1.8):
+def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, current_utc_hours):
     """
-    Compute minutes from now until solar geometry release.
+    Compute minutes from now until PV drops below threshold (safe time).
 
     Models clear-sky PV as scale * sin(elevation). Finds when this drops
     below threshold_kw on the declining side of the solar curve.
-    Lead time is computed dynamically: headroom_kwh / charge_rate_at_crossing.
 
     Args:
-        scale: float kW — clear-sky scale (max_pv / sin(elevation_at_peak))
+        scale: float kW — clear-sky scale (peak_pv / sin(elevation_at_peak))
         lat_deg, lon_deg: location
         day_of_year: 1-366
         threshold_kw: PV level below which it's safe (DNO + min_base_load)
         current_utc_hours: decimal UTC hours now
-        headroom_kwh: float — battery headroom above floor (soc_max - soc_cap)
 
     Returns:
-        (minutes_until_release, crossing_utc_hours) or (None, None) if
+        (minutes_until_crossing, crossing_utc_hours) or (None, None) if
         cannot compute (scale too low, sun below horizon, etc.)
     """
     # Find solar noon
@@ -416,7 +289,7 @@ def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, cur
     noon_elev = solar_elevation(lat_deg, lon_deg, solar_noon_utc, day_of_year)
     peak_pv = scale * max(0.0, math.sin(math.radians(noon_elev)))
     if peak_pv < threshold_kw:
-        return 0, current_utc_hours  # peak can't reach threshold — release now
+        return 0, current_utc_hours  # peak can't reach threshold — safe now
 
     # Start scanning from the later of (now, solar noon)
     scan_start = max(current_utc_hours, solar_noon_utc)
@@ -434,10 +307,5 @@ def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, cur
     if crossing_utc is None:
         return None, None
 
-    # Dynamic lead time: how long to fill headroom at the charge rate near crossing
-    # At crossing, PV ≈ threshold, so charge rate ≈ threshold - min_base_load
-    charge_rate_at_crossing = max(threshold_kw - MIN_BASE_LOAD_KW, 0.5)
-    lead_hours = headroom_kwh / charge_rate_at_crossing
-    release_utc = crossing_utc - lead_hours
-    minutes_until = (release_utc - current_utc_hours) * 60.0
+    minutes_until = (crossing_utc - current_utc_hours) * 60.0
     return minutes_until, crossing_utc
