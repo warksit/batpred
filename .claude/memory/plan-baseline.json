@@ -1,0 +1,602 @@
+[
+  {
+    "time": "21:50",
+    "soc_percent": 62,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.39,
+    "curtailed": 0,
+    "cost": 2.21
+  },
+  {
+    "time": "22:00",
+    "soc_percent": 60,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.76,
+    "curtailed": 0,
+    "cost": 2.21
+  },
+  {
+    "time": "22:30",
+    "soc_percent": 55,
+    "state": "Chrg",
+    "target": "55",
+    "pv": 0.0,
+    "load": 0.5,
+    "curtailed": 0,
+    "cost": 2.28
+  },
+  {
+    "time": "23:00",
+    "soc_percent": 55,
+    "state": "HoldChrg",
+    "target": "55",
+    "pv": 0.0,
+    "load": 0.52,
+    "curtailed": 0,
+    "cost": 2.35
+  },
+  {
+    "time": "23:30",
+    "soc_percent": 55,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.51,
+    "curtailed": 0,
+    "cost": 2.35
+  },
+  {
+    "time": "00:00",
+    "soc_percent": 52,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.35,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "00:30",
+    "soc_percent": 50,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "01:00",
+    "soc_percent": 48,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.34,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "01:30",
+    "soc_percent": 46,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.33,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "02:00",
+    "soc_percent": 45,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.33,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "02:30",
+    "soc_percent": 43,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.31,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "03:00",
+    "soc_percent": 41,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.33,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "03:30",
+    "soc_percent": 39,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "04:00",
+    "soc_percent": 37,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "04:30",
+    "soc_percent": 35,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.3,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "05:00",
+    "soc_percent": 33,
+    "state": "HoldChrg",
+    "target": "30",
+    "pv": 0.0,
+    "load": 0.39,
+    "curtailed": 0,
+    "cost": 2.84
+  },
+  {
+    "time": "05:30",
+    "soc_percent": 31,
+    "state": "HoldChrg",
+    "target": "28",
+    "pv": 0.0,
+    "load": 1.22,
+    "curtailed": 0,
+    "cost": 2.95
+  },
+  {
+    "time": "06:00",
+    "soc_percent": 29,
+    "state": "HoldChrg",
+    "target": "22",
+    "pv": 0.0,
+    "load": 1.42,
+    "curtailed": 0,
+    "cost": 3.02
+  },
+  {
+    "time": "06:30",
+    "soc_percent": 23,
+    "state": "HoldChrg",
+    "target": "19",
+    "pv": 0.02,
+    "load": 1.45,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "07:00",
+    "soc_percent": 20,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.18,
+    "load": 1.19,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "07:30",
+    "soc_percent": 14,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.56,
+    "load": 0.37,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "08:00",
+    "soc_percent": 15,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.98,
+    "load": 0.45,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "08:30",
+    "soc_percent": 18,
+    "state": "Demand",
+    "target": "",
+    "pv": 1.31,
+    "load": 0.75,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "09:00",
+    "soc_percent": 20,
+    "state": "Demand",
+    "target": "",
+    "pv": 1.93,
+    "load": 1.2,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "09:30",
+    "soc_percent": 24,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.21,
+    "load": 0.56,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "10:00",
+    "soc_percent": 32,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.15,
+    "load": 0.46,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "10:30",
+    "soc_percent": 41,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.78,
+    "load": 0.48,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "11:00",
+    "soc_percent": 53,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.79,
+    "load": 0.46,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "11:30",
+    "soc_percent": 65,
+    "state": "Demand",
+    "target": "",
+    "pv": 3.52,
+    "load": 0.51,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "12:00",
+    "soc_percent": 80,
+    "state": "Demand",
+    "target": "",
+    "pv": 3.74,
+    "load": 0.92,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "12:30",
+    "soc_percent": 92,
+    "state": "Demand",
+    "target": "",
+    "pv": 4.04,
+    "load": 1.04,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "13:00",
+    "soc_percent": 97,
+    "state": "Demand",
+    "target": "",
+    "pv": 3.72,
+    "load": 1.2,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "13:30",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.63,
+    "load": 1.78,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "14:00",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.77,
+    "load": 1.8,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "14:30",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.21,
+    "load": 0.84,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "15:00",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 2.29,
+    "load": 0.49,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "15:30",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 1.93,
+    "load": 0.39,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "16:00",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 1.26,
+    "load": 0.44,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "16:30",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.75,
+    "load": 0.59,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "17:00",
+    "soc_percent": 100,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.3,
+    "load": 0.98,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "17:30",
+    "soc_percent": 96,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.03,
+    "load": 0.47,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "18:00",
+    "soc_percent": 93,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.64,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "18:30",
+    "soc_percent": 89,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.93,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "19:00",
+    "soc_percent": 84,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.75,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "19:30",
+    "soc_percent": 79,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.45,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "20:00",
+    "soc_percent": 77,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.57,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "20:30",
+    "soc_percent": 73,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.82,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "21:00",
+    "soc_percent": 68,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.95,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "21:30",
+    "soc_percent": 63,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.84,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "22:00",
+    "soc_percent": 58,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.45,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "22:30",
+    "soc_percent": 55,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "23:00",
+    "soc_percent": 53,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.3,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "23:30",
+    "soc_percent": 51,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.3,
+    "curtailed": 0,
+    "cost": 3.15
+  },
+  {
+    "time": "00:00",
+    "soc_percent": 50,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 3.64
+  },
+  {
+    "time": "00:30",
+    "soc_percent": 48,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 3.64
+  },
+  {
+    "time": "01:00",
+    "soc_percent": 46,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.34,
+    "curtailed": 0,
+    "cost": 3.64
+  },
+  {
+    "time": "01:30",
+    "soc_percent": 44,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.32,
+    "curtailed": 0,
+    "cost": 3.64
+  },
+  {
+    "time": "02:00",
+    "soc_percent": 42,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.34,
+    "curtailed": 0,
+    "cost": 3.64
+  },
+  {
+    "time": "02:30",
+    "soc_percent": 40,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.31,
+    "curtailed": 0,
+    "cost": 3.64
+  },
+  {
+    "time": "03:00",
+    "soc_percent": 38,
+    "state": "Demand",
+    "target": "",
+    "pv": 0.0,
+    "load": 0.33,
+    "curtailed": 0,
+    "cost": 3.64
+  }
+]
