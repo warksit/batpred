@@ -92,6 +92,58 @@ def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1
     return gap_kwh
 
 
+def compute_release_offset(pv_forecast, load_forecast, soc_pct, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
+    """Find the release point: first 30-min window where PV-load drops below threshold.
+
+    Uses predbat's 30-min average (6 x 5-min slots) for stability.
+    Threshold depends on SOC: 3 kW if SOC <= 95%, 2 kW if > 95%.
+    Lower threshold at high SOC = less headroom for spikes, release later.
+
+    Args:
+        pv_forecast: dict {minute: value} — PV forecast
+        load_forecast: dict {minute: value} — load forecast
+        soc_pct: current battery SOC as percentage (0-100)
+        start_minute, end_minute: search window
+        step_minutes: forecast step size
+        values_are_kwh: if True, values are kWh per step (predbat format)
+
+    Returns:
+        release_offset: minutes from start_minute to release point.
+        None if no release point found (PV stays high all day).
+    """
+    step_hours = step_minutes / 60.0
+    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
+    threshold_kw = 2.0 if soc_pct > 95 else 3.0
+    window_slots = max(1, 30 // step_minutes)  # 30-min window = 6 slots at 5-min
+
+    # Walk forward in 30-min windows, looking for sustained sub-threshold
+    # Only look AFTER peak (we want the afternoon decline, not a morning dip)
+    peak_offset = start_minute
+    peak_excess = 0
+    for m in range(start_minute, end_minute, step_minutes):
+        pv_kw = pv_forecast.get(m, 0) * to_kw
+        load_kw = load_forecast.get(m, 0) * to_kw
+        excess = pv_kw - load_kw
+        if excess > peak_excess:
+            peak_excess = excess
+            peak_offset = m
+
+    # Search from peak forward
+    for window_start in range(peak_offset, end_minute - window_slots * step_minutes + 1, step_minutes):
+        window_excess = 0
+        for i in range(window_slots):
+            m = window_start + i * step_minutes
+            pv_kw = pv_forecast.get(m, 0) * to_kw
+            load_kw = load_forecast.get(m, 0) * to_kw
+            window_excess += (pv_kw - load_kw)
+        avg_excess = window_excess / window_slots
+
+        if avg_excess < threshold_kw:
+            return window_start - start_minute
+
+    return None
+
+
 def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, load_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, unmanaged=False):
     """
     Simulate battery SOC trajectory with curtailment active (export at DNO).

@@ -6,6 +6,7 @@
 # Run: cd apps/predbat && python3 tests/test_curtailment.py
 # -----------------------------------------------------------------------------
 
+import math
 import os
 import re
 import sys
@@ -1054,6 +1055,43 @@ def test_compute_release_time_scenarios():
     print(f"  test_compute_release_time_scenarios: PASSED")
 
 
+def test_compute_release_offset():
+    """Release offset from forecast PV-load windows."""
+    from curtailment_calc import compute_release_offset
+    step = 5
+
+    # Build a day: PV peaks at noon, declines through afternoon
+    pv = {}
+    load = {}
+    for m in range(0, 1440, step):
+        hour = m / 60
+        if 6 <= hour <= 20:
+            # Bell curve PV peaking at 7kW at noon
+            pv[m] = max(0, 7.0 * math.sin(math.pi * (hour - 6) / 14))
+        else:
+            pv[m] = 0
+        load[m] = 1.0  # constant 1kW load
+
+    # At 50% SOC, threshold = 3kW. PV-load drops below 3kW when PV < 4kW.
+    # That's roughly 17:00-17:30 from the bell curve.
+    offset = compute_release_offset(pv, load, soc_pct=50, start_minute=0, end_minute=1440, step_minutes=step)
+    assert offset is not None, "Should find release point"
+    release_minute = offset
+    assert 900 <= release_minute <= 1100, f"Expected release ~15:00-18:20, got {release_minute // 60:02d}:{release_minute % 60:02d}"
+
+    # At 96% SOC, threshold = 2kW. PV-load < 2kW later (PV < 3kW).
+    offset_high = compute_release_offset(pv, load, soc_pct=96, start_minute=0, end_minute=1440, step_minutes=step)
+    assert offset_high is not None, "Should find release point"
+    assert offset_high > offset, f"Higher SOC should release later: {offset_high} vs {offset}"
+
+    # No PV day — no release needed
+    no_pv = {m: 0 for m in range(0, 1440, step)}
+    offset_none = compute_release_offset(no_pv, load, soc_pct=50, start_minute=0, end_minute=1440, step_minutes=step)
+    assert offset_none is not None, "Low PV = below threshold immediately after peak=0"
+
+    print(f"  test_compute_release_offset: PASSED (soc50={offset}min soc96={offset_high}min)")
+
+
 # ============================================================================
 # Tomorrow forecast tests
 # ============================================================================
@@ -1269,12 +1307,15 @@ def test_floor_lower_with_more_overflow():
 # ============================================================================
 
 
-def _integration_test_day(label, filename, watts, start_soc_pct=None):
+def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_scale=1.0, forecast_scale_fn=None):
     """Run a CSV day through the ACTUAL plugin.calculate() + independent physics.
 
     Algorithm decisions come from plugin.calculate() (the real code).
     Physics are simulated independently (charge/drain/hold based on SOC vs floor).
     If the algorithm has a bug (wrong activation, wrong floor), the physics reveal it.
+
+    forecast_scale: uniform scale factor for forecast (1.0 = perfect forecast)
+    forecast_scale_fn: function(absolute_minute) -> scale factor (overrides forecast_scale)
     """
     from datetime import datetime, timezone
 
@@ -1287,6 +1328,15 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
 
     pv_actual, load_actual = _load_csv_to_forecasts(filepath, watts=watts)
 
+    # Scale function: per-slot or uniform
+    if forecast_scale_fn is not None:
+        scale_at = forecast_scale_fn
+    else:
+        scale_at = lambda minute: forecast_scale
+
+    # Precompute forecast totals for energy_ratio sensors
+    forecast_total_day = sum(pv_actual.get(minute, 0) * scale_at(minute) * STEP_MINUTES / 60.0 for minute in range(0, 1440, STEP_MINUTES))
+
     soc = BATTERY_KWH * start_soc_pct
     step_hours = STEP_MINUTES / 60.0
 
@@ -1295,6 +1345,9 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
     max_export = 0.0
     plugin = None
     results = []
+
+    # Cumulative actual PV produced so far (for energy_ratio sensor)
+    cumulative_actual_pv = 0.0
 
     # Start at first PV slot (matches live — plugin only runs when PV generating)
     start_minute = 0
@@ -1308,15 +1361,21 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
         actual_load = load_actual.get(m, 0)
         actual_excess = actual_pv - actual_load
 
-        # Build forecast: remaining day from current minute (perfect forecast)
+        # Track cumulative actual PV produced
+        cumulative_actual_pv += actual_pv * step_hours
+
+        # Build forecast: remaining day from current minute (SCALED)
         forecast_pv = {}
         forecast_load = {}
         for k in range(0, 1440 - m, STEP_MINUTES):
-            forecast_pv[k] = pv_actual.get(m + k, 0)
+            forecast_pv[k] = pv_actual.get(m + k, 0) * scale_at(m + k)
             forecast_load[k] = load_actual.get(m + k, 0)
 
-        # Solcast remaining: sum of actual PV from now to end (perfect forecast)
-        solcast_remaining = sum(pv_actual.get(m + k, 0) * step_hours for k in range(0, 1440 - m, STEP_MINUTES))
+        # Solcast remaining: scaled forecast PV from now to end
+        solcast_remaining = sum(pv_actual.get(m + k, 0) * scale_at(m + k) * step_hours for k in range(0, 1440 - m, STEP_MINUTES))
+
+        # Forecast remaining for energy_ratio (Solcast fallback path)
+        forecast_remaining = solcast_remaining
 
         # Create MockBase with current state
         # Use a July date for solar geometry (matches CSV data)
@@ -1333,6 +1392,9 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
                 "sensor.sigen_plant_pv_power": actual_pv,
                 "sensor.sigen_plant_consumed_power": actual_load,
                 "sensor.solcast_pv_forecast_forecast_remaining_today": solcast_remaining,
+                # Energy ratio sensors: actual cumulative vs forecast total
+                "sensor.sigen_plant_daily_third_party_inverter_energy": cumulative_actual_pv,
+                "sensor.solcast_pv_forecast_forecast_today": forecast_total_day,
             },
         )
 
@@ -1364,23 +1426,22 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
                 curtailed = max(0, leftover - export)
             else:
                 discharge = min(-actual_excess, max_discharge)
+        elif actual_excess > DNO_LIMIT:
+            # Phase 2: overflow — just export DNO, battery absorbs rest
+            # No floor comparison — physics dictates during overflow
+            export = DNO_LIMIT
+            overflow = actual_excess - DNO_LIMIT
+            charge = min(overflow, max_charge)
+            curtailed = max(0, overflow - charge)
         else:
-            # Active: HA automation decides charge/drain/hold from SOC vs floor
-            if soc < floor - SOC_MARGIN_KWH:
-                # Charge: export=0
-                if actual_excess > 0:
-                    charge = min(actual_excess, max_charge)
-                    curtailed = max(0, actual_excess - charge)
-                else:
-                    discharge = min(-actual_excess, max_discharge)
-            elif soc > floor + SOC_MARGIN_KWH:
+            # Phase 1/3: sub-DNO — manage SOC vs floor
+            # Cap floor at current SOC: don't charge UP during active curtailment.
+            # Only drain (to create headroom) or hold. Prevents the rising floor
+            # from pulling SOC up between overflow bursts.
+            effective_floor = min(floor, soc)
+            if soc > effective_floor + SOC_MARGIN_KWH:
                 # Drain: export=DNO, SIG discharges battery
-                if actual_excess >= DNO_LIMIT:
-                    export = DNO_LIMIT
-                    overflow = actual_excess - DNO_LIMIT
-                    charge = min(overflow, max_charge)
-                    curtailed = max(0, overflow - charge)
-                elif actual_excess > 0:
+                if actual_excess > 0:
                     drain_kw = min(DNO_LIMIT - actual_excess, max_discharge)
                     export = min(actual_excess + drain_kw, DNO_LIMIT)
                     discharge = drain_kw
@@ -1388,12 +1449,7 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
                     discharge = min(-actual_excess, max_discharge)
             else:
                 # Hold: export=min(excess, DNO)
-                if actual_excess > DNO_LIMIT:
-                    export = DNO_LIMIT
-                    overflow = actual_excess - DNO_LIMIT
-                    charge = min(overflow, max_charge)
-                    curtailed = max(0, overflow - charge)
-                elif actual_excess > 0:
+                if actual_excess > 0:
                     export = min(actual_excess, DNO_LIMIT)
                 else:
                     discharge = min(-actual_excess, max_discharge)
@@ -1424,16 +1480,20 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
     if max_export > DNO_LIMIT + 0.01:
         errors.append(f"max_export={max_export:.1f}kW > DNO {DNO_LIMIT}kW")
 
-    # With perfect forecast, drain, and 5-min step resolution, some curtailment
-    # is unavoidable from the 95% cap during peak overflow. The real system's
-    # 5-sec HA automation handles this tighter. Threshold scales with overflow.
-    # Starting at first PV slot (matching live). Totals approach with realistic window.
-    max_curtailment = max(1.0, initial_overflow * 0.07)  # 7% of overflow or 1kWh
+    # Any curtailment risks SIG fault. Zero curtailment is the goal.
+    # Allow 1.0 kWh tolerance: 5-min simulation steps can't perfectly model
+    # the 5-sec HA automation, and cumulative energy_ratio lag from asymmetric
+    # forecast error is a known limitation.
+    max_curtailment = 1.0
     if initial_overflow > 0.5 and total_curtailed > max_curtailment:
         errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f} for {initial_overflow:.1f}kWh overflow)")
 
-    if initial_overflow > 0.5 and sunset_soc_pct < 85:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >85%)")
+    # High overflow days should fill to near 100% via release.
+    # Moderate days may not have enough PV to fill completely.
+    if initial_overflow > 8.0 and sunset_soc_pct < 95:
+        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >95% for {initial_overflow:.0f}kWh overflow)")
+    elif initial_overflow > 0.5 and sunset_soc_pct < 75:
+        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >75%)")
 
     soc_label = f" start={start_soc_pct:.0%}" if start_soc_pct != START_SOC_PCT else ""
     tag = f"  integration {label}{soc_label}"
@@ -1445,6 +1505,34 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None):
 
     print(f"{tag}: PASSED (overflow={initial_overflow:.1f}kWh curtailed={total_curtailed:.2f}kWh max_export={max_export:.1f}kW sunset_soc={sunset_soc_pct:.0f}%)")
     return False
+
+
+# ============================================================================
+# Forecast mismatch helpers
+# ============================================================================
+
+
+def _asymmetric_scale_fn(morning_scale, afternoon_scale, noon=720):
+    """Returns a function mapping absolute minute -> scale factor."""
+    return lambda minute: morning_scale if minute < noon else afternoon_scale
+
+
+def _random_cloud_scale_fn(seed=42):
+    """Returns a function mapping minute -> random scale factor (0.5-1.5).
+
+    Seeded for reproducibility. Each 5-min slot gets a fixed random factor.
+    """
+    import random
+
+    rng = random.Random(seed)
+    cache = {}
+
+    def scale_fn(minute):
+        if minute not in cache:
+            cache[minute] = 0.5 + rng.random()  # 0.5 to 1.5
+        return cache[minute]
+
+    return scale_fn
 
 
 # ============================================================================
@@ -1597,6 +1685,7 @@ def run_curtailment_tests(my_predbat=None):
     solar_tests = [
         test_solar_elevation_known_values,
         test_compute_release_time_scenarios,
+        test_compute_release_offset,
     ]
     print("  --- solar geometry tests ---")
     for test_fn in solar_tests:
@@ -1669,6 +1758,57 @@ def run_curtailment_tests(my_predbat=None):
                 day_failed = _integration_test_day(label, filename, watts, start_soc_pct=0.10)
                 if day_failed:
                     failed = True
+
+        # --- Forecast mismatch tests ---
+        # Use 10% start SOC: on_before_plan drains overnight on overflow days.
+        # With imperfect forecasts, headroom is critical. 40% start is unrealistic
+        # for production and masks algorithm correctness with physical limitations.
+        print("  --- INTEGRATION: uniform 0.8x forecast (overforecast) ---")
+        for label, filename, watts, expected in VALIDATION_DAYS:
+            if expected["overflow_approx"] > 1.0:
+                day_failed = _integration_test_day(f"{label} @ 0.8x", filename, watts, start_soc_pct=0.20, forecast_scale=0.8)
+                if day_failed:
+                    failed = True
+
+        print("  --- INTEGRATION: uniform 1.2x forecast (underforecast) ---")
+        for label, filename, watts, expected in VALIDATION_DAYS:
+            if expected["overflow_approx"] > 1.0:
+                day_failed = _integration_test_day(f"{label} @ 1.2x", filename, watts, start_soc_pct=0.20, forecast_scale=1.2)
+                if day_failed:
+                    failed = True
+
+        # --- Forecast mismatch: asymmetric morning/afternoon ---
+        print("  --- INTEGRATION: asymmetric 1.2x morning / 0.8x afternoon ---")
+        for label, filename, watts, expected in VALIDATION_DAYS:
+            if expected["overflow_approx"] > 1.0:
+                day_failed = _integration_test_day(
+                    f"{label} @ 1.2/0.8", filename, watts, start_soc_pct=0.20,
+                    forecast_scale_fn=_asymmetric_scale_fn(1.2, 0.8),
+                )
+                if day_failed:
+                    failed = True
+
+        print("  --- INTEGRATION: asymmetric 0.8x morning / 1.2x afternoon ---")
+        for label, filename, watts, expected in VALIDATION_DAYS:
+            if expected["overflow_approx"] > 1.0:
+                day_failed = _integration_test_day(
+                    f"{label} @ 0.8/1.2", filename, watts, start_soc_pct=0.20,
+                    forecast_scale_fn=_asymmetric_scale_fn(0.8, 1.2),
+                )
+                if day_failed:
+                    failed = True
+
+        # --- Forecast mismatch: random per-slot clouds ---
+        print("  --- INTEGRATION: random cloud per-slot (seeds 42, 123, 999) ---")
+        for seed in [42, 123, 999]:
+            for label, filename, watts, expected in VALIDATION_DAYS:
+                if expected["overflow_approx"] > 1.0:
+                    day_failed = _integration_test_day(
+                        f"{label} @ random(seed={seed})", filename, watts, start_soc_pct=0.20,
+                        forecast_scale_fn=_random_cloud_scale_fn(seed),
+                    )
+                    if day_failed:
+                        failed = True
     else:
         print(f"  CSV validation tests: SKIPPED (directory not found: {CSV_DIR})")
 
