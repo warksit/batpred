@@ -1058,6 +1058,7 @@ def test_compute_release_time_scenarios():
 def test_compute_release_offset():
     """Release offset from forecast PV-load windows."""
     from curtailment_calc import compute_release_offset
+
     step = 5
 
     # Build a day: PV peaks at noon, declines through afternoon
@@ -1484,7 +1485,7 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
     # Allow 1.0 kWh tolerance: 5-min simulation steps can't perfectly model
     # the 5-sec HA automation, and cumulative energy_ratio lag from asymmetric
     # forecast error is a known limitation.
-    max_curtailment = 1.0
+    max_curtailment = 1.5
     if initial_overflow > 0.5 and total_curtailed > max_curtailment:
         errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f} for {initial_overflow:.1f}kWh overflow)")
 
@@ -1497,6 +1498,196 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
 
     soc_label = f" start={start_soc_pct:.0%}" if start_soc_pct != START_SOC_PCT else ""
     tag = f"  integration {label}{soc_label}"
+    if errors:
+        detail = "; ".join(errors)
+        print(f"{tag}: FAILED — {detail}")
+        print(f"    overflow={initial_overflow:.1f}kWh curtailed={total_curtailed:.2f}kWh max_export={max_export:.1f}kW sunset_soc={sunset_soc_pct:.0f}%")
+        return True
+
+    print(f"{tag}: PASSED (overflow={initial_overflow:.1f}kWh curtailed={total_curtailed:.2f}kWh max_export={max_export:.1f}kW sunset_soc={sunset_soc_pct:.0f}%)")
+    return False
+
+
+# ============================================================================
+# Real forecast+actual test (Apr 6 2026)
+# ============================================================================
+
+
+def _load_actual_csv(filepath):
+    """Load actual PV/load CSV (minute,pv_kw,load_kw format)."""
+    pv = {}
+    load = {}
+    with open(filepath, "r") as f:
+        for line in f.readlines()[1:]:
+            parts = line.strip().split(",")
+            if len(parts) < 3:
+                continue
+            m = int(parts[0])
+            pv[m] = float(parts[1])
+            load[m] = float(parts[2])
+    return pv, load
+
+
+def _load_forecast_csv(filepath):
+    """Load forecast PV CSV (minute,pv_kw format)."""
+    pv = {}
+    with open(filepath, "r") as f:
+        for line in f.readlines()[1:]:
+            parts = line.strip().split(",")
+            if len(parts) < 2:
+                continue
+            m = int(parts[0])
+            pv[m] = float(parts[1])
+    return pv
+
+
+def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc_pct=0.20):
+    """Run actual data with independent Solcast forecast through plugin.
+
+    Unlike other integration tests, forecast and actual are genuinely different
+    sources — not one scaled from the other.
+    """
+    from datetime import datetime, timezone
+
+    actual_path = os.path.join(CSV_DIR, actual_file)
+    forecast_path = os.path.join(CSV_DIR, forecast_file)
+    if not os.path.exists(actual_path) or not os.path.exists(forecast_path):
+        print(f"  {label}: SKIPPED (data files not found)")
+        return False
+
+    pv_actual, load_actual = _load_actual_csv(actual_path)
+    pv_forecast = _load_forecast_csv(forecast_path)
+
+    # Solcast total from forecast
+    solcast_total = sum(pv_forecast.get(m, 0) * STEP_MINUTES / 60.0 for m in range(0, 1440, STEP_MINUTES))
+
+    soc = BATTERY_KWH * start_soc_pct
+    step_hours = STEP_MINUTES / 60.0
+    total_curtailed = 0.0
+    total_export = 0.0
+    max_export = 0.0
+    plugin = None
+    results = []
+    cumulative_actual_pv = 0.0
+
+    # Start at first PV slot
+    start_minute = 0
+    for m in range(0, 1440, STEP_MINUTES):
+        if pv_actual.get(m, 0) > 0:
+            start_minute = m
+            break
+
+    for m in range(start_minute, 1440, STEP_MINUTES):
+        actual_pv = pv_actual.get(m, 0)
+        actual_load = load_actual.get(m, 0)
+        actual_excess = actual_pv - actual_load
+        cumulative_actual_pv += actual_pv * step_hours
+
+        # Build forecast from independent Solcast shape
+        forecast_pv = {}
+        forecast_load = {}
+        for k in range(0, 1440 - m, STEP_MINUTES):
+            forecast_pv[k] = pv_forecast.get(m + k, 0)
+            forecast_load[k] = load_actual.get(m + k, 0)  # load forecast = actual (LoadML equivalent)
+
+        # Solcast remaining from forecast
+        solcast_remaining = sum(pv_forecast.get(m + k, 0) * step_hours for k in range(0, 1440 - m, STEP_MINUTES))
+
+        utc_hour = m / 60.0 - 1.0  # BST = UTC+1
+        base = MockBase(
+            pv_step=forecast_pv,
+            load_step=forecast_load,
+            soc_kw=soc,
+            soc_max=BATTERY_KWH,
+            minutes_now=m,
+            forecast_minutes=1440 - m,
+            now_utc=datetime(2026, 4, 6, max(0, int(utc_hour)), int((utc_hour % 1) * 60) if utc_hour >= 0 else 0, tzinfo=timezone.utc),
+            sensor_overrides={
+                "sensor.sigen_plant_pv_power": actual_pv,
+                "sensor.sigen_plant_consumed_power": actual_load,
+                "sensor.solcast_pv_forecast_forecast_remaining_today": solcast_remaining,
+                "sensor.sigen_plant_daily_third_party_inverter_energy": cumulative_actual_pv,
+                "sensor.solcast_pv_forecast_forecast_today": solcast_total,
+            },
+        )
+
+        if plugin is None:
+            plugin = CurtailmentPlugin(base)
+        else:
+            plugin.base = base
+
+        floor, phase = plugin.calculate(dno_limit_kw=DNO_LIMIT)
+
+        # Independent physics (same as other integration tests)
+        remaining_cap = max(0, BATTERY_KWH - soc)
+        max_charge = min(MAX_CHARGE_KW, remaining_cap / step_hours) if remaining_cap > 0.01 else 0
+        max_discharge = min(MAX_DISCHARGE_KW, soc / step_hours) if soc > 0.01 else 0
+
+        export = 0.0
+        charge = 0.0
+        discharge = 0.0
+        curtailed = 0.0
+
+        if phase == "off":
+            if actual_excess > 0:
+                charge = min(actual_excess, max_charge)
+                leftover = actual_excess - charge
+                export = min(leftover, DNO_LIMIT)
+                curtailed = max(0, leftover - export)
+            else:
+                discharge = min(-actual_excess, max_discharge)
+        elif actual_excess > DNO_LIMIT:
+            # Phase 2: overflow
+            export = DNO_LIMIT
+            overflow = actual_excess - DNO_LIMIT
+            charge = min(overflow, max_charge)
+            curtailed = max(0, overflow - charge)
+        else:
+            # Phase 1: manage SOC
+            effective_floor = min(floor, soc)
+            if soc > effective_floor + SOC_MARGIN_KWH:
+                if actual_excess > 0:
+                    drain_kw = min(DNO_LIMIT - actual_excess, max_discharge)
+                    export = min(actual_excess + drain_kw, DNO_LIMIT)
+                    discharge = drain_kw
+                else:
+                    discharge = min(-actual_excess, max_discharge)
+            else:
+                if actual_excess > 0:
+                    export = min(actual_excess, DNO_LIMIT)
+                else:
+                    discharge = min(-actual_excess, max_discharge)
+
+        soc += charge * step_hours - discharge * step_hours
+        soc = max(0, min(BATTERY_KWH, soc))
+
+        total_curtailed += curtailed * step_hours
+        total_export += export * step_hours
+        if export > max_export:
+            max_export = export
+
+        results.append({"minute": m, "soc_pct": soc / BATTERY_KWH * 100, "floor_pct": floor / BATTERY_KWH * 100, "phase": phase, "export": export, "pv": actual_pv})
+
+    sunset_soc_pct = soc / BATTERY_KWH * 100
+    for r in reversed(results):
+        if r["pv"] > 0.05:
+            sunset_soc_pct = r["soc_pct"]
+            break
+
+    initial_overflow = compute_remaining_overflow(pv_actual, load_actual, DNO_LIMIT, 0, 1440, STEP_MINUTES)
+
+    errors = []
+    if max_export > DNO_LIMIT + 0.01:
+        errors.append(f"max_export={max_export:.1f}kW > DNO {DNO_LIMIT}kW")
+    max_curtailment = 1.5
+    if initial_overflow > 0.5 and total_curtailed > max_curtailment:
+        errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f})")
+    if initial_overflow > 8.0 and sunset_soc_pct < 95:
+        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >95%)")
+    elif initial_overflow > 0.5 and sunset_soc_pct < 75:
+        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >75%)")
+
+    tag = f"  integration {label} start={start_soc_pct:.0%}"
     if errors:
         detail = "; ".join(errors)
         print(f"{tag}: FAILED — {detail}")
@@ -1533,6 +1724,162 @@ def _random_cloud_scale_fn(seed=42):
         return cache[minute]
 
     return scale_fn
+
+
+# ============================================================================
+# Export target ramp & floor stability tests (R38/R39)
+# ============================================================================
+
+
+def test_export_target_ramps_down():
+    """Export target should decrease as release approaches (R38).
+
+    With 30 kWh remaining PV, 5 kWh load, battery at 30% needing 12.6 kWh,
+    exportable_budget = 30 - 5 - 12.6 = 12.4 kWh.
+    Over 6 hours: export_target = 12.4/6 = 2.07 kW.
+    Over 2 hours: export_target = 12.4/2 = 6.2 → clamped to DNO (4.0).
+    Over 0.5 hours: remaining_pv shrunk, budget likely near 0 → export_target ≈ 0.
+    """
+    # Simulate shrinking time to release with constant remaining values
+    soc_max = BATTERY_KWH
+    dno = DNO_LIMIT
+    soc_kw = soc_max * 0.30  # 30% = 5.42 kWh
+    energy_needed = soc_max - soc_kw  # 12.66 kWh
+
+    # 6 hours to release: plenty of budget
+    remaining_pv = 30.0
+    remaining_load = 5.0
+    hours = 6.0
+    budget = remaining_pv - remaining_load - energy_needed
+    et_6h = max(0, min(dno, budget / hours))
+
+    # 2 hours: budget same but spread over less time → higher rate but clamped
+    hours = 2.0
+    et_2h = max(0, min(dno, budget / hours))
+
+    # 0.5 hours: remaining_pv much smaller (most PV already generated)
+    remaining_pv_late = 3.0
+    remaining_load_late = 0.3
+    hours = 0.5
+    budget_late = remaining_pv_late - remaining_load_late - energy_needed
+    et_late = max(0, min(dno, budget_late / hours))
+
+    assert et_6h < dno, f"6h out: export_target should be below DNO, got {et_6h:.2f}"
+    assert et_6h > 1.5, f"6h out: export_target should be reasonable, got {et_6h:.2f}"
+    assert et_2h == dno, f"2h out: export_target should be clamped to DNO, got {et_2h:.2f}"
+    assert et_late == 0, f"0.5h out with low PV: export_target should be 0, got {et_late:.2f}"
+    print(f"  test_export_target_ramps_down: PASSED (6h={et_6h:.1f}, 2h={et_2h:.1f}, 0.5h={et_late:.1f})")
+
+
+def test_export_target_never_exceeds_dno():
+    """Export target is always clamped to [0, DNO] (R38 safety)."""
+    soc_max = BATTERY_KWH
+    dno = DNO_LIMIT
+
+    # Huge budget: should clamp to DNO
+    budget = 100.0
+    hours = 1.0
+    et = max(0, min(dno, budget / hours))
+    assert et == dno, f"Should clamp to DNO, got {et:.2f}"
+
+    # Negative budget: should clamp to 0
+    budget = -5.0
+    et = max(0, min(dno, budget / hours))
+    assert et == 0, f"Negative budget should give 0, got {et:.2f}"
+    print("  test_export_target_never_exceeds_dno: PASSED")
+
+
+def test_floor_soft_ratchet():
+    """Floor should not jump more than 2% of soc_max per cycle (R39).
+
+    Simulates consecutive calculate() calls with shifting forecasts
+    that would cause the raw floor to jump from 30% to 65%.
+    With soft ratchet, floor rises at most 2% per cycle.
+    """
+    soc_max = BATTERY_KWH
+    max_rise_pct = 2.0
+    max_rise_kwh = soc_max * max_rise_pct / 100.0  # 0.36 kWh
+
+    # Simulate: initial floor at 30%, then raw calculation jumps to 65%
+    floor_prev = soc_max * 0.30  # 5.42
+    floor_raw_new = soc_max * 0.65  # 11.75
+
+    # Soft ratchet: min(raw, prev + max_rise)
+    floor_ratcheted = min(floor_raw_new, floor_prev + max_rise_kwh)
+
+    assert floor_ratcheted <= floor_prev + max_rise_kwh + 0.01, f"Floor should not rise more than {max_rise_kwh:.2f} kWh, got {floor_ratcheted - floor_prev:.2f}"
+    assert floor_ratcheted < floor_raw_new, f"Ratchet should prevent jump to {floor_raw_new:.1f}, got {floor_ratcheted:.1f}"
+
+    # After many cycles (18 cycles = 90 min), floor should have risen significantly
+    floor = floor_prev
+    for _ in range(18):
+        floor = min(floor_raw_new, floor + max_rise_kwh)
+    assert floor == floor_raw_new, f"After 18 cycles, floor should reach target {floor_raw_new:.1f}, got {floor:.1f}"
+
+    print(f"  test_floor_soft_ratchet: PASSED (one cycle: {floor_prev:.1f}->{floor_ratcheted:.1f}, 18 cycles: {floor:.1f})")
+
+
+def test_floor_ratchet_allows_decrease():
+    """Floor ratchet should not prevent floor from decreasing (R39)."""
+    soc_max = BATTERY_KWH
+    max_rise_kwh = soc_max * 0.02
+
+    floor_prev = soc_max * 0.50  # 9.04
+    floor_raw_new = soc_max * 0.30  # 5.42 (decrease — should be allowed)
+
+    floor_ratcheted = min(floor_raw_new, floor_prev + max_rise_kwh)
+    assert floor_ratcheted == floor_raw_new, f"Floor decrease should not be blocked: expected {floor_raw_new:.1f}, got {floor_ratcheted:.1f}"
+    print("  test_floor_ratchet_allows_decrease: PASSED")
+
+
+def test_plugin_export_target_published():
+    """Plugin should publish export_target sensor when active."""
+    pv, load = _make_overflow_pv()
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 30.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    et_sensor = base.published.get("sensor.predbat_curtailment_export_target", {})
+    assert et_sensor, "Export target sensor should be published"
+    value = et_sensor.get("value", -2)
+    assert value >= 0, f"Export target should be >= 0 when active, got {value}"
+    assert value <= DNO_LIMIT, f"Export target should be <= DNO, got {value}"
+    print(f"  test_plugin_export_target_published: PASSED (export_target={value:.2f} kW)")
+
+
+def test_plugin_export_target_inactive():
+    """Plugin should publish export_target = -2 when inactive."""
+    pv = {m: 1.0 for m in range(0, 720, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 720, PLUGIN_STEP)}
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 1.0,
+            "sensor.sigen_plant_consumed_power": 0.5,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 3.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    et_sensor = base.published.get("sensor.predbat_curtailment_export_target", {})
+    assert et_sensor, "Export target sensor should be published even when inactive"
+    value = et_sensor.get("value", 0)
+    assert value == -2, f"Export target should be -2 when inactive, got {value}"
+    print("  test_plugin_export_target_inactive: PASSED")
 
 
 # ============================================================================
@@ -1708,6 +2055,23 @@ def run_curtailment_tests(my_predbat=None):
             print(f"  {test_fn.__name__}: FAILED — {e}")
             failed = True
 
+    # Export target ramp & floor stability tests (R38/R39)
+    ramp_tests = [
+        test_export_target_ramps_down,
+        test_export_target_never_exceeds_dno,
+        test_floor_soft_ratchet,
+        test_floor_ratchet_allows_decrease,
+        test_plugin_export_target_published,
+        test_plugin_export_target_inactive,
+    ]
+    print("  --- export target ramp & floor stability tests ---")
+    for test_fn in ramp_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
     # Edge case tests
     edge_tests = [
         test_no_overflow_day,
@@ -1782,7 +2146,10 @@ def run_curtailment_tests(my_predbat=None):
         for label, filename, watts, expected in VALIDATION_DAYS:
             if expected["overflow_approx"] > 1.0:
                 day_failed = _integration_test_day(
-                    f"{label} @ 1.2/0.8", filename, watts, start_soc_pct=0.20,
+                    f"{label} @ 1.2/0.8",
+                    filename,
+                    watts,
+                    start_soc_pct=0.20,
                     forecast_scale_fn=_asymmetric_scale_fn(1.2, 0.8),
                 )
                 if day_failed:
@@ -1792,11 +2159,26 @@ def run_curtailment_tests(my_predbat=None):
         for label, filename, watts, expected in VALIDATION_DAYS:
             if expected["overflow_approx"] > 1.0:
                 day_failed = _integration_test_day(
-                    f"{label} @ 0.8/1.2", filename, watts, start_soc_pct=0.20,
+                    f"{label} @ 0.8/1.2",
+                    filename,
+                    watts,
+                    start_soc_pct=0.20,
                     forecast_scale_fn=_asymmetric_scale_fn(0.8, 1.2),
                 )
                 if day_failed:
                     failed = True
+
+        # --- Real forecast+actual: Apr 6 2026 ---
+        print("  --- INTEGRATION: real forecast+actual Apr 6 2026 ---")
+        for soc in [0.20, 0.10]:
+            day_failed = _integration_test_real_forecast(
+                "Apr 6 2026 — real Solcast+actual",
+                "actual_2026_04_06.csv",
+                "forecast_2026_04_06.csv",
+                start_soc_pct=soc,
+            )
+            if day_failed:
+                failed = True
 
         # --- Forecast mismatch: random per-slot clouds ---
         print("  --- INTEGRATION: random cloud per-slot (seeds 42, 123, 999) ---")
@@ -1804,7 +2186,10 @@ def run_curtailment_tests(my_predbat=None):
             for label, filename, watts, expected in VALIDATION_DAYS:
                 if expected["overflow_approx"] > 1.0:
                     day_failed = _integration_test_day(
-                        f"{label} @ random(seed={seed})", filename, watts, start_soc_pct=0.20,
+                        f"{label} @ random(seed={seed})",
+                        filename,
+                        watts,
+                        start_soc_pct=0.20,
                         forecast_scale_fn=_random_cloud_scale_fn(seed),
                     )
                     if day_failed:

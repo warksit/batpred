@@ -114,32 +114,36 @@ def compute_release_offset(pv_forecast, load_forecast, soc_pct, start_minute=0, 
     step_hours = step_minutes / 60.0
     to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
     threshold_kw = 2.0 if soc_pct > 95 else 3.0
-    window_slots = max(1, 30 // step_minutes)  # 30-min window = 6 slots at 5-min
+    window_minutes = 30
+    window_slots = max(1, window_minutes // step_minutes)
 
-    # Walk forward in 30-min windows, looking for sustained sub-threshold
-    # Only look AFTER peak (we want the afternoon decline, not a morning dip)
-    peak_offset = start_minute
-    peak_excess = 0
-    for m in range(start_minute, end_minute, step_minutes):
-        pv_kw = pv_forecast.get(m, 0) * to_kw
-        load_kw = load_forecast.get(m, 0) * to_kw
-        excess = pv_kw - load_kw
-        if excess > peak_excess:
-            peak_excess = excess
-            peak_offset = m
-
-    # Search from peak forward
-    for window_start in range(peak_offset, end_minute - window_slots * step_minutes + 1, step_minutes):
-        window_excess = 0
+    # Build 30-min windows aligned to 30-min boundaries (like predbat plan table)
+    # Each window tracks the MAX excess across its 5-min slots — spikes matter
+    windows = []
+    for w_start in range(start_minute, end_minute, window_minutes):
+        max_excess = 0
         for i in range(window_slots):
-            m = window_start + i * step_minutes
+            m = w_start + i * step_minutes
+            if m >= end_minute:
+                break
             pv_kw = pv_forecast.get(m, 0) * to_kw
             load_kw = load_forecast.get(m, 0) * to_kw
-            window_excess += (pv_kw - load_kw)
-        avg_excess = window_excess / window_slots
+            max_excess = max(max_excess, pv_kw - load_kw)
+        windows.append((w_start, max_excess))
 
-        if avg_excess < threshold_kw:
-            return window_start - start_minute
+    # Find peak window (search from peak forward for release)
+    peak_idx = 0
+    peak_kw = 0
+    for i, (w_start, max_kw) in enumerate(windows):
+        if max_kw > peak_kw:
+            peak_kw = max_kw
+            peak_idx = i
+
+    # First 30-min window after peak where NO slot exceeds threshold
+    for i in range(peak_idx, len(windows)):
+        w_start, max_kw = windows[i]
+        if max_kw < threshold_kw:
+            return w_start - start_minute
 
     return None
 

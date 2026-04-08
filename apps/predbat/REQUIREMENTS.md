@@ -91,6 +91,24 @@ No export capacity in the activation check — export is what management DOES, n
 - **R29**: Tomorrow forecast waits until today's PV is done (last forecast PV slot < 30 min away). Shows "Pending" with estimated availability time while waiting. Shows clean zeroed attributes when Inactive.
 - **R30**: Tomorrow sensor uses SAME `_compute_absorption` function as live (R31). Solcast tomorrow total for PV. Per-slot shape for release fraction. Cached for 30 minutes.
 
+## Export Target Ramp
+
+- **R38**: Export target ramps from DNO toward 0 as release approaches:
+  `export_target = clamp(0, DNO, exportable_budget / hours_to_release)` where
+  `exportable_budget = remaining_pv - remaining_load - energy_still_needed`.
+  Published as `sensor.predbat_curtailment_export_target`. HA automation uses
+  this instead of hardcoded DNO for Drain and Hold export limits.
+  When inactive, value = -2 (automation falls back to DNO).
+
+## Floor & Release Stability
+
+- **R39**: Soft floor ratchet: floor can rise at most 2% of soc_max per 5-min
+  cycle. Prevents oscillation from forecast updates while allowing floor to
+  track remaining PV (R13). Reset on deactivation.
+  Release offset hysteresis: release time can move earlier freely but later
+  by at most 15 minutes per cycle. Prevents balance_end jumps that destabilize
+  floor and absorption calculations. Reset on deactivation.
+
 ## Testing
 
 - **R34**: Integration tests run ACTUAL plugin.calculate() against CSV data with independent physics simulation. Algorithm bugs cannot hide in reimplemented simulation logic.
