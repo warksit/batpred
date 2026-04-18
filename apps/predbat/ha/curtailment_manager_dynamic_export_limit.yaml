@@ -34,6 +34,8 @@ trigger:
   - entity_id: sensor.predbat_curtailment_target_soc
     id: target_change
     platform: state
+  - entity_id: input_boolean.curtailment_manual_hold
+    platform: state
 
 condition:
   - condition: or
