@@ -1,0 +1,107 @@
+# Curtailment Manager - Dynamic Export Limit
+# HA automation: real-time (5-sec) export control for curtailment system.
+#
+# Three-phase logic:
+#   Manual Hold: export = min(excess, DNO) — bypasses plugin, forces hold at DNO
+#   Drain:       SOC > floor → export = min(export_cap, DNO) — drain battery pre-overflow
+#   Hold:        SOC <= floor → export = min(excess, export_cap, DNO) — hold at floor
+#
+# export_cap comes from sensor.predbat_curtailment_export_target (ramp sensor).
+# Falls back to DNO if sensor is unavailable or -2 (inactive).
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+# Deploy: paste into HA automation editor (raw config mode).
+
+id: "1773747411848"
+alias: "Curtailment Manager - Dynamic Export Limit"
+description: >-
+  Three-phase export control with ramp-down and manual hold override.
+  When manual_hold is on: export min(excess, DNO) regardless of plugin phase.
+  When off: SOC > floor exports at export_target (drain), SOC <= floor exports
+  min(excess, export_target) (hold).
+mode: single
+
+trigger:
+  - entity_id: sensor.sigen_plant_pv_power
+    id: pv_load_change
+    platform: state
+  - entity_id: sensor.sigen_plant_consumed_power
+    id: pv_load_change
+    platform: state
+  - entity_id: sensor.sigen_plant_battery_state_of_charge
+    id: soc_change
+    platform: state
+  - entity_id: sensor.predbat_curtailment_target_soc
+    id: target_change
+    platform: state
+
+condition:
+  - condition: or
+    conditions:
+      - condition: state
+        entity_id: input_boolean.curtailment_manual_hold
+        state: "on"
+      - condition: and
+        conditions:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.predbat_curtailment_phase
+                state:
+                  - unavailable
+                  - unknown
+                  - "Off"
+          - condition: state
+            entity_id: select.sigen_plant_remote_ems_control_mode
+            state: "Command Discharging (ESS First)"
+
+action:
+  - variables:
+      soc_kwh: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) / 100.0 * 18.08 }}"
+      target_kwh: "{{ state_attr('sensor.predbat_curtailment_target_soc', 'target_kwh') | float(18.08) }}"
+      pv: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
+      load: "{{ states('sensor.sigen_plant_consumed_power') | float(0) }}"
+      excess: "{{ pv - load }}"
+      dno: 4
+      export_cap_raw: "{{ states('sensor.predbat_curtailment_export_target') | float(-2) }}"
+      export_cap: >-
+        {% if export_cap_raw | float(-2) >= 0 %}
+          {{ export_cap_raw | float(4) }}
+        {% else %}
+          {{ dno }}
+        {% endif %}
+      manual_hold: "{{ is_state('input_boolean.curtailment_manual_hold', 'on') }}"
+      phase: >-
+        {% if manual_hold %}Manual Hold
+        {% elif soc_kwh > target_kwh %}Drain
+        {% else %}Hold
+        {% endif %}
+      new_limit: >-
+        {% if manual_hold %}
+          {{ [[excess, 0] | max, dno] | min | round(1) }}
+        {% elif soc_kwh > target_kwh %}
+          {{ [[export_cap, 0] | max, dno] | min | round(1) }}
+        {% else %}
+          {{ [[excess, 0] | max, export_cap | float(4), dno] | min | round(1) }}
+        {% endif %}
+      current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
+      current_phase: "{{ states('input_text.curtailment_live_phase') }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ phase != current_phase }}"
+    then:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.curtailment_live_phase
+        data:
+          value: "{{ phase }}"
+
+  - condition: template
+    value_template: "{{ (new_limit | float - current_limit | float) | abs >= 0.05 }}"
+
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_grid_export_limitation
+    data:
+      value: "{{ new_limit }}"

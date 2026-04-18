@@ -23,6 +23,14 @@ When a flaw is found: **write a failing test FIRST**, then fix the code. Never d
 - **Do not arbitrarily remove features** without checking REQUIREMENTS.md. The drain mechanism was removed twice and had to be restored both times.
 - **Discuss before coding** when the approach is uncertain. Don't iterate through 10 broken deploys mid-day.
 
+## HA Automation Version Control
+
+The HA automation `curtailment_manager_dynamic_export_limit` is stored in:
+`apps/predbat/ha/curtailment_manager_dynamic_export_limit.yaml`
+
+**Never change the automation in HA without first updating and committing this file.**
+After changing in HA, pull the updated config and commit it so the file stays in sync.
+
 ## Pre-Deploy Checks
 
 - `pre-commit run --all-files`
