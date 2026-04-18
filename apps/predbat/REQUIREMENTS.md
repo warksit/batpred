@@ -29,7 +29,7 @@ All three (PV, load, export capacity) cover the same window: now to release time
 
 **R33**: PV total from Solcast remaining sensor (updated from actual conditions).
 Per-slot forecast shape used ONLY to estimate the fraction before release time.
-Magnitude from Solcast, shape from forecast, both-ways energy_ratio scaling.
+Magnitude from Solcast unmodified — no energy_ratio on PV (see R24).
 
 ## Safety
 
@@ -47,7 +47,9 @@ No export capacity in the activation check — export is what management DOES, n
 - **R5**: Activate when `total_excess > headroom` where:
     - `total_excess = remaining_pv - remaining_load` (to safe_time, from Solcast + LoadML)
     - `headroom = soc_max * 0.95 - soc_kw`
-- **R6**: Deactivate when `total_excess < headroom * 0.9`. Hysteresis prevents toggling.
+- **R6**: Deactivate only when PV is physically exhausted: actual PV < SAFE_PV_THRESHOLD_KW
+  (2.0 kW) for 3 consecutive plugin cycles (15 min) AND overflow window has ended.
+  Never deactivate on a forecast miss or cloud during the overflow window.
 - **R7**: Trust forecast + energy ratio for activation. No force-activate from actual excess.
 - **R8**: When inactive and no overflow forecast, stay off. Predbat manages normally.
 
@@ -56,7 +58,9 @@ No export capacity in the activation check — export is what management DOES, n
 - **R9**: `floor = soc_cap - battery_must_absorb * safety_factor` where battery_must_absorb
   comes from the totals-based energy balance (R32). Safety factor = 1.10 (10% buffer).
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
-- **R11**: `floor = min(floor, soc_max * 0.95)` before safe_time — 0.9 kWh spike headroom.
+- **R11**: Dynamic headroom reserve: `headroom_reserve = remaining_pv * 0.10` when
+  `pv_now >= SAFE_PV_THRESHOLD_KW`, else 0. `floor = min(floor, soc_max - headroom_reserve)`.
+  Scales with remaining PV (large early, zero near end). Replaces fixed 95% cap.
 - **R12**: After safe_time, cap removed: `floor = min(floor, soc_max)`. Battery fills to 100%.
 - **R13**: Floor rises naturally each cycle as remaining PV and absorption shrink.
 
@@ -78,7 +82,9 @@ No export capacity in the activation check — export is what management DOES, n
 
 - **R22**: `energy_ratio = cumulative_actual_pv / cumulative_forecast_pv` with 15% blend ramp.
 - **R23**: `load_ratio = cumulative_actual_load / cumulative_forecast_load` with 15% blend.
-- **R24**: energy_ratio scales Solcast remaining both ways (fine-tuning on accurate base). load_ratio scales LoadML load both ways.
+- **R24**: energy_ratio NOT applied to PV. Solcast remaining is trusted as-is — morning clouds
+  ≠ afternoon clouds. load_ratio scales LoadML load both ways. energy_ratio used only for
+  activation comparison (cumulative_actual_pv / cumulative_forecast_pv), not for floor calc.
 
 ## Planning
 
@@ -93,9 +99,10 @@ No export capacity in the activation check — export is what management DOES, n
 
 ## Export Target Ramp
 
-- **R38**: Export target ramps from DNO toward 0 as release approaches:
-  `export_target = clamp(0, DNO, exportable_budget / hours_to_release)` where
-  `exportable_budget = remaining_pv - remaining_load - energy_still_needed`.
+- **R38**: Export target ramps from DNO toward 0 across all active phases:
+    - **Overflow window (Phase 2)**: export_target = DNO (battery fills from overflow).
+    - **Post-release (Phase 3/4)**: `export_target = clamp(0, DNO, budget / hours_to_pv_end)`
+    where `budget = remaining_pv - remaining_load - energy_still_needed - headroom_reserve`.
   Published as `sensor.predbat_curtailment_export_target`. HA automation uses
   this instead of hardcoded DNO for Drain and Hold export limits.
   When inactive, value = -2 (automation falls back to DNO).
@@ -108,6 +115,19 @@ No export capacity in the activation check — export is what management DOES, n
   Release offset hysteresis: release time can move earlier freely but later
   by at most 15 minutes per cycle. Prevents balance_end jumps that destabilize
   floor and absorption calculations. Reset on deactivation.
+
+## Stay-Active
+
+- **R40**: Plugin maintains D-ESS from activation until PV is physically exhausted.
+  Non-overflow days stay Off (R8 unchanged). Once active, plugin does NOT deactivate
+  when the overflow window ends — it enters Post-Release phase (R41) and continues D-ESS.
+  Deactivation only when actual PV < SAFE_PV_THRESHOLD_KW for 3 consecutive cycles (15 min).
+
+- **R41**: Post-Release phase: after overflow window ends (no more forecast overflow), plugin
+  publishes `target_soc = current_soc_pct` — automation sees SOC ≈ floor → Hold phase →
+  `export = min(excess, export_target)`. No forced drain. Export target follows R38 formula
+  using `hours_to_pv_end` (time until PV drops below threshold). Dynamic headroom reserve
+  (R11) applied to `exportable_budget` — battery not rushed to 100%.
 
 ## Testing
 

@@ -1,13 +1,16 @@
 # Curtailment Manager - Dynamic Export Limit
-# HA automation: real-time (5-sec) export control for curtailment system.
+# HA automation: event-driven export control for curtailment system.
 #
 # Three-phase logic:
-#   Manual Hold: export = min(excess, DNO) — bypasses plugin, forces hold at DNO
+#   Manual Hold: force D-ESS, export = min(excess, DNO) — bypasses plugin
 #   Drain:       SOC > floor → export = min(export_cap, DNO) — drain battery pre-overflow
 #   Hold:        SOC <= floor → export = min(excess, export_cap, DNO) — hold at floor
 #
 # export_cap comes from sensor.predbat_curtailment_export_target (ramp sensor).
 # Falls back to DNO if sensor is unavailable or -2 (inactive).
+#
+# Manual hold forces D-ESS mode so the export limit is respected by SIG.
+# Plugin stay-active (R40) ensures D-ESS is maintained while PV is present.
 #
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 # Deploy: paste into HA automation editor (raw config mode).
@@ -88,6 +91,16 @@ action:
         {% endif %}
       current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ manual_hold and states('select.sigen_plant_remote_ems_control_mode') != 'Command Discharging (ESS First)' }}"
+    then:
+      - action: select.select_option
+        target:
+          entity_id: select.sigen_plant_remote_ems_control_mode
+        data:
+          option: "Command Discharging (ESS First)"
 
   - if:
       - condition: template

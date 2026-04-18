@@ -29,6 +29,7 @@ from curtailment_calc import (
     solar_elevation,
     compute_release_time,
     MIN_BASE_LOAD_KW,
+    SAFE_PV_THRESHOLD_KW,
 )
 from plugin_system import PredBatPlugin
 
@@ -85,6 +86,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._floor_ratchet = None  # Soft ratchet: floor rises max 2%/cycle (R39)
         self._release_offset_cached = None  # Release hysteresis (R39)
         self._export_target = -2  # Published export target kW; -2 = inactive (R38)
+        self._low_pv_count = 0  # Consecutive cycles with PV < SAFE_PV_THRESHOLD_KW (R40)
+        self._actual_pv_kw = 0.0  # Last actual PV reading (for post_release deactivation)
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0
@@ -424,22 +427,22 @@ class CurtailmentPlugin(PredBatPlugin):
         return past, scale, crossing_label, max(0, release_mins)
 
     @staticmethod
-    def _compute_curtailment(pv_step, load_step, solcast_total, pv_ratio, load_ratio, window_start, window_end, soc_kw, soc_max, dno_limit, release_offset=None, was_active=False, floor_min=0):
+    def _compute_curtailment(pv_step, load_step, solcast_total, load_ratio, window_start, window_end, soc_kw, soc_max, dno_limit, release_offset=None, was_active=False, floor_min=0):
         """Single curtailment calculation — shared by live and tomorrow (R31).
 
         Three-phase model:
           Phase 1 (pre-overflow): position battery via Charge/Drain/Hold
           Phase 2 (overflow): export min(excess, DNO), physics dictates
-          Phase 3 (release): fill to 100%
+          Phase 3 (post-release): ramp export to fill battery, stay in D-ESS
 
-        Absorption = per-slot forced overflow, using Solcast-corrected per-slot values.
-        pv_scale aligns forecast shape with Solcast magnitude × energy_ratio.
+        Absorption = per-slot forced overflow, using Solcast magnitude (no energy_ratio).
+        pv_scale aligns forecast shape with Solcast magnitude.
         Activation: absorption > headroom (stable — not sensitive to export fraction).
 
         Args:
             pv_step, load_step: forecast dicts (kWh per step)
-            solcast_total: Solcast PV total for this window (kWh)
-            pv_ratio, load_ratio: energy/load scaling (1.0 for tomorrow)
+            solcast_total: Solcast PV total for this window (kWh) — not scaled by energy_ratio (R24/R33)
+            load_ratio: load scaling (1.0 for tomorrow)
             window_start, window_end: forecast window (minutes from now)
             soc_kw: battery SOC at start of window (kWh)
             soc_max: battery capacity (kWh)
@@ -463,9 +466,9 @@ class CurtailmentPlugin(PredBatPlugin):
         per_slot_total = sum(pv_step.get(m, 0) for m in range(window_start, window_end, PREDICT_STEP))
         fraction = (per_slot_to_release / per_slot_total) if per_slot_total > 0 else 1.0
 
-        remaining_pv = solcast_total * fraction * pv_ratio
+        remaining_pv = solcast_total * fraction
         if solcast_total <= 0:
-            remaining_pv = per_slot_to_release * to_kw * step_hours * pv_ratio
+            remaining_pv = per_slot_to_release * to_kw * step_hours
 
         # --- Load: LoadML sum to release ---
         remaining_load = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(window_start, balance_end, PREDICT_STEP)) * load_ratio
@@ -725,6 +728,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # --- Energy ratio & load ratio ---
         actual_pv, actual_load, energy_ratio = self._get_energy_ratio()
         self._energy_ratio = energy_ratio
+        self._actual_pv_kw = actual_pv
         load_ratio = self._get_load_ratio()
         self._load_ratio = load_ratio
 
@@ -772,7 +776,6 @@ class CurtailmentPlugin(PredBatPlugin):
             pv_step,
             load_step,
             solcast_remaining,
-            energy_ratio,
             load_ratio,
             PREDICT_STEP,
             solar_end,
@@ -785,20 +788,52 @@ class CurtailmentPlugin(PredBatPlugin):
         )
         self._remaining_overflow = round(absorption, 2)
 
-        # Detect Phase 2: currently in overflow (actual PV - load > DNO)
-        if not active:
-            self._floor_ratchet = None
-            self._release_offset_cached = None
-            self._export_target = -2
-            return soc_max, "off"
+        step_hours = PREDICT_STEP / 60.0
+        to_kw = 1.0 / step_hours
 
-        # 95% cap until release — but remove cap if battery will fill past 95%
-        # from overflow alone (keeping cap would just cause curtailment)
-        past_release = release_mins is not None and release_mins <= 0
-        if past_release or (soc_kw + absorption > soc_max * SOC_CAP_FACTOR):
-            floor = min(floor, soc_max)
-        else:
-            floor = min(floor, soc_max * SOC_CAP_FACTOR)
+        if not active:
+            if not self.was_active:
+                # Never activated (non-overflow day) — truly off (R8)
+                self._floor_ratchet = None
+                self._release_offset_cached = None
+                self._export_target = -2
+                return soc_max, "off"
+
+            # was_active + no longer active: post-release phase (R40/R41).
+            # Stay in D-ESS with Hold — compute export_target to ramp down toward 0.
+            last_significant_pv = PREDICT_STEP
+            for m in range(PREDICT_STEP, solar_end, PREDICT_STEP):
+                if pv_step.get(m, 0) * to_kw >= SAFE_PV_THRESHOLD_KW:
+                    last_significant_pv = m
+            hours_to_pv_end = max(last_significant_pv, PREDICT_STEP) / 60.0
+
+            post_load = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(PREDICT_STEP, solar_end, PREDICT_STEP)) * load_ratio
+            headroom_reserve = solcast_remaining * 0.10 if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
+            energy_still_needed = max(0.0, soc_max - soc_kw)
+
+            # Would overflow alone fill battery?
+            charge_at_dno_post = 0.0
+            for m in range(PREDICT_STEP, solar_end, PREDICT_STEP):
+                slot_excess = pv_step.get(m, 0) * to_kw - load_step.get(m, 0) * to_kw * load_ratio
+                if slot_excess > dno_limit_kw:
+                    charge_at_dno_post += (slot_excess - dno_limit_kw) * step_hours
+
+            if charge_at_dno_post >= energy_still_needed:
+                self._export_target = dno_limit_kw
+            elif hours_to_pv_end <= 0:
+                self._export_target = 0.0
+            else:
+                budget = solcast_remaining - post_load - energy_still_needed - headroom_reserve
+                self._export_target = round(max(0.0, min(dno_limit_kw, budget / hours_to_pv_end)), 2)
+
+            # Floor = current SOC: automation sees SOC ≈ floor → Hold (not Drain)
+            return soc_kw, "post_release"
+
+        # Active: overflow still forecast. Apply dynamic headroom reserve (R11 replacement).
+        # Reserve scales with remaining PV to absorb unexpected solar spikes.
+        headroom_reserve = remaining_pv * 0.10 if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
+        max_soc = soc_max - headroom_reserve
+        floor = min(floor, max_soc)
 
         # Soft floor ratchet: floor can rise max 2% of soc_max per cycle (R39)
         if self._floor_ratchet is not None:
@@ -807,26 +842,19 @@ class CurtailmentPlugin(PredBatPlugin):
         self._floor_ratchet = floor
 
         # Export target ramp: reduce export only when battery won't fill at DNO (R38)
-        # Compute per-slot battery charge available if we export at DNO for all remaining slots.
-        # If that's enough to fill the battery, no ramp needed — keep at DNO.
-        # Only reduce export when PV is declining and DNO export would leave battery short.
         energy_still_needed = max(0.0, soc_max - soc_kw)
         hours_to_release = max(release_offset, PREDICT_STEP) / 60.0
-        step_hours = PREDICT_STEP / 60.0
-        to_kw = 1.0 / step_hours  # kWh/slot → kW
         charge_at_dno = 0.0
         for m in range(PREDICT_STEP, release_offset, PREDICT_STEP):
-            pv_kw = pv_step.get(m, 0) * to_kw * energy_ratio
+            pv_kw = pv_step.get(m, 0) * to_kw
             load_kw = load_step.get(m, 0) * to_kw * load_ratio
             slot_excess = pv_kw - load_kw
             if slot_excess > dno_limit_kw:
                 charge_at_dno += (slot_excess - dno_limit_kw) * step_hours
         if charge_at_dno >= energy_still_needed:
-            # Battery fills in time at DNO — no ramp needed
             self._export_target = dno_limit_kw
         else:
-            # Battery won't fill at DNO — reduce export to let battery charge faster
-            exportable_budget = remaining_pv - remaining_load - energy_still_needed
+            exportable_budget = remaining_pv - remaining_load - energy_still_needed - headroom_reserve
             self._export_target = round(max(0, min(dno_limit_kw, exportable_budget / hours_to_release)), 2)
 
         return floor, "active"
@@ -834,16 +862,24 @@ class CurtailmentPlugin(PredBatPlugin):
     def publish(self, phase, floor_kwh, dno_limit_kw, export_target=None):
         """Publish curtailment sensors via dashboard_item.
 
-        Phase sensor shows Active/Off (plugin's strategic decision).
+        Phase sensor shows Active/Post-Release/Off (plugin's strategic decision).
         Real-time phase (Charge/Drain/Hold) is published by the HA automation.
         export_target: kW export cap for HA automation (R38). -2 = inactive.
         """
         prefix = self.base.prefix
         soc_max = getattr(self.base, "soc_max", 10)
-        floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
 
-        # Plugin publishes Active or Off — HA automation publishes Charge/Drain/Hold
-        state = "Off" if phase == "off" else "Active"
+        if phase == "post_release":
+            # Publish current SOC as target so automation stays in Hold (not Drain)
+            soc_kw = getattr(self.base, "soc_kw", 0)
+            floor_pct = round(soc_kw / soc_max * 100, 1) if soc_max > 0 else 100
+            state = "Post-Release"
+        elif phase == "off":
+            floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
+            state = "Off"
+        else:
+            floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
+            state = "Active"
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
@@ -1044,11 +1080,28 @@ class CurtailmentPlugin(PredBatPlugin):
             soc_pct = soc_kw / max(soc_max, 0.1) * 100
             floor_pct = floor / max(soc_max, 0.1) * 100
 
+            # Post-release deactivation (R40): stay in D-ESS after overflow window ends.
+            # Only deactivate when PV is physically exhausted (3 consecutive cycles < threshold).
+            if phase == "post_release":
+                if self._actual_pv_kw < SAFE_PV_THRESHOLD_KW:
+                    self._low_pv_count += 1
+                else:
+                    self._low_pv_count = 0
+                if self._low_pv_count >= 3:
+                    self.log("Curtailment: PV exhausted ({:.1f}kW < {:.1f}kW for 3 cycles) — deactivating".format(self._actual_pv_kw, SAFE_PV_THRESHOLD_KW))
+                    phase = "off"
+                    floor = soc_max
+                    self._floor_ratchet = None
+                    self._release_offset_cached = None
+                    self._export_target = -2
+            else:
+                self._low_pv_count = 0
+
             # Log phase transitions
             if phase != self.last_phase:
                 self.log(
                     "Curtailment: PHASE {} -> {} | SOC={:.1f}kWh ({:.0f}%) floor={:.1f}kWh ({:.0f}%) "
-                    "overflow={:.1f}kWh dno={:.1f}kW energy_ratio={:.2f}x".format(
+                    "overflow={:.1f}kWh dno={:.1f}kW energy_ratio={:.2f}x low_pv_count={}".format(
                         self.last_phase or "none",
                         phase,
                         soc_kw,
@@ -1058,6 +1111,7 @@ class CurtailmentPlugin(PredBatPlugin):
                         self._remaining_overflow,
                         dno_limit,
                         self._energy_ratio,
+                        self._low_pv_count,
                     )
                 )
                 self.last_phase = phase
@@ -1069,12 +1123,15 @@ class CurtailmentPlugin(PredBatPlugin):
                 if manual_hold:
                     self.log("Curtailment: manual_hold active — staying in D-ESS despite plugin off")
                     self.apply("active")
-                    self.publish(phase, floor, dno_limit, export_target=self._export_target)
+                    self.publish("off", floor, dno_limit, export_target=self._export_target)
                     return
+
+            # post_release → apply D-ESS (same as "active") until PV exhausted
+            apply_phase = "active" if phase == "post_release" else phase
 
             # Apply BEFORE publish: EMS mode must be set before sensor publish
             # triggers the HA automation (which requires D-ESS as a condition)
-            self.apply(phase)
+            self.apply(apply_phase)
             self.publish(phase, floor, dno_limit, export_target=self._export_target)
 
             # Tomorrow forecast (separate try/except — don't break today's control)

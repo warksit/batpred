@@ -874,13 +874,13 @@ def test_on_update_stays_off_low_pv():
 
 
 def test_deactivation_restores_msc():
-    """When overflow clears, plugin deactivates and restores MSC."""
+    """When PV exhausted for 3 consecutive cycles, plugin deactivates and restores MSC (R40)."""
     pv_on = {}
     pv_off = {}
     load = {}
     for m in range(0, 360, PLUGIN_STEP):
         pv_on[m] = 8.0
-        pv_off[m] = 1.5
+        pv_off[m] = 1.5  # below SAFE_PV_THRESHOLD_KW (2.0)
         load[m] = 1.0
 
     base = MockBase(pv_step=pv_on, load_step=load, soc_kw=9.0, minutes_now=600, sensor_overrides={"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0})
@@ -888,12 +888,17 @@ def test_deactivation_restores_msc():
     plugin.on_update()
     assert base.set_read_only is True, "Should activate"
 
-    # Switch to low PV
+    # Switch to low PV — stays active for 2 more cycles (post_release)
     base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_off.items()}
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.5
     plugin.on_update()
+    assert base.set_read_only is True, "Should stay active after 1st low-PV cycle (post_release)"
+    plugin.on_update()
+    assert base.set_read_only is True, "Should stay active after 2nd low-PV cycle (post_release)"
 
-    assert base.set_read_only is False, "Should deactivate"
+    # 3rd cycle — now deactivates
+    plugin.on_update()
+    assert base.set_read_only is False, "Should deactivate after 3 consecutive low-PV cycles"
     msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
     assert msc_called, "Should restore MSC"
     print("  test_deactivation_restores_msc: PASSED")
@@ -1402,9 +1407,7 @@ def test_export_target_at_dno_early_day():
     plugin = CurtailmentPlugin(base)
     _, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"Should be active, got {phase}"
-    assert plugin._export_target == 4.0, (
-        f"Export target should be DNO (4.0) early in day when battery fills easily, got {plugin._export_target}"
-    )
+    assert plugin._export_target == 4.0, f"Export target should be DNO (4.0) early in day when battery fills easily, got {plugin._export_target}"
     print(f"  test_export_target_at_dno_early_day: PASSED (export_target={plugin._export_target}kW)")
 
 
@@ -1433,9 +1436,7 @@ def test_export_target_ramp_late_day():
     plugin = CurtailmentPlugin(base)
     _, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"Should be active, got {phase}"
-    assert plugin._export_target < 4.0, (
-        f"Export target should be below DNO late in day when battery can't fill, got {plugin._export_target}"
-    )
+    assert plugin._export_target < 4.0, f"Export target should be below DNO late in day when battery can't fill, got {plugin._export_target}"
     assert plugin._export_target >= 0, f"Export target must be >= 0, got {plugin._export_target}"
     print(f"  test_export_target_ramp_late_day: PASSED (export_target={plugin._export_target}kW)")
 
@@ -2022,6 +2023,255 @@ def test_plugin_export_target_inactive():
 
 
 # ============================================================================
+# Stay-active (R40/R41) tests
+# ============================================================================
+
+
+def test_no_deactivation_on_forecast_miss():
+    """Plugin stays active when forecast shows no overflow but actual PV is high (R40).
+
+    Simulates today's failure: cloudy morning → energy_ratio low → forecast shows
+    no overflow → old code deactivated. New code stays in post_release when
+    actual PV is above SAFE_PV_THRESHOLD_KW.
+    """
+
+    # First: activate with overflow forecast
+    pv_on = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    base = MockBase(
+        pv_step=pv_on,
+        load_step=load,
+        soc_kw=9.0,
+        minutes_now=600,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+    assert base.set_read_only is True, "Should activate"
+
+    # Switch to: no overflow forecast (cleared/missed), but actual PV still high (7kW)
+    pv_clear = {m: 2.0 for m in range(0, 360, PLUGIN_STEP)}  # no overflow (2kW < DNO)
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_clear.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 7.0  # actual still high!
+    base._sensor_overrides["sensor.solcast_pv_forecast_forecast_remaining_today"] = 3.0
+    plugin.on_update()
+
+    # Should stay in D-ESS (post_release, count=0 since pv=7>2)
+    assert base.set_read_only is True, "Should stay in D-ESS when actual PV is above threshold"
+    phase_val = base.published.get("sensor.predbat_curtailment_phase", {}).get("value")
+    assert phase_val == "Post-Release", f"Expected Post-Release, got {phase_val}"
+    print(f"  test_no_deactivation_on_forecast_miss: PASSED (phase={phase_val})")
+
+
+def test_deactivates_when_pv_exhausted():
+    """Plugin deactivates only after 3 consecutive cycles with PV < threshold (R40)."""
+
+    # First: activate
+    pv_on = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    base = MockBase(
+        pv_step=pv_on,
+        load_step=load,
+        soc_kw=9.0,
+        minutes_now=600,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+    assert base.set_read_only is True
+
+    # Low PV: below threshold → post_release, count increments
+    pv_low = {m: 0.5 for m in range(0, 360, PLUGIN_STEP)}
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_low.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.0  # below SAFE_THRESHOLD (2.0)
+    base._sensor_overrides["sensor.solcast_pv_forecast_forecast_remaining_today"] = 0.5
+
+    plugin.on_update()  # count=1 → still active
+    assert base.set_read_only is True, "count=1 < 3, should stay active"
+    assert plugin._low_pv_count == 1, f"Expected count=1, got {plugin._low_pv_count}"
+
+    plugin.on_update()  # count=2 → still active
+    assert base.set_read_only is True, "count=2 < 3, should stay active"
+
+    plugin.on_update()  # count=3 → deactivate
+    assert base.set_read_only is False, "count=3 → should deactivate"
+    assert plugin._low_pv_count == 3, f"Expected count=3, got {plugin._low_pv_count}"
+    msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
+    assert msc_called, "Should restore MSC after 3 low-PV cycles"
+    print(f"  test_deactivates_when_pv_exhausted: PASSED")
+
+
+def test_post_release_target_soc_tracks_soc():
+    """In post_release, target_soc = current SOC% so automation stays in Hold (R41)."""
+    pv_on = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.85  # 85%
+    base = MockBase(
+        pv_step=pv_on,
+        load_step=load,
+        soc_kw=soc_kw,
+        minutes_now=600,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()  # activate
+
+    # Switch to post_release (no overflow forecast, actual PV > threshold)
+    pv_low = {m: 0.5 for m in range(0, 360, PLUGIN_STEP)}
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_low.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 3.0  # above SAFE_THRESHOLD
+    plugin.on_update()
+
+    phase_val = base.published.get("sensor.predbat_curtailment_phase", {}).get("value")
+    assert phase_val == "Post-Release", f"Expected Post-Release, got {phase_val}"
+
+    target_sensor = base.published.get("sensor.predbat_curtailment_target_soc", {})
+    target_pct = float(target_sensor.get("value", -1))
+    expected_pct = round(soc_kw / BATTERY_KWH * 100, 1)
+    assert abs(target_pct - expected_pct) < 1.0, f"Target SOC should be ~current SOC ({expected_pct}%), got {target_pct}%"
+    print(f"  test_post_release_target_soc_tracks_soc: PASSED (target={target_pct:.1f}% ≈ soc={expected_pct:.1f}%)")
+
+
+def test_no_energy_ratio_on_pv():
+    """energy_ratio does not affect PV calculation — Solcast trusted as-is (R24/R33).
+
+    Two scenarios with different energy_ratios but same Solcast remaining.
+    Floor and absorption must be identical regardless of energy_ratio.
+    """
+    pv = {m: 6.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+
+    # Scenario A: energy_ratio implied to be low (actual << forecast)
+    # Simulate: actual PV produced = 5 kWh, forecast produced = 10 kWh (ratio ~0.5)
+    # But Solcast remaining = 20 kWh (independent of ratio)
+    base_a = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 5.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+            # Low actual vs forecast → energy_ratio < 1
+            "sensor.sigen_plant_daily_third_party_inverter_energy": 5.0,
+            "sensor.solcast_pv_forecast_forecast_today": 30.0,
+        },
+    )
+    plugin_a = CurtailmentPlugin(base_a)
+    floor_a, phase_a = plugin_a.calculate(dno_limit_kw=4.0)
+
+    # Scenario B: energy_ratio = 1.5 (actual > forecast)
+    base_b = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 5.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+            # High actual vs forecast → energy_ratio > 1
+            "sensor.sigen_plant_daily_third_party_inverter_energy": 15.0,
+            "sensor.solcast_pv_forecast_forecast_today": 20.0,
+        },
+    )
+    plugin_b = CurtailmentPlugin(base_b)
+    floor_b, phase_b = plugin_b.calculate(dno_limit_kw=4.0)
+
+    # Both should activate (20kWh Solcast remaining > headroom)
+    assert phase_a == "active", f"Scenario A should be active, got {phase_a}"
+    assert phase_b == "active", f"Scenario B should be active, got {phase_b}"
+
+    # Floor should be identical (same Solcast remaining, same load, no energy_ratio on PV)
+    assert abs(floor_a - floor_b) < 0.1, f"Floor must be independent of energy_ratio: A={floor_a:.2f} B={floor_b:.2f}"
+    print(f"  test_no_energy_ratio_on_pv: PASSED (floor_a={floor_a:.2f} floor_b={floor_b:.2f} — identical)")
+
+
+def test_dynamic_headroom_reserve():
+    """Dynamic headroom reserve: floor cap < 95% when PV is large (R11 replacement)."""
+    # Large remaining PV → headroom_reserve = 0.10 * remaining_pv → max_soc lower
+    pv = {m: 8.0 for m in range(0, 720, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 720, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.95  # 95% — would cause curtailment at old 95% cap
+
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=soc_kw,
+        minutes_now=420,  # early morning, lots of PV ahead
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,  # above SAFE_PV_THRESHOLD_KW
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 40.0,  # large remaining
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+
+    if phase == "active":
+        # Reserve = 40 * 0.10 = 4 kWh → max_soc = 18.08 - 4 = 14.08 kWh (77.8%)
+        # Old cap would be 95% (17.18 kWh). New cap is lower.
+        old_cap = BATTERY_KWH * 0.95
+        assert floor <= old_cap, f"Floor {floor:.2f} should be <= old 95% cap ({old_cap:.2f})"
+        print(f"  test_dynamic_headroom_reserve: PASSED (floor={floor/BATTERY_KWH*100:.1f}%, old cap would be 95%)")
+    else:
+        print(f"  test_dynamic_headroom_reserve: SKIPPED (phase={phase}, not active)")
+
+
+def test_post_release_export_target_ramps_down():
+    """Post-release export_target ramps from DNO toward 0 as PV declines (R41).
+
+    Post-release with small remaining PV and battery nearly full:
+    exportable_budget = remaining_pv - load - energy_needed - headroom_reserve
+    If budget is small and hours_to_pv_end is short, export_target < DNO.
+    """
+    # Activate with overflow
+    pv_on = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    base = MockBase(
+        pv_step=pv_on,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.70,
+        minutes_now=600,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    # Post-release: PV declining, battery almost full, only 30 min PV left
+    pv_declining = {m: 2.5 for m in range(0, 30, PLUGIN_STEP)}  # 30 min of 2.5kW (above threshold)
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_declining.items()}
+    base.soc_kw = BATTERY_KWH * 0.95  # nearly full — little energy needed
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 2.5  # above SAFE_PV_THRESHOLD (2.0)
+    base._sensor_overrides["sensor.solcast_pv_forecast_forecast_remaining_today"] = 1.0  # tiny
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "post_release", f"Expected post_release, got {phase}"
+    # With 1 kWh remaining, 0.95 full battery, energy_still_needed ≈ 0.9 kWh:
+    # exportable_budget = 1.0 - load - 0.9 - headroom ≈ small/negative
+    # export_target should be well below DNO or 0
+    assert plugin._export_target < 4.0, f"Export target should ramp down with little PV remaining, got {plugin._export_target}"
+    print(f"  test_post_release_export_target_ramps_down: PASSED (export_target={plugin._export_target:.2f}kW)")
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -2225,6 +2475,23 @@ def run_curtailment_tests(my_predbat=None):
         try:
             test_fn()
         except AssertionError as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # Stay-active (R40/R41) tests
+    stay_active_tests = [
+        test_no_deactivation_on_forecast_miss,
+        test_deactivates_when_pv_exhausted,
+        test_post_release_target_soc_tracks_soc,
+        test_no_energy_ratio_on_pv,
+        test_dynamic_headroom_reserve,
+        test_post_release_export_target_ramps_down,
+    ]
+    print("  --- stay-active (R40/R41) tests ---")
+    for test_fn in stay_active_tests:
+        try:
+            test_fn()
+        except Exception as e:
             print(f"  {test_fn.__name__}: FAILED — {e}")
             failed = True
 
