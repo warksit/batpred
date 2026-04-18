@@ -92,60 +92,42 @@ def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1
     return gap_kwh
 
 
-def compute_release_offset(pv_forecast, load_forecast, soc_pct, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
-    """Find the release point: first 30-min window where PV-load drops below threshold.
+def compute_release_offset(pv_forecast, load_forecast, dno_limit=4.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
+    """Find the release point: one slot after the last slot where PV-load > DNO.
 
-    Uses predbat's 30-min average (6 x 5-min slots) for stability.
-    Threshold depends on SOC: 3 kW if SOC <= 95%, 2 kW if > 95%.
-    Lower threshold at high SOC = less headroom for spikes, release later.
+    Scans the forecast for the last slot where overflow (PV-load > DNO) occurs.
+    Returns the minute of the slot immediately following that, relative to start_minute.
+
+    Using the DNO threshold directly (not a SOC-adjusted proxy) means load spikes
+    can never create a false early release — a spike reduces PV-load, making it
+    less likely to qualify as overflow, not more.
 
     Args:
-        pv_forecast: dict {minute: value} — PV forecast
-        load_forecast: dict {minute: value} — load forecast
-        soc_pct: current battery SOC as percentage (0-100)
+        pv_forecast: dict {minute: value}
+        load_forecast: dict {minute: value}
+        dno_limit: float kW — grid export limit (overflow = PV-load > dno_limit)
         start_minute, end_minute: search window
         step_minutes: forecast step size
         values_are_kwh: if True, values are kWh per step (predbat format)
 
     Returns:
-        release_offset: minutes from start_minute to release point.
-        None if no release point found (PV stays high all day).
+        release_offset: minutes from start_minute to the slot after last overflow.
+        None if no overflow found (PV-load never exceeds DNO — release now).
     """
     step_hours = step_minutes / 60.0
     to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
-    threshold_kw = 2.0 if soc_pct > 95 else 3.0
-    window_minutes = 30
-    window_slots = max(1, window_minutes // step_minutes)
 
-    # Build 30-min windows aligned to 30-min boundaries (like predbat plan table)
-    # Each window tracks the MAX excess across its 5-min slots — spikes matter
-    windows = []
-    for w_start in range(start_minute, end_minute, window_minutes):
-        max_excess = 0
-        for i in range(window_slots):
-            m = w_start + i * step_minutes
-            if m >= end_minute:
-                break
-            pv_kw = pv_forecast.get(m, 0) * to_kw
-            load_kw = load_forecast.get(m, 0) * to_kw
-            max_excess = max(max_excess, pv_kw - load_kw)
-        windows.append((w_start, max_excess))
+    last_overflow_minute = None
+    for m in range(start_minute, end_minute, step_minutes):
+        pv_kw = pv_forecast.get(m, 0) * to_kw
+        load_kw = load_forecast.get(m, 0) * to_kw
+        if pv_kw - load_kw > dno_limit:
+            last_overflow_minute = m
 
-    # Find peak window (search from peak forward for release)
-    peak_idx = 0
-    peak_kw = 0
-    for i, (w_start, max_kw) in enumerate(windows):
-        if max_kw > peak_kw:
-            peak_kw = max_kw
-            peak_idx = i
+    if last_overflow_minute is None:
+        return None  # No overflow — no release delay needed
 
-    # First 30-min window after peak where NO slot exceeds threshold
-    for i in range(peak_idx, len(windows)):
-        w_start, max_kw = windows[i]
-        if max_kw < threshold_kw:
-            return w_start - start_minute
-
-    return None
+    return last_overflow_minute + step_minutes - start_minute
 
 
 def simulate_soc_trajectory(pv_forecast, load_forecast, current_soc, soc_max, dno_limit, energy_ratio=1.0, load_ratio=1.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, unmanaged=False):

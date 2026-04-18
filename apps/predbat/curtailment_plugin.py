@@ -743,18 +743,18 @@ class CurtailmentPlugin(PredBatPlugin):
         soc_keep = getattr(self.base, "best_soc_keep", 0)
         reserve = getattr(self.base, "reserve", 0)
 
-        # Release offset: when PV-load drops below 3kW (2kW if SOC > 95%)
-        # Uses 30-min averaged forecast windows for stability.
-        soc_pct = (soc_kw / soc_max * 100) if soc_max > 0 else 0
+        # Release offset: one slot after last slot where PV-load > DNO in the forecast.
+        # DNO threshold directly matches overflow definition — immune to load spikes.
         release_mins = compute_release_offset(
             pv_step,
             load_step,
-            soc_pct,
+            dno_limit=dno_limit_kw,
             start_minute=PREDICT_STEP,
             end_minute=solar_end,
             step_minutes=PREDICT_STEP,
             values_are_kwh=True,
         )
+        soc_pct = (soc_kw / soc_max * 100) if soc_max > 0 else 0
         if release_mins is not None:
             release_offset = min(release_mins, solar_end)
             # Release hysteresis: can move earlier freely, later by max 15 min/cycle (R39)
@@ -806,13 +806,28 @@ class CurtailmentPlugin(PredBatPlugin):
             floor = min(floor, self._floor_ratchet + max_rise)
         self._floor_ratchet = floor
 
-        # Export target ramp: reduce export as release approaches (R38)
-        # exportable_budget = remaining PV - remaining load - energy still needed
-        # Spread budget evenly over hours to release → export rate
-        energy_still_needed = soc_max - soc_kw
+        # Export target ramp: reduce export only when battery won't fill at DNO (R38)
+        # Compute per-slot battery charge available if we export at DNO for all remaining slots.
+        # If that's enough to fill the battery, no ramp needed — keep at DNO.
+        # Only reduce export when PV is declining and DNO export would leave battery short.
+        energy_still_needed = max(0.0, soc_max - soc_kw)
         hours_to_release = max(release_offset, PREDICT_STEP) / 60.0
-        exportable_budget = remaining_pv - remaining_load - energy_still_needed
-        self._export_target = round(max(0, min(dno_limit_kw, exportable_budget / hours_to_release)), 2)
+        step_hours = PREDICT_STEP / 60.0
+        to_kw = 1.0 / step_hours  # kWh/slot → kW
+        charge_at_dno = 0.0
+        for m in range(PREDICT_STEP, release_offset, PREDICT_STEP):
+            pv_kw = pv_step.get(m, 0) * to_kw * energy_ratio
+            load_kw = load_step.get(m, 0) * to_kw * load_ratio
+            slot_excess = pv_kw - load_kw
+            if slot_excess > dno_limit_kw:
+                charge_at_dno += (slot_excess - dno_limit_kw) * step_hours
+        if charge_at_dno >= energy_still_needed:
+            # Battery fills in time at DNO — no ramp needed
+            self._export_target = dno_limit_kw
+        else:
+            # Battery won't fill at DNO — reduce export to let battery charge faster
+            exportable_budget = remaining_pv - remaining_load - energy_still_needed
+            self._export_target = round(max(0, min(dno_limit_kw, exportable_budget / hours_to_release)), 2)
 
         return floor, "active"
 

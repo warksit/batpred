@@ -1055,11 +1055,51 @@ def test_compute_release_time_scenarios():
     print(f"  test_compute_release_time_scenarios: PASSED")
 
 
-def test_compute_release_offset():
-    """Release offset from forecast PV-load windows."""
+def test_compute_release_offset_load_spike():
+    """Load spike mid-afternoon must NOT cause early false release.
+
+    Scenario: GSHP-style load spike at 13:30 temporarily brings PV-load below
+    DNO threshold, but overflow continues after the spike. Release should be
+    one slot after the LAST overflow slot (~17:35), not at the spike (13:30).
+    """
     from curtailment_calc import compute_release_offset
 
     step = 5
+    dno = 4.0
+
+    pv = {}
+    load = {}
+    for m in range(0, 1440, step):
+        hour = m / 60
+        if 6 <= hour <= 20:
+            pv[m] = max(0, 7.0 * math.sin(math.pi * (hour - 6) / 14))
+        else:
+            pv[m] = 0
+        # Load: normal 0.5 kW but GSHP spike 4.0 kW at 13:30–14:00
+        if 810 <= m < 840:
+            load[m] = 4.0  # spike: PV-load drops below DNO for these slots
+        else:
+            load[m] = 0.5
+
+    # At 13:30 (m=810): PV ≈ 6.9 kW, load = 4.0 → PV-load = 2.9 < DNO=4.0 (not overflow)
+    # But after spike (14:00+): PV still ~6.7 kW, load = 0.5 → PV-load = 6.2 > DNO (still overflow)
+    # Last overflow slot should be well after 14:00, ~17:30.
+    offset = compute_release_offset(pv, load, dno_limit=dno, start_minute=0, end_minute=1440, step_minutes=step)
+    assert offset is not None, "Should find release point"
+    # Old (flawed) algorithm would return ~810 min (13:30); new must return >840 min (after spike)
+    assert offset > 840, f"Release should be after load spike ends (>840 min = 14:00), got {offset} min ({offset // 60:02d}:{offset % 60:02d})"
+    # Should be somewhere around 17:30-18:00 (last overflow slot ~17:30 + one step)
+    assert offset <= 1100, f"Release too late: {offset} min"
+
+    print(f"  test_compute_release_offset_load_spike: PASSED (release at {offset}min = {offset // 60:02d}:{offset % 60:02d})")
+
+
+def test_compute_release_offset():
+    """Release offset: one slot after last slot where PV-load > DNO."""
+    from curtailment_calc import compute_release_offset
+
+    step = 5
+    dno = 4.0
 
     # Build a day: PV peaks at noon, declines through afternoon
     pv = {}
@@ -1073,24 +1113,23 @@ def test_compute_release_offset():
             pv[m] = 0
         load[m] = 1.0  # constant 1kW load
 
-    # At 50% SOC, threshold = 3kW. PV-load drops below 3kW when PV < 4kW.
-    # That's roughly 17:00-17:30 from the bell curve.
-    offset = compute_release_offset(pv, load, soc_pct=50, start_minute=0, end_minute=1440, step_minutes=step)
+    # Overflow when PV-load > 4.0 → PV > 5.0.
+    # 7*sin(π*(h-6)/14) = 5 → h ≈ 16:32. Last overflow slot ~16:30, release at 16:35.
+    offset = compute_release_offset(pv, load, dno_limit=dno, start_minute=0, end_minute=1440, step_minutes=step)
     assert offset is not None, "Should find release point"
-    release_minute = offset
-    assert 900 <= release_minute <= 1100, f"Expected release ~15:00-18:20, got {release_minute // 60:02d}:{release_minute % 60:02d}"
+    # Release = one slot AFTER last overflow slot → ~16:30-17:00 range
+    assert 980 <= offset <= 1030, f"Expected release ~16:20-17:10, got {offset // 60:02d}:{offset % 60:02d}"
 
-    # At 96% SOC, threshold = 2kW. PV-load < 2kW later (PV < 3kW).
-    offset_high = compute_release_offset(pv, load, soc_pct=96, start_minute=0, end_minute=1440, step_minutes=step)
-    assert offset_high is not None, "Should find release point"
-    assert offset_high > offset, f"Higher SOC should release later: {offset_high} vs {offset}"
+    # No overflow day (PV max 2kW, never exceeds DNO)
+    low_pv = {m: 0 for m in range(0, 1440, step)}
+    for m in range(0, 1440, step):
+        hour = m / 60
+        if 6 <= hour <= 20:
+            low_pv[m] = max(0, 2.0 * math.sin(math.pi * (hour - 6) / 14))
+    offset_none = compute_release_offset(low_pv, load, dno_limit=dno, start_minute=0, end_minute=1440, step_minutes=step)
+    assert offset_none is None, f"No overflow day should return None, got {offset_none}"
 
-    # No PV day — no release needed
-    no_pv = {m: 0 for m in range(0, 1440, step)}
-    offset_none = compute_release_offset(no_pv, load, soc_pct=50, start_minute=0, end_minute=1440, step_minutes=step)
-    assert offset_none is not None, "Low PV = below threshold immediately after peak=0"
-
-    print(f"  test_compute_release_offset: PASSED (soc50={offset}min soc96={offset_high}min)")
+    print(f"  test_compute_release_offset: PASSED (release at {offset}min = {offset // 60:02d}:{offset % 60:02d})")
 
 
 # ============================================================================
@@ -1299,6 +1338,68 @@ def test_floor_lower_with_more_overflow():
 
     assert floor2 < floor1, f"Higher overflow should give lower floor: 9kW={floor2:.1f} vs 6kW={floor1:.1f}"
     print(f"  test_floor_lower_with_more_overflow: PASSED (6kW={floor1/BATTERY_KWH*100:.0f}%, 9kW={floor2/BATTERY_KWH*100:.0f}%)")
+
+
+def test_export_target_at_dno_early_day():
+    """Export target = DNO when battery fills in time at DNO.
+
+    Early in day: PV=8kW, load=1kW, 6 hours of overflow. Battery at 73.8%.
+    Per-slot charge at DNO = 3kW × 6h = 18kWh >> 4.73kWh needed.
+    Ramp must NOT reduce export — battery fills easily at DNO.
+    """
+    pv = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}  # 6 hours high PV
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.738  # 73.8%
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=soc_kw,
+        minutes_now=600,  # 10:00 local
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 25.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    _, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Should be active, got {phase}"
+    assert plugin._export_target == 4.0, (
+        f"Export target should be DNO (4.0) early in day when battery fills easily, got {plugin._export_target}"
+    )
+    print(f"  test_export_target_at_dno_early_day: PASSED (export_target={plugin._export_target}kW)")
+
+
+def test_export_target_ramp_late_day():
+    """Export target < DNO when battery won't fill at DNO rate.
+
+    Late in day: PV=5.5kW, load=0.5kW, only 60 min remaining.
+    Battery at 80%. Charge at DNO = 1kW × 1h = 1kWh < 3.62kWh needed.
+    Ramp must reduce export below DNO.
+    """
+    pv = {m: 5.5 for m in range(0, 60, PLUGIN_STEP)}  # only 1 hour of PV left
+    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.80  # 80%
+    solcast_remaining = 5.5 * 1.0  # 1h of PV
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=soc_kw,
+        minutes_now=900,  # 15:00 local
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 5.5,
+            "sensor.sigen_plant_consumed_power": 0.5,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": solcast_remaining,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    _, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Should be active, got {phase}"
+    assert plugin._export_target < 4.0, (
+        f"Export target should be below DNO late in day when battery can't fill, got {plugin._export_target}"
+    )
+    assert plugin._export_target >= 0, f"Export target must be >= 0, got {plugin._export_target}"
+    print(f"  test_export_target_ramp_late_day: PASSED (export_target={plugin._export_target}kW)")
 
 
 # ============================================================================
@@ -1974,6 +2075,8 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_clamped_above_soc_keep,
         test_floor_clamped_above_reserve,
         test_floor_lower_with_more_overflow,
+        test_export_target_at_dno_early_day,
+        test_export_target_ramp_late_day,
     ]
     print("  --- plugin integration tests ---")
     for test_fn in plugin_tests:
@@ -2032,6 +2135,7 @@ def run_curtailment_tests(my_predbat=None):
     solar_tests = [
         test_solar_elevation_known_values,
         test_compute_release_time_scenarios,
+        test_compute_release_offset_load_spike,
         test_compute_release_offset,
     ]
     print("  --- solar geometry tests ---")
