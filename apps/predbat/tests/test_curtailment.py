@@ -899,6 +899,44 @@ def test_deactivation_restores_msc():
     print("  test_deactivation_restores_msc: PASSED")
 
 
+def test_manual_hold_maintains_dess_after_deactivation():
+    """When manual_hold is on, plugin stays in D-ESS even after overflow clears.
+
+    Without fix: plugin deactivates → restores MSC → Predbat fights automation.
+    With fix: plugin detects manual_hold, keeps D-ESS + read_only=True.
+    """
+    pv_on = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
+    pv_off = {m: 1.5 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+
+    base = MockBase(
+        pv_step=pv_on,
+        load_step=load,
+        soc_kw=9.0,
+        minutes_now=600,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 8.0,
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "input_boolean.curtailment_manual_hold": "on",
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+    assert base.set_read_only is True, "Should activate"
+
+    # Overflow clears — plugin would normally deactivate
+    base.pv_forecast_minute_step = {k: v * PLUGIN_STEP / 60.0 for k, v in pv_off.items()}
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.5
+    base.services.clear()
+    plugin.on_update()
+
+    # manual_hold is on → must stay in D-ESS, must NOT restore MSC
+    assert base.set_read_only is True, "read_only must stay True when manual_hold is on"
+    msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
+    assert not msc_called, "Must NOT restore MSC when manual_hold is on"
+    print("  test_manual_hold_maintains_dess_after_deactivation: PASSED")
+
+
 # ============================================================================
 # Charge window deferral tests
 # ============================================================================
@@ -2094,6 +2132,7 @@ def run_curtailment_tests(my_predbat=None):
         test_on_update_full_flow,
         test_on_update_stays_off_low_pv,
         test_deactivation_restores_msc,
+        test_manual_hold_maintains_dess_after_deactivation,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:

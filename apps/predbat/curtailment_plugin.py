@@ -1062,6 +1062,16 @@ class CurtailmentPlugin(PredBatPlugin):
                 )
                 self.last_phase = phase
 
+            # Manual hold: keep D-ESS even when plugin goes off, so Predbat
+            # can't reset to MSC while the user has forced hold active.
+            if phase == "off" and self.was_active:
+                manual_hold = self.base.get_state_wrapper("input_boolean.curtailment_manual_hold", default="off") == "on"
+                if manual_hold:
+                    self.log("Curtailment: manual_hold active — staying in D-ESS despite plugin off")
+                    self.apply("active")
+                    self.publish(phase, floor, dno_limit, export_target=self._export_target)
+                    return
+
             # Apply BEFORE publish: EMS mode must be set before sensor publish
             # triggers the HA automation (which requires D-ESS as a condition)
             self.apply(phase)
