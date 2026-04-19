@@ -349,11 +349,11 @@ class CurtailmentPlugin(PredBatPlugin):
                 actual_scale = self._peak_pv / sin_peak
 
         # floor_scale: p90 unless actual confirms a cloudier day (R43).
-        # Only apply R43 once actual peak is well-established (>= 50% of p90 peak), so that
-        # early-morning low readings don't prematurely drag floor_scale down and raise the floor.
-        p90_peak_kw = self._p90_peak_kw if self._p90_peak_kw > 0 else p90_scale * 0.85
-        actual_peak_established = self._peak_pv >= p90_peak_kw * 0.5
-        if actual_scale > 0 and actual_scale < p90_scale and actual_peak_established:
+        # Not before 10:00 local — early-morning low PV readings are not representative
+        # of the day's peak. After 10:00 the actual scale is meaningful (rising well past
+        # DNO threshold) and can confirm cloud cover.
+        past_10am = minutes_now >= 600
+        if actual_scale > 0 and actual_scale < p90_scale and past_10am:
             floor_scale = actual_scale
         else:
             floor_scale = p90_scale
