@@ -1363,35 +1363,32 @@ def test_export_never_exceeds_dno():
 
 
 def test_floor_lower_with_more_overflow():
-    """Higher actual PV → higher scale → more overflow integral → lower floor.
+    """Higher p90 peak → larger overflow integral → lower floor (R9).
 
-    In v17, scale drives the overflow integral. Higher actual PV near p90 keeps
-    scale at p90 (large overflow). Lower actual PV → actual_scale < p90 → smaller
-    integral → higher floor. So 6kW (cloudy) → higher floor, 9kW (sunny) → lower floor.
+    Floor is always computed from p90_scale regardless of actual PV.
+    Higher p90_peak → higher scale → more overflow expected → lower floor.
     """
     load = {}
     for m in range(0, 120, PLUGIN_STEP):
         load[m] = 1.0
 
-    # Scenario 1: 6kW actual PV (cloudy, actual_scale < p90_scale → higher floor)
-    pv_moderate = {m: 6.0 for m in range(0, 120, PLUGIN_STEP)}
-    p90_sensors = _make_p90_sensors(p90_peak_kw=8.58, solcast_remaining=12.0)
-    sensor1 = {"sensor.sigen_plant_pv_power": 6.0, "sensor.sigen_plant_consumed_power": 1.0}
-    sensor1.update(p90_sensors)
-    base1 = MockBase(pv_step=pv_moderate, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=sensor1)
+    # Scenario 1: lower p90 peak → smaller overflow integral → higher floor
+    pv = {m: 8.0 for m in range(0, 120, PLUGIN_STEP)}
+    sensor1 = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    sensor1.update(_make_p90_sensors(p90_peak_kw=6.0, solcast_remaining=12.0))
+    base1 = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=sensor1)
     plugin1 = CurtailmentPlugin(base1)
     floor1, _ = plugin1.calculate(dno_limit_kw=4.0)
 
-    # Scenario 2: 9kW actual PV (sunny, actual_scale > p90_scale → p90 scale → larger integral → lower floor)
-    pv_high = {m: 9.0 for m in range(0, 120, PLUGIN_STEP)}
-    sensor2 = {"sensor.sigen_plant_pv_power": 9.0, "sensor.sigen_plant_consumed_power": 1.0}
-    sensor2.update(_make_p90_sensors(p90_peak_kw=8.58, solcast_remaining=18.0))
-    base2 = MockBase(pv_step=pv_high, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=sensor2)
+    # Scenario 2: higher p90 peak → larger overflow integral → lower floor
+    sensor2 = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    sensor2.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=20.0))
+    base2 = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=sensor2)
     plugin2 = CurtailmentPlugin(base2)
     floor2, _ = plugin2.calculate(dno_limit_kw=4.0)
 
-    assert floor2 < floor1, f"Higher overflow should give lower floor: 9kW={floor2:.1f} vs 6kW={floor1:.1f}"
-    print(f"  test_floor_lower_with_more_overflow: PASSED (6kW={floor1/BATTERY_KWH*100:.0f}%, 9kW={floor2/BATTERY_KWH*100:.0f}%)")
+    assert floor2 < floor1, f"Higher p90 should give lower floor: p90=10kW floor={floor2:.1f} vs p90=6kW floor={floor1:.1f}"
+    print(f"  test_floor_lower_with_more_overflow: PASSED (p90=6kW→{floor1/BATTERY_KWH*100:.0f}%, p90=10kW→{floor2/BATTERY_KWH*100:.0f}%)")
 
 
 def test_export_target_at_dno_when_soc_above_floor():
@@ -1425,12 +1422,14 @@ def test_export_target_at_dno_when_soc_above_floor():
 def test_export_target_zero_when_soc_below_floor():
     """Export target = 0 when SOC < floor - 0.5 (Charge phase, R16/R38).
 
-    Late in day with small remaining overflow → floor is high. Low SOC → Charge mode.
-    Plugin signals HA automation with export_target=0 so battery charges from PV.
+    Late afternoon (15:00 BST = 14:00 UTC): small remaining overflow from p90_scale
+    → floor is high (close to soc_max). SOC=80% is below floor → Charge mode → export_target=0.
     """
+    from datetime import datetime, timezone
+
     pv = {m: 5.5 for m in range(0, 60, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.80  # 80%
+    soc_kw = BATTERY_KWH * 0.80  # 80% = 14.46 kWh
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 5.5,
         "sensor.sigen_plant_consumed_power": 0.5,
@@ -1440,7 +1439,8 @@ def test_export_target_zero_when_soc_below_floor():
         pv_step=pv,
         load_step=load,
         soc_kw=soc_kw,
-        minutes_now=900,  # 15:00 local — late day, small overflow remaining, floor is high
+        minutes_now=1020,  # 17:00 BST — late enough that remaining overflow is small
+        now_utc=datetime(2025, 7, 12, 16, 0, tzinfo=timezone.utc),  # 16:00 UTC
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)

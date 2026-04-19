@@ -45,10 +45,11 @@ reserved cannot be reclaimed.
 - **R42**: At activation, derive scale from Solcast p90 forecast:
   `scale = p90_peak_kw / sin(elevation at p90_peak_time)`
   This represents a near-perfect solar day — the worst case for overflow headroom.
-- **R43**: Once actual peak PV is observed during the day, update scale:
-  `scale = actual_peak_kw / sin(elevation at actual_peak_time)`
-  Only apply if this raises the floor (i.e. actual_peak < p90_peak). If actual
-  peak exceeds p90 (rare clear-sky burst), floor stays — headroom already reserved.
+- **R43**: actual_scale is computed from observed peak but is NOT used for the floor.
+  The floor always uses p90_scale. Reason: cloud at peak hour gives a false low
+  actual_scale — afternoon could still be clear and produce full p90 overflow.
+  actual_scale is used only for safe_scale (R21): if actual > p90 (very clear day),
+  safe_time extends (conservative deactivation).
 - **R44**: Before today's peak is observed, use yesterday's scale as fallback if
   Solcast p90 is unavailable. Scale changes slowly day-to-day (~1° elevation per day).
 

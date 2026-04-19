@@ -19,7 +19,7 @@
 #   integrated from now to safe_time
 #
 # Scale (R42): p90_peak / sin(elev_at_p90_peak) — near-perfect day worst case
-#   Updated if actual < p90 (cloudier day → floor rises, R43)
+#   Floor always uses p90_scale. actual_scale only used for safe_time (R21/R43).
 #
 # Safe time (R19): when scale × sin(elev) < DNO + base_load
 #   Deactivate at safe_time: restore MSC, Predbat fills battery (R6)
@@ -348,17 +348,13 @@ class CurtailmentPlugin(PredBatPlugin):
             if sin_peak >= 0.05:
                 actual_scale = self._peak_pv / sin_peak
 
-        # floor_scale: p90 unless actual confirms a cloudier day (R43).
-        # Not before 10:00 local — early-morning low PV readings are not representative
-        # of the day's peak. After 10:00 the actual scale is meaningful (rising well past
-        # DNO threshold) and can confirm cloud cover.
-        past_10am = minutes_now >= 600
-        if actual_scale > 0 and actual_scale < p90_scale and past_10am:
-            floor_scale = actual_scale
-        else:
-            floor_scale = p90_scale
+        # floor always uses p90_scale (worst-case clear day).
+        # actual_scale is unreliable for floor: cloud at peak hour gives false low scale,
+        # and afternoon could still be clear. Safe to always reserve p90 headroom.
+        floor_scale = p90_scale
 
-        # safe_scale: conservative — use whichever gives a later safe_time (R21)
+        # safe_scale: conservative — use whichever gives a later safe_time (R21).
+        # actual_scale > p90 on very clear days → extends safe_time (correct, R21).
         safe_scale = max(p90_scale, actual_scale) if actual_scale > 0 else p90_scale
 
         self._floor_scale = floor_scale
