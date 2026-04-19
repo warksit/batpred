@@ -73,7 +73,10 @@ class CurtailmentPlugin(PredBatPlugin):
     Deactivates at safe_time, handing back to Predbat MSC to fill the battery.
     """
 
-    priority = 200  # Run after cold_weather_plugin (priority 100)
+    # Run before cold_weather (which additively boosts best_soc_keep). With curtailment
+    # setting the target value first and cold weather boosting on top, the cold weather
+    # floor for overnight GSHP load is preserved on overflow + cold days.
+    PLUGIN_PRIORITY = 10
 
     def __init__(self, base):
         super().__init__(base)

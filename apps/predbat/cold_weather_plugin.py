@@ -57,7 +57,11 @@ class ColdWeatherPlugin(PredBatPlugin):
     Bootstrap: queries Open-Meteo + HA statistics on first run.
     """
 
-    priority = 50  # Run before curtailment_plugin (priority 200)
+    # Run late: cold weather additively boosts best_soc_keep, so it must run after
+    # plugins that SET best_soc_keep (e.g. curtailment at priority 10). The additive
+    # boost then preserves the cold weather floor for overnight GSHP load.
+    # Plugins with no PLUGIN_PRIORITY default to 100, so this also runs after those.
+    PLUGIN_PRIORITY = 200
 
     def __init__(self, base):
         super().__init__(base)

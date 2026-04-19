@@ -10,7 +10,7 @@
 Provides dynamic plugin discovery from filesystem, class instantiation via
 multiple detection strategies (class name, attribute marker, module function),
 and a hook system for plugins to register callbacks on lifecycle events
-(on_init, on_before_plan, on_update, on_shutdown, on_web_start).
+(on_init, on_update, on_shutdown, on_web_start).
 """
 
 import importlib
@@ -29,23 +29,21 @@ class PluginSystem:
         self.base = base
         self.log = base.log
         self.plugins = {}
-        self.hooks = {"on_init": [], "on_update": [], "on_shutdown": [], "on_web_start": [], "on_before_plan": []}
+        self.hooks = {"on_init": [], "on_update": [], "on_shutdown": [], "on_web_start": []}
 
-    def register_hook(self, hook_name: str, callback: Callable, plugin=None):
+    def register_hook(self, hook_name: str, callback: Callable):
         """
         Register a callback for a specific hook
 
         Args:
-            hook_name (str): Name of the hook
+            hook_name (str): Name of the hook ('on_init', 'on_update', 'on_shutdown', 'on_web_start')
             callback (Callable): Function to call when hook is triggered
-            plugin: Plugin instance (used to read priority for ordered hooks)
         """
         if hook_name not in self.hooks:
             self.hooks[hook_name] = []
 
-        priority = getattr(plugin, "priority", 100) if plugin else 100
-        self.hooks[hook_name].append({"callback": callback, "priority": priority})
-        self.log("Registered hook: {} -> {} (priority={})".format(hook_name, callback.__name__, priority))
+        self.hooks[hook_name].append(callback)
+        self.log(f"Registered hook: {hook_name} -> {callback.__name__}")
 
     def call_hooks(self, hook_name: str, *args, **kwargs):
         """
@@ -56,48 +54,21 @@ class PluginSystem:
             *args, **kwargs: Arguments to pass to the callbacks
         """
         if hook_name in self.hooks:
-            for entry in sorted(self.hooks[hook_name], key=lambda e: e["priority"]):
+            for callback in self.hooks[hook_name]:
                 try:
-                    entry["callback"](*args, **kwargs)
+                    callback(*args, **kwargs)
                 except Exception as e:
-                    self.log("Error calling hook {} callback {}: {}".format(hook_name, entry["callback"].__name__, e))
-
-    def call_before_plan_hooks(self, context: dict) -> dict:
-        """
-        Call all registered on_before_plan callbacks, chaining the context dict.
-
-        Each callback receives the context dict and must return it (possibly modified).
-        This allows plugins to adjust planning parameters (e.g. best_soc_keep) before
-        Predbat's calculate_plan() runs.
-
-        Plugins chain in priority order (lower priority value runs first).
-        Each plugin sets its priority via the ``priority`` class attribute
-        on PredBatPlugin (default 100).
-
-        Args:
-            context (dict): Planning parameters, e.g. {"best_soc_keep": 3.0}
-
-        Returns:
-            dict: The (possibly modified) context dict
-        """
-        if "on_before_plan" in self.hooks:
-            for entry in sorted(self.hooks["on_before_plan"], key=lambda e: e["priority"]):
-                try:
-                    result = entry["callback"](context)
-                    if isinstance(result, dict):
-                        context = result
-                    else:
-                        self.log("Warning: on_before_plan callback {} returned {}, expected dict. Ignoring.".format(entry["callback"].__name__, type(result).__name__))
-                except Exception as e:
-                    self.log("Error calling on_before_plan callback {}: {}".format(entry["callback"].__name__, e))
-        return context
+                    self.log(f"Error calling hook {hook_name} callback {callback.__name__}: {e}")
 
     def discover_plugins(self, plugin_dirs: List[str] = None):
         """
-        Auto-discover plugins in specified directories
+        Auto-discover plugins in specified directories.
 
-        Args:
-            plugin_dirs (List[str]): List of directories to search for plugins
+        Plugins are instantiated first, then hooks are registered in ascending
+        PLUGIN_PRIORITY order (default 100). Lower priority runs first, so
+        plugins that set values (e.g. curtailment override) should use a lower
+        priority than plugins that additively adjust them (e.g. cold weather
+        boost) — ensuring the additive plugin preserves the set value.
         """
         if plugin_dirs is None:
             # Default plugin directories
@@ -107,33 +78,44 @@ class PluginSystem:
                 os.path.join(os.path.dirname(__file__), "..", "plugins"),  # plugins in parent
             ]
 
-        discovered_count = 0
-
         for plugin_dir in plugin_dirs:
             if not os.path.exists(plugin_dir):
                 continue
 
             self.log(f"Scanning for plugins in: {plugin_dir}")
 
-            for filename in sorted(os.listdir(plugin_dir)):
+            for filename in os.listdir(plugin_dir):
                 if filename.endswith("_plugin.py"):
                     plugin_name = filename[:-3]  # Remove .py extension
 
                     try:
-                        self.load_plugin(plugin_dir, plugin_name)
-                        discovered_count += 1
+                        self.load_plugin(plugin_dir, plugin_name, register_hooks=False)
                     except Exception as e:
                         self.log(f"Failed to load plugin {plugin_name}: {e}")
 
-        self.log(f"Plugin discovery complete. Loaded {discovered_count} plugins.")
+        # Register hooks in priority order so value interactions are deterministic.
+        ordered = sorted(self.plugins.items(), key=lambda kv: (getattr(kv[1], "PLUGIN_PRIORITY", 100), kv[0]))
+        for plugin_name, plugin_instance in ordered:
+            if hasattr(plugin_instance, "register_hooks"):
+                priority = getattr(plugin_instance, "PLUGIN_PRIORITY", 100)
+                try:
+                    self.log(f"Registering hooks for {plugin_name} (priority={priority})")
+                    plugin_instance.register_hooks(self)
+                except Exception as e:
+                    self.log(f"Failed to register hooks for plugin {plugin_name}: {e}")
 
-    def load_plugin(self, plugin_dir: str, plugin_name: str):
+        self.log(f"Plugin discovery complete. Loaded {len(self.plugins)} plugins.")
+
+    def load_plugin(self, plugin_dir: str, plugin_name: str, register_hooks: bool = True):
         """
         Load a specific plugin from a directory
 
         Args:
             plugin_dir (str): Directory containing the plugin
             plugin_name (str): Name of the plugin module (without .py)
+            register_hooks (bool): Whether to register hooks immediately. Set
+                False during discover_plugins so hooks can be registered in
+                priority order after all plugins are instantiated.
         """
         plugin_path = os.path.join(plugin_dir, f"{plugin_name}.py")
 
@@ -186,8 +168,7 @@ class PluginSystem:
             self.plugins[plugin_name] = plugin_instance
             self.log(f"Successfully loaded plugin: {plugin_name}")
 
-            # Call the plugin's registration hooks if it has them
-            if hasattr(plugin_instance, "register_hooks"):
+            if register_hooks and hasattr(plugin_instance, "register_hooks"):
                 try:
                     plugin_instance.register_hooks(self)
                 except Exception as e:
@@ -238,7 +219,6 @@ class PredBatPlugin:
     """
 
     PREDBAT_PLUGIN = True  # Marker for auto-discovery
-    priority = 100  # Hook execution order: lower runs first (e.g. 10 before 100)
 
     def __init__(self, base):
         self.base = base
