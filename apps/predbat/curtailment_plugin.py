@@ -733,9 +733,10 @@ class CurtailmentPlugin(PredBatPlugin):
         load_ratio = self._get_load_ratio()
         self._load_ratio = load_ratio
 
-        # --- Don't activate before 07:00 or before PV starts ---
-        # Let predbat complete overnight charging (cheap rates, soc_keep).
-        if minutes_now < 420 or (self._peak_pv < 0.1 and actual_pv < 0.1):
+        # --- Don't activate before PV starts ---
+        # Guard: no meaningful PV yet (handles pre-dawn and winter mornings).
+        # No clock gate — GSHP morning CH doesn't run in summer; activation is PV-presence gated.
+        if self._peak_pv < 0.1 and actual_pv < 0.1:
             return soc_max, "off"
 
         # --- Solcast remaining today ---
