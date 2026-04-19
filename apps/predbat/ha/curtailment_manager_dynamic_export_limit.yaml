@@ -1,15 +1,19 @@
 # Curtailment Manager - Dynamic Export Limit
 # HA automation: event-driven export control for curtailment system.
 #
-# Three-phase logic:
-#   Manual Hold: force D-ESS, export = min(excess, DNO) — bypasses plugin
-#   Drain:       SOC > floor → export = min(export_cap, DNO) — drain battery pre-overflow
-#   Hold:        SOC <= floor → export = min(excess, export_cap, DNO) — hold at floor
+# Manual override: input_select.curtailment_manual_hold — Off / Hold / Drain
+#   Off:   plugin controls export (default)
+#   Hold:  force export = min(excess, DNO) — clamp at available PV
+#   Drain: force export = DNO — force battery discharge to grid
+#
+# Plugin-controlled phases:
+#   Drain: SOC > floor → export = min(export_cap, DNO) — drain battery pre-overflow
+#   Hold:  SOC <= floor → export = min(excess, export_cap, DNO) — hold at floor
 #
 # export_cap comes from sensor.predbat_curtailment_export_target (ramp sensor).
 # Falls back to DNO if sensor is unavailable or -2 (inactive).
 #
-# Manual hold forces D-ESS mode so the export limit is respected by SIG.
+# Manual Hold/Drain forces D-ESS mode so the export limit is respected by SIG.
 # Plugin stay-active (R40) ensures D-ESS is maintained while PV is present.
 #
 # IMPORTANT: Update and commit this file before changing the automation in HA.
@@ -18,10 +22,9 @@
 id: "1773747411848"
 alias: "Curtailment Manager - Dynamic Export Limit"
 description: >-
-  Three-phase export control with ramp-down and manual hold override.
-  When manual_hold is on: export min(excess, DNO) regardless of plugin phase.
-  When off: SOC > floor exports at export_target (drain), SOC <= floor exports
-  min(excess, export_target) (hold).
+  Export control with manual override select (Off/Hold/Drain) and plugin-driven ramp-down.
+  Manual Hold: export = min(excess, DNO). Manual Drain: export = DNO.
+  Plugin: SOC > floor drains at export_target; SOC <= floor holds at min(excess, export_target, DNO).
 mode: single
 
 trigger:
@@ -37,15 +40,17 @@ trigger:
   - entity_id: sensor.predbat_curtailment_target_soc
     id: target_change
     platform: state
-  - entity_id: input_boolean.curtailment_manual_hold
+  - entity_id: input_select.curtailment_manual_hold
     platform: state
 
 condition:
   - condition: or
     conditions:
-      - condition: state
-        entity_id: input_boolean.curtailment_manual_hold
-        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.curtailment_manual_hold
+            state: "Off"
       - condition: and
         conditions:
           - condition: not
@@ -75,15 +80,18 @@ action:
         {% else %}
           {{ dno }}
         {% endif %}
-      manual_hold: "{{ is_state('input_boolean.curtailment_manual_hold', 'on') }}"
+      manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       phase: >-
-        {% if manual_hold %}Manual Hold
+        {% if manual_mode == 'Hold' %}Manual Hold
+        {% elif manual_mode == 'Drain' %}Manual Drain
         {% elif soc_kwh > target_kwh %}Drain
         {% else %}Hold
         {% endif %}
       new_limit: >-
-        {% if manual_hold %}
+        {% if manual_mode == 'Hold' %}
           {{ [[excess, 0] | max, dno] | min | round(1) }}
+        {% elif manual_mode == 'Drain' %}
+          {{ dno | round(1) }}
         {% elif soc_kwh > target_kwh %}
           {{ [[export_cap, 0] | max, dno] | min | round(1) }}
         {% else %}
@@ -94,7 +102,7 @@ action:
 
   - if:
       - condition: template
-        value_template: "{{ manual_hold and states('select.sigen_plant_remote_ems_control_mode') != 'Command Discharging (ESS First)' }}"
+        value_template: "{{ manual_mode != 'Off' and states('select.sigen_plant_remote_ems_control_mode') != 'Command Discharging (ESS First)' }}"
     then:
       - action: select.select_option
         target:
