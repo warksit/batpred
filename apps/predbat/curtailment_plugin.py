@@ -844,21 +844,10 @@ class CurtailmentPlugin(PredBatPlugin):
             floor = min(floor, self._floor_ratchet + max_rise)
         self._floor_ratchet = floor
 
-        # Export target ramp: reduce export only when battery won't fill at DNO (R38)
-        energy_still_needed = max(0.0, soc_max - soc_kw)
-        hours_to_release = max(release_offset, PREDICT_STEP) / 60.0
-        charge_at_dno = 0.0
-        for m in range(PREDICT_STEP, release_offset, PREDICT_STEP):
-            pv_kw = pv_step.get(m, 0) * to_kw
-            load_kw = load_step.get(m, 0) * to_kw * load_ratio
-            slot_excess = pv_kw - load_kw
-            if slot_excess > dno_limit_kw:
-                charge_at_dno += (slot_excess - dno_limit_kw) * step_hours
-        if charge_at_dno >= energy_still_needed:
-            self._export_target = dno_limit_kw
-        else:
-            exportable_budget = remaining_pv - remaining_load - energy_still_needed - headroom_reserve
-            self._export_target = round(max(0, min(dno_limit_kw, exportable_budget / hours_to_release)), 2)
+        # Active phase: always export at DNO (R38).
+        # Floor ensures overflow headroom; post-release formula fills battery afterward.
+        # Pre-throttling here is redundant and wastes certain peak-PV export opportunity.
+        self._export_target = dno_limit_kw
 
         return floor, "active"
 

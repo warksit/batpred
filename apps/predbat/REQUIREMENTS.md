@@ -101,10 +101,12 @@ No export capacity in the activation check — export is what management DOES, n
 
 ## Export Target Ramp
 
-- **R38**: Export target ramps from DNO toward 0 across all active phases:
-    - **Overflow window (Phase 2)**: export_target = DNO (battery fills from overflow).
+- **R38**: Export target controls HA automation export cap:
+    - **Active phase (pre-overflow + overflow window)**: export_target = DNO always. Export at
+      full capacity while PV is abundant and certain. Floor ensures overflow headroom.
     - **Post-release (Phase 3/4)**: `export_target = clamp(0, DNO, budget / hours_to_pv_end)`
     where `budget = remaining_pv - remaining_load - energy_still_needed - headroom_reserve`.
+    Ramps from DNO toward 0, causing battery to absorb remaining PV as PV declines.
   Published as `sensor.predbat_curtailment_export_target`. HA automation uses
   this instead of hardcoded DNO for Drain and Hold export limits.
   When inactive, value = -2 (automation falls back to DNO).
