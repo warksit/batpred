@@ -353,9 +353,16 @@ class CurtailmentPlugin(PredBatPlugin):
         # and afternoon could still be clear. Safe to always reserve p90 headroom.
         floor_scale = p90_scale
 
-        # safe_scale: conservative — use whichever gives a later safe_time (R21).
-        # actual_scale > p90 on very clear days → extends safe_time (correct, R21).
-        safe_scale = max(p90_scale, actual_scale) if actual_scale > 0 else p90_scale
+        # safe_scale drives safe_time (R19/R21).
+        # Before peak confirmed: use p90_scale (conservative — don't deactivate early).
+        # After peak confirmed (≥60 min past peak): use actual_scale.
+        #   - actual > p90 (very clear day) → later safe_time (more conservative, R21)
+        #   - actual < p90 (cloudy day) → earlier safe_time → earlier MSC recovery → better sunset SOC
+        peak_confirmed = self._peak_pv_time > 0 and (minutes_now - self._peak_pv_time) >= 60
+        if actual_scale > 0 and peak_confirmed:
+            safe_scale = actual_scale
+        else:
+            safe_scale = p90_scale
 
         self._floor_scale = floor_scale
         self._safe_scale = safe_scale
