@@ -300,6 +300,90 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 
+def compute_solar_overflow(scale, lat_deg, lon_deg, day_of_year, from_utc_hours, to_utc_hours, dno_limit, base_load=MIN_BASE_LOAD_KW, step_minutes=5):
+    """
+    Integrate overflow energy from the solar geometry curve between two UTC times.
+
+    overflow(t) = max(0, scale × sin(elev(t)) - base_load - dno_limit)
+    Returns ∫ overflow(t) dt in kWh.
+
+    Args:
+        scale: float kW — clear-sky scale (peak_pv / sin(elevation_at_peak))
+        lat_deg, lon_deg: location
+        day_of_year: 1-366
+        from_utc_hours: integration start (decimal UTC hours, i.e. now)
+        to_utc_hours: integration end (decimal UTC hours, i.e. safe_time)
+        dno_limit: float kW — max grid export
+        base_load: float kW — minimum household load offsetting PV
+        step_minutes: integration step size in minutes
+
+    Returns:
+        float kWh — total overflow energy over the window
+    """
+    if scale <= 0 or to_utc_hours <= from_utc_hours:
+        return 0.0
+    step_hours = step_minutes / 60.0
+    total = 0.0
+    t = from_utc_hours
+    while t < to_utc_hours:
+        elev = solar_elevation(lat_deg, lon_deg, t, day_of_year)
+        pv_kw = scale * max(0.0, math.sin(math.radians(elev)))
+        total += max(0.0, pv_kw - base_load - dno_limit) * step_hours
+        t += step_hours
+    return total
+
+
+def p90_scale_from_forecast(detailed_forecast, lat_deg, lon_deg, day_of_year, local_offset_hours=0):
+    """
+    Derive clear-sky scale from Solcast p90 (near-worst-case) forecast.
+
+    Finds the 30-min slot with highest pv_estimate90, converts to UTC time,
+    computes solar elevation at that time, returns scale = p90_peak / sin(elev).
+
+    Args:
+        detailed_forecast: list of dicts with 'period_start' (ISO string BST/local)
+                           and 'pv_estimate90' (kW average over 30-min period)
+        lat_deg, lon_deg: location
+        day_of_year: 1-366
+        local_offset_hours: local time offset from UTC (e.g. 1.0 for BST)
+
+    Returns:
+        (scale, p90_peak_kw, p90_peak_utc_hours) or (0, 0, 0) if unavailable
+    """
+    if not detailed_forecast:
+        return 0.0, 0.0, 0.0
+
+    best_kw = 0.0
+    best_utc = 0.0
+    for slot in detailed_forecast:
+        kw = slot.get("pv_estimate90", 0.0)
+        if kw <= best_kw:
+            continue
+        # Parse period_start hour — assume local time, convert to UTC
+        try:
+            ps = slot["period_start"]
+            # Format: "2026-04-19T13:00:00+01:00" or similar
+            time_part = ps[11:16]  # "HH:MM"
+            h, m = int(time_part[:2]), int(time_part[3:5])
+            local_h = h + m / 60.0 + 0.25  # mid-point of 30-min slot
+            utc_h = local_h - local_offset_hours
+        except (ValueError, IndexError, KeyError):
+            continue
+        best_kw = kw
+        best_utc = utc_h
+
+    if best_kw < 0.5:
+        return 0.0, 0.0, 0.0
+
+    elev = solar_elevation(lat_deg, lon_deg, best_utc, day_of_year)
+    sin_elev = math.sin(math.radians(elev))
+    if sin_elev < 0.05:
+        return 0.0, 0.0, 0.0
+
+    scale = best_kw / sin_elev
+    return scale, best_kw, best_utc
+
+
 def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, current_utc_hours):
     """
     Compute minutes from now until PV drops below threshold (safe time).

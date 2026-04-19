@@ -1,35 +1,43 @@
 # -----------------------------------------------------------------------------
-# Curtailment Manager Plugin for Predbat — v10
-# Overflow-vs-headroom algorithm to eliminate solar curtailment
+# Curtailment Manager Plugin for Predbat — v17
+# Solar-geometry floor algorithm to eliminate solar curtailment
 #
 # Works WITH the HA automation (curtailment_manager_dynamic_export_limit):
-#   - Plugin (5-min): computes floor from overflow forecast, publishes sensors
-#   - HA automation (~5s): binary export limit (0 if SOC < floor, else min(excess, DNO))
+#   - Plugin (5-min): computes floor from solar geometry integral, publishes sensors
+#   - HA automation (~5s): Drain (SOC > floor) or Hold (SOC ≤ floor)
 #
 # Control model (SIG inverter):
-#   Active:  D-ESS mode, read_only=True (suppresses Predbat inverter control)
-#   Inactive: MSC mode, read_only=False (Predbat resumes)
+#   Active:   D-ESS mode, read_only=True (suppresses Predbat inverter control)
+#   Inactive: MSC mode, read_only=False (Predbat resumes, fills battery from PV)
 #
-# v10 activation (one check):
-#   remaining_overflow * 1.10 > available_headroom (soc_max * 0.95 - soc_kw)
+# Activation (R5): BOTH must be true:
+#   1. remaining_overflow > 0 — solar geometry curve predicts overflow
+#   2. solcast_remaining - load_remaining > (soc_max - soc_kw) — battery fills
 #
-# v10 phases (binary):
-#   charge:  SOC < floor → export=0, absorb all PV
-#   managed: SOC >= floor → export=DNO, SIG handles overflow naturally
-#   off:     No overflow risk → hand to Predbat
+# Floor (R9): soc_max - overflow_integral × 1.25
+#   overflow_integral = ∫ max(0, scale × sin(elev) - base_load - DNO) dt
+#   integrated from now to safe_time
+#
+# Scale (R42): p90_peak / sin(elev_at_p90_peak) — near-perfect day worst case
+#   Updated if actual < p90 (cloudier day → floor rises, R43)
+#
+# Safe time (R19): when scale × sin(elev) < DNO + base_load
+#   Deactivate at safe_time: restore MSC, Predbat fills battery (R6)
+#
+# Floor ratchet (R11): floor can only rise within a day — headroom cannot be reclaimed
 # -----------------------------------------------------------------------------
 
 import math
 
 from curtailment_calc import (
     compute_morning_gap,
-    compute_release_offset,
     compute_remaining_overflow,
+    compute_solar_overflow,
+    p90_scale_from_forecast,
     simulate_soc_trajectory,
     solar_elevation,
     compute_release_time,
     MIN_BASE_LOAD_KW,
-    SAFE_PV_THRESHOLD_KW,
 )
 from plugin_system import PredBatPlugin
 
@@ -46,23 +54,23 @@ HA_ENABLE = "input_boolean.curtailment_manager_enable"
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
 
-# SIG/Solcast sensor entities for energy ratio
+# SIG/Solcast sensor entities
 SIG_DAILY_PV = "sensor.sigen_plant_daily_third_party_inverter_energy"
 PREDBAT_PV_TODAY = "sensor.predbat_pv_today"
+SOLCAST_TODAY = "sensor.solcast_pv_forecast_forecast_today"
+SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 
-# Safety factors
-OVERFLOW_SAFETY_FACTOR = 1.25  # 25% buffer on overflow-only energy (R9)
-SOC_CAP_FACTOR = 0.95  # 95% cap for activation headroom check (R5)
+# Safety factor: 25% buffer on overflow headroom (R9)
+OVERFLOW_SAFETY_FACTOR = 1.25
 
 
 class CurtailmentPlugin(PredBatPlugin):
     """
-    Curtailment manager v10.1 — overflow-vs-headroom algorithm.
+    Curtailment manager v17 — solar geometry floor algorithm.
 
-    Activation: overflow * 1.10 > headroom to 95% (with hysteresis).
-    Floor: soc_max - overflow * 1.10, capped at 95% until safe_time.
-    Control: plugin sets D-ESS + Active/Off. HA automation handles
-    real-time export (charge/drain/hold) based on SOC vs floor.
+    Floor derived from integral of overflow above DNO on a worst-case (p90) solar curve.
+    Scale from Solcast p90 peak at activation; updated downward if actual peak is lower.
+    Deactivates at safe_time, handing back to Predbat MSC to fill the battery.
     """
 
     priority = 200  # Run after cold_weather_plugin (priority 100)
@@ -75,19 +83,22 @@ class CurtailmentPlugin(PredBatPlugin):
         self.was_active = False
         self._dno_limit = 4.0
         self.last_phase = None
-        self._energy_ratio = 1.0
-        self._load_ratio = 1.0
-        # Day's peak PV for solar geometry calibration
+        # Day's peak PV (actual observed) for scale calibration (R43)
         self._peak_pv = 0.0
         self._peak_pv_time = 0
-        self._release_scale = 0
-        self._release_crossing = "none"
-        self._remaining_overflow = 0
-        self._floor_ratchet = None  # Soft ratchet: floor rises max 2%/cycle (R39)
-        self._release_offset_cached = None  # Release hysteresis (R39)
-        self._export_target = -2  # Published export target kW; -2 = inactive (R38)
-        self._low_pv_count = 0  # Consecutive cycles with PV < SAFE_PV_THRESHOLD_KW (R40)
-        self._actual_pv_kw = 0.0  # Last actual PV reading (for post_release deactivation)
+        # p90 scale from Solcast (set at activation, stable through day, R42)
+        self._p90_scale = 0.0
+        self._p90_peak_kw = 0.0
+        # Diagnostics published to sensors
+        self._remaining_overflow = 0.0
+        self._safe_time_str = "none"
+        self._floor_scale = 0.0
+        self._safe_scale = 0.0
+        # Floor ratchet: floor can only rise (R11)
+        self._floor_ratchet = None
+        # Export target published to HA automation (-2 = inactive)
+        self._export_target = -2
+        self._actual_pv_kw = 0.0
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0
@@ -113,13 +124,11 @@ class CurtailmentPlugin(PredBatPlugin):
 
         minutes_now = getattr(self.base, "minutes_now", 720)
 
-        # Caching: overnight (22:00-06:00) recompute max every 30 min,
-        # morning (06:00-12:00) recalculate each cycle, afternoon skip
+        # Caching: morning (06:00-12:00) recalculate each cycle, other times every 30 min
         if self._cached_keep is not None:
             minutes_since = minutes_now - self._cached_at
             if minutes_since < 0:
                 minutes_since += 1440  # wrapped past midnight
-            # 06:00=360, 12:00=720, 22:00=1320
             if 360 <= minutes_now < 720:
                 pass  # morning: always recalculate
             elif minutes_since < 30:
@@ -145,10 +154,8 @@ class CurtailmentPlugin(PredBatPlugin):
         dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
         today_solar_end = min(forecast_minutes, max(PREDICT_STEP, 23 * 60 - minutes_now))
 
-        # After today's solar hours (evening/night), use tomorrow's forecast window.
-        # The keep reduction is for TONIGHT's charge — needs tomorrow's overflow data.
+        # After today's solar hours, use tomorrow's forecast window for overnight planning
         if today_solar_end < 60:
-            # Less than 1 hour of today's solar left — use tomorrow's window
             tomorrow_start = 1440 - minutes_now + 5 * 60  # tomorrow 05:00
             tomorrow_end = 1440 - minutes_now + 23 * 60  # tomorrow 23:00
             tomorrow_end = min(tomorrow_end, forecast_minutes)
@@ -187,7 +194,6 @@ class CurtailmentPlugin(PredBatPlugin):
             values_are_kwh=True,
         )
 
-        # Will battery fill? Use 90% as activation threshold for planning
         will_fill = peak_soc > soc_max * 0.90
 
         if not will_fill:
@@ -219,10 +225,6 @@ class CurtailmentPlugin(PredBatPlugin):
         )
         current_keep = context["best_soc_keep"]
 
-        # Only reduce keep if the overflow actually needs the headroom.
-        # Headroom with current keep: soc_max - current_keep.
-        # If overflow fits in that headroom, don't reduce — keep the cold
-        # weather boost and other safety buffers intact.
         headroom_with_current_keep = soc_max - current_keep
         if remaining_overflow_total * OVERFLOW_SAFETY_FACTOR <= headroom_with_current_keep:
             self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap, 2), "overflow_kwh": round(remaining_overflow_total, 2), "original_keep": round(current_keep, 2), "reason": "overflow_fits_in_headroom"})
@@ -245,10 +247,7 @@ class CurtailmentPlugin(PredBatPlugin):
         """Read configuration from HA input helpers and Predbat config."""
         enabled = self.base.get_state_wrapper(HA_ENABLE, default="off")
         enabled = str(enabled).lower() in ("on", "true")
-
-        # DNO limit from Predbat's export_limit config (apps.yaml, in Watts)
         dno_limit = self.base.get_arg("export_limit", 4000, index=0) / 1000.0
-
         return enabled, dno_limit
 
     def _publish_offset(self, value, attrs):
@@ -257,267 +256,184 @@ class CurtailmentPlugin(PredBatPlugin):
         self.base.dashboard_item("sensor.{}_curtailment_solar_offset".format(self.base.prefix), value, attrs)
         self._cached_offset = (value, attrs)
 
-    def _get_energy_ratio(self):
-        """Compute energy ratio: actual cumulative PV / calibrated forecast cumulative PV.
+    def _get_p90_scale(self, lat, lon, doy, local_offset):
+        """Get clear-sky scale from Solcast p90 forecast (R42).
 
-        Uses calibrated forecast (totalCL/remainingCL from predbat_pv_today) to match
-        the reference frame of remaining_overflow (which uses calibrated pv_forecast_minute_step).
-
-        Returns (actual_pv, actual_load, energy_ratio) where energy_ratio smoothly
-        blends from 1.0 during the first 10% of daily forecast production.
+        Reads detailedForecast attribute from today's Solcast sensor.
+        Falls back to yesterday's scale if unavailable (R44).
         """
         try:
-            actual_pv = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0))
-            actual_load = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0))
-        except (ValueError, TypeError):
-            return 0.0, 0.0, 1.0
+            detailed = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="detailedForecast", default=[])
+            if detailed:
+                scale, peak_kw, peak_utc = p90_scale_from_forecast(detailed, lat, lon, doy, local_offset)
+                if scale > 0:
+                    self._p90_scale = scale
+                    self._p90_peak_kw = peak_kw
+                    return scale, peak_kw, peak_utc
+        except Exception:
+            pass
+        # Fallback: yesterday's scale (changes ~1° elevation per day, R44)
+        return self._p90_scale, self._p90_peak_kw, 0.0
 
-        try:
-            actual_produced = float(self.base.get_state_wrapper(SIG_DAILY_PV, default=0))
-        except (ValueError, TypeError):
-            actual_produced = 0.0
+    def calculate(self, dno_limit_kw):
+        """Compute floor using v17 solar geometry model.
 
-        # Read calibrated forecast from predbat_pv_today attributes.
-        try:
-            total_cl = float(self.base.get_state_wrapper(PREDBAT_PV_TODAY, attribute="totalCL", default=0))
-            remaining_cl = float(self.base.get_state_wrapper(PREDBAT_PV_TODAY, attribute="remainingCL", default=0))
-        except (ValueError, TypeError):
-            total_cl = 0
-            remaining_cl = 0
+        Scale from Solcast p90 (R42). Floor = soc_max - overflow_integral × 1.25 (R9).
+        Floor ratchet: floor can only rise (R11). Deactivate at safe_time (R6).
 
-        # Fallback: if calibrated forecast attributes are unavailable (e.g. first boot),
-        # use raw Solcast sensors.
-        if total_cl <= 0:
-            try:
-                forecast_today = float(self.base.get_state_wrapper("sensor.solcast_pv_forecast_forecast_today", default=0))
-                forecast_remaining = float(self.base.get_state_wrapper("sensor.solcast_pv_forecast_forecast_remaining_today", default=0))
-                total_cl = forecast_today
-                remaining_cl = forecast_remaining
-            except (ValueError, TypeError):
-                pass
-
-        forecast_produced = total_cl - remaining_cl
-
-        # Blend: smoothly ramp from 1.0 toward real ratio over first 15% of daily forecast
-        threshold = total_cl * 0.15
-        if forecast_produced < 0.5 or threshold < 0.5:
-            return actual_pv, actual_load, 1.0
-
-        blend = min(1.0, forecast_produced / threshold)
-        raw_ratio = actual_produced / max(forecast_produced, 0.5)
-        energy_ratio = 1.0 + (raw_ratio - 1.0) * blend
-
-        return actual_pv, actual_load, energy_ratio
-
-    def _get_load_ratio(self):
-        """Compute load ratio: actual cumulative load / predicted cumulative load.
-
-        Uses predbat.load_energy_adjusted (today_so_far) as the predicted load
-        consumed so far, and sigen daily load as actual.
-
-        Returns load_ratio with same 10% blend as PV ratio for early stability.
-        Ratio > 1 means actual load higher than predicted (less overflow risk).
-        Ratio < 1 means actual load lower than predicted (more overflow risk).
+        Returns:
+            (floor_kwh, phase) where phase is "active" or "off"
         """
-        try:
-            actual_load_total = float(self.base.get_state_wrapper("sensor.sigen_plant_daily_load_consumption", default=0))
-        except (ValueError, TypeError):
-            return 1.0
+        soc_kw = getattr(self.base, "soc_kw", 0)
+        soc_max = getattr(self.base, "soc_max", 10)
 
-        try:
-            predicted_so_far = float(self.base.get_state_wrapper("predbat.load_energy_adjusted", attribute="today_so_far", default=0))
-            predicted_today = float(self.base.get_state_wrapper("predbat.load_energy_adjusted", attribute="today", default=0))
-        except (ValueError, TypeError):
-            return 1.0
+        if not soc_max:
+            return soc_max, "off"
 
-        if predicted_so_far < 2.0 or predicted_today < 5.0:
-            return 1.0  # too early for meaningful ratio
+        minutes_now = getattr(self.base, "minutes_now", 720)
 
-        # 15% blend: stable early, responsive by mid-morning
-        threshold = predicted_today * 0.15
-        blend = min(1.0, predicted_so_far / max(threshold, 0.5))
-        raw_ratio = actual_load_total / max(predicted_so_far, 0.5)
-        load_ratio = 1.0 + (raw_ratio - 1.0) * blend
-
-        return load_ratio
-
-    def _update_peak_pv(self, minutes_now, actual_pv_kw):
-        """Track the day's peak PV for solar geometry scale calibration.
-
-        Updates whenever a new peak is seen. Resets when PV drops to zero
-        in the evening (minutes_now > 1200 = after 20:00).
-        """
-        if actual_pv_kw > self._peak_pv:
-            self._peak_pv = actual_pv_kw
-            self._peak_pv_time = minutes_now
-        # Reset after PV dies in evening
-        if actual_pv_kw < 0.1 and minutes_now > 1200:
-            self._peak_pv = 0.0
-            self._peak_pv_time = 0
-            self._release_scale = 0
-
-    def _compute_solar_release(self, minutes_now, actual_pv_kw, dno_limit_kw, forecast_peak_kw=0, forecast_peak_time=720):
-        """Compute whether we're past the solar safe time.
-
-        Uses the day's peak PV to calibrate a clear-sky model:
-        pv = scale * sin(elevation). Safe when this drops below DNO + base_load.
-
-        Before midday, uses forecast peak (stable). After midday, uses actual.
-
-        Returns (past_safe_time, scale, crossing_time_str, safe_time_mins).
-        """
-        self._update_peak_pv(minutes_now, actual_pv_kw)
-
+        # Get location
         try:
             lat = float(self.base.get_state_wrapper("zone.home", attribute="latitude", default=0))
             lon = float(self.base.get_state_wrapper("zone.home", attribute="longitude", default=0))
         except (ValueError, TypeError):
-            return False, 0, "none", None
+            return soc_max, "off"
 
         if lat == 0 and lon == 0:
-            return False, 0, "none", None
+            return soc_max, "off"
 
         now_utc = getattr(self.base, "now_utc", None)
         if now_utc is None:
-            return False, 0, "none", None
+            return soc_max, "off"
 
         utc_hours = now_utc.hour + now_utc.minute / 60.0 + now_utc.second / 3600.0
         doy = now_utc.timetuple().tm_yday
+        local_offset = (minutes_now / 60.0) - utc_hours  # hours ahead of UTC
 
-        # Before midday: use forecast peak (stable from start of day).
-        # After midday: use actual observed peak (calibrated to real conditions).
-        if minutes_now < 720:
-            peak_pv = max(self._peak_pv, forecast_peak_kw)
-            peak_time = forecast_peak_time if forecast_peak_kw >= self._peak_pv else self._peak_pv_time
+        # Read actual PV
+        try:
+            actual_pv = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0))
+        except (ValueError, TypeError):
+            actual_pv = 0.0
+        self._actual_pv_kw = actual_pv
+
+        # Guard: no PV yet (pre-dawn / winter morning)
+        if self._peak_pv < 0.1 and actual_pv < 0.1:
+            return soc_max, "off"
+
+        # Track actual peak for scale calibration (R43)
+        if actual_pv > self._peak_pv:
+            self._peak_pv = actual_pv
+            self._peak_pv_time = minutes_now
+
+        # Reset peak tracking at end of day
+        if actual_pv < 0.1 and minutes_now > 1200:
+            self._peak_pv = 0.0
+            self._peak_pv_time = 0
+
+        # Get p90 scale from Solcast (R42)
+        p90_scale, _p90_peak_kw, _p90_peak_utc = self._get_p90_scale(lat, lon, doy, local_offset)
+
+        if p90_scale < 0.5:
+            # No Solcast data and no yesterday's scale — cannot compute safely
+            self._export_target = -2
+            return soc_max, "off"
+
+        # Compute actual scale from observed peak (R43)
+        actual_scale = 0.0
+        if self._peak_pv >= 1.0:
+            peak_utc_h = (self._peak_pv_time / 60.0) - local_offset
+            peak_elev = solar_elevation(lat, lon, peak_utc_h, doy)
+            sin_peak = math.sin(math.radians(peak_elev))
+            if sin_peak >= 0.05:
+                actual_scale = self._peak_pv / sin_peak
+
+        # floor_scale: p90 unless actual shows a cloudier day (smaller scale → higher floor, R43)
+        if actual_scale > 0 and actual_scale < p90_scale:
+            floor_scale = actual_scale
         else:
-            peak_pv = self._peak_pv
-            peak_time = self._peak_pv_time
+            floor_scale = p90_scale
 
-        if peak_pv < 1.0:
-            return False, 0, "none", None
+        # safe_scale: conservative — use whichever gives a later safe_time (R21)
+        safe_scale = max(p90_scale, actual_scale) if actual_scale > 0 else p90_scale
 
-        # Before peak: don't RELEASE (uncap 95%), but still estimate safe_time
-        # for the energy balance cutoff.
-        before_peak = minutes_now <= peak_time
+        self._floor_scale = floor_scale
+        self._safe_scale = safe_scale
 
-        # Compute scale from elevation at peak time
-        local_offset_hours = (minutes_now / 60.0) - utc_hours
-        peak_utc_hours = (peak_time / 60.0) - local_offset_hours
-        peak_elev = solar_elevation(lat, lon, peak_utc_hours, doy)
-        sin_peak = math.sin(math.radians(peak_elev))
-        if sin_peak < 0.05:
-            return True, 0, "low_sun", 0
+        # Compute safe_time: when scale × sin(elev) < DNO + base_load (R19)
+        threshold_kw = dno_limit_kw + MIN_BASE_LOAD_KW
+        safe_mins, safe_utc = compute_release_time(safe_scale, lat, lon, doy, threshold_kw, utc_hours)
 
-        scale = peak_pv / sin_peak
-        self._release_scale = scale
-        threshold = dno_limit_kw + MIN_BASE_LOAD_KW
+        if safe_mins is None:
+            # Can't compute — assume far future (very high scale, unusual)
+            safe_utc = utc_hours + 12.0
+            safe_mins = 720
+            self._safe_time_str = "none"
+        elif safe_mins <= 0:
+            # Past safe_time → deactivate (R6/R12)
+            safe_local = safe_utc + local_offset
+            self._safe_time_str = "{:02d}:{:02d}".format(int(safe_local) % 24, int((safe_local % 1) * 60))
+            self._floor_ratchet = None
+            self._export_target = -2
+            self._remaining_overflow = 0.0
+            return soc_max, "off"
+        else:
+            safe_local = safe_utc + local_offset
+            self._safe_time_str = "{:02d}:{:02d}".format(int(safe_local) % 24, int((safe_local % 1) * 60))
 
-        release_mins, crossing_utc = compute_release_time(scale, lat, lon, doy, threshold, utc_hours)
+        # Compute remaining overflow from solar geometry (R9)
+        remaining_overflow = compute_solar_overflow(floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw)
+        self._remaining_overflow = round(remaining_overflow, 2)
 
-        if release_mins is None:
-            return False, scale, "none", None
+        # Activation check (R5): overflow predicted AND battery would fill
+        try:
+            solcast_remaining = float(self.base.get_state_wrapper(SOLCAST_REMAINING, default=0))
+        except (ValueError, TypeError):
+            solcast_remaining = 0.0
 
-        # Format crossing time for diagnostics
-        crossing_local = crossing_utc + local_offset_hours
-        crossing_str = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
-        self._release_crossing = crossing_str
-
-        past = release_mins <= 0 and not before_peak
-        crossing_label = "before_peak ({})".format(crossing_str) if before_peak else crossing_str
-        return past, scale, crossing_label, max(0, release_mins)
-
-    @staticmethod
-    def _compute_curtailment(pv_step, load_step, solcast_total, load_ratio, window_start, window_end, soc_kw, soc_max, dno_limit, release_offset=None, was_active=False, floor_min=0):
-        """Single curtailment calculation — shared by live and tomorrow (R31).
-
-        Three-phase model:
-          Phase 1 (pre-overflow): position battery via Charge/Drain/Hold
-          Phase 2 (overflow): export min(excess, DNO), physics dictates
-          Phase 3 (post-release): ramp export to fill battery, stay in D-ESS
-
-        Absorption = per-slot forced overflow, using Solcast magnitude (no energy_ratio).
-        pv_scale aligns forecast shape with Solcast magnitude.
-        Activation: absorption > headroom (stable — not sensitive to export fraction).
-
-        Args:
-            pv_step, load_step: forecast dicts (kWh per step)
-            solcast_total: Solcast PV total for this window (kWh) — not scaled by energy_ratio (R24/R33)
-            load_ratio: load scaling (1.0 for tomorrow)
-            window_start, window_end: forecast window (minutes from now)
-            soc_kw: battery SOC at start of window (kWh)
-            soc_max: battery capacity (kWh)
-            dno_limit: max export (kW)
-            release_offset: minutes offset for release cutoff (from solar geometry)
-            was_active: for hysteresis (live only)
-            floor_min: minimum floor (soc_keep/reserve for live, 0 for tomorrow)
-
-        Returns:
-            (active, floor_kwh, absorption_kwh, remaining_pv_kwh, remaining_load_kwh)
-        """
+        load_step = getattr(self.base, "load_minutes_step", {})
         step_hours = PREDICT_STEP / 60.0
         to_kw = 1.0 / step_hours
-        soc_cap = soc_max * SOC_CAP_FACTOR
+        safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
+        load_remaining = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(PREDICT_STEP, safe_offset_mins + PREDICT_STEP, PREDICT_STEP))
 
-        # --- Release cutoff from solar geometry (stable) ---
-        balance_end = release_offset if release_offset is not None else window_end
+        battery_headroom = soc_max - soc_kw
+        total_excess = max(0.0, solcast_remaining - load_remaining)
 
-        # --- PV: Solcast magnitude × forecast shape fraction to release (R32/R33) ---
-        per_slot_to_release = sum(pv_step.get(m, 0) for m in range(window_start, balance_end, PREDICT_STEP))
-        per_slot_total = sum(pv_step.get(m, 0) for m in range(window_start, window_end, PREDICT_STEP))
-        fraction = (per_slot_to_release / per_slot_total) if per_slot_total > 0 else 1.0
+        overflow_active = remaining_overflow > 0.1
+        will_fill = total_excess > battery_headroom
 
-        remaining_pv = solcast_total * fraction
-        if solcast_total <= 0:
-            remaining_pv = per_slot_to_release * to_kw * step_hours
+        if not overflow_active or not will_fill:
+            self._floor_ratchet = None
+            self._export_target = -2
+            return soc_max, "off"
 
-        # --- Load: LoadML sum to release ---
-        remaining_load = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(window_start, balance_end, PREDICT_STEP)) * load_ratio
+        # Active: compute floor (R9/R10)
+        soc_keep = getattr(self.base, "best_soc_keep", 0)
+        reserve = getattr(self.base, "reserve", 0)
 
-        # --- Total excess from Solcast-corrected totals ---
-        total_excess = max(0, remaining_pv - remaining_load)
+        floor = soc_max - remaining_overflow * OVERFLOW_SAFETY_FACTOR
+        floor = max(floor, max(soc_keep, reserve))
+        floor = min(floor, soc_max)
 
-        # --- Activation: total_excess > headroom (R5/R6) ---
-        headroom = soc_cap - soc_kw
-        if was_active:
-            headroom *= 0.9  # hysteresis: lower threshold = harder to deactivate (R6)
-        active = total_excess > headroom
+        # Floor ratchet: floor can only rise within a day (R11)
+        if self._floor_ratchet is not None:
+            floor = max(floor, self._floor_ratchet)
+        self._floor_ratchet = floor
 
-        # --- Floor: overflow-only energy (R9) ---
-        # Only energy ABOVE DNO requires dedicated battery headroom.
-        # Sub-DNO PV is exported in Hold mode — not stored, no headroom needed.
-        overflow_only = sum(
-            max(0.0, pv_step.get(m, 0) * to_kw - load_step.get(m, 0) * to_kw * load_ratio - dno_limit) * step_hours
-            for m in range(window_start, balance_end, PREDICT_STEP)
-        )
+        # Export target: DNO — HA automation splits into Drain/Hold based on SOC vs floor
+        self._export_target = dno_limit_kw
 
-        # Store debug for diagnostics
-        CurtailmentPlugin._last_debug = {
-            "remaining_pv": round(remaining_pv, 2),
-            "remaining_load": round(remaining_load, 2),
-            "fraction": round(fraction, 3),
-            "excess": round(total_excess, 2),
-            "overflow_only": round(overflow_only, 2),
-        }
-
-        if not active or overflow_only < 0.1:
-            return False, soc_cap, 0, remaining_pv, remaining_load
-
-        # --- Floor (R9/R10): drain exactly to make room for overflow ---
-        floor = soc_max - overflow_only * OVERFLOW_SAFETY_FACTOR
-        floor = max(floor, floor_min)
-
-        return True, floor, overflow_only, remaining_pv, remaining_load
+        return floor, "active"
 
     def _compute_tomorrow_forecast(self):
-        """Compute curtailment forecast for tomorrow using totals-based energy balance.
+        """Compute curtailment forecast for tomorrow using p90 solar geometry.
 
-        Same _compute_absorption as live calculate(), just with tomorrow's window.
-        Only computes after today's PV is done (last forecast PV < 30 min away).
-        Cached for 30 minutes.
+        Uses tomorrow's Solcast total and p90 scale to estimate overflow and safe_time.
+        Only computes after today's PV is done. Cached for 30 minutes.
         """
         minutes_now = getattr(self.base, "minutes_now", 720)
 
-        # Cache check
         if self._tomorrow_cache is not None:
             since = minutes_now - self._tomorrow_cache_at
             if since < 0:
@@ -557,7 +473,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._tomorrow_cache_at = minutes_now
             return None
 
-        # Tomorrow's solar window in minutes-from-now
+        # Tomorrow's solar window
         tomorrow_start = 1440 - minutes_now + 5 * 60
         tomorrow_end = 1440 - minutes_now + 23 * 60
         tomorrow_end = min(tomorrow_end, forecast_minutes)
@@ -573,7 +489,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._tomorrow_cache_at = minutes_now
             return None
 
-        # --- PV total from Solcast tomorrow sensor ---
+        # Tomorrow Solcast total
         try:
             solcast_tomorrow = float(self.base.get_state_wrapper("sensor.solcast_pv_forecast_forecast_tomorrow", default=0))
         except (ValueError, TypeError):
@@ -581,7 +497,7 @@ class CurtailmentPlugin(PredBatPlugin):
         if solcast_tomorrow <= 0:
             solcast_tomorrow = sum(pv_step.get(m, 0) * to_kw * step_hours for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP))
 
-        # --- Release time from solar geometry ---
+        # Safe_time from p90 solar geometry for tomorrow
         release_time_str = "unknown"
         release_end = tomorrow_end
         try:
@@ -590,40 +506,49 @@ class CurtailmentPlugin(PredBatPlugin):
             now_utc = getattr(self.base, "now_utc", None)
             if lat and lon and now_utc:
                 tomorrow_doy = (now_utc.timetuple().tm_yday % 365) + 1
-                peak_pv_kw = 0
-                peak_offset = tomorrow_start
-                for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP):
-                    pv_kw = pv_step.get(m, 0) * to_kw
-                    if pv_kw > peak_pv_kw:
-                        peak_pv_kw = pv_kw
-                        peak_offset = m
+                utc_now = now_utc.hour + now_utc.minute / 60.0
+                local_offset = (minutes_now / 60.0) - utc_now
 
-                if peak_pv_kw > 1.0:
-                    utc_now = now_utc.hour + now_utc.minute / 60.0
-                    local_offset = (minutes_now / 60.0) - utc_now
-                    peak_abs_utc = (utc_now + peak_offset / 60.0) % 24
-                    peak_elev = solar_elevation(lat, lon, peak_abs_utc, tomorrow_doy)
-                    sin_elev = math.sin(math.radians(peak_elev))
-                    if sin_elev > 0.05:
-                        scale = peak_pv_kw / sin_elev
-                        threshold = dno_limit + MIN_BASE_LOAD_KW
-                        scan_abs_utc = (utc_now + tomorrow_start / 60.0) % 24
-                        rel_mins, crossing_utc = compute_release_time(scale, lat, lon, tomorrow_doy, threshold, scan_abs_utc)
-                        if crossing_utc:
-                            crossing_local = crossing_utc + local_offset
-                            release_time_str = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
-                            release_end = tomorrow_start + min(int(rel_mins), tomorrow_end - tomorrow_start)
+                # Get p90 scale for tomorrow from detailedForecast of tomorrow sensor
+                try:
+                    det_tomorrow = self.base.get_state_wrapper("sensor.solcast_pv_forecast_forecast_tomorrow", attribute="detailedForecast", default=[])
+                    t_scale, _t_peak, _t_utc = p90_scale_from_forecast(det_tomorrow, lat, lon, tomorrow_doy, local_offset) if det_tomorrow else (0.0, 0.0, 0.0)
+                except Exception:
+                    t_scale = 0.0
+
+                if t_scale < 0.5:
+                    # Fall back to peak from pv_step shape
+                    peak_pv_kw = 0
+                    for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP):
+                        pv_kw = pv_step.get(m, 0) * to_kw
+                        if pv_kw > peak_pv_kw:
+                            peak_pv_kw = pv_kw
+                            peak_offset = m
+                    if peak_pv_kw > 1.0:
+                        peak_abs_utc = (utc_now + peak_offset / 60.0) % 24
+                        peak_elev = solar_elevation(lat, lon, peak_abs_utc, tomorrow_doy)
+                        sin_elev = math.sin(math.radians(peak_elev))
+                        if sin_elev > 0.05:
+                            t_scale = peak_pv_kw / sin_elev
+
+                if t_scale >= 0.5:
+                    threshold = dno_limit + MIN_BASE_LOAD_KW
+                    scan_abs_utc = (utc_now + tomorrow_start / 60.0) % 24
+                    rel_mins, crossing_utc = compute_release_time(t_scale, lat, lon, tomorrow_doy, threshold, scan_abs_utc)
+                    if crossing_utc:
+                        crossing_local = crossing_utc + local_offset
+                        release_time_str = "{:02d}:{:02d}".format(int(crossing_local) % 24, int((crossing_local % 1) * 60))
+                        release_end = tomorrow_start + min(int(rel_mins), tomorrow_end - tomorrow_start)
         except Exception:
             pass
 
-        # --- First PV slot (when PV starts generating) ---
+        # PV and load from PV start to safe_time
         pv_start = tomorrow_start
         for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP):
             if pv_step.get(m, 0) > 0:
                 pv_start = m
                 break
 
-        # --- PV and load from PV start to release time ---
         per_slot_to_release = sum(pv_step.get(m, 0) for m in range(pv_start, release_end, PREDICT_STEP))
         per_slot_total = sum(pv_step.get(m, 0) for m in range(tomorrow_start, tomorrow_end, PREDICT_STEP))
         fraction = (per_slot_to_release / per_slot_total) if per_slot_total > 0 else 1.0
@@ -633,7 +558,6 @@ class CurtailmentPlugin(PredBatPlugin):
         load_to_release = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(pv_start, release_end, PREDICT_STEP))
         excess = max(0, pv_to_release - load_to_release)
 
-        # --- Morning gap ---
         morning_gap = compute_morning_gap(
             pv_step,
             load_step,
@@ -643,12 +567,11 @@ class CurtailmentPlugin(PredBatPlugin):
             values_are_kwh=True,
         )
 
-        # --- Activation: excess > headroom? ---
+        # Activation: excess > headroom to full from estimated morning SOC
         estimated_morning_soc = morning_gap + 0.5
-        headroom = soc_max * SOC_CAP_FACTOR - estimated_morning_soc
+        headroom = soc_max - estimated_morning_soc
         will_activate = excess > headroom
 
-        # --- Expected soc_keep ---
         reserve = getattr(self.base, "reserve", 0)
         if will_activate and excess > morning_gap:
             soc_keep = round(reserve, 2)
@@ -663,7 +586,7 @@ class CurtailmentPlugin(PredBatPlugin):
             "excess_kwh": round(excess, 1),
             "headroom_kwh": round(headroom, 1),
             "morning_gap_kwh": round(morning_gap, 2),
-            "release_time": release_time_str,
+            "safe_time": release_time_str,
             "soc_keep_kwh": soc_keep,
             "solcast_kwh": round(solcast_tomorrow, 1),
         }
@@ -673,10 +596,7 @@ class CurtailmentPlugin(PredBatPlugin):
         return forecast
 
     def _publish_tomorrow_forecast(self, forecast):
-        """Publish tomorrow's curtailment forecast as a sensor.
-
-        When Inactive, clear attributes to avoid stale data on dashboard.
-        """
+        """Publish tomorrow's curtailment forecast as a sensor."""
         prefix = self.base.prefix
         if forecast["will_activate"]:
             state = "Active"
@@ -694,170 +614,18 @@ class CurtailmentPlugin(PredBatPlugin):
         attrs["icon"] = "mdi:solar-power-variant-outline"
         self.base.dashboard_item("sensor.{}_curtailment_tomorrow".format(prefix), state, attrs)
 
-    def calculate(self, dno_limit_kw):
-        """Compute floor using v10.1 overflow-vs-headroom algorithm.
-
-        Activation: overflow * factor > headroom to 95% (with hysteresis).
-        Floor: soc_max - overflow * 1.10, capped at 95% until safe_time.
-        HA automation handles real-time control (charge/drain/hold).
-
-        Returns:
-            (floor_kwh, phase) where phase is "active" or "off"
-        """
-        pv_step = getattr(self.base, "pv_forecast_minute_step", {})
-        load_step = getattr(self.base, "load_minutes_step", {})
-        soc_kw = getattr(self.base, "soc_kw", 0)
-        soc_max = getattr(self.base, "soc_max", 10)
-        forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
-
-        if not pv_step or not soc_max:
-            return soc_max, "off"
-
-        minutes_now = getattr(self.base, "minutes_now", 720)
-        solar_end = min(forecast_minutes, max(PREDICT_STEP, 23 * 60 - minutes_now))
-
-        # --- Energy ratio & load ratio ---
-        actual_pv, actual_load, energy_ratio = self._get_energy_ratio()
-        self._energy_ratio = energy_ratio
-        self._actual_pv_kw = actual_pv
-        load_ratio = self._get_load_ratio()
-        self._load_ratio = load_ratio
-
-        # --- Don't activate before PV starts ---
-        # Guard: no meaningful PV yet (handles pre-dawn and winter mornings).
-        # No clock gate — GSHP morning CH doesn't run in summer; activation is PV-presence gated.
-        if self._peak_pv < 0.1 and actual_pv < 0.1:
-            return soc_max, "off"
-
-        # --- Solcast remaining today ---
-        try:
-            solcast_remaining = float(self.base.get_state_wrapper("sensor.solcast_pv_forecast_forecast_remaining_today", default=0))
-        except (ValueError, TypeError):
-            solcast_remaining = 0
-
-        # --- Single shared curtailment calculation (R31) ---
-        soc_keep = getattr(self.base, "best_soc_keep", 0)
-        reserve = getattr(self.base, "reserve", 0)
-
-        # Release offset: one slot after last slot where PV-load > DNO in the forecast.
-        # DNO threshold directly matches overflow definition — immune to load spikes.
-        release_mins = compute_release_offset(
-            pv_step,
-            load_step,
-            dno_limit=dno_limit_kw,
-            start_minute=PREDICT_STEP,
-            end_minute=solar_end,
-            step_minutes=PREDICT_STEP,
-            values_are_kwh=True,
-        )
-        soc_pct = (soc_kw / soc_max * 100) if soc_max > 0 else 0
-        if release_mins is not None:
-            release_offset = min(release_mins, solar_end)
-            # Release hysteresis: can move earlier freely, later by max 15 min/cycle (R39)
-            if self._release_offset_cached is not None and release_offset > self._release_offset_cached:
-                release_offset = min(release_offset, self._release_offset_cached + 15)
-            self._release_offset_cached = release_offset
-            release_abs = minutes_now + release_offset
-            self._release_time_str = "{:02d}:{:02d}".format(int(release_abs // 60) % 24, int(release_abs % 60))
-        else:
-            release_offset = solar_end
-            self._release_offset_cached = None
-            self._release_time_str = "none"
-
-        active, floor, absorption, remaining_pv, remaining_load = self._compute_curtailment(
-            pv_step,
-            load_step,
-            solcast_remaining,
-            load_ratio,
-            PREDICT_STEP,
-            solar_end,
-            soc_kw,
-            soc_max,
-            dno_limit_kw,
-            release_offset=release_offset,
-            was_active=self.was_active,
-            floor_min=max(soc_keep, reserve),
-        )
-        self._remaining_overflow = round(absorption, 2)
-
-        step_hours = PREDICT_STEP / 60.0
-        to_kw = 1.0 / step_hours
-
-        if not active:
-            if not self.was_active:
-                # Never activated (non-overflow day) — truly off (R8)
-                self._floor_ratchet = None
-                self._release_offset_cached = None
-                self._export_target = -2
-                return soc_max, "off"
-
-            # was_active + no longer active: post-release phase (R40/R41).
-            # Stay in D-ESS with Hold — compute export_target to ramp down toward 0.
-            last_significant_pv = PREDICT_STEP
-            for m in range(PREDICT_STEP, solar_end, PREDICT_STEP):
-                if pv_step.get(m, 0) * to_kw >= SAFE_PV_THRESHOLD_KW:
-                    last_significant_pv = m
-            hours_to_pv_end = max(last_significant_pv, PREDICT_STEP) / 60.0
-
-            post_load = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(PREDICT_STEP, solar_end, PREDICT_STEP)) * load_ratio
-            energy_still_needed = max(0.0, soc_max - soc_kw)
-
-            # Would overflow alone fill battery?
-            charge_at_dno_post = 0.0
-            for m in range(PREDICT_STEP, solar_end, PREDICT_STEP):
-                slot_excess = pv_step.get(m, 0) * to_kw - load_step.get(m, 0) * to_kw * load_ratio
-                if slot_excess > dno_limit_kw:
-                    charge_at_dno_post += (slot_excess - dno_limit_kw) * step_hours
-
-            if charge_at_dno_post >= energy_still_needed:
-                self._export_target = dno_limit_kw
-            elif hours_to_pv_end <= 0:
-                self._export_target = 0.0
-            else:
-                budget = solcast_remaining - post_load - energy_still_needed
-                self._export_target = round(max(0.0, min(dno_limit_kw, budget / hours_to_pv_end)), 2)
-
-            # Floor = current SOC: automation sees SOC ≈ floor → Hold (not Drain)
-            return soc_kw, "post_release"
-
-        # Soft floor ratchet: floor can rise max 2% of soc_max per cycle (R39)
-        if self._floor_ratchet is not None:
-            max_rise = soc_max * 0.02
-            floor = min(floor, self._floor_ratchet + max_rise)
-        self._floor_ratchet = floor
-
-        # Export target (R38): 0 when SOC below floor and not in overflow; DNO otherwise.
-        # SOC below floor + no overflow → Charge mode: battery charges from PV, export nothing.
-        # SOC at/above floor, or in overflow: export at full DNO.
-        current_excess = actual_pv - actual_load
-        if soc_kw < floor - SOC_MARGIN_KWH and current_excess <= dno_limit_kw:
-            self._export_target = 0.0
-        else:
-            self._export_target = dno_limit_kw
-
-        return floor, "active"
-
     def publish(self, phase, floor_kwh, dno_limit_kw, export_target=None):
         """Publish curtailment sensors via dashboard_item.
 
-        Phase sensor shows Active/Post-Release/Off (plugin's strategic decision).
-        Real-time phase (Charge/Drain/Hold) is published by the HA automation.
-        export_target: kW export cap for HA automation (R38). -2 = inactive.
+        Phase sensor shows Active/Off (plugin's strategic decision).
+        Real-time phase (Drain/Hold) is published by the HA automation.
+        export_target: kW export cap for HA automation. -2 = inactive.
         """
         prefix = self.base.prefix
         soc_max = getattr(self.base, "soc_max", 10)
 
-        if phase == "post_release":
-            # Publish current SOC as target so automation stays in Hold (not Drain)
-            soc_kw = getattr(self.base, "soc_kw", 0)
-            floor_pct = round(soc_kw / soc_max * 100, 1) if soc_max > 0 else 100
-            state = "Post-Release"
-        elif phase == "off":
-            floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
-            state = "Off"
-        else:
-            floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
-            state = "Active"
+        floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
+        state = "Active" if phase == "active" else "Off"
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
@@ -865,11 +633,12 @@ class CurtailmentPlugin(PredBatPlugin):
             {
                 "friendly_name": "Curtailment Phase",
                 "icon": "mdi:solar-power-variant",
-                "energy_ratio": round(self._energy_ratio, 2),
-                "load_ratio": round(getattr(self, "_load_ratio", 1.0), 2),
                 "floor_pct": floor_pct,
-                "battery_absorb_kwh": round(getattr(self, "_remaining_overflow", 0), 2),
-                "release_time": getattr(self, "_release_time_str", "none"),
+                "floor_scale": round(self._floor_scale, 2),
+                "safe_scale": round(self._safe_scale, 2),
+                "p90_scale": round(self._p90_scale, 2),
+                "overflow_kwh": round(self._remaining_overflow, 2),
+                "safe_time": self._safe_time_str,
             },
         )
 
@@ -909,8 +678,6 @@ class CurtailmentPlugin(PredBatPlugin):
         Export limit is written FIRST (before EMS mode) to ensure there is
         never a window where D-ESS is active with a stale export limit.
         """
-        # Write export limit BEFORE EMS mode to avoid race condition:
-        # D-ESS + stale export limit could force-discharge battery to grid
         if export_limit is not None and export_limit != self.last_export_limit:
             self.base.call_service_wrapper(
                 "number/set_value",
@@ -939,11 +706,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self.log("Curtailment: Set charge limit -> {}%".format(charge_limit))
 
     def _set_read_only(self, value):
-        """
-        Set read_only via internal flag only — NOT via HA entity.
-        Writing the HA entity triggers Predbat's switch event handler
-        which forces an inverter reset back to MSC.
-        """
+        """Set read_only via internal flag only — NOT via HA entity."""
         self.base.set_read_only = value
         item = self.base.config_index.get("set_read_only")
         if item:
@@ -953,7 +716,7 @@ class CurtailmentPlugin(PredBatPlugin):
         """Apply inverter control based on phase.
 
         Active:  D-ESS, export=0 (safe default), read_only=true.
-                 HA automation takes over export limit within 5 seconds.
+                 HA automation overrides export limit within 5 seconds.
         Off:     MSC, export=DNO (cleanup), read_only=false.
         """
         active = phase != "off"
@@ -961,15 +724,12 @@ class CurtailmentPlugin(PredBatPlugin):
         if active:
             if not self.was_active:
                 self.log("Curtailment activating")
-                # Set export=0 as safe default before D-ESS mode
-                # HA automation overrides within 5 seconds
                 self.write_sig(
                     ems_mode="Command Discharging (ESS First)",
                     charge_limit=100,
                     export_limit=0,
                 )
             else:
-                # Already active — just ensure D-ESS mode (don't touch export limit)
                 self.write_sig(
                     ems_mode="Command Discharging (ESS First)",
                     charge_limit=100,
@@ -979,7 +739,6 @@ class CurtailmentPlugin(PredBatPlugin):
             self.was_active = True
 
         elif self.was_active:
-            # Deactivating: restore MSC
             self.log("Curtailment deactivating, restoring MSC")
             self.write_sig(
                 ems_mode="Maximum Self Consumption",
@@ -993,7 +752,6 @@ class CurtailmentPlugin(PredBatPlugin):
 
             self._set_read_only(False)
 
-            # Reset tracked values so next activation re-writes everything
             self.last_ems_mode = None
             self.last_charge_limit = None
             self.last_export_limit = None
@@ -1006,7 +764,6 @@ class CurtailmentPlugin(PredBatPlugin):
         if not self.was_active and self.base.set_read_only:
             self.log("Curtailment: clearing stale read_only from previous run")
             self._set_read_only(False)
-        # Re-enable HA automation on restart (may have been manually disabled)
         if not getattr(self, "_automation_checked", False):
             self._automation_checked = True
             try:
@@ -1035,10 +792,7 @@ class CurtailmentPlugin(PredBatPlugin):
             floor, phase = self.calculate(dno_limit)
             soc_max = getattr(self.base, "soc_max", 10)
 
-            # Defer to Predbat charge windows ONLY when SOC is below the
-            # effective keep floor (battery genuinely needs grid charging,
-            # e.g. morning cheap rate before GSHP drains it). Once SOC is
-            # at or above keep, curtailment manages — ignore charge windows.
+            # Defer to Predbat charge windows when SOC below effective keep (R4)
             soc_kw = getattr(self.base, "soc_kw", 0)
             effective_keep = getattr(self.base, "best_soc_keep", 0)
             if phase != "off" and soc_kw < effective_keep:
@@ -1058,28 +812,11 @@ class CurtailmentPlugin(PredBatPlugin):
             soc_pct = soc_kw / max(soc_max, 0.1) * 100
             floor_pct = floor / max(soc_max, 0.1) * 100
 
-            # Post-release deactivation (R40): stay in D-ESS after overflow window ends.
-            # Only deactivate when PV is physically exhausted (3 consecutive cycles < threshold).
-            if phase == "post_release":
-                if self._actual_pv_kw < SAFE_PV_THRESHOLD_KW:
-                    self._low_pv_count += 1
-                else:
-                    self._low_pv_count = 0
-                if self._low_pv_count >= 3:
-                    self.log("Curtailment: PV exhausted ({:.1f}kW < {:.1f}kW for 3 cycles) — deactivating".format(self._actual_pv_kw, SAFE_PV_THRESHOLD_KW))
-                    phase = "off"
-                    floor = soc_max
-                    self._floor_ratchet = None
-                    self._release_offset_cached = None
-                    self._export_target = -2
-            else:
-                self._low_pv_count = 0
-
             # Log phase transitions
             if phase != self.last_phase:
                 self.log(
                     "Curtailment: PHASE {} -> {} | SOC={:.1f}kWh ({:.0f}%) floor={:.1f}kWh ({:.0f}%) "
-                    "overflow={:.1f}kWh dno={:.1f}kW energy_ratio={:.2f}x low_pv_count={}".format(
+                    "overflow={:.1f}kWh dno={:.1f}kW p90_scale={:.1f} floor_scale={:.1f} safe_time={}".format(
                         self.last_phase or "none",
                         phase,
                         soc_kw,
@@ -1088,14 +825,14 @@ class CurtailmentPlugin(PredBatPlugin):
                         floor_pct,
                         self._remaining_overflow,
                         dno_limit,
-                        self._energy_ratio,
-                        self._low_pv_count,
+                        self._p90_scale,
+                        self._floor_scale,
+                        self._safe_time_str,
                     )
                 )
                 self.last_phase = phase
 
-            # Manual hold: keep D-ESS even when plugin goes off, so Predbat
-            # can't reset to MSC while the user has forced hold active.
+            # Manual hold: keep D-ESS even when plugin goes off
             if phase == "off" and self.was_active:
                 manual_hold = self.base.get_state_wrapper("input_select.curtailment_manual_hold", default="Off") != "Off"
                 if manual_hold:
@@ -1104,12 +841,7 @@ class CurtailmentPlugin(PredBatPlugin):
                     self.publish("off", floor, dno_limit, export_target=self._export_target)
                     return
 
-            # post_release → apply D-ESS (same as "active") until PV exhausted
-            apply_phase = "active" if phase == "post_release" else phase
-
-            # Apply BEFORE publish: EMS mode must be set before sensor publish
-            # triggers the HA automation (which requires D-ESS as a condition)
-            self.apply(apply_phase)
+            self.apply(phase)
             self.publish(phase, floor, dno_limit, export_target=self._export_target)
 
             # Tomorrow forecast (separate try/except — don't break today's control)
