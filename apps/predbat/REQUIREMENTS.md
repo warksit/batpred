@@ -55,14 +55,12 @@ No export capacity in the activation check — export is what management DOES, n
 
 ## Floor
 
-- **R9**: `floor = soc_cap - battery_must_absorb * safety_factor` where battery_must_absorb
-  comes from the totals-based energy balance (R32). Safety factor = 1.10 (10% buffer).
+- **R9**: `floor = soc_max - overflow_energy × 1.25` where `overflow_energy = Σ max(0, PV-load-DNO)×dt`
+  summed over the overflow window (window_start to release_offset). Safety factor = 1.25 (25% buffer).
+  Only energy ABOVE the DNO limit requires dedicated headroom — sub-DNO PV is exported in Hold mode.
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
-- **R11**: Dynamic headroom reserve: `headroom_reserve = remaining_pv * 0.10` when
-  `pv_now >= SAFE_PV_THRESHOLD_KW`, else 0. Subtracted directly from floor:
-  `floor = max(floor - headroom_reserve, floor_min)`. Scales with remaining PV (large
-  early, zero near end). Replaces fixed 95% cap. Applied as subtraction (not cap)
-  so it always lowers the floor — cap had no effect on big-overflow days.
+- **R11**: No separate headroom reserve — the 1.25× safety factor in R9 replaces it.
+  The 95% activation cap (R5) remains for the activation check only.
 - **R12**: After safe_time, cap removed: `floor = min(floor, soc_max)`. Battery fills to 100%.
 - **R13**: Floor rises naturally each cycle as remaining PV and absorption shrink.
 
@@ -102,11 +100,13 @@ No export capacity in the activation check — export is what management DOES, n
 ## Export Target Ramp
 
 - **R38**: Export target controls HA automation export cap:
-    - **Active phase (pre-overflow + overflow window)**: export_target = DNO always. Export at
-      full capacity while PV is abundant and certain. Floor ensures overflow headroom.
-    - **Post-release (Phase 3/4)**: `export_target = clamp(0, DNO, budget / hours_to_pv_end)`
-    where `budget = remaining_pv - remaining_load - energy_still_needed - headroom_reserve`.
-    Ramps from DNO toward 0, causing battery to absorb remaining PV as PV declines.
+    - **Active phase, SOC < floor−0.5 AND excess ≤ DNO (Charge mode)**: export_target = 0.
+      Battery charges from sub-DNO PV toward floor; no export.
+    - **Active phase, SOC ≥ floor−0.5 OR in overflow (excess > DNO)**: export_target = DNO.
+      Export at full capacity; floor ensures overflow headroom was pre-created.
+    - **Post-release**: `export_target = clamp(0, DNO, budget / hours_to_pv_end)`
+      where `budget = remaining_pv - remaining_load - energy_still_needed`.
+      Ramps from DNO toward 0 as PV declines, causing battery to absorb remaining PV.
   Published as `sensor.predbat_curtailment_export_target`. HA automation uses
   this instead of hardcoded DNO for Drain and Hold export limits.
   When inactive, value = -2 (automation falls back to DNO).

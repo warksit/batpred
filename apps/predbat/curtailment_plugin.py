@@ -51,9 +51,8 @@ SIG_DAILY_PV = "sensor.sigen_plant_daily_third_party_inverter_energy"
 PREDBAT_PV_TODAY = "sensor.predbat_pv_today"
 
 # Safety factors
-OVERFLOW_SAFETY_FACTOR = 1.50  # 50% buffer — conservative drain early, recovered at release
-HEADROOM_RESERVE_FACTOR = 0.10  # 10% of remaining PV subtracted from floor (R11)
-SOC_CAP_FACTOR = 0.95  # 95% cap until safe_time (spike headroom)
+OVERFLOW_SAFETY_FACTOR = 1.25  # 25% buffer on overflow-only energy (R9)
+SOC_CAP_FACTOR = 0.95  # 95% cap for activation headroom check (R5)
 
 
 class CurtailmentPlugin(PredBatPlugin):
@@ -483,40 +482,31 @@ class CurtailmentPlugin(PredBatPlugin):
             headroom *= 0.9  # hysteresis: lower threshold = harder to deactivate (R6)
         active = total_excess > headroom
 
-        # --- Absorption: export fraction from unscaled shape (R9/R32) ---
-        # export_fraction computed from RAW forecast (no energy_ratio) — stable.
-        # total_excess from Solcast totals — changes slowly.
-        # absorption = total_excess × (1 - export_fraction) — smooth, proportional.
-        excess_unscaled = 0
-        exportable_unscaled = 0
-        for m in range(window_start, balance_end, PREDICT_STEP):
-            pv_kw = pv_step.get(m, 0) * to_kw
-            load_kw = load_step.get(m, 0) * to_kw
-            slot_excess = max(0, pv_kw - load_kw)
-            excess_unscaled += slot_excess * step_hours
-            exportable_unscaled += min(slot_excess, dno_limit) * step_hours
-
-        export_fraction = (exportable_unscaled / excess_unscaled) if excess_unscaled > 0.1 else 1.0
-        absorption = max(0, total_excess * (1 - export_fraction))
+        # --- Floor: overflow-only energy (R9) ---
+        # Only energy ABOVE DNO requires dedicated battery headroom.
+        # Sub-DNO PV is exported in Hold mode — not stored, no headroom needed.
+        overflow_only = sum(
+            max(0.0, pv_step.get(m, 0) * to_kw - load_step.get(m, 0) * to_kw * load_ratio - dno_limit) * step_hours
+            for m in range(window_start, balance_end, PREDICT_STEP)
+        )
 
         # Store debug for diagnostics
         CurtailmentPlugin._last_debug = {
             "remaining_pv": round(remaining_pv, 2),
             "remaining_load": round(remaining_load, 2),
             "fraction": round(fraction, 3),
-            "export_fraction": round(export_fraction, 3),
             "excess": round(total_excess, 2),
-            "absorption": round(absorption, 2),
+            "overflow_only": round(overflow_only, 2),
         }
 
-        if not active or absorption < 0.1:
+        if not active or overflow_only < 0.1:
             return False, soc_cap, 0, remaining_pv, remaining_load
 
-        # --- Floor (R9/R10) ---
-        floor = soc_cap - absorption * OVERFLOW_SAFETY_FACTOR
+        # --- Floor (R9/R10): drain exactly to make room for overflow ---
+        floor = soc_max - overflow_only * OVERFLOW_SAFETY_FACTOR
         floor = max(floor, floor_min)
 
-        return True, floor, absorption, remaining_pv, remaining_load
+        return True, floor, overflow_only, remaining_pv, remaining_load
 
     def _compute_tomorrow_forecast(self):
         """Compute curtailment forecast for tomorrow using totals-based energy balance.
@@ -810,7 +800,6 @@ class CurtailmentPlugin(PredBatPlugin):
             hours_to_pv_end = max(last_significant_pv, PREDICT_STEP) / 60.0
 
             post_load = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(PREDICT_STEP, solar_end, PREDICT_STEP)) * load_ratio
-            headroom_reserve = solcast_remaining * HEADROOM_RESERVE_FACTOR if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
             energy_still_needed = max(0.0, soc_max - soc_kw)
 
             # Would overflow alone fill battery?
@@ -825,18 +814,11 @@ class CurtailmentPlugin(PredBatPlugin):
             elif hours_to_pv_end <= 0:
                 self._export_target = 0.0
             else:
-                budget = solcast_remaining - post_load - energy_still_needed - headroom_reserve
+                budget = solcast_remaining - post_load - energy_still_needed
                 self._export_target = round(max(0.0, min(dno_limit_kw, budget / hours_to_pv_end)), 2)
 
             # Floor = current SOC: automation sees SOC ≈ floor → Hold (not Drain)
             return soc_kw, "post_release"
-
-        # Active: overflow still forecast. Subtract dynamic headroom reserve from floor (R11).
-        # Reserve scales with remaining PV to absorb unexpected solar spikes.
-        # Subtracted directly so floor is always lower by this amount (cap had no effect on big days).
-        headroom_reserve = remaining_pv * HEADROOM_RESERVE_FACTOR if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
-        floor = floor - headroom_reserve
-        floor = max(floor, max(soc_keep, reserve))
 
         # Soft floor ratchet: floor can rise max 2% of soc_max per cycle (R39)
         if self._floor_ratchet is not None:
@@ -844,10 +826,14 @@ class CurtailmentPlugin(PredBatPlugin):
             floor = min(floor, self._floor_ratchet + max_rise)
         self._floor_ratchet = floor
 
-        # Active phase: always export at DNO (R38).
-        # Floor ensures overflow headroom; post-release formula fills battery afterward.
-        # Pre-throttling here is redundant and wastes certain peak-PV export opportunity.
-        self._export_target = dno_limit_kw
+        # Export target (R38): 0 when SOC below floor and not in overflow; DNO otherwise.
+        # SOC below floor + no overflow → Charge mode: battery charges from PV, export nothing.
+        # SOC at/above floor, or in overflow: export at full DNO.
+        current_excess = actual_pv - actual_load
+        if soc_kw < floor - SOC_MARGIN_KWH and current_excess <= dno_limit_kw:
+            self._export_target = 0.0
+        else:
+            self._export_target = dno_limit_kw
 
         return floor, "active"
 
@@ -1111,7 +1097,7 @@ class CurtailmentPlugin(PredBatPlugin):
             # Manual hold: keep D-ESS even when plugin goes off, so Predbat
             # can't reset to MSC while the user has forced hold active.
             if phase == "off" and self.was_active:
-                manual_hold = self.base.get_state_wrapper("input_boolean.curtailment_manual_hold", default="off") == "on"
+                manual_hold = self.base.get_state_wrapper("input_select.curtailment_manual_hold", default="Off") != "Off"
                 if manual_hold:
                     self.log("Curtailment: manual_hold active — staying in D-ESS despite plugin off")
                     self.apply("active")

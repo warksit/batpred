@@ -31,7 +31,7 @@ STEP_MINUTES = 5
 START_SOC_PCT = 0.40
 
 # v10 constants (match curtailment_plugin.py)
-OVERFLOW_SAFETY_FACTOR = 1.10
+OVERFLOW_SAFETY_FACTOR = 1.25
 SOC_CAP_FACTOR = 0.95
 SOC_MARGIN_KWH = 0.5
 
@@ -454,42 +454,22 @@ def test_activation_high_soc_low_overflow():
 
 
 def test_floor_computation():
-    """Floor = soc_max - overflow * 1.10."""
+    """Floor = soc_max - overflow_only * 1.25 (R9)."""
     overflow = 10.0
     floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
-    expected = 18.08 - 11.0  # 7.08
+    expected = 18.08 - 12.5  # 5.58
     assert abs(floor - expected) < 0.01, f"Expected {expected}, got {floor}"
     print(f"  test_floor_computation: PASSED (floor={floor:.2f}kWh = {floor/BATTERY_KWH*100:.0f}%)")
 
 
-def test_floor_capped_at_95():
-    """Floor capped at 95% before safe_time."""
-    overflow = 0.5  # small overflow → floor = 18.08 - 0.55 = 17.53 > 95% (17.18)
-    floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
-    assert floor > BATTERY_KWH * SOC_CAP_FACTOR, f"Raw floor should exceed 95%: {floor:.2f}"
-    floor_capped = min(floor, BATTERY_KWH * SOC_CAP_FACTOR)
-    assert abs(floor_capped - BATTERY_KWH * SOC_CAP_FACTOR) < 0.01, f"Floor should be capped at 95%, got {floor_capped/BATTERY_KWH*100:.1f}%"
-    print(f"  test_floor_capped_at_95: PASSED (raw={floor:.2f}, capped={floor_capped:.2f})")
-
-
 def test_floor_above_soc_keep():
     """Floor never goes below soc_keep."""
-    overflow = 20.0  # huge overflow → floor = 18.08 - 22 = -3.92
+    overflow = 20.0  # huge overflow → floor = 18.08 - 25 = -6.92
     soc_keep = 4.0
     floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
     floor = max(floor, soc_keep)
     assert floor >= soc_keep, f"Floor should be >= soc_keep ({soc_keep}), got {floor}"
     print(f"  test_floor_above_soc_keep: PASSED (floor={floor:.2f}kWh)")
-
-
-def test_floor_uncapped_after_safe_time():
-    """After safe_time, floor can reach 100% (small overflow, no 95% cap)."""
-    overflow = 0.5  # tiny overflow → floor = 18.08 - 0.55 = 17.53
-    floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
-    # After safe_time: cap is soc_max instead of soc_max * 0.95
-    floor_uncapped = min(floor, BATTERY_KWH)
-    assert floor_uncapped > BATTERY_KWH * SOC_CAP_FACTOR, f"After safe_time, floor should exceed 95%, got {floor_uncapped/BATTERY_KWH*100:.1f}%"
-    print(f"  test_floor_uncapped_after_safe_time: PASSED (floor={floor_uncapped:.2f}kWh = {floor_uncapped/BATTERY_KWH*100:.1f}%)")
 
 
 # ============================================================================
@@ -922,7 +902,7 @@ def test_manual_hold_maintains_dess_after_deactivation():
         sensor_overrides={
             "sensor.sigen_plant_pv_power": 8.0,
             "sensor.sigen_plant_consumed_power": 1.0,
-            "input_boolean.curtailment_manual_hold": "on",
+            "input_select.curtailment_manual_hold": "Hold",
         },
     )
     plugin = CurtailmentPlugin(base)
@@ -1384,11 +1364,11 @@ def test_floor_lower_with_more_overflow():
 
 
 def test_export_target_at_dno_early_day():
-    """Export target = DNO when battery fills in time at DNO.
+    """Export target = DNO when SOC is at/above floor (Drain or Hold mode).
 
-    Early in day: PV=8kW, load=1kW, 6 hours of overflow. Battery at 73.8%.
-    Per-slot charge at DNO = 3kW × 6h = 18kWh >> 4.73kWh needed.
-    Ramp must NOT reduce export — battery fills easily at DNO.
+    Early in day: PV=8kW, load=1kW, 6 hours of overflow → overflow_only=18kWh.
+    floor = max(18.08 - 18×1.25, 0) = 0kWh. SOC=73.8% >> floor → Drain mode.
+    export_target = DNO (not throttled — SOC is above floor, not in Charge mode).
     """
     pv = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}  # 6 hours high PV
     load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
@@ -1412,11 +1392,11 @@ def test_export_target_at_dno_early_day():
 
 
 def test_export_target_dno_during_active():
-    """Export target = DNO during active phase even when overflow alone can't fill battery.
+    """Export target = DNO during overflow (excess > DNO), even when SOC < floor.
 
-    Active phase always exports at DNO — floor and post-release formula handle filling.
-    Late in day: PV=5.5kW, load=0.5kW, only 60 min remaining, battery at 80%.
-    Even though overflow alone gives only 1kWh < 3.62kWh needed, export_target = DNO.
+    Late in day: PV=5.5kW, load=0.5kW, excess=5kW > DNO. Battery at 80%, floor≈93%.
+    SOC < floor−0.5 BUT we are in overflow (excess > DNO) → export_target = DNO.
+    Overflow rule wins: always export at DNO during overflow window.
     """
     pv = {m: 5.5 for m in range(0, 60, PLUGIN_STEP)}  # only 1 hour of PV left
     load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
@@ -1641,8 +1621,8 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
     # Moderate days may not have enough PV to fill completely.
     if initial_overflow > 8.0 and sunset_soc_pct < 95:
         errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >95% for {initial_overflow:.0f}kWh overflow)")
-    elif initial_overflow > 0.5 and sunset_soc_pct < 60:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >60%)")
+    elif initial_overflow > 0.5 and sunset_soc_pct < 90:
+        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >90%)")
 
     soc_label = f" start={start_soc_pct:.0%}" if start_soc_pct != START_SOC_PCT else ""
     tag = f"  integration {label}{soc_label}"
@@ -1840,8 +1820,8 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
         errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f})")
     if initial_overflow > 8.0 and sunset_soc_pct < 95:
         errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >95%)")
-    elif initial_overflow > 0.5 and sunset_soc_pct < 60:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >60%)")
+    elif initial_overflow > 0.5 and sunset_soc_pct < 90:
+        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >90%)")
 
     tag = f"  integration {label} start={start_soc_pct:.0%}"
     if errors:
@@ -2217,57 +2197,41 @@ def test_no_energy_ratio_on_pv():
     print(f"  test_no_energy_ratio_on_pv: PASSED (floor_a={floor_a:.2f} floor_b={floor_b:.2f} — identical)")
 
 
-def test_dynamic_headroom_reserve():
-    """Dynamic headroom reserve subtracts from floor directly (R11).
+def test_floor_charges_on_marginal_day():
+    """On marginal days (small overflow), floor is HIGH so battery charges toward it.
 
-    With PV active: reserve = remaining_pv * 0.10 is SUBTRACTED from floor.
-    With PV inactive (below threshold): reserve = 0, floor unchanged.
-    Floor with reserve must be lower than floor without reserve.
-
-    Sized so absorption is small enough that floor is well above floor_min
-    before the reserve subtraction (otherwise both hit floor_min = 0 and diff = 0).
-    pv=6kW/360min, load=1kW, solcast=20kWh → absorption≈2.8kWh, floor≈13kWh.
-    reserve = 20 * 0.10 = 2 kWh → floor drops by 2 kWh when PV active.
+    overflow_only ≈ 4kWh → floor ≈ 72% (18.08 - 4.0×1.25 = 13.08kWh).
+    When SOC=20% and pre-overflow (excess < DNO): export_target=0 → Charge mode.
+    Battery charges from all sub-DNO PV toward floor; overflow then fills to near 100%.
     """
-    pv = {m: 6.0 for m in range(0, 360, PLUGIN_STEP)}
-    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.50
+    # Forecast: 7kW PV, 1kW load → 2kW overflow × ~2h ≈ 4kWh overflow_only
+    pv = {m: 7.0 for m in range(0, 130, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 130, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.20  # very low start
 
-    # Scenario A: PV active → reserve = 20 * 0.10 = 2 kWh subtracted from floor
-    base_a = MockBase(
+    base = MockBase(
         pv_step=pv,
         load_step=load,
         soc_kw=soc_kw,
-        minutes_now=420,
+        minutes_now=600,
         sensor_overrides={
-            "sensor.sigen_plant_pv_power": 6.0,  # above SAFE_PV_THRESHOLD_KW (2.0)
+            "sensor.sigen_plant_pv_power": 3.0,   # current PV sub-DNO (pre-overflow)
             "sensor.sigen_plant_consumed_power": 1.0,
             "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
         },
     )
-    # Scenario B: PV below threshold → reserve = 0, no subtraction
-    base_b = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=soc_kw,
-        minutes_now=420,
-        sensor_overrides={
-            "sensor.sigen_plant_pv_power": 0.5,  # below SAFE_PV_THRESHOLD_KW (2.0)
-            "sensor.sigen_plant_consumed_power": 1.0,
-            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
-        },
-    )
-    floor_a, phase_a = CurtailmentPlugin(base_a).calculate(dno_limit_kw=4.0)
-    floor_b, phase_b = CurtailmentPlugin(base_b).calculate(dno_limit_kw=4.0)
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
 
-    assert phase_a == "active", f"Scenario A (PV active) should be active, got {phase_a}"
-    assert phase_b == "active", f"Scenario B (PV low) should be active, got {phase_b}"
-
-    # Reserve SUBTRACTS from floor — floor_a must be meaningfully lower than floor_b
-    expected_reserve = 20.0 * 0.10  # = 2.0 kWh
-    assert floor_a < floor_b, f"Reserve should lower floor: floor_a={floor_a:.2f} floor_b={floor_b:.2f}"
-    assert abs((floor_b - floor_a) - expected_reserve) < 0.5, f"Floor difference should ≈ {expected_reserve:.1f} kWh reserve: got {floor_b - floor_a:.2f} kWh"
-    print(f"  test_dynamic_headroom_reserve: PASSED (floor_a={floor_a:.2f} floor_b={floor_b:.2f} diff={floor_b-floor_a:.2f} kWh ≈ {expected_reserve:.1f} kWh reserve)")
+    floor_pct = floor / BATTERY_KWH * 100
+    assert phase == "active", f"Should be active (overflow in forecast), got {phase}"
+    # Floor should be in 60-85% range — marginal day, not drained to empty
+    assert 60 < floor_pct < 90, f"Floor should be 60-85% on marginal day, got {floor_pct:.0f}%"
+    # Floor should be well above SOC — battery must CHARGE toward it, not drain
+    assert floor > soc_kw + 2.0, f"Floor ({floor:.1f}kWh) should be >> SOC ({soc_kw:.1f}kWh)"
+    # SOC below floor + pre-overflow → export_target = 0 (Charge mode)
+    assert plugin._export_target == 0.0, f"SOC below floor + pre-overflow → export_target=0, got {plugin._export_target}"
+    print(f"  test_floor_charges_on_marginal_day: PASSED (floor={floor_pct:.0f}%, export_target={plugin._export_target})")
 
 
 def test_post_release_export_target_ramps_down():
@@ -2304,7 +2268,7 @@ def test_post_release_export_target_ramps_down():
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "post_release", f"Expected post_release, got {phase}"
     # With 1 kWh remaining, 0.95 full battery, energy_still_needed ≈ 0.9 kWh:
-    # exportable_budget = 1.0 - load - 0.9 - headroom ≈ small/negative
+    # budget = 1.0 - load - 0.9 ≈ small/negative
     # export_target should be well below DNO or 0
     assert plugin._export_target < 4.0, f"Export target should ramp down with little PV remaining, got {plugin._export_target}"
     print(f"  test_post_release_export_target_ramps_down: PASSED (export_target={plugin._export_target:.2f}kW)")
@@ -2366,9 +2330,7 @@ def run_curtailment_tests(my_predbat=None):
     # v10 floor tests
     floor_tests = [
         test_floor_computation,
-        test_floor_capped_at_95,
         test_floor_above_soc_keep,
-        test_floor_uncapped_after_safe_time,
     ]
     print("  --- v10 floor tests ---")
     for test_fn in floor_tests:
@@ -2523,7 +2485,7 @@ def run_curtailment_tests(my_predbat=None):
         test_deactivates_when_pv_exhausted,
         test_post_release_target_soc_tracks_soc,
         test_no_energy_ratio_on_pv,
-        test_dynamic_headroom_reserve,
+        test_floor_charges_on_marginal_day,
         test_post_release_export_target_ramps_down,
     ]
     print("  --- stay-active (R40/R41) tests ---")
