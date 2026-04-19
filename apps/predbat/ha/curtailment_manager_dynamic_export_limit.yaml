@@ -7,12 +7,13 @@
 #   Hold:  force export = min(excess, DNO) — clamp at available PV
 #   Drain: force export = DNO — force battery discharge to grid
 #
-# Plugin-controlled phases:
-#   Drain: SOC > floor → export = min(export_cap, DNO) — drain battery pre-overflow
-#   Hold:  SOC <= floor → export = min(excess, export_cap, DNO) — hold at floor
+# Plugin-controlled phases (three-state):
+#   Charge: export_target=0 (SOC < floor-0.5) → export = 0, battery charges from PV
+#   Drain:  export_target=DNO, SOC > floor+0.5 → export = min(export_cap, DNO)
+#   Hold:   export_target=DNO, SOC at floor → export = min(excess, export_cap, DNO)
 #
-# export_cap comes from sensor.predbat_curtailment_export_target (ramp sensor).
-# Falls back to DNO if sensor is unavailable or -2 (inactive).
+# export_cap comes from sensor.predbat_curtailment_export_target.
+# Charge detected when export_cap_raw == 0. Falls back to DNO if -2 (inactive).
 #
 # Manual Hold/Drain forces D-ESS mode so the export limit is respected by SIG.
 # Plugin stay-active (R40) ensures D-ESS is maintained while PV is present.
@@ -23,9 +24,9 @@
 id: "1773747411848"
 alias: "Curtailment Manager - Dynamic Export Limit"
 description: >-
-  Export control with manual override select (Off/Zero/Hold/Drain) and plugin-driven ramp-down.
-  Manual Zero: export = 0. Manual Hold: export = min(excess, DNO). Manual Drain: export = DNO.
-  Plugin: SOC > floor drains at export_target; SOC <= floor holds at min(excess, export_target, DNO).
+  Export control with manual override (Off/Zero/Hold/Drain) and three-state plugin phases.
+  Manual Zero: export = 0. Manual Hold: min(excess, DNO). Manual Drain: DNO.
+  Plugin Charge: export=0 (SOC below floor). Drain: export=DNO (above floor). Hold: min(excess, DNO).
 mode: single
 
 trigger:
@@ -86,7 +87,8 @@ action:
         {% if manual_mode == 'Zero' %}Manual Zero
         {% elif manual_mode == 'Hold' %}Manual Hold
         {% elif manual_mode == 'Drain' %}Manual Drain
-        {% elif soc_kwh > target_kwh %}Drain
+        {% elif export_cap_raw == 0 %}Charge
+        {% elif soc_kwh > target_kwh + 0.5 %}Drain
         {% else %}Hold
         {% endif %}
       new_limit: >-
@@ -96,7 +98,9 @@ action:
           {{ [[excess, 0] | max, dno] | min | round(1) }}
         {% elif manual_mode == 'Drain' %}
           {{ dno | round(1) }}
-        {% elif soc_kwh > target_kwh %}
+        {% elif export_cap_raw == 0 %}
+          {{ 0 | round(1) }}
+        {% elif soc_kwh > target_kwh + 0.5 %}
           {{ [[export_cap, 0] | max, dno] | min | round(1) }}
         {% else %}
           {{ [[excess, 0] | max, export_cap | float(4), dno] | min | round(1) }}

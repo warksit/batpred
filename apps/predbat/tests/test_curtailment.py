@@ -30,8 +30,8 @@ DNO_LIMIT = 4.0
 STEP_MINUTES = 5
 START_SOC_PCT = 0.40
 
-# v10 constants (match curtailment_plugin.py)
-OVERFLOW_SAFETY_FACTOR = 1.25
+# v18 constants (match curtailment_plugin.py)
+OVERFLOW_SAFETY_FACTOR = 1.0
 SOC_CAP_FACTOR = 0.95
 SOC_MARGIN_KWH = 0.5
 
@@ -454,10 +454,10 @@ def test_activation_high_soc_low_overflow():
 
 
 def test_floor_computation():
-    """Floor = soc_max - overflow_only * 1.25 (R9)."""
+    """Floor = soc_max - overflow_only * 1.0 (R9, OVERFLOW_SAFETY_FACTOR=1.0)."""
     overflow = 10.0
     floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
-    expected = 18.08 - 12.5  # 5.58
+    expected = 18.08 - 10.0  # 8.08
     assert abs(floor - expected) < 0.01, f"Expected {expected}, got {floor}"
     print(f"  test_floor_computation: PASSED (floor={floor:.2f}kWh = {floor/BATTERY_KWH*100:.0f}%)")
 
@@ -1394,15 +1394,14 @@ def test_floor_lower_with_more_overflow():
     print(f"  test_floor_lower_with_more_overflow: PASSED (6kW={floor1/BATTERY_KWH*100:.0f}%, 9kW={floor2/BATTERY_KWH*100:.0f}%)")
 
 
-def test_export_target_at_dno_early_day():
-    """Export target = DNO when active (HA automation handles Drain/Hold split).
+def test_export_target_at_dno_when_soc_above_floor():
+    """Export target = DNO when SOC is above floor (Drain/Hold territory, R38).
 
-    In v17, plugin always publishes export_target=DNO when active.
-    The HA automation splits Drain (SOC>floor) vs Hold (SOC≤floor) based on SOC.
+    SOC=90% at midday: floor ≈ 30% (large overflow predicted). SOC >> floor+0.5 → Drain → DNO.
     """
     pv = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
     load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.738  # 73.8%
+    soc_kw = BATTERY_KWH * 0.90  # 90% — well above any floor
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 8.0,
         "sensor.sigen_plant_consumed_power": 1.0,
@@ -1416,21 +1415,22 @@ def test_export_target_at_dno_early_day():
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
-    _, phase = plugin.calculate(dno_limit_kw=4.0)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"Should be active, got {phase}"
-    assert plugin._export_target == 4.0, f"Export target should be DNO (4.0) when active, got {plugin._export_target}"
-    print(f"  test_export_target_at_dno_early_day: PASSED (export_target={plugin._export_target}kW)")
+    assert soc_kw > floor + 0.5, f"Test requires SOC above floor+0.5 ({soc_kw:.1f} vs {floor + 0.5:.1f})"
+    assert plugin._export_target == 4.0, f"Export target should be DNO when SOC above floor, got {plugin._export_target}"
+    print(f"  test_export_target_at_dno_when_soc_above_floor: PASSED (floor={floor/BATTERY_KWH*100:.0f}%, SOC=90%, export_target={plugin._export_target}kW)")
 
 
-def test_export_target_dno_during_active():
-    """Export target = DNO whenever plugin is active (no Charge mode in v17, R16).
+def test_export_target_zero_when_soc_below_floor():
+    """Export target = 0 when SOC < floor - 0.5 (Charge phase, R16/R38).
 
-    Plugin always sets export_target=DNO when active. The HA automation interprets
-    this as: SOC>floor → export at DNO (Drain); SOC≤floor → export at min(excess,DNO) (Hold).
+    Late in day with small remaining overflow → floor is high. Low SOC → Charge mode.
+    Plugin signals HA automation with export_target=0 so battery charges from PV.
     """
     pv = {m: 5.5 for m in range(0, 60, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.80
+    soc_kw = BATTERY_KWH * 0.80  # 80%
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 5.5,
         "sensor.sigen_plant_consumed_power": 0.5,
@@ -1440,14 +1440,15 @@ def test_export_target_dno_during_active():
         pv_step=pv,
         load_step=load,
         soc_kw=soc_kw,
-        minutes_now=900,  # 15:00 local
+        minutes_now=900,  # 15:00 local — late day, small overflow remaining, floor is high
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
-    _, phase = plugin.calculate(dno_limit_kw=4.0)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"Should be active, got {phase}"
-    assert plugin._export_target == 4.0, f"Active phase must always export at DNO, got {plugin._export_target}"
-    print(f"  test_export_target_dno_during_active: PASSED (export_target={plugin._export_target}kW)")
+    assert soc_kw < floor - 0.5, f"Test requires SOC below floor-0.5 ({soc_kw:.1f} vs {floor - 0.5:.1f})"
+    assert plugin._export_target == 0.0, f"Export target should be 0 (Charge) when SOC below floor, got {plugin._export_target}"
+    print(f"  test_export_target_zero_when_soc_below_floor: PASSED (floor={floor/BATTERY_KWH*100:.0f}%, SOC=80%, export_target={plugin._export_target}kW)")
 
 
 # ============================================================================
@@ -1580,10 +1581,11 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
             charge = min(overflow, max_charge)
             curtailed = max(0, overflow - charge)
         else:
-            # Phase 1/3: sub-DNO — manage SOC vs floor
-            # Cap floor at current SOC: don't charge UP during active curtailment.
-            # Only drain (to create headroom) or hold. Prevents the rising floor
-            # from pulling SOC up between overflow bursts.
+            # Phase 1/3: sub-DNO — manage SOC vs floor (three-state: Charge/Drain/Hold)
+            # Charge (export_target=0): export=0, battery charges from any PV excess.
+            # Drain (export_target=DNO, SOC > floor+0.5): SIG discharges toward floor.
+            # Hold (export_target=DNO, SOC at floor): export=min(excess, DNO).
+            # effective_floor cap: prevents Drain when SOC already below floor.
             effective_floor = min(floor, soc)
             if soc > effective_floor + SOC_MARGIN_KWH:
                 # Drain: export=DNO, SIG discharges battery
@@ -1808,7 +1810,8 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
                 else:
                     discharge = min(-actual_excess, max_discharge)
             else:
-                # Hold: export=min(excess, export_target, DNO) per HA automation (R16/R38/R41)
+                # Charge/Hold: export=min(excess, export_target, DNO) per HA automation (R38).
+                # export_target=0 → Charge (battery charges from PV). export_target=DNO → Hold.
                 hold_cap = plugin._export_target if (plugin._export_target >= 0) else DNO_LIMIT
                 if actual_excess > 0:
                     export = min(actual_excess, hold_cap, DNO_LIMIT)
@@ -2202,8 +2205,8 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_clamped_above_soc_keep,
         test_floor_clamped_above_reserve,
         test_floor_lower_with_more_overflow,
-        test_export_target_at_dno_early_day,
-        test_export_target_dno_during_active,
+        test_export_target_at_dno_when_soc_above_floor,
+        test_export_target_zero_when_soc_below_floor,
     ]
     print("  --- plugin integration tests ---")
     for test_fn in plugin_tests:

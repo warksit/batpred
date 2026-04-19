@@ -1,10 +1,10 @@
 # -----------------------------------------------------------------------------
-# Curtailment Manager Plugin for Predbat — v17
+# Curtailment Manager Plugin for Predbat — v18
 # Solar-geometry floor algorithm to eliminate solar curtailment
 #
 # Works WITH the HA automation (curtailment_manager_dynamic_export_limit):
 #   - Plugin (5-min): computes floor from solar geometry integral, publishes sensors
-#   - HA automation (~5s): Drain (SOC > floor) or Hold (SOC ≤ floor)
+#   - HA automation (~5s): Charge (SOC < floor-0.5), Drain (SOC > floor+0.5), Hold (at floor)
 #
 # Control model (SIG inverter):
 #   Active:   D-ESS mode, read_only=True (suppresses Predbat inverter control)
@@ -14,7 +14,7 @@
 #   1. remaining_overflow > 0 — solar geometry curve predicts overflow
 #   2. solcast_remaining - load_remaining > (soc_max - soc_kw) — battery fills
 #
-# Floor (R9): soc_max - overflow_integral × 1.25
+# Floor (R9): soc_max - overflow_integral × 1.0
 #   overflow_integral = ∫ max(0, scale × sin(elev) - base_load - DNO) dt
 #   integrated from now to safe_time
 #
@@ -61,7 +61,7 @@ SOLCAST_TODAY = "sensor.solcast_pv_forecast_forecast_today"
 SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 
 # Safety factor: 25% buffer on overflow headroom (R9)
-OVERFLOW_SAFETY_FACTOR = 1.25
+OVERFLOW_SAFETY_FACTOR = 1.0
 
 
 class CurtailmentPlugin(PredBatPlugin):
@@ -348,8 +348,12 @@ class CurtailmentPlugin(PredBatPlugin):
             if sin_peak >= 0.05:
                 actual_scale = self._peak_pv / sin_peak
 
-        # floor_scale: p90 unless actual shows a cloudier day (smaller scale → higher floor, R43)
-        if actual_scale > 0 and actual_scale < p90_scale:
+        # floor_scale: p90 unless actual confirms a cloudier day (R43).
+        # Only apply R43 once actual peak is well-established (>= 50% of p90 peak), so that
+        # early-morning low readings don't prematurely drag floor_scale down and raise the floor.
+        p90_peak_kw = self._p90_peak_kw if self._p90_peak_kw > 0 else p90_scale * 0.85
+        actual_peak_established = self._peak_pv >= p90_peak_kw * 0.5
+        if actual_scale > 0 and actual_scale < p90_scale and actual_peak_established:
             floor_scale = actual_scale
         else:
             floor_scale = p90_scale
@@ -421,8 +425,11 @@ class CurtailmentPlugin(PredBatPlugin):
             floor = max(floor, self._floor_ratchet)
         self._floor_ratchet = floor
 
-        # Export target: DNO — HA automation splits into Drain/Hold based on SOC vs floor
-        self._export_target = dno_limit_kw
+        # Three-state: Charge when SOC below floor (R16/R38), else Drain/Hold split by HA automation
+        if soc_kw < floor - 0.5:
+            self._export_target = 0.0
+        else:
+            self._export_target = dno_limit_kw
 
         return floor, "active"
 

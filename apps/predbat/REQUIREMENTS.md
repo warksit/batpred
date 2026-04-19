@@ -56,7 +56,8 @@ reserved cannot be reclaimed.
 
 - **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - base_load - DNO) dt`
   integrated from now to safe_time (R19). Evaluated each 5-minute plugin cycle.
-  `floor = soc_max - remaining_overflow × 1.25`
+  `floor = soc_max - remaining_overflow × 1.0`
+  p90 scale is already a near-worst-case estimate — no additional safety factor needed.
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
 - **R11**: Floor ratchet — floor can only rise, never fall. Once headroom is reserved
   it cannot be reclaimed mid-day. Reset on deactivation.
@@ -65,18 +66,23 @@ reserved cannot be reclaimed.
   sin(elev) falling). Rises faster on cloudy days (actual peak < p90 → scale updates
   down → integral smaller → floor higher sooner).
 
-## Control — Two Behaviours (HA automation, 5-second cycle)
+## Control — Three Phases (HA automation, 5-second cycle)
 
 - **R14**: **Drain** (SOC > floor + 0.5kWh): export = DNO. SIG discharges battery
   toward floor. Creates headroom before overflow window.
-- **R15**: **Hold** (SOC ≤ floor + 0.5kWh): export = min(excess, DNO). Battery
+- **R15**: **Hold** (SOC within 0.5kWh of floor): export = min(excess, DNO). Battery
   absorbs overflow above DNO naturally. Sub-DNO PV is exported, not stored.
-- **R16**: No Charge mode. Battery charges from overflow absorption in Hold, not
-  from a forced zero-export state.
+- **R16**: **Charge** (SOC < floor − 0.5kWh): export = 0. Battery charges from
+  sub-DNO PV toward floor. Plugin sets export_target=0 to signal Charge.
+  Charge is safe because the p90-based floor is already a worst-case estimate —
+  there is no risk of overcrowding the battery before overflow arrives.
 - **R17**: All active states use D-ESS mode. MSC only when off (R6).
 - **R18**: HA automation (5-sec) handles real-time export control AND publishes live
-  phase (Drain/Hold) to `input_text.curtailment_live_phase`. Plugin (5-min) computes
-  floor, sets D-ESS mode, publishes Active/Off. Plugin sets live phase to Off on deactivation.
+  phase (Charge/Drain/Hold) to `input_text.curtailment_live_phase`. Plugin (5-min)
+  computes floor, sets D-ESS mode, publishes Active/Off. Plugin sets live phase to Off
+  on deactivation.
+- **R38**: Plugin export_target signal: 0.0 = Charge phase (SOC < floor−0.5);
+  DNO = Drain or Hold (HA automation splits by SOC vs floor+0.5).
 
 ## Solar Geometry — Safe Time
 
