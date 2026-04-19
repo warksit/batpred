@@ -59,8 +59,10 @@ No export capacity in the activation check — export is what management DOES, n
   comes from the totals-based energy balance (R32). Safety factor = 1.10 (10% buffer).
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
 - **R11**: Dynamic headroom reserve: `headroom_reserve = remaining_pv * 0.10` when
-  `pv_now >= SAFE_PV_THRESHOLD_KW`, else 0. `floor = min(floor, soc_max - headroom_reserve)`.
-  Scales with remaining PV (large early, zero near end). Replaces fixed 95% cap.
+  `pv_now >= SAFE_PV_THRESHOLD_KW`, else 0. Subtracted directly from floor:
+  `floor = max(floor - headroom_reserve, floor_min)`. Scales with remaining PV (large
+  early, zero near end). Replaces fixed 95% cap. Applied as subtraction (not cap)
+  so it always lowers the floor — cap had no effect on big-overflow days.
 - **R12**: After safe_time, cap removed: `floor = min(floor, soc_max)`. Battery fills to 100%.
 - **R13**: Floor rises naturally each cycle as remaining PV and absorption shrink.
 

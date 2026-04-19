@@ -52,6 +52,7 @@ PREDBAT_PV_TODAY = "sensor.predbat_pv_today"
 
 # Safety factors
 OVERFLOW_SAFETY_FACTOR = 1.50  # 50% buffer — conservative drain early, recovered at release
+HEADROOM_RESERVE_FACTOR = 0.10  # 10% of remaining PV subtracted from floor (R11)
 SOC_CAP_FACTOR = 0.95  # 95% cap until safe_time (spike headroom)
 
 
@@ -808,7 +809,7 @@ class CurtailmentPlugin(PredBatPlugin):
             hours_to_pv_end = max(last_significant_pv, PREDICT_STEP) / 60.0
 
             post_load = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(PREDICT_STEP, solar_end, PREDICT_STEP)) * load_ratio
-            headroom_reserve = solcast_remaining * 0.10 if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
+            headroom_reserve = solcast_remaining * HEADROOM_RESERVE_FACTOR if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
             energy_still_needed = max(0.0, soc_max - soc_kw)
 
             # Would overflow alone fill battery?
@@ -829,11 +830,12 @@ class CurtailmentPlugin(PredBatPlugin):
             # Floor = current SOC: automation sees SOC ≈ floor → Hold (not Drain)
             return soc_kw, "post_release"
 
-        # Active: overflow still forecast. Apply dynamic headroom reserve (R11 replacement).
+        # Active: overflow still forecast. Subtract dynamic headroom reserve from floor (R11).
         # Reserve scales with remaining PV to absorb unexpected solar spikes.
-        headroom_reserve = remaining_pv * 0.10 if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
-        max_soc = soc_max - headroom_reserve
-        floor = min(floor, max_soc)
+        # Subtracted directly so floor is always lower by this amount (cap had no effect on big days).
+        headroom_reserve = remaining_pv * HEADROOM_RESERVE_FACTOR if actual_pv >= SAFE_PV_THRESHOLD_KW else 0.0
+        floor = floor - headroom_reserve
+        floor = max(floor, max(soc_keep, reserve))
 
         # Soft floor ratchet: floor can rise max 2% of soc_max per cycle (R39)
         if self._floor_ratchet is not None:

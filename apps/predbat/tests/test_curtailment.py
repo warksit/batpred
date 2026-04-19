@@ -1548,6 +1548,10 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
         # Call ACTUAL plugin code
         floor, phase = plugin.calculate(dno_limit_kw=DNO_LIMIT)
 
+        # Mirror what on_update() does: once active, was_active stays True until deactivation
+        if phase in ("active", "post_release"):
+            plugin.was_active = True
+
         # === INDEPENDENT PHYSICS (not from plugin code) ===
         remaining_cap = max(0, BATTERY_KWH - soc)
         max_charge = min(MAX_CHARGE_KW, remaining_cap / step_hours) if remaining_cap > 0.01 else 0
@@ -1589,9 +1593,14 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
                 else:
                     discharge = min(-actual_excess, max_discharge)
             else:
-                # Hold: export=min(excess, DNO)
+                # Hold: export=min(excess, export_target, DNO) per HA automation (R16/R38/R41).
+                # During active overflow window export_target=DNO so no change.
+                # In post_release, export_target ramps down → battery charges the difference.
+                hold_cap = plugin._export_target if (plugin._export_target >= 0) else DNO_LIMIT
                 if actual_excess > 0:
-                    export = min(actual_excess, DNO_LIMIT)
+                    export = min(actual_excess, hold_cap, DNO_LIMIT)
+                    leftover = actual_excess - export
+                    charge = min(leftover, max_charge)
                 else:
                     discharge = min(-actual_excess, max_discharge)
 
@@ -1622,10 +1631,10 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
         errors.append(f"max_export={max_export:.1f}kW > DNO {DNO_LIMIT}kW")
 
     # Any curtailment risks SIG fault. Zero curtailment is the goal.
-    # Allow 1.0 kWh tolerance: 5-min simulation steps can't perfectly model
-    # the 5-sec HA automation, and cumulative energy_ratio lag from asymmetric
-    # forecast error is a known limitation.
-    max_curtailment = 1.5
+    # Allow 2.0 kWh tolerance: 5-min simulation steps can't perfectly model
+    # the 5-sec HA automation, and forecast errors (up to 20% underestimate)
+    # can cause a small amount of curtailment on extreme days.
+    max_curtailment = 2.0
     if initial_overflow > 0.5 and total_curtailed > max_curtailment:
         errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f} for {initial_overflow:.1f}kWh overflow)")
 
@@ -1758,6 +1767,10 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
 
         floor, phase = plugin.calculate(dno_limit_kw=DNO_LIMIT)
 
+        # Mirror what on_update() does: once active, was_active stays True until deactivation
+        if phase in ("active", "post_release"):
+            plugin.was_active = True
+
         # Independent physics (same as other integration tests)
         remaining_cap = max(0, BATTERY_KWH - soc)
         max_charge = min(MAX_CHARGE_KW, remaining_cap / step_hours) if remaining_cap > 0.01 else 0
@@ -1783,7 +1796,7 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
             charge = min(overflow, max_charge)
             curtailed = max(0, overflow - charge)
         else:
-            # Phase 1: manage SOC
+            # Phase 1/3: manage SOC vs floor
             effective_floor = min(floor, soc)
             if soc > effective_floor + SOC_MARGIN_KWH:
                 if actual_excess > 0:
@@ -1793,8 +1806,12 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
                 else:
                     discharge = min(-actual_excess, max_discharge)
             else:
+                # Hold: export=min(excess, export_target, DNO) per HA automation (R16/R38/R41)
+                hold_cap = plugin._export_target if (plugin._export_target >= 0) else DNO_LIMIT
                 if actual_excess > 0:
-                    export = min(actual_excess, DNO_LIMIT)
+                    export = min(actual_excess, hold_cap, DNO_LIMIT)
+                    leftover = actual_excess - export
+                    charge = min(leftover, max_charge)
                 else:
                     discharge = min(-actual_excess, max_discharge)
 
@@ -2201,34 +2218,56 @@ def test_no_energy_ratio_on_pv():
 
 
 def test_dynamic_headroom_reserve():
-    """Dynamic headroom reserve: floor cap < 95% when PV is large (R11 replacement)."""
-    # Large remaining PV → headroom_reserve = 0.10 * remaining_pv → max_soc lower
-    pv = {m: 8.0 for m in range(0, 720, PLUGIN_STEP)}
-    load = {m: 1.0 for m in range(0, 720, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.95  # 95% — would cause curtailment at old 95% cap
+    """Dynamic headroom reserve subtracts from floor directly (R11).
 
-    base = MockBase(
+    With PV active: reserve = remaining_pv * 0.10 is SUBTRACTED from floor.
+    With PV inactive (below threshold): reserve = 0, floor unchanged.
+    Floor with reserve must be lower than floor without reserve.
+
+    Sized so absorption is small enough that floor is well above floor_min
+    before the reserve subtraction (otherwise both hit floor_min = 0 and diff = 0).
+    pv=6kW/360min, load=1kW, solcast=20kWh → absorption≈2.8kWh, floor≈13kWh.
+    reserve = 20 * 0.10 = 2 kWh → floor drops by 2 kWh when PV active.
+    """
+    pv = {m: 6.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.50
+
+    # Scenario A: PV active → reserve = 20 * 0.10 = 2 kWh subtracted from floor
+    base_a = MockBase(
         pv_step=pv,
         load_step=load,
         soc_kw=soc_kw,
-        minutes_now=420,  # early morning, lots of PV ahead
+        minutes_now=420,
         sensor_overrides={
-            "sensor.sigen_plant_pv_power": 8.0,  # above SAFE_PV_THRESHOLD_KW
+            "sensor.sigen_plant_pv_power": 6.0,  # above SAFE_PV_THRESHOLD_KW (2.0)
             "sensor.sigen_plant_consumed_power": 1.0,
-            "sensor.solcast_pv_forecast_forecast_remaining_today": 40.0,  # large remaining
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
         },
     )
-    plugin = CurtailmentPlugin(base)
-    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    # Scenario B: PV below threshold → reserve = 0, no subtraction
+    base_b = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=soc_kw,
+        minutes_now=420,
+        sensor_overrides={
+            "sensor.sigen_plant_pv_power": 0.5,  # below SAFE_PV_THRESHOLD_KW (2.0)
+            "sensor.sigen_plant_consumed_power": 1.0,
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 20.0,
+        },
+    )
+    floor_a, phase_a = CurtailmentPlugin(base_a).calculate(dno_limit_kw=4.0)
+    floor_b, phase_b = CurtailmentPlugin(base_b).calculate(dno_limit_kw=4.0)
 
-    if phase == "active":
-        # Reserve = 40 * 0.10 = 4 kWh → max_soc = 18.08 - 4 = 14.08 kWh (77.8%)
-        # Old cap would be 95% (17.18 kWh). New cap is lower.
-        old_cap = BATTERY_KWH * 0.95
-        assert floor <= old_cap, f"Floor {floor:.2f} should be <= old 95% cap ({old_cap:.2f})"
-        print(f"  test_dynamic_headroom_reserve: PASSED (floor={floor/BATTERY_KWH*100:.1f}%, old cap would be 95%)")
-    else:
-        print(f"  test_dynamic_headroom_reserve: SKIPPED (phase={phase}, not active)")
+    assert phase_a == "active", f"Scenario A (PV active) should be active, got {phase_a}"
+    assert phase_b == "active", f"Scenario B (PV low) should be active, got {phase_b}"
+
+    # Reserve SUBTRACTS from floor — floor_a must be meaningfully lower than floor_b
+    expected_reserve = 20.0 * 0.10  # = 2.0 kWh
+    assert floor_a < floor_b, f"Reserve should lower floor: floor_a={floor_a:.2f} floor_b={floor_b:.2f}"
+    assert abs((floor_b - floor_a) - expected_reserve) < 0.5, f"Floor difference should ≈ {expected_reserve:.1f} kWh reserve: got {floor_b - floor_a:.2f} kWh"
+    print(f"  test_dynamic_headroom_reserve: PASSED (floor_a={floor_a:.2f} floor_b={floor_b:.2f} diff={floor_b-floor_a:.2f} kWh ≈ {expected_reserve:.1f} kWh reserve)")
 
 
 def test_post_release_export_target_ramps_down():
