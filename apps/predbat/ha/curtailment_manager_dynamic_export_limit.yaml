@@ -1,8 +1,9 @@
 # Curtailment Manager - Dynamic Export Limit
 # HA automation: event-driven export control for curtailment system.
 #
-# Manual override: input_select.curtailment_manual_hold — Off / Hold / Drain
+# Manual override: input_select.curtailment_manual_hold — Off / Zero / Hold / Drain
 #   Off:   plugin controls export (default)
+#   Zero:  force export = 0 — battery absorbs all PV (emergency curtailment)
 #   Hold:  force export = min(excess, DNO) — clamp at available PV
 #   Drain: force export = DNO — force battery discharge to grid
 #
@@ -22,8 +23,8 @@
 id: "1773747411848"
 alias: "Curtailment Manager - Dynamic Export Limit"
 description: >-
-  Export control with manual override select (Off/Hold/Drain) and plugin-driven ramp-down.
-  Manual Hold: export = min(excess, DNO). Manual Drain: export = DNO.
+  Export control with manual override select (Off/Zero/Hold/Drain) and plugin-driven ramp-down.
+  Manual Zero: export = 0. Manual Hold: export = min(excess, DNO). Manual Drain: export = DNO.
   Plugin: SOC > floor drains at export_target; SOC <= floor holds at min(excess, export_target, DNO).
 mode: single
 
@@ -82,13 +83,16 @@ action:
         {% endif %}
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       phase: >-
-        {% if manual_mode == 'Hold' %}Manual Hold
+        {% if manual_mode == 'Zero' %}Manual Zero
+        {% elif manual_mode == 'Hold' %}Manual Hold
         {% elif manual_mode == 'Drain' %}Manual Drain
         {% elif soc_kwh > target_kwh %}Drain
         {% else %}Hold
         {% endif %}
       new_limit: >-
-        {% if manual_mode == 'Hold' %}
+        {% if manual_mode == 'Zero' %}
+          {{ 0 | round(1) }}
+        {% elif manual_mode == 'Hold' %}
           {{ [[excess, 0] | max, dno] | min | round(1) }}
         {% elif manual_mode == 'Drain' %}
           {{ dno | round(1) }}

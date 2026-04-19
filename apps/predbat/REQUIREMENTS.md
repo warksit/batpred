@@ -9,27 +9,17 @@ features without verifying they are not required here.
 Prevent grid export exceeding 4kW DNO limit while minimizing curtailment
 and filling the battery by sunset.
 
-## Key Design Principle — Pre-Overflow is the Only Window
+## Key Design Principle — Solar Geometry is the Ground Truth
 
-**R25**: Once PV-load > DNO, we have NO control levers. Battery fills from
-overflow at whatever rate physics dictates (excess - DNO). The ONLY export
-option is DNO. All management — drain, charge, hold — must happen BEFORE
-overflow starts. This is why drain (R15) is essential: the battery must be
-at the floor when overflow begins.
+**R25**: The overflow window and its energy are derived from the solar geometry
+curve, not from the forecast per-slot scan. The smooth solar curve (scale × sin(elev))
+defines when overflow is possible and how much headroom is needed. Forecast per-slot
+data is too noisy (cloud calibration, Predbat scaling) to be trusted for this.
 
-## Architecture — Shared Calculation
-
-**R31**: Live calculate() and tomorrow forecast MUST use the same energy
-balance function (`_compute_absorption`). One function, two time windows.
-If the formula changes, it changes in one place. They must NEVER diverge.
-
-**R32**: The energy balance uses TOTALS, not per-slot overflow:
-`battery_must_absorb = remaining_pv - remaining_load - DNO * hours_to_release`
-All three (PV, load, export capacity) cover the same window: now to release time.
-
-**R33**: PV total from Solcast remaining sensor (updated from actual conditions).
-Per-slot forecast shape used ONLY to estimate the fraction before release time.
-Magnitude from Solcast unmodified — no energy_ratio on PV (see R24).
+Scale is initialised from Solcast p90 forecast peak (worst-case near-perfect day).
+Once actual peak PV is observed, scale updates — but only if it raises the floor
+(reduces headroom). The floor can never be lowered mid-day; headroom already
+reserved cannot be reclaimed.
 
 ## Safety
 
@@ -38,104 +28,95 @@ Magnitude from Solcast unmodified — no energy_ratio on PV (see R24).
 - **R3**: read_only=true during active control. Predbat must not change inverter settings.
 - **R4**: Defer to Predbat charge windows when SOC < soc_keep and charge window active.
 
-## Activation — "Is there a problem?"
+## Activation
 
-Activation asks: will the total PV excess fill the battery before safe_time?
-This is SEPARATE from the floor calculation (which computes the solution).
-No export capacity in the activation check — export is what management DOES, not an input.
+- **R5**: Activate when BOTH conditions are true:
+  1. `remaining_overflow > 0` — solar geometry curve (R9) predicts overflow.
+  2. `solcast_remaining - load_remaining > (soc_max - soc_kw)` — total PV exceeds
+     what is needed to fill the battery. If the battery won't reach 100% even with
+     all the PV, the overflow energy is needed for charging — do not activate.
+- **R6**: Deactivate at safe_time (R19): restore MSC, hand back to Predbat.
+  Predbat MSC fills the battery with remaining post-safe_time PV.
+- **R7**: No activation from per-slot forecast scan. Solar geometry and Solcast p90 only.
+- **R8**: When inactive, Predbat manages normally.
 
-- **R5**: Activate when `total_excess > headroom` where:
-    - `total_excess = remaining_pv - remaining_load` (to safe_time, from Solcast + LoadML)
-    - `headroom = soc_max * 0.95 - soc_kw`
-- **R6**: Deactivate only when PV is physically exhausted: actual PV < SAFE_PV_THRESHOLD_KW
-  (2.0 kW) for 3 consecutive plugin cycles (15 min) AND overflow window has ended.
-  Never deactivate on a forecast miss or cloud during the overflow window.
-- **R7**: Trust forecast + energy ratio for activation. No force-activate from actual excess.
-- **R8**: When inactive and no overflow forecast, stay off. Predbat manages normally.
+## Scale — Worst-Case Clear Day
 
-## Floor
+- **R42**: At activation, derive scale from Solcast p90 forecast:
+  `scale = p90_peak_kw / sin(elevation at p90_peak_time)`
+  This represents a near-perfect solar day — the worst case for overflow headroom.
+- **R43**: Once actual peak PV is observed during the day, update scale:
+  `scale = actual_peak_kw / sin(elevation at actual_peak_time)`
+  Only apply if this raises the floor (i.e. actual_peak < p90_peak). If actual
+  peak exceeds p90 (rare clear-sky burst), floor stays — headroom already reserved.
+- **R44**: Before today's peak is observed, use yesterday's scale as fallback if
+  Solcast p90 is unavailable. Scale changes slowly day-to-day (~1° elevation per day).
 
-- **R9**: `floor = soc_max - overflow_energy × 1.25` where `overflow_energy = Σ max(0, PV-load-DNO)×dt`
-  summed over the overflow window (window_start to release_offset). Safety factor = 1.25 (25% buffer).
-  Only energy ABOVE the DNO limit requires dedicated headroom — sub-DNO PV is exported in Hold mode.
+## Floor — Solar Geometry Integral
+
+- **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - base_load - DNO) dt`
+  integrated from now to safe_time (R19). Evaluated each 5-minute plugin cycle.
+  `floor = soc_max - remaining_overflow × 1.25`
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
-- **R11**: No separate headroom reserve — the 1.25× safety factor in R9 replaces it.
-  The 95% activation cap (R5) remains for the activation check only.
-- **R12**: After safe_time, cap removed: `floor = min(floor, soc_max)`. Battery fills to 100%.
-- **R13**: Floor rises naturally each cycle as remaining PV and absorption shrink.
+- **R11**: Floor ratchet — floor can only rise, never fall. Once headroom is reserved
+  it cannot be reclaimed mid-day. Reset on deactivation.
+- **R12**: At safe_time, remaining_overflow = 0, floor = soc_max. Plugin deactivates.
+- **R13**: Floor rises naturally each cycle as the integral shrinks (time passing,
+  sin(elev) falling). Rises faster on cloudy days (actual peak < p90 → scale updates
+  down → integral smaller → floor higher sooner).
 
-## Control — Three Behaviors (HA automation, 5-second cycle)
+## Control — Two Behaviours (HA automation, 5-second cycle)
 
-- **R14**: **Charge** (SOC < floor - 0.5kWh): export=0, battery absorbs all PV.
-- **R15**: **Drain** (SOC > floor + 0.5kWh): export=DNO, SIG discharges battery toward floor. THIS IS ESSENTIAL — creates headroom before overflow peaks.
-- **R16**: **Hold** (SOC within 0.5kWh of floor): export=min(excess, DNO), battery maintains at floor.
-- **R17**: All active states use D-ESS mode. MSC only when off.
-- **R18**: HA automation (5-sec) handles real-time export control AND publishes live phase (Charge/Drain/Hold) to `input_text.curtailment_live_phase`. Plugin (5-min) computes floor, sets D-ESS mode, publishes Active/Off. Plugin sets live phase to Off when deactivating.
+- **R14**: **Drain** (SOC > floor + 0.5kWh): export = DNO. SIG discharges battery
+  toward floor. Creates headroom before overflow window.
+- **R15**: **Hold** (SOC ≤ floor + 0.5kWh): export = min(excess, DNO). Battery
+  absorbs overflow above DNO naturally. Sub-DNO PV is exported, not stored.
+- **R16**: No Charge mode. Battery charges from overflow absorption in Hold, not
+  from a forced zero-export state.
+- **R17**: All active states use D-ESS mode. MSC only when off (R6).
+- **R18**: HA automation (5-sec) handles real-time export control AND publishes live
+  phase (Drain/Hold) to `input_text.curtailment_live_phase`. Plugin (5-min) computes
+  floor, sets D-ESS mode, publishes Active/Off. Plugin sets live phase to Off on deactivation.
 
-## Solar Geometry
+## Solar Geometry — Safe Time
 
-- **R19**: Safe time from day's peak PV: `scale = peak_pv / sin(elevation_at_peak)`. Safe when `scale * sin(elev) < DNO + 0.5`.
-- **R20**: Before peak time, still estimate safe_time for energy balance window. Only block the 95% uncap (don't release before peak).
-- **R21**: New peak resets safe_time calculation (re-engages 95% cap).
-
-## Forecast Scaling
-
-- **R22**: `energy_ratio = cumulative_actual_pv / cumulative_forecast_pv` with 15% blend ramp.
-- **R23**: `load_ratio = cumulative_actual_load / cumulative_forecast_load` with 15% blend.
-- **R24**: energy_ratio NOT applied to PV. Solcast remaining is trusted as-is — morning clouds
-  ≠ afternoon clouds. load_ratio scales LoadML load both ways. energy_ratio used only for
-  activation comparison (cumulative_actual_pv / cumulative_forecast_pv), not for floor calc.
+- **R19**: Safe time = when `scale × sin(elev) < DNO + base_load`. No curtailment
+  risk beyond this point. Computed each cycle from current scale.
+  `base_load` = 0.5 kW (minimum household load that offsets PV before grid sees it).
+- **R20**: Before today's actual peak is observed, safe_time is estimated from p90
+  scale. Once actual peak seen and scale updates, safe_time recalculates.
+- **R21**: Safe_time only moves later (more conservative) until actual peak is
+  confirmed. Cannot move earlier until scale is updated downward from actual peak.
 
 ## Planning
 
-- **R26**: on_before_plan reduces soc_keep on overflow days to morning_gap + margin. Only reduces if overflow needs the headroom (overflow * safety > headroom with current keep).
-- **R27**: on_before_plan uses tomorrow's forecast window overnight (when today's solar < 1 hour remaining).
-- **R28**: Overflow days should result in low morning SOC (max headroom for overflow absorption).
+- **R26**: on_before_plan reduces soc_keep on overflow days to morning_gap + margin.
+  Uses tomorrow's Solcast p90 peak to determine if overflow is expected.
+- **R27**: on_before_plan uses tomorrow's forecast window overnight (when today's
+  solar < 1 hour remaining).
+- **R28**: Overflow days should result in low morning SOC (max headroom for overflow).
 
 ## Tomorrow Sensor
 
-- **R29**: Tomorrow forecast waits until today's PV is done (last forecast PV slot < 30 min away). Shows "Pending" with estimated availability time while waiting. Shows clean zeroed attributes when Inactive.
-- **R30**: Tomorrow sensor uses SAME `_compute_absorption` function as live (R31). Solcast tomorrow total for PV. Per-slot shape for release fraction. Cached for 30 minutes.
+- **R29**: Tomorrow sensor shows expected overflow energy (from p90 scale integral)
+  and estimated safe_time. Available after today's PV is done. Shows "Pending" while
+  waiting. Shows zeroed attributes when Inactive.
+- **R30**: Tomorrow sensor uses same solar geometry calculation as live (R9/R19).
+  Solcast p90 tomorrow peak for scale. Cached for 30 minutes.
 
-## Export Target Ramp
+## Floor Stability
 
-- **R38**: Export target controls HA automation export cap:
-    - **Active phase, SOC < floor−0.5 AND excess ≤ DNO (Charge mode)**: export_target = 0.
-      Battery charges from sub-DNO PV toward floor; no export.
-    - **Active phase, SOC ≥ floor−0.5 OR in overflow (excess > DNO)**: export_target = DNO.
-      Export at full capacity; floor ensures overflow headroom was pre-created.
-    - **Post-release**: `export_target = clamp(0, DNO, budget / hours_to_pv_end)`
-      where `budget = remaining_pv - remaining_load - energy_still_needed`.
-      Ramps from DNO toward 0 as PV declines, causing battery to absorb remaining PV.
-  Published as `sensor.predbat_curtailment_export_target`. HA automation uses
-  this instead of hardcoded DNO for Drain and Hold export limits.
-  When inactive, value = -2 (automation falls back to DNO).
-
-## Floor & Release Stability
-
-- **R39**: Soft floor ratchet: floor can rise at most 2% of soc_max per 5-min
-  cycle. Prevents oscillation from forecast updates while allowing floor to
-  track remaining PV (R13). Reset on deactivation.
-  Release offset hysteresis: release time can move earlier freely but later
-  by at most 15 minutes per cycle. Prevents balance_end jumps that destabilize
-  floor and absorption calculations. Reset on deactivation.
-
-## Stay-Active
-
-- **R40**: Plugin maintains D-ESS from activation until PV is physically exhausted.
-  Non-overflow days stay Off (R8 unchanged). Once active, plugin does NOT deactivate
-  when the overflow window ends — it enters Post-Release phase (R41) and continues D-ESS.
-  Deactivation only when actual PV < SAFE_PV_THRESHOLD_KW for 3 consecutive cycles (15 min).
-
-- **R41**: Post-Release phase: after overflow window ends (no more forecast overflow), plugin
-  publishes `target_soc = current_soc_pct` — automation sees SOC ≈ floor → Hold phase →
-  `export = min(excess, export_target)`. No forced drain. Export target follows R38 formula
-  using `hours_to_pv_end` (time until PV drops below threshold). Dynamic headroom reserve
-  (R11) applied to `exportable_budget` — battery not rushed to 100%.
+- **R39**: Floor ratchet (R11): floor never falls within a day. No separate rate
+  limit needed — the integral naturally falls smoothly as sin(elev) decreases.
+  Safe_time only moves later until scale is confirmed (R21).
 
 ## Testing
 
-- **R34**: Integration tests run ACTUAL plugin.calculate() against CSV data with independent physics simulation. Algorithm bugs cannot hide in reimplemented simulation logic.
-- **R35**: Tests must provide Solcast remaining via MockBase sensor overrides to match production behavior. Fallback to per-slot sum is for production resilience, not the primary test path.
-- **R36**: TDD — when a flaw is found, write a FAILING test first that demonstrates the flaw. Then fix the code to make the test pass. Never deploy a fix without a test that would have caught the bug.
-- **R37**: Never break production code to make tests pass. If tests fail but production is correct, fix the tests.
+- **R34**: Integration tests run ACTUAL plugin.calculate() against CSV data with
+  independent physics simulation. Algorithm bugs cannot hide in reimplemented logic.
+- **R35**: Tests must provide Solcast p90 peak via MockBase sensor overrides.
+  Scale derivation must be testable with known p90 inputs.
+- **R36**: TDD — when a flaw is found, write a FAILING test first. Then fix the
+  code. Never deploy a fix without a test that would have caught the bug.
+- **R37**: Never break production code to make tests pass. If tests fail but
+  production is correct, fix the tests.
