@@ -38,6 +38,7 @@ class ActiveTestInverter:
         self.charge_time_enable = False
         self.in_calibration = False
         self.inv_charge_discharge_with_rate = False
+        self.inv_soc_limits_block_solar = False
         self.inv_can_span_midnight = True
         self.inv_has_target_soc = True
         self.inv_has_charge_enable_time = True

@@ -591,13 +591,20 @@ class Execute:
                             inverter.adjust_charge_immediate(calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max), freeze=True)
 
             # Charging/Discharging off via service
+            # For SIG inverters, charge and export share a single EMS mode entity,
+            # so skip the "off" call if the other mode is active to avoid overwriting it.
             if not isCharging and self.set_charge_window:
-                if carHolding or boostHolding:
+                if inverter.inv_soc_limits_block_solar and isExporting:
+                    pass  # EMS export mode already set; don't overwrite with demand
+                elif carHolding or boostHolding:
                     inverter.adjust_charge_immediate(inverter.soc_percent, freeze=True)
                 else:
                     inverter.adjust_charge_immediate(0)
             if not isExporting and self.set_export_window:
-                inverter.adjust_export_immediate(100)
+                if inverter.inv_soc_limits_block_solar and isCharging:
+                    pass  # EMS charge mode already set; don't overwrite with demand
+                else:
+                    inverter.adjust_export_immediate(100)
 
             # Reset reserve as discharge is enable but not running right now
             if self.set_reserve_enable and resetReserve:
@@ -629,7 +636,20 @@ class Execute:
         """
         Adjust target SoC based on the current SoC of all the inverters accounting for their
         charge rates and battery capacities
+
+        For inverters where charge_limit blocks all charging including solar
+        (soc_limits_block_solar), charge_limit MUST always be 100%. Setting it
+        below 100% blocks ALL charging including solar, which can cause over-export
+        and CLS faults. Charge control is handled by EMS mode switching (Grid First
+        → MSC), not the charge ceiling. The discharge floor prevents discharge
+        below target.
         """
+        # SIG: charge_limit blocks ALL charging including solar.
+        # ALWAYS set charge_limit=100% — charge control uses EMS mode, not the ceiling.
+        # Setting charge_limit < 100% blocks solar → forced export → CLS fault risk.
+        if getattr(inverter, "inv_soc_limits_block_solar", False):
+            soc = 100.0
+
         target_kwh = dp2(self.soc_max * (soc / 100.0))
         soc_percent = calc_percent_limit(self.soc_kw, self.soc_max)
 

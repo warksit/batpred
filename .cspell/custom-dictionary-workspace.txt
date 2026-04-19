@@ -76,6 +76,7 @@ daysymbol
 dedup
 dend
 denorm
+dess
 devcontainer
 devcontainers
 dexport
@@ -136,6 +137,7 @@ givtcp
 gridconsumption
 gridconsumptionpower
 growatt
+gshp
 HACS
 hadashboard
 hahistory
@@ -250,7 +252,9 @@ oninput
 onmouseout
 onmouseover
 openweathermap
+overdrains
 overfitting
+overforecast
 ownerapi
 pdata
 pdetails
@@ -370,6 +374,7 @@ tojson
 Trefor
 treforsiphone
 twinx
+underforecast
 unsmoothed
 unstaged
 useid

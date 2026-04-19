@@ -103,6 +103,7 @@ from tests.test_temperature import test_temperature
 from tests.test_oauth_mixin import run_oauth_mixin_tests
 from tests.test_fox_oauth import run_fox_oauth_tests
 from tests.test_band_rate_text import test_band_rate_text
+from tests.test_inverter_integration import run_inverter_integration_tests
 
 
 # Mock the components and plugin system
@@ -157,6 +158,7 @@ def main():
         ("model", run_model_tests, "Model tests", False),
         ("inverter", run_inverter_tests, "Inverter tests", False),
         ("execute", run_execute_tests, "Execute tests", False),
+        ("inverter_integration", run_inverter_integration_tests, "Inverter integration tests", False),
         ("basic_rates", test_basic_rates, "Basic rates tests", False),
         ("window_sort", run_window_sort_tests, "Window sort tests", False),
         ("window2minutes", test_window2minutes, "Window to minutes tests", False),

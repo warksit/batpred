@@ -238,6 +238,7 @@ class Inverter:
         self.inv_charge_discharge_with_rate = INVERTER_DEF[self.inverter_type].get("charge_discharge_with_rate", False)
         self.inv_target_soc_used_for_discharge = INVERTER_DEF[self.inverter_type].get("target_soc_used_for_discharge", True)
         self.inv_has_fox_inverter_mode = INVERTER_DEF[self.inverter_type].get("has_fox_inverter_mode", False)
+        self.inv_soc_limits_block_solar = INVERTER_DEF[self.inverter_type].get("soc_limits_block_solar", False)
 
         # If it's not a GE inverter then turn Quiet off
         if self.inverter_type != "GE":
@@ -530,7 +531,7 @@ class Inverter:
             self.base.args["charge_rate"][id] = self.create_entity("charge_rate", max_charge, uom="W", device_class="power")
             self.base.args["discharge_rate"][id] = self.create_entity("discharge_rate", max_discharge, uom="W", device_class="power")
 
-        if not self.inv_has_ge_inverter_mode and not self.inv_has_fox_inverter_mode and not self.inv_has_ge_eco_toggle:
+        if not self.inv_has_ge_inverter_mode and not self.inv_has_fox_inverter_mode and not self.inv_has_ge_eco_toggle and not self.inv_soc_limits_block_solar:
             self.create_missing_arg("inverter_mode", "Eco")
             self.base.args["inverter_mode"][id] = self.create_entity("inverter_mode", "Eco")
 
@@ -1794,6 +1795,39 @@ class Inverter:
         self.base.record_status("Warn: Inverter {} write to {} failed".format(self.id, name), had_errors=True)
         return False
 
+    def adjust_ems_mode(self, ems_mode, discharge_floor, charge_rate=None, discharge_rate=None):
+        """
+        Set EMS-controlled inverter mode via direct entity writes.
+
+        Coordinates mode + rates + discharge floor atomically for SIG inverters.
+        The charge ceiling (charge_limit) is handled separately by adjust_battery_target.
+
+        Args:
+            ems_mode: EMS mode string (e.g. "Maximum Self Consumption", "Standby")
+            discharge_floor: Discharge cut-off SOC percentage
+            charge_rate: Charge rate in W, or None to skip
+            discharge_rate: Discharge rate in W, or None to skip
+        """
+        self.log("Inverter {} EMS mode: {} discharge_floor={}% charge_rate={} discharge_rate={}".format(self.id, ems_mode, discharge_floor, charge_rate, discharge_rate))
+
+        ems_entity = self.base.get_arg("inverter_mode", indirect=False, index=self.id)
+        if ems_entity:
+            self.write_and_poll_option("inverter_mode", ems_entity, ems_mode)
+
+        discharge_entity = self.base.get_arg("sig_discharge_cut_off_soc", indirect=False, index=self.id)
+        if discharge_entity:
+            self.write_and_poll_value("sig_discharge_cut_off_soc", discharge_entity, discharge_floor)
+
+        if charge_rate is not None:
+            charge_rate_entity = self.base.get_arg("charge_rate", indirect=False, index=self.id, required_unit="W")
+            if charge_rate_entity:
+                self.write_and_poll_value("charge_rate", charge_rate_entity, int(charge_rate + 0.5), fuzzy=(self.battery_rate_max_charge * MINUTE_WATT / 20), required_unit="W")
+
+        if discharge_rate is not None:
+            discharge_rate_entity = self.base.get_arg("discharge_rate", indirect=False, index=self.id)
+            if discharge_rate_entity:
+                self.write_and_poll_value("discharge_rate", discharge_rate_entity, int(discharge_rate + 0.5), fuzzy=(self.battery_rate_max_discharge * MINUTE_WATT / 20), required_unit="W")
+
     def adjust_pause_mode(self, pause_charge=False, pause_discharge=False):
         """
         Inverter control for Pause mode
@@ -1905,6 +1939,10 @@ class Inverter:
             inverter_mode                      string
 
         """
+        # EMS inverters manage mode via adjust_ems_mode — skip GE/Fox mode writes
+        if self.inv_soc_limits_block_solar:
+            return
+
         if self.rest_data:
             old_inverter_mode = self.rest_data["Control"]["Mode"]
         else:
@@ -2440,6 +2478,26 @@ class Inverter:
         """
         Adjust from charging or not charging based on passed target soc
         """
+        # SIG: EMS mode control — charge ceiling handled by adjust_battery_target
+        if self.inv_soc_limits_block_solar:
+            reserve = self.reserve_percent
+            max_charge = int(self.battery_rate_max_charge * MINUTE_WATT + 0.5)
+            max_discharge = int(self.battery_rate_max_discharge * MINUTE_WATT + 0.5)
+            if target_soc > 0 and not freeze and self.soc_percent < target_soc:
+                # Active charge: Grid First mode with max rates
+                self.adjust_ems_mode("Command Charging (Grid First)", reserve, charge_rate=max_charge, discharge_rate=max_discharge)
+            elif target_soc > 0 and not freeze and self.soc_percent > target_soc:
+                # Hold above target: MSC with discharge floor at target
+                self.adjust_ems_mode("Maximum Self Consumption", target_soc, charge_rate=max_charge, discharge_rate=max_discharge)
+            elif target_soc > 0:
+                # Freeze or hold at target: MSC with discharge floor at current SOC
+                # Use soc_percent (not soc+1) — on SIG, floor > SOC causes grid charging
+                self.adjust_ems_mode("Maximum Self Consumption", self.soc_percent, charge_rate=max_charge, discharge_rate=max_discharge)
+            else:
+                # Demand (target_soc=0): MSC with discharge floor at reserve
+                self.adjust_ems_mode("Maximum Self Consumption", reserve, charge_rate=max_charge, discharge_rate=max_discharge)
+            return
+
         service_data_stop = {"device_id": self.base.get_arg("device_id", index=self.id, default="")}
         extra_data = {"charge_start_time": self.base.get_arg("charge_start_time", index=self.id, default="00:00:00"), "charge_end_time": self.base.get_arg("charge_end_time", index=self.id, default="00:00:00")}
         if target_soc > 0:
@@ -2469,6 +2527,34 @@ class Inverter:
         """
         Adjust from exporting or not exporting based on passed target soc
         """
+        # SIG: EMS mode control
+        if self.inv_soc_limits_block_solar:
+            reserve = self.reserve_percent
+            if freeze:
+                # Freeze export: Standby — battery completely idle
+                self.adjust_ems_mode("Standby", reserve)
+            elif target_soc < 100:
+                # Active export: ESS First with safe discharge rate, charge disabled
+                max_discharge = int(self.battery_rate_max_discharge * MINUTE_WATT + 0.5)
+                # Cap discharge rate to avoid exceeding site export limit
+                # safe_rate = export_limit - current_pv - 500W margin
+                export_limit_w = self.export_limit * MINUTE_WATT
+                pv_w = self.base.pv_power
+                safe_rate = max(export_limit_w - pv_w - 500, 0)
+                discharge_rate = min(max_discharge, int(safe_rate + 0.5))
+                if discharge_rate <= 0:
+                    # PV already near/above export limit — stay MSC, don't force export
+                    self.log("Inverter {} safe discharge rate is 0 (PV {}W, export limit {}W) — staying MSC".format(self.id, pv_w, export_limit_w))
+                    self.adjust_ems_mode("Maximum Self Consumption", reserve, charge_rate=int(self.battery_rate_max_charge * MINUTE_WATT + 0.5), discharge_rate=max_discharge)
+                else:
+                    self.adjust_ems_mode("Command Discharging (ESS First)", reserve, charge_rate=0, discharge_rate=discharge_rate)
+            else:
+                # Demand export: MSC with max rates
+                max_charge = int(self.battery_rate_max_charge * MINUTE_WATT + 0.5)
+                max_discharge = int(self.battery_rate_max_discharge * MINUTE_WATT + 0.5)
+                self.adjust_ems_mode("Maximum Self Consumption", reserve, charge_rate=max_charge, discharge_rate=max_discharge)
+            return
+
         service_data_stop = {"device_id": self.base.get_arg("device_id", index=self.id, default="")}
         extra_data = {"discharge_start_time": self.base.get_arg("discharge_start_time", index=self.id, default="00:00:00"), "discharge_end_time": self.base.get_arg("discharge_end_time", index=self.id, default="00:00:00")}
         if target_soc < 100:
