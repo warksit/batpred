@@ -118,6 +118,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._tomorrow_cache_at = 0
         # Floor scale from previous cycle (for R11-over-R43 precedence, Bug 3)
         self._last_floor_scale = 0.0
+        # Date this state belongs to — lets us detect day rollover in calculate()
+        self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
         self._load_state()
 
@@ -151,6 +153,7 @@ class CurtailmentPlugin(PredBatPlugin):
         ratchet = data.get("floor_ratchet")
         self._floor_ratchet = float(ratchet) if ratchet is not None else None
         self._last_floor_scale = float(data.get("last_floor_scale", 0.0))
+        self._state_date = today
         try:
             self.log("Curtailment: restored state from {} (peak={:.2f}kW, ratchet={})".format(
                 path, self._peak_pv, self._floor_ratchet,
@@ -163,8 +166,9 @@ class CurtailmentPlugin(PredBatPlugin):
         path = self._state_file_path()
         if path is None:
             return
+        today = datetime.now().strftime("%Y-%m-%d")
         data = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
+            "date": today,
             "peak_pv_kw": self._peak_pv,
             "peak_pv_time": self._peak_pv_time,
             "floor_ratchet": self._floor_ratchet,
@@ -173,8 +177,17 @@ class CurtailmentPlugin(PredBatPlugin):
         try:
             with open(path, "w") as f:
                 json.dump(data, f)
+            self._state_date = today
         except OSError:
             pass
+
+    def _reset_for_new_day(self):
+        """Reset in-memory daily state. Called when calculate() detects day rollover."""
+        self._peak_pv = 0.0
+        self._peak_pv_time = 0
+        self._floor_ratchet = None
+        self._last_floor_scale = 0.0
+        self._state_date = datetime.now().strftime("%Y-%m-%d")
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update, plugin=self)
@@ -353,6 +366,14 @@ class CurtailmentPlugin(PredBatPlugin):
         Returns:
             (floor_kwh, phase) where phase is "active" or "off"
         """
+        # Day rollover: if our in-memory state belongs to yesterday, reset.
+        # Handles plugin running continuously across midnight (state file may
+        # still hold yesterday's date; we don't want to carry yesterday's peak_pv
+        # into today's actual_scale computation).
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._state_date is not None and self._state_date != today:
+            self._reset_for_new_day()
+
         soc_kw = getattr(self.base, "soc_kw", 0)
         soc_max = getattr(self.base, "soc_max", 10)
 
