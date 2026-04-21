@@ -79,6 +79,12 @@ reserved cannot be reclaimed.
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
 - **R11**: Floor ratchet — floor can only rise, never fall. Once headroom is reserved
   it cannot be reclaimed mid-day. Reset on deactivation.
+- **R45**: Pre-safe-time floor cap: `floor ≤ soc_max × 0.9` while plugin is active.
+  Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window overflow that the
+  forecast integral underestimates (LoadML over-predicting load, PV above p90 curve).
+  After safe_time the plugin deactivates and Predbat MSC fills the remaining 10%
+  from post-safe-time sub-DNO PV. Trade-off: sunset SOC ~95% on days with weak
+  post-safe-time PV instead of 99–100%. Acceptable vs the cost of DNO breach.
 - **R12**: At safe_time, remaining_overflow = 0, floor = soc_max. Plugin deactivates.
 - **R13**: Floor rises naturally each cycle as the integral shrinks (time passing,
   sin(elev) falling). Rises faster on cloudy days (actual peak < p90 → scale updates

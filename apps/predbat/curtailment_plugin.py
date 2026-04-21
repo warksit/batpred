@@ -435,6 +435,12 @@ class CurtailmentPlugin(PredBatPlugin):
         floor = max(floor, max(soc_keep, reserve))
         floor = min(floor, soc_max)
 
+        # Pre-safe-time cap (R45): never let floor exceed 90% while plugin is active.
+        # Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window overflow that
+        # forecast integral underestimates (LoadML over-prediction, PV above p90 curve).
+        # After safe_time plugin deactivates → MSC fills remaining from sub-DNO PV.
+        floor = min(floor, soc_max * 0.9)
+
         # Floor ratchet: floor can only rise within a day (R11)
         if self._floor_ratchet is not None:
             floor = max(floor, self._floor_ratchet)
