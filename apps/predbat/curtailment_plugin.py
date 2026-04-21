@@ -431,8 +431,10 @@ class CurtailmentPlugin(PredBatPlugin):
             floor = max(floor, self._floor_ratchet)
         self._floor_ratchet = floor
 
-        # Three-state: Charge when SOC below floor (R16/R38), else Drain/Hold split by HA automation
-        if soc_kw < floor - 0.5:
+        # Three-state: Charge when SOC below floor (R16/R38), else Drain/Hold split by HA automation.
+        # 0.2 kWh hysteresis — tight enough that SOC tracks a rising floor closely, wide enough
+        # to absorb ~3 min of 2 kW PV swing without flipping phase.
+        if soc_kw < floor - 0.2:
             self._export_target = 0.0
         else:
             self._export_target = dno_limit_kw
