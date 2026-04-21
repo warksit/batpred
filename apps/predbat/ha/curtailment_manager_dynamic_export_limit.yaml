@@ -7,16 +7,14 @@
 #   Hold:  force export = min(excess, DNO) — clamp at available PV
 #   Drain: force export = DNO — force battery discharge to grid
 #
-# Plugin-controlled phases (three-state):
-#   Charge: export_target=0 (SOC < floor-0.5) → export = 0, battery charges from PV
-#   Drain:  export_target=DNO, SOC > floor+0.5 → export = min(export_cap, DNO)
-#   Hold:   export_target=DNO, SOC at floor → export = min(excess, export_cap, DNO)
+# Automation-decided phases (when manual = Off and plugin active):
+#   Charge: SOC < target_kwh - 0.2 → export = 0, battery charges
+#   Drain:  SOC > target_kwh + 0.2 → export = DNO
+#   Hold:   within ±0.2 kWh of target → export = min(excess, DNO)
 #
-# export_cap comes from sensor.predbat_curtailment_export_target.
-# Charge detected when export_cap_raw == 0. Falls back to DNO if -2 (inactive).
-#
-# Manual Hold/Drain forces D-ESS mode so the export limit is respected by SIG.
-# Plugin stay-active (R40) ensures D-ESS is maintained while PV is present.
+# EMS mode management:
+#   Manual != Off OR plugin active → Command Discharging (ESS First)
+#   Both off → Maximum Self Consumption (normal operation)
 #
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 # Deploy: paste into HA automation editor (raw config mode).
@@ -24,9 +22,10 @@
 id: "1773747411848"
 alias: "Curtailment Manager - Dynamic Export Limit"
 description: >-
-  Export control with manual override (Off/Zero/Hold/Drain) and three-state plugin phases.
-  Manual Zero: export = 0. Manual Hold: min(excess, DNO). Manual Drain: DNO.
-  Plugin Charge: export=0 (SOC below floor). Drain: export=DNO (above floor). Hold: min(excess, DNO).
+  Export control with manual override (Off/Zero/Hold/Drain) and automation-decided phases.
+  Automation picks Charge/Drain/Hold from SOC vs target_kwh with ±0.2 kWh hysteresis.
+  Plugin publishes target and Active/Off; automation handles fast (5-sec) phase transitions.
+  When both manual and plugin off, restores Maximum Self Consumption mode.
 mode: single
 
 trigger:
@@ -48,11 +47,13 @@ trigger:
 condition:
   - condition: or
     conditions:
+      # Manual override active
       - condition: not
         conditions:
           - condition: state
             entity_id: input_select.curtailment_manual_hold
             state: "Off"
+      # Plugin active and already in D-ESS (continue managing)
       - condition: and
         conditions:
           - condition: not
@@ -66,6 +67,20 @@ condition:
           - condition: state
             entity_id: select.sigen_plant_remote_ems_control_mode
             state: "Command Discharging (ESS First)"
+      # Both off and EMS not MSC — trigger MSC restoration
+      - condition: and
+        conditions:
+          - condition: state
+            entity_id: input_select.curtailment_manual_hold
+            state: "Off"
+          - condition: state
+            entity_id: sensor.predbat_curtailment_phase
+            state: "Off"
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.sigen_plant_remote_ems_control_mode
+                state: "Maximum Self Consumption"
 
 action:
   - variables:
@@ -76,19 +91,15 @@ action:
       excess: "{{ pv - load }}"
       dno: 4
       export_cap_raw: "{{ states('sensor.predbat_curtailment_export_target') | float(-2) }}"
-      export_cap: >-
-        {% if export_cap_raw | float(-2) >= 0 %}
-          {{ export_cap_raw | float(4) }}
-        {% else %}
-          {{ dno }}
-        {% endif %}
+      export_cap: "{% if export_cap_raw | float(-2) >= 0 %}{{ export_cap_raw | float(4) }}{% else %}{{ dno }}{% endif %}"
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       phase: >-
         {% if manual_mode == 'Zero' %}Manual Zero
         {% elif manual_mode == 'Hold' %}Manual Hold
         {% elif manual_mode == 'Drain' %}Manual Drain
-        {% elif export_cap_raw == 0 %}Charge
-        {% elif soc_kwh > target_kwh + 0.5 %}Drain
+        {% elif export_cap_raw < 0 %}Off
+        {% elif soc_kwh > target_kwh + 0.2 %}Drain
+        {% elif soc_kwh < target_kwh - 0.2 %}Charge
         {% else %}Hold
         {% endif %}
       new_limit: >-
@@ -98,16 +109,19 @@ action:
           {{ [[excess, 0] | max, dno] | min | round(1) }}
         {% elif manual_mode == 'Drain' %}
           {{ dno | round(1) }}
-        {% elif export_cap_raw == 0 %}
-          {{ 0 | round(1) }}
-        {% elif soc_kwh > target_kwh + 0.5 %}
+        {% elif export_cap_raw < 0 %}
+          {{ dno | round(1) }}
+        {% elif soc_kwh > target_kwh + 0.2 %}
           {{ [[export_cap, 0] | max, dno] | min | round(1) }}
+        {% elif soc_kwh < target_kwh - 0.2 %}
+          {{ 0 | round(1) }}
         {% else %}
           {{ [[excess, 0] | max, export_cap | float(4), dno] | min | round(1) }}
         {% endif %}
       current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
 
+  # Switch to D-ESS when manual override active
   - if:
       - condition: template
         value_template: "{{ manual_mode != 'Off' and states('select.sigen_plant_remote_ems_control_mode') != 'Command Discharging (ESS First)' }}"
@@ -118,6 +132,18 @@ action:
         data:
           option: "Command Discharging (ESS First)"
 
+  # Restore MSC when both manual and plugin off
+  - if:
+      - condition: template
+        value_template: "{{ manual_mode == 'Off' and states('sensor.predbat_curtailment_phase') == 'Off' and states('select.sigen_plant_remote_ems_control_mode') != 'Maximum Self Consumption' }}"
+    then:
+      - action: select.select_option
+        target:
+          entity_id: select.sigen_plant_remote_ems_control_mode
+        data:
+          option: "Maximum Self Consumption"
+
+  # Publish live phase
   - if:
       - condition: template
         value_template: "{{ phase != current_phase }}"
