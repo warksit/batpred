@@ -300,12 +300,16 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 
-def compute_solar_overflow(scale, lat_deg, lon_deg, day_of_year, from_utc_hours, to_utc_hours, dno_limit, base_load=MIN_BASE_LOAD_KW, step_minutes=5):
+def compute_solar_overflow(scale, lat_deg, lon_deg, day_of_year, from_utc_hours, to_utc_hours, dno_limit, base_load=MIN_BASE_LOAD_KW, step_minutes=5, load_forecast_kw=None):
     """
     Integrate overflow energy from the solar geometry curve between two UTC times.
 
-    overflow(t) = max(0, scale × sin(elev(t)) - base_load - dno_limit)
+    overflow(t) = max(0, scale × sin(elev(t)) - effective_load(t) - dno_limit)
     Returns ∫ overflow(t) dt in kWh.
+
+    effective_load(t) = max(base_load, load_forecast_kw[i]) at step i, or base_load if no forecast.
+    Using LoadML's forecast lets the integral account for real daytime load (DHW, EV, etc.)
+    which absorbs PV and reduces the overflow needing export headroom.
 
     Args:
         scale: float kW — clear-sky scale (peak_pv / sin(elevation_at_peak))
@@ -314,8 +318,11 @@ def compute_solar_overflow(scale, lat_deg, lon_deg, day_of_year, from_utc_hours,
         from_utc_hours: integration start (decimal UTC hours, i.e. now)
         to_utc_hours: integration end (decimal UTC hours, i.e. safe_time)
         dno_limit: float kW — max grid export
-        base_load: float kW — minimum household load offsetting PV
+        base_load: float kW — minimum household load offsetting PV (floor)
         step_minutes: integration step size in minutes
+        load_forecast_kw: optional list of kW per step starting at from_utc_hours.
+            Each entry is the forecast load for that step. If None or shorter than
+            the integration, remaining steps use base_load.
 
     Returns:
         float kWh — total overflow energy over the window
@@ -325,11 +332,15 @@ def compute_solar_overflow(scale, lat_deg, lon_deg, day_of_year, from_utc_hours,
     step_hours = step_minutes / 60.0
     total = 0.0
     t = from_utc_hours
+    i = 0
     while t < to_utc_hours:
         elev = solar_elevation(lat_deg, lon_deg, t, day_of_year)
         pv_kw = scale * max(0.0, math.sin(math.radians(elev)))
-        total += max(0.0, pv_kw - base_load - dno_limit) * step_hours
+        forecast_load = load_forecast_kw[i] if load_forecast_kw and i < len(load_forecast_kw) else 0.0
+        load_kw = max(base_load, forecast_load)
+        total += max(0.0, pv_kw - load_kw - dno_limit) * step_hours
         t += step_hours
+        i += 1
     return total
 
 

@@ -391,8 +391,17 @@ class CurtailmentPlugin(PredBatPlugin):
             safe_local = safe_utc + local_offset
             self._safe_time_str = "{:02d}:{:02d}".format(int(safe_local) % 24, int((safe_local % 1) * 60))
 
-        # Compute remaining overflow from solar geometry (R9)
-        remaining_overflow = compute_solar_overflow(floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw)
+        # Load forecast from LoadML (per 5-min slot, values in kWh). Convert to kW and
+        # align with the integration steps. Lets overflow formula credit real daytime
+        # load (DHW, EV, etc.) that absorbs PV instead of assuming a flat 0.5 kW minimum.
+        load_step = getattr(self.base, "load_minutes_step", {})
+        step_hours = PREDICT_STEP / 60.0
+        to_kw = 1.0 / step_hours
+        safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
+        load_forecast_kw = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
+
+        # Compute remaining overflow from solar geometry (R9) with LoadML-informed load.
+        remaining_overflow = compute_solar_overflow(floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw)
         self._remaining_overflow = round(remaining_overflow, 2)
 
         # Activation check (R5): overflow predicted AND battery would fill
@@ -401,10 +410,6 @@ class CurtailmentPlugin(PredBatPlugin):
         except (ValueError, TypeError):
             solcast_remaining = 0.0
 
-        load_step = getattr(self.base, "load_minutes_step", {})
-        step_hours = PREDICT_STEP / 60.0
-        to_kw = 1.0 / step_hours
-        safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
         load_remaining = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(PREDICT_STEP, safe_offset_mins + PREDICT_STEP, PREDICT_STEP))
 
         battery_headroom = soc_max - soc_kw

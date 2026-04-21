@@ -55,10 +55,17 @@ reserved cannot be reclaimed.
 
 ## Floor — Solar Geometry Integral
 
-- **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - base_load - DNO) dt`
+- **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - effective_load(t) - DNO) dt`
   integrated from now to safe_time (R19). Evaluated each 5-minute plugin cycle.
   `floor = soc_max - remaining_overflow × 1.0`
   p90 scale is already a near-worst-case estimate — no additional safety factor needed.
+- **R9a**: `effective_load(t) = max(base_load, loadml_forecast(t))` — the overflow
+  integral MUST use Predbat's LoadML per-slot forecast with `base_load` (0.5 kW) as
+  a floor. LoadML already learns regular daytime loads (DHW cycle, EV charging,
+  cooking). Those absorb PV directly and reduce the overflow needing export headroom.
+  Reason: with only the 0.5 kW flat constant, the formula overestimated overflow by
+  1–2 kW × ~10 daylight hours on normal days, forcing unnecessary drain and lower
+  sunset SOC. See also `feedback_use_loadml_for_floor.md`.
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
 - **R11**: Floor ratchet — floor can only rise, never fall. Once headroom is reserved
   it cannot be reclaimed mid-day. Reset on deactivation.
