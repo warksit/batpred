@@ -61,7 +61,7 @@ SOLCAST_TODAY = "sensor.solcast_pv_forecast_forecast_today"
 SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 
 # Safety factor: 25% buffer on overflow headroom (R9)
-OVERFLOW_SAFETY_FACTOR = 1.0
+OVERFLOW_SAFETY_FACTOR = 1.1
 
 
 class CurtailmentPlugin(PredBatPlugin):

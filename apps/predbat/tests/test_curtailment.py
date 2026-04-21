@@ -31,7 +31,7 @@ STEP_MINUTES = 5
 START_SOC_PCT = 0.40
 
 # v18 constants (match curtailment_plugin.py)
-OVERFLOW_SAFETY_FACTOR = 1.0
+OVERFLOW_SAFETY_FACTOR = 1.1
 SOC_CAP_FACTOR = 0.95
 SOC_MARGIN_KWH = 0.2  # HA automation hysteresis for Charge/Hold/Drain split
 
@@ -454,10 +454,10 @@ def test_activation_high_soc_low_overflow():
 
 
 def test_floor_computation():
-    """Floor = soc_max - overflow_only * 1.0 (R9, OVERFLOW_SAFETY_FACTOR=1.0)."""
+    """Floor = soc_max - overflow * OVERFLOW_SAFETY_FACTOR (R9)."""
     overflow = 10.0
     floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
-    expected = 18.08 - 10.0  # 8.08
+    expected = 18.08 - 10.0 * OVERFLOW_SAFETY_FACTOR
     assert abs(floor - expected) < 0.01, f"Expected {expected}, got {floor}"
     print(f"  test_floor_computation: PASSED (floor={floor:.2f}kWh = {floor/BATTERY_KWH*100:.0f}%)")
 

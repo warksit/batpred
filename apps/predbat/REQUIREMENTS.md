@@ -64,8 +64,11 @@ reserved cannot be reclaimed.
 
 - **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - effective_load(t) - DNO) dt`
   integrated from now to safe_time (R19). Evaluated each 5-minute plugin cycle.
-  `floor = soc_max - remaining_overflow × 1.0`
-  p90 scale is already a near-worst-case estimate — no additional safety factor needed.
+  `floor = soc_max - remaining_overflow × OVERFLOW_SAFETY_FACTOR`
+  Safety factor = 1.1: reserves 10% extra headroom to absorb forecast error on either
+  side (actual PV above p90, load below LoadML). Trade-off: sunset SOC ~5% lower on
+  perfectly-forecast days. Preferred over 1.0 because R11 ratchet prevents recovering
+  from an under-reserved floor mid-day.
 - **R9a**: `effective_load(t) = max(base_load, loadml_forecast(t))` — the overflow
   integral MUST use Predbat's LoadML per-slot forecast with `base_load` (0.5 kW) as
   a floor. LoadML already learns regular daytime loads (DHW cycle, EV charging,
