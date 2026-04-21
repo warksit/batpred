@@ -351,10 +351,14 @@ class CurtailmentPlugin(PredBatPlugin):
             if sin_peak >= 0.05:
                 actual_scale = self._peak_pv / sin_peak
 
-        # floor always uses p90_scale (worst-case clear day).
-        # actual_scale is unreliable for floor: cloud at peak hour gives false low scale,
-        # and afternoon could still be clear. Safe to always reserve p90 headroom.
-        floor_scale = p90_scale
+        # floor uses max(p90_scale, actual_scale) — asymmetric (R43):
+        #   - actual > p90 (sunnier than forecast) → bigger overflow, lower floor, safer
+        #   - actual < p90 (cloudier) → keep p90_scale (afternoon could still clear)
+        # Prevents DNO breach on days where reality exceeds the 90th percentile forecast.
+        if actual_scale > p90_scale:
+            floor_scale = actual_scale
+        else:
+            floor_scale = p90_scale
 
         # safe_scale drives safe_time (R19/R21).
         # Before peak confirmed: use p90_scale (conservative — don't deactivate early).
