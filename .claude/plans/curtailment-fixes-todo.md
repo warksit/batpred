@@ -95,6 +95,23 @@ Overnight, in order:
 6. Verify tomorrow morning: sensor populates, target sensible, no early
    deactivation when PV still above DNO + load
 
+## Bug 4: `on_before_plan` "today is done" heuristic is arbitrary
+
+Currently uses hardcoded `23*60 - minutes_now < 60` — i.e., switch to tomorrow's
+forecast at 23:00 BST. This is sunset + 2.5h in April, but sunset + 7.5h in
+winter. Fine for today (cheap rate doesn't start until 04:00 so plenty of
+headroom), but sub-optimal on short winter days where overnight cheap-rate
+windows are tight.
+
+**Fix:** Switch to tomorrow's forecast once PV has been effectively 0 for
+30 minutes. Observation-based rather than clock-based.
+
+Implementation: track consecutive cycles where `actual_pv < 0.1 kW`. On the
+6th consecutive cycle (30 min × 5-min cycles), switch to tomorrow's window.
+Reset counter when PV returns.
+
+Not urgent — only matters in winter.
+
 ## Key insight: never deploy mid-day
 
 Every restart resets in-memory state. Once state is persisted (Bug 2), this
