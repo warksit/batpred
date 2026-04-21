@@ -77,8 +77,25 @@ reserved cannot be reclaimed.
   1–2 kW × ~10 daylight hours on normal days, forcing unnecessary drain and lower
   sunset SOC. See also `feedback_use_loadml_for_floor.md`.
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
-- **R11**: Floor ratchet — floor can only rise, never fall. Once headroom is reserved
-  it cannot be reclaimed mid-day. Reset on deactivation.
+- **R11**: Floor ratchet — floor can only rise, never fall, EXCEPT when
+  `floor_scale` has increased from the previous cycle (R43 triggered).
+  Rationale: when actual PV exceeds p90, R43 wants to LOWER the floor to
+  reserve more headroom. R11 would normally block this; the exception lets
+  safety override the ratchet. Reset on deactivation.
+- **R46**: Deactivation uses `safe_time`, not the forecast integral. Plugin goes
+  Off only when `now >= safe_time` (solar geometry past overflow threshold) or
+  when the battery-fill check fails. The LoadML-driven integral can under-
+  estimate overflow (phantom afternoon load pushes predicted overflow to zero
+  even while sun is still above threshold), which would cause premature
+  deactivation and lose R45 protection during the last chunk of the overflow
+  window. Activation still uses the integral (need forecast confidence to
+  start draining the battery). R25/R19 solar geometry is ground truth.
+- **R47**: Persist state `{date, peak_pv_kw, peak_pv_time, floor_ratchet,
+  last_floor_scale}` to `curtailment_state.json` under `config_root`. Load
+  on plugin init if date matches today; ignore if stale. Prevents restarts
+  from losing observed peak_pv (and therefore actual_scale → safe_scale →
+  safe_time) mid-day. Test environments without `config_root` skip
+  persistence to avoid cross-test pollution.
 - **R45**: Pre-safe-time floor cap: `floor ≤ soc_max × 0.9` while plugin is active.
   Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window overflow that the
   forecast integral underestimates (LoadML over-predicting load, PV above p90 curve).

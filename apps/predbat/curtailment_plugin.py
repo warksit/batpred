@@ -27,7 +27,10 @@
 # Floor ratchet (R11): floor can only rise within a day — headroom cannot be reclaimed
 # -----------------------------------------------------------------------------
 
+import json
 import math
+import os
+from datetime import datetime
 
 from curtailment_calc import (
     compute_morning_gap,
@@ -62,6 +65,10 @@ SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 
 # Safety factor: 25% buffer on overflow headroom (R9)
 OVERFLOW_SAFETY_FACTOR = 1.1
+
+# State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
+# _floor_ratchet across plugin restarts within the same day.
+STATE_FILE_NAME = "curtailment_state.json"
 
 
 class CurtailmentPlugin(PredBatPlugin):
@@ -109,6 +116,65 @@ class CurtailmentPlugin(PredBatPlugin):
         # Caching for tomorrow forecast
         self._tomorrow_cache = None
         self._tomorrow_cache_at = 0
+        # Floor scale from previous cycle (for R11-over-R43 precedence, Bug 3)
+        self._last_floor_scale = 0.0
+        # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
+        self._load_state()
+
+    def _state_file_path(self):
+        """Return state file path, or None if persistence is not configured.
+
+        Returns None for test environments where base.config_root isn't set —
+        avoids cross-test pollution when fresh plugin instances all read/write
+        the same file.
+        """
+        config_root = getattr(self.base, "config_root", None)
+        if not config_root:
+            return None
+        return os.path.join(config_root, STATE_FILE_NAME)
+
+    def _load_state(self):
+        """Load persisted state from disk if it matches today's date (Bug 2)."""
+        path = self._state_file_path()
+        if path is None or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if data.get("date") != today:
+            return  # stale — belongs to a previous day, ignore
+        self._peak_pv = float(data.get("peak_pv_kw", 0.0))
+        self._peak_pv_time = int(data.get("peak_pv_time", 0))
+        ratchet = data.get("floor_ratchet")
+        self._floor_ratchet = float(ratchet) if ratchet is not None else None
+        self._last_floor_scale = float(data.get("last_floor_scale", 0.0))
+        try:
+            self.log("Curtailment: restored state from {} (peak={:.2f}kW, ratchet={})".format(
+                path, self._peak_pv, self._floor_ratchet,
+            ))
+        except Exception:
+            pass
+
+    def _save_state(self):
+        """Persist state to disk so a restart doesn't lose peak_pv / ratchet (Bug 2)."""
+        path = self._state_file_path()
+        if path is None:
+            return
+        data = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "peak_pv_kw": self._peak_pv,
+            "peak_pv_time": self._peak_pv_time,
+            "floor_ratchet": self._floor_ratchet,
+            "last_floor_scale": self._last_floor_scale,
+        }
+        try:
+            with open(path, "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update, plugin=self)
@@ -419,13 +485,26 @@ class CurtailmentPlugin(PredBatPlugin):
         battery_headroom = soc_max - soc_kw
         total_excess = max(0.0, solcast_remaining - load_remaining)
 
-        overflow_active = remaining_overflow > 0.1
         will_fill = total_excess > battery_headroom
+        past_safe_time = utc_hours >= safe_utc
 
-        if not overflow_active or not will_fill:
-            self._floor_ratchet = None
-            self._export_target = -2
-            return soc_max, "off"
+        # Activation (R5) vs deactivation (R6) use different gates:
+        #   - When currently Off: need the forecast integral > 0.1 kWh to activate
+        #     (otherwise we're just seeing a single-slot blip).
+        #   - When currently Active: stay active until safe_time reached — solar
+        #     geometry is ground truth (R25). The LoadML-driven integral can under-
+        #     estimate (phantom load pushes predicted overflow to zero even though
+        #     sun is still above threshold).
+        if self.was_active:
+            if past_safe_time or not will_fill:
+                self._floor_ratchet = None
+                self._export_target = -2
+                self._save_state()
+                return soc_max, "off"
+        else:
+            if remaining_overflow <= 0.1 or not will_fill:
+                self._export_target = -2
+                return soc_max, "off"
 
         # Active: compute floor (R9/R10)
         soc_keep = getattr(self.base, "best_soc_keep", 0)
@@ -441,16 +520,23 @@ class CurtailmentPlugin(PredBatPlugin):
         # After safe_time plugin deactivates → MSC fills remaining from sub-DNO PV.
         floor = min(floor, soc_max * 0.9)
 
-        # Floor ratchet: floor can only rise within a day (R11)
-        if self._floor_ratchet is not None:
+        # Floor ratchet (R11): floor can only rise within a day, EXCEPT when
+        # floor_scale has increased (R43 safety): actual PV sunnier than p90 → we
+        # need MORE headroom (lower floor), not less. Ratchet bypassed in that case.
+        scale_rose = floor_scale > self._last_floor_scale + 0.01
+        if self._floor_ratchet is not None and not scale_rose:
             floor = max(floor, self._floor_ratchet)
         self._floor_ratchet = floor
+        self._last_floor_scale = floor_scale
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase
         # (Charge/Hold/Drain) from SOC vs target with symmetric hysteresis. Plugin just
         # signals "active with this floor" — the automation handles fast-reaction phase
         # transitions on 5-sec cadence.
         self._export_target = dno_limit_kw
+
+        # Persist state so restarts recover (Bug 2 / R46)
+        self._save_state()
 
         return floor, "active"
 
