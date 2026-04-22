@@ -64,11 +64,12 @@ reserved cannot be reclaimed.
 
 - **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - effective_load(t) - DNO) dt`
   integrated from now to safe_time (R19). Evaluated each 5-minute plugin cycle.
-  `floor = soc_max - remaining_overflow × OVERFLOW_SAFETY_FACTOR`
-  Safety factor = 1.1: reserves 10% extra headroom to absorb forecast error on either
-  side (actual PV above p90, load below LoadML). Trade-off: sunset SOC ~5% lower on
-  perfectly-forecast days. Preferred over 1.0 because R11 ratchet prevents recovering
-  from an under-reserved floor mid-day.
+  `overflow_floor = (soc_max × 0.9) - remaining_overflow × OVERFLOW_SAFETY_FACTOR`
+  Safety factor = 1.1: reserves 10% extra headroom for forecast error.
+  Formula targets peak SOC = 90% (not 100%), matching R45's intent — reserves room
+  only up to 90% so the last 10% stays as an uncommitted safety buffer absorbing
+  forecast error that R9a/R43 don't catch. Post-safe-time MSC fills 90→100%
+  from sub-DNO PV.
 - **R9a**: `effective_load(t) = max(base_load, loadml_forecast(t))` — the overflow
   integral MUST use Predbat's LoadML per-slot forecast with `base_load` (0.5 kW) as
   a floor. LoadML already learns regular daytime loads (DHW cycle, EV charging,
@@ -99,12 +100,12 @@ reserved cannot be reclaimed.
   from losing observed peak_pv (and therefore actual_scale → safe_scale →
   safe_time) mid-day. Test environments without `config_root` skip
   persistence to avoid cross-test pollution.
-- **R45**: Pre-safe-time floor cap: `floor ≤ soc_max × 0.9` while plugin is active.
-  Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window overflow that the
-  forecast integral underestimates (LoadML over-predicting load, PV above p90 curve).
-  After safe_time the plugin deactivates and Predbat MSC fills the remaining 10%
-  from post-safe-time sub-DNO PV. Trade-off: sunset SOC ~95% on days with weak
-  post-safe-time PV instead of 99–100%. Acceptable vs the cost of DNO breach.
+- **R45**: Floor formula targets peak SOC = 90% (see R9), reserving 10%
+  (~1.8 kWh) as an uncommitted safety buffer. Protects against forecast
+  errors the explicit guards (R9a, R43) miss: actual load below LoadML
+  prediction (inflates real overflow), or PV staying above p90 curve late
+  in the window. Post-safe-time, MSC fills 90→100% from sub-DNO PV.
+  Trade-off on weak post-safe-time PV days: sunset SOC 92-95% instead of 99.
 - **R12**: At safe_time, remaining_overflow = 0, floor = soc_max. Plugin deactivates.
 - **R13**: Floor rises naturally each cycle as the integral shrinks (time passing,
   sin(elev) falling). Rises faster on cloudy days (actual peak < p90 → scale updates

@@ -536,12 +536,13 @@ class CurtailmentPlugin(PredBatPlugin):
         # are DYNAMIC clamps applied after ratchet — so when cold weather boost
         # ends or on_before_plan reduces keep, the final floor follows without
         # being held up by yesterday's ratcheted value.
-        overflow_floor = soc_max - remaining_overflow * OVERFLOW_SAFETY_FACTOR
-
-        # Pre-safe-time cap (R45): never let overflow reservation exceed 90% of
-        # battery. Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window
-        # forecast errors (LoadML over-prediction, PV above p90 curve).
-        overflow_floor = min(overflow_floor, soc_max * 0.9)
+        #
+        # R45: target peak SOC is 90% (not 100%). The formula reserves room from
+        # floor UP TO 90%, leaving the last 10% (~1.8 kWh) as an uncommitted
+        # buffer that absorbs forecast error. Post-safe-time MSC fills 90→100%
+        # from sub-DNO PV.
+        max_target_soc = soc_max * 0.9
+        overflow_floor = max_target_soc - remaining_overflow * OVERFLOW_SAFETY_FACTOR
         overflow_floor = max(overflow_floor, 0.0)
 
         # Overflow floor ratchet (R11): only the overflow reservation ratchets.

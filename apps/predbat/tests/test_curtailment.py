@@ -454,10 +454,10 @@ def test_activation_high_soc_low_overflow():
 
 
 def test_floor_computation():
-    """Floor = soc_max - overflow * OVERFLOW_SAFETY_FACTOR (R9)."""
+    """Floor = (soc_max * 0.9) - overflow * OVERFLOW_SAFETY_FACTOR (R9 + R45)."""
     overflow = 10.0
-    floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
-    expected = 18.08 - 10.0 * OVERFLOW_SAFETY_FACTOR
+    floor = BATTERY_KWH * 0.9 - overflow * OVERFLOW_SAFETY_FACTOR
+    expected = 18.08 * 0.9 - 10.0 * OVERFLOW_SAFETY_FACTOR
     assert abs(floor - expected) < 0.01, f"Expected {expected}, got {floor}"
     print(f"  test_floor_computation: PASSED (floor={floor:.2f}kWh = {floor/BATTERY_KWH*100:.0f}%)")
 
