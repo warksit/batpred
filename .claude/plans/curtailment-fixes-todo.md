@@ -97,6 +97,7 @@ LoadML is unreliable the floor gets more conservative automatically.
   uses `days_previous` averaging internally; query that.
 - Alert via HA notification when status flips to "suspicious".
 
+
 ### Bug 4: `on_before_plan` clock-based heuristic
 
 Current: switch to tomorrow's forecast at 23:00 BST hardcoded. Fine in April,
@@ -135,6 +136,11 @@ Zero operational impact — add after a few stable days.
 - **Bug 7** (done 2026-04-22 morning): Ratchet only the overflow-derived
   floor; soc_keep/reserve applied as dynamic clamps after ratchet. Fixes
   battery over-reservation when cold weather boost ends mid-day.
+- **Bug 11** (done 2026-04-22 afternoon): Timezone bug — `base.now_utc` is
+  local-tz-aware (misnamed in Predbat), `.hour` returned local hour not UTC.
+  Plugin was computing `local_offset = 0` always, shifting solar geometry
+  by 1h in BST (0h in GMT). Fix: `.astimezone(timezone.utc)` before
+  extracting hour. Affected safe_time, overflow integral, R43 scale calc.
 
 ## Key insight: never deploy mid-day
 
