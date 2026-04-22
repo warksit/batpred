@@ -113,6 +113,10 @@ class CurtailmentPlugin(PredBatPlugin):
         # R4 hysteresis: True while deferring to charge window (Bug 6).
         # Released only when SOC >= soc_keep + 0.2.
         self._r4_deferring = False
+        # R48 (Bug 8): one-way ratchet for relaxed soc_keep. Once SOC reaches
+        # soc_keep_base, locks to True — prevents re-relaxing if SOC dips later.
+        # Reset on day rollover via _reset_for_new_day.
+        self._keep_recovered = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
         # Export target published to HA automation (-2 = inactive)
@@ -162,6 +166,7 @@ class CurtailmentPlugin(PredBatPlugin):
         ratchet = data.get("floor_ratchet")
         self._floor_ratchet = float(ratchet) if ratchet is not None else None
         self._last_floor_scale = float(data.get("last_floor_scale", 0.0))
+        self._keep_recovered = bool(data.get("keep_recovered", False))
         self._state_date = today
         try:
             self.log("Curtailment: restored state from {} (peak={:.2f}kW, ratchet={})".format(
@@ -182,6 +187,7 @@ class CurtailmentPlugin(PredBatPlugin):
             "peak_pv_time": self._peak_pv_time,
             "floor_ratchet": self._floor_ratchet,
             "last_floor_scale": self._last_floor_scale,
+            "keep_recovered": self._keep_recovered,
         }
         try:
             with open(path, "w") as f:
@@ -196,6 +202,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._peak_pv_time = 0
         self._floor_ratchet = None
         self._last_floor_scale = 0.0
+        self._keep_recovered = False
         self._state_date = datetime.now().strftime("%Y-%m-%d")
 
     def register_hooks(self, plugin_system):
@@ -575,8 +582,32 @@ class CurtailmentPlugin(PredBatPlugin):
         self._floor_ratchet = overflow_floor
         self._last_floor_scale = floor_scale
 
-        # Final floor clamps: soc_keep / reserve are dynamic — no ratchet here.
-        floor = max(overflow_floor, max(soc_keep, reserve))
+        # Bug 8 (R48): relaxed soc_keep when BOTH (a) overflow won't fit with base
+        # keep AND (b) PV currently covers load. One-way ratchet: once SOC has
+        # recovered to soc_keep_base, lock back to base for rest of day. Gives
+        # extra overflow headroom on big-PV mornings without compromising
+        # afternoon reserve protection.
+        RELAXED_KEEP_KWH = 0.5
+        PV_MARGIN_KW = 0.5
+        try:
+            actual_load = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0))
+        except (ValueError, TypeError):
+            actual_load = 0.0
+
+        room_with_base_keep = max_target_soc - soc_keep
+        needs_room = remaining_overflow * OVERFLOW_SAFETY_FACTOR > room_with_base_keep
+        pv_covering = (self._actual_pv_kw - actual_load) > PV_MARGIN_KW
+
+        if soc_kw >= soc_keep:
+            self._keep_recovered = True
+
+        if needs_room and pv_covering and not self._keep_recovered and soc_keep > RELAXED_KEEP_KWH:
+            effective_keep = RELAXED_KEEP_KWH
+        else:
+            effective_keep = soc_keep
+
+        # Final floor clamps: effective_keep / reserve are dynamic — no ratchet here.
+        floor = max(overflow_floor, max(effective_keep, reserve))
         floor = min(floor, soc_max)
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase

@@ -79,7 +79,16 @@ reserved cannot be reclaimed.
   Reason: with only the 0.5 kW flat constant, the formula overestimated overflow by
   1–2 kW × ~10 daylight hours on normal days, forcing unnecessary drain and lower
   sunset SOC. See also `feedback_use_loadml_for_floor.md`.
-- **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
+- **R10**: `floor = max(floor, effective_keep, reserve)` — never drain below
+  household needs. `effective_keep` is normally `soc_keep` but can be relaxed
+  to 0.5 kWh under R48 conditions.
+- **R48**: Relaxed soc_keep on big-overflow mornings. When BOTH (a) the forecast
+  overflow × safety_factor exceeds room available with base keep, AND (b) PV
+  currently exceeds load by ≥ 0.5 kW, use `effective_keep = 0.5 kWh` instead
+  of `soc_keep`. One-way ratchet: once SOC reaches `soc_keep`, flag
+  `_keep_recovered = True` for the rest of the day and effective_keep
+  reverts to base. Prevents wasted headroom in the morning drain window
+  without compromising evening reserve protection. Persisted via state file.
 - **R11**: Floor ratchet applies to the OVERFLOW-DERIVED floor only, not the
   final floor after soc_keep/reserve clamps. `soc_keep` and `reserve` are
   DYNAMIC — when cold weather boost ends or on_before_plan reduces keep, the

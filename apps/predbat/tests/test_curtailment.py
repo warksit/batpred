@@ -679,7 +679,7 @@ def test_plugin_publishes_active_not_phase():
 
 
 def test_plugin_floor_clamped_by_soc_keep():
-    """With big overflow, floor clamped to soc_keep. Plugin activates."""
+    """With big overflow that needs room, Bug 8 relaxes keep to 0.5 kWh; otherwise clamps to soc_keep."""
     pv, load = _make_overflow_pv(minutes_now=720)
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 8.0,
@@ -689,7 +689,7 @@ def test_plugin_floor_clamped_by_soc_keep():
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=2.0,
+        soc_kw=2.0,  # below soc_keep=6 → keep_recovered stays False
         minutes_now=720,
         best_soc_keep=6.0,
         sensor_overrides=sensor_overrides,
@@ -697,9 +697,13 @@ def test_plugin_floor_clamped_by_soc_keep():
     plugin = CurtailmentPlugin(base)
 
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert floor >= 6.0, f"Floor should be clamped to soc_keep (6.0), got {floor:.1f}"
+    # Bug 8: PV (8) >> load (1) + 0.5 margin → pv_covering. Big overflow >
+    # room with base keep (16.27 - 6 = 10.27). Both conditions met → keep
+    # relaxes to 0.5. Floor clamped to that.
+    assert floor >= 0.5, f"Floor should be clamped to at least RELAXED_KEEP (0.5), got {floor:.1f}"
+    assert floor < 6.0, f"Bug 8 should have relaxed keep below 6.0, got {floor:.1f}"
     assert phase == "active", f"Expected active, got {phase}"
-    print(f"  test_plugin_floor_clamped_by_soc_keep: PASSED (floor={floor:.1f})")
+    print(f"  test_plugin_floor_clamped_by_soc_keep: PASSED (Bug 8 relaxed; floor={floor:.1f})")
 
 
 def test_plugin_active_high_soc():
