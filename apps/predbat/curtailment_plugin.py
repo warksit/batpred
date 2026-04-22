@@ -70,6 +70,13 @@ SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 # — this doesn't fully cover that but substantially reduces breach probability.
 OVERFLOW_SAFETY_FACTOR = 1.2
 
+# v19 tapered cap (R45): reserved headroom = min(MAX_RESERVED_KWH, remaining_overflow).
+# At peak overflow the buffer clamps at 1.8 kWh (10% of 18.08 kWh = current R45 cap).
+# As overflow winds down toward safe_time, buffer tapers to 0 and max_target_soc
+# approaches soc_max — battery reaches ~100% before handoff to MSC, rather than
+# capping at 90% and relying on post-release MSC to fill 90→100%.
+MAX_RESERVED_KWH = 1.8
+
 # State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
 # _floor_ratchet across plugin restarts within the same day.
 STATE_FILE_NAME = "curtailment_state.json"
@@ -169,9 +176,13 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_recovered = bool(data.get("keep_recovered", False))
         self._state_date = today
         try:
-            self.log("Curtailment: restored state from {} (peak={:.2f}kW, ratchet={})".format(
-                path, self._peak_pv, self._floor_ratchet,
-            ))
+            self.log(
+                "Curtailment: restored state from {} (peak={:.2f}kW, ratchet={})".format(
+                    path,
+                    self._peak_pv,
+                    self._floor_ratchet,
+                )
+            )
         except Exception:
             pass
 
@@ -565,11 +576,13 @@ class CurtailmentPlugin(PredBatPlugin):
         # ends or on_before_plan reduces keep, the final floor follows without
         # being held up by yesterday's ratcheted value.
         #
-        # R45: target peak SOC is 90% (not 100%). The formula reserves room from
-        # floor UP TO 90%, leaving the last 10% (~1.8 kWh) as an uncommitted
-        # buffer that absorbs forecast error. Post-safe-time MSC fills 90→100%
-        # from sub-DNO PV.
-        max_target_soc = soc_max * 0.9
+        # R45 (v19 taper): reserve headroom equal to remaining_overflow, capped
+        # at MAX_RESERVED_KWH (10% of soc_max). The cap is only binding during
+        # peak overflow. At the tail, buffer tapers with remaining_overflow, so
+        # max_target_soc approaches soc_max as safe_time nears — battery fills
+        # to ~100% with MSC only picking up any residual.
+        buffer_kwh = min(MAX_RESERVED_KWH, max(0.0, remaining_overflow))
+        max_target_soc = soc_max - buffer_kwh
         overflow_floor = max_target_soc - remaining_overflow * OVERFLOW_SAFETY_FACTOR
         overflow_floor = max(overflow_floor, 0.0)
 

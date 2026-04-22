@@ -32,6 +32,7 @@ START_SOC_PCT = 0.40
 
 # v18 constants (match curtailment_plugin.py)
 OVERFLOW_SAFETY_FACTOR = 1.2
+MAX_RESERVED_KWH = 1.8  # v19: ceiling on tapered buffer (= 10% of soc_max)
 SOC_CAP_FACTOR = 0.95
 SOC_MARGIN_KWH = 0.2  # HA automation hysteresis for Charge/Hold/Drain split
 
@@ -470,6 +471,103 @@ def test_floor_above_soc_keep():
     floor = max(floor, soc_keep)
     assert floor >= soc_keep, f"Floor should be >= soc_keep ({soc_keep}), got {floor}"
     print(f"  test_floor_above_soc_keep: PASSED (floor={floor:.2f}kWh)")
+
+
+# ============================================================================
+# v19 tapered-cap tests (R9/R45 rewritten)
+# ============================================================================
+
+
+def _taper_cap_formula(remaining_overflow):
+    """Reference taper formula — buffer scales with remaining, capped at 10%."""
+    buffer = min(MAX_RESERVED_KWH, max(0.0, remaining_overflow))
+    return BATTERY_KWH - buffer, buffer
+
+
+def test_cap_taper_at_peak_overflow():
+    """Peak overflow: buffer clamps at 1.8 kWh, max_target stays at 90% (unchanged)."""
+    max_target, buffer = _taper_cap_formula(remaining_overflow=10.0)
+    assert abs(buffer - MAX_RESERVED_KWH) < 0.01, f"Peak-overflow buffer should clamp at {MAX_RESERVED_KWH}, got {buffer:.3f}"
+    assert abs(max_target - BATTERY_KWH * 0.9) < 0.01, f"Peak-overflow max_target should be 90% soc_max, got {max_target:.3f}"
+    print(f"  test_cap_taper_at_peak_overflow: PASSED (remaining=10 → max_target={max_target/BATTERY_KWH*100:.0f}%)")
+
+
+def test_cap_taper_near_safe_time():
+    """Tail of overflow: buffer = remaining (not clamped), max_target rises above 90%."""
+    max_target, buffer = _taper_cap_formula(remaining_overflow=0.5)
+    assert abs(buffer - 0.5) < 0.01, f"Tail buffer should equal remaining_overflow, got {buffer:.3f}"
+    expected_target = BATTERY_KWH - 0.5
+    assert abs(max_target - expected_target) < 0.01, f"Tail max_target should be {expected_target:.2f}, got {max_target:.3f}"
+    assert max_target > BATTERY_KWH * 0.9, f"Tail max_target should be above 90% cap, got {max_target/BATTERY_KWH*100:.1f}%"
+    print(f"  test_cap_taper_near_safe_time: PASSED (remaining=0.5 → max_target={max_target/BATTERY_KWH*100:.1f}%)")
+
+
+def test_cap_at_safe_time_hits_100():
+    """At safe_time: remaining=0 → buffer=0 → max_target=soc_max (100%)."""
+    max_target, buffer = _taper_cap_formula(remaining_overflow=0.0)
+    assert abs(buffer) < 0.01, f"Zero-remaining buffer should be 0, got {buffer:.3f}"
+    assert abs(max_target - BATTERY_KWH) < 0.01, f"Zero-remaining max_target should be soc_max, got {max_target:.3f}"
+    print(f"  test_cap_at_safe_time_hits_100: PASSED (remaining=0 → max_target=100%)")
+
+
+def test_plugin_cap_taper_near_safe_time():
+    """Plugin integration: late in day with tiny remaining overflow, cap tapers toward 100%.
+
+    minutes_now=1020 (17:00 local, 16:00 UTC for July), now_utc matched. p90 peak
+    at noon, so by 17:00 the remaining solar geometry integral is small. Taper
+    should raise the floor above the old hardcoded 90% cap.
+    """
+    from datetime import datetime, timezone
+
+    minutes_now = 1020  # 17:00 local
+    # PV/load for the short remaining tail
+    pv = {m: 4.5 for m in range(0, 120, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 120, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 4.5,
+        "sensor.sigen_plant_consumed_power": 1.0,
+    }
+    # p90 peak ~9 kW → small overflow by 17:00 (elev declining fast)
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=9.0, solcast_remaining=3.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.95,  # near full already
+        minutes_now=minutes_now,
+        now_utc=datetime(2025, 7, 12, 16, 0, tzinfo=timezone.utc),  # 17:00 BST
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    remaining = plugin._remaining_overflow
+
+    # The taper raises the floor by exactly (MAX_RESERVED_KWH - remaining_overflow) above
+    # what the old hardcoded 90% cap would produce — provided remaining < MAX_RESERVED.
+    assert remaining < MAX_RESERVED_KWH, f"Test scenario must have small remaining_overflow, got {remaining:.2f}"
+    old_formula_floor = BATTERY_KWH * 0.9 - remaining * OVERFLOW_SAFETY_FACTOR
+    expected_lift = MAX_RESERVED_KWH - remaining
+    assert floor - old_formula_floor > expected_lift * 0.95, f"Taper should lift floor by ≈{expected_lift:.2f} kWh above old formula " f"({old_formula_floor:.2f}), got floor={floor:.2f} (lift={floor-old_formula_floor:.2f})"
+    print(f"  test_plugin_cap_taper_near_safe_time: PASSED (remaining={remaining:.2f}, floor={floor/BATTERY_KWH*100:.1f}%, lift={floor-old_formula_floor:.2f}kWh)")
+
+
+def test_cap_taper_ratchet_noise_immune():
+    """Ratchet: if remaining oscillates up-down-up, floor never drops below its peak."""
+    # Simulate three cycles with oscillating remaining overflow
+    floors_seen = []
+    ratchet = None
+    for remaining in [1.0, 1.5, 1.0]:
+        max_target, _ = _taper_cap_formula(remaining)
+        overflow_floor = max(0.0, max_target - remaining * OVERFLOW_SAFETY_FACTOR)
+        if ratchet is not None:
+            overflow_floor = max(overflow_floor, ratchet)
+        ratchet = overflow_floor
+        floors_seen.append(overflow_floor)
+
+    # Each step must be >= previous (ratchet only rises)
+    for i in range(1, len(floors_seen)):
+        assert floors_seen[i] >= floors_seen[i - 1] - 1e-6, f"Ratchet violated: cycle {i} floor {floors_seen[i]:.3f} < cycle {i-1} floor {floors_seen[i-1]:.3f}"
+    print(f"  test_cap_taper_ratchet_noise_immune: PASSED (floors={[f'{f:.2f}' for f in floors_seen]})")
 
 
 # ============================================================================
@@ -1477,7 +1575,7 @@ def test_plugin_handles_local_tz_aware_now_utc():
         pv_step=pv,
         load_step=load,
         soc_kw=5.0,
-        minutes_now=720,   # 12:00 local BST
+        minutes_now=720,  # 12:00 local BST
         now_utc=fake_now_local_aware,
         sensor_overrides=sensor_overrides,
     )
@@ -2221,6 +2319,12 @@ def run_curtailment_tests(my_predbat=None):
     floor_tests = [
         test_floor_computation,
         test_floor_above_soc_keep,
+        # v19 tapered-cap tests
+        test_cap_taper_at_peak_overflow,
+        test_cap_taper_near_safe_time,
+        test_cap_at_safe_time_hits_100,
+        test_plugin_cap_taper_near_safe_time,
+        test_cap_taper_ratchet_noise_immune,
     ]
     print("  --- v10 floor tests ---")
     for test_fn in floor_tests:

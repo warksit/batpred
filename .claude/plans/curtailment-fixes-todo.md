@@ -16,6 +16,7 @@ Not dangerous but causes a spurious `target_soc: 100%` transient and a brief
 MSC switch.
 
 **Fix:** Add ±0.2 kWh hysteresis to the R4 defer check:
+
 - Defer when `soc_kw < soc_keep - 0.2`
 - Release when `soc_kw >= soc_keep + 0.2`
 
@@ -23,12 +24,14 @@ MSC switch.
 
 **Rationale:** `soc_keep` reserves battery for short-term load without grid
 import. Safe to relax ONLY when BOTH:
+
 1. The forecast overflow won't fit in the available room → we NEED the room
 2. PV is currently above load → dropping keep won't force grid import
 
 Once SOC has recovered to base keep, lock it back for the rest of the day.
 
 **Logic:**
+
 ```python
 RELAXED_KEEP_KWH = 0.5
 PV_MARGIN_KW = 0.5  # PV must exceed load by this for "safe to relax"
@@ -76,6 +79,7 @@ afternoon forecast was only caught because the user spotted it.
 **Minimum: a "LoadML trust" sensor**
 
 Publish `sensor.predbat_load_ml_accuracy` with attributes:
+
 - `yesterday_mae_kwh` — mean absolute error between yesterday morning's
   LoadML forecast and yesterday's actual load, bucketed per hour
 - `yesterday_peak_error_kwh` — worst single-slot error
@@ -91,12 +95,12 @@ If `status != "normal"`, curtailment plugin auto-increases
 LoadML is unreliable the floor gets more conservative automatically.
 
 **Implementation notes:**
+
 - Error computation: store yesterday's LoadML forecast snapshot at
   end-of-day, compare to actual load history today.
 - Divergence: don't need to re-implement rolling average — Predbat already
   uses `days_previous` averaging internally; query that.
 - Alert via HA notification when status flips to "suspicious".
-
 
 ### Bug 4: `on_before_plan` clock-based heuristic
 
@@ -109,6 +113,7 @@ Not urgent — winter improvement.
 ### Bug 5: Diagnostic visibility gaps
 
 **Add to phase sensor attributes:**
+
 - `peak_pv_kw` — observed daily peak
 - `peak_pv_time` — minutes-since-midnight
 - `actual_scale` — derived from peak_pv

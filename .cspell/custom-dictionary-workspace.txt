@@ -16,6 +16,7 @@ appkey
 appsyaml
 argname
 ASHP
+astimezone
 asyncio
 autodocstring
 autoflake
