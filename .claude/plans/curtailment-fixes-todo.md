@@ -19,35 +19,6 @@ MSC switch.
 - Defer when `soc_kw < soc_keep - 0.2`
 - Release when `soc_kw >= soc_keep + 0.2`
 
-### Bug 7: Ratchet captures soc_keep inflation
-
-**Symptom (2026-04-22):** Cold weather plugin boosts `best_soc_keep` during
-04:00–07:00 (GSHP protection). At 07:00 the boost drops (3.4 → 1.5 kWh), but
-the curtailment ratchet has already captured 3.4 as the floor and holds it,
-artificially restricting battery ~2 kWh for the rest of the day.
-
-**Fix:** Ratchet only the overflow-derived floor, not the soc_keep-clamped
-floor. Structure:
-
-```python
-overflow_floor = soc_max - remaining_overflow * OVERFLOW_SAFETY_FACTOR
-overflow_floor = min(overflow_floor, soc_max * 0.9)  # R45 cap
-
-# Ratchet only the overflow reservation
-scale_rose = floor_scale > self._last_floor_scale + 0.01
-if self._floor_ratchet is not None and not scale_rose:
-    overflow_floor = max(overflow_floor, self._floor_ratchet)
-self._floor_ratchet = overflow_floor
-
-# Apply dynamic clamps AFTER ratchet
-floor = max(overflow_floor, max(soc_keep, reserve))
-floor = min(floor, soc_max)
-```
-
-soc_keep and reserve become dynamic clamps — when they drop (cold boost ends,
-GSHP cycle ends), floor can drop too. When they rise, floor rises. The
-real "no, we've committed this headroom" is the overflow ratchet only.
-
 ### Bug 4: `on_before_plan` clock-based heuristic
 
 Current: switch to tomorrow's forecast at 23:00 BST hardcoded. Fine in April,
@@ -83,6 +54,9 @@ Zero operational impact — add after a few stable days.
   rises (R43-triggered safety path).
 - **Day-rollover reset** (done 2026-04-21 eve): If `_state_date != today`
   at start of calculate(), reset in-memory daily state.
+- **Bug 7** (done 2026-04-22 morning): Ratchet only the overflow-derived
+  floor; soc_keep/reserve applied as dynamic clamps after ratchet. Fixes
+  battery over-reservation when cold weather boost ends mid-day.
 
 ## Key insight: never deploy mid-day
 
