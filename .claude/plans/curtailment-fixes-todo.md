@@ -112,6 +112,23 @@ Reset counter when PV returns.
 
 Not urgent — only matters in winter.
 
+## Bug 6: R4 defer-to-Predbat-charge-window flips without hysteresis
+
+**Symptom (Wed 06:59 BST):** Plugin flipped Active→Off→Active over 3 minutes.
+Cause: R4 triggered when SOC (3.3 kWh) was 0.1 kWh below `best_soc_keep`
+(3.4 kWh). Log: `Curtailment: deferring to charge window (SOC 3.3 < keep 3.4)`.
+SOC nudged above keep 3 min later → plugin re-activated.
+
+Not dangerous, but unnecessary flicker. Shows up as a spurious
+`target_soc: 100%` transient and a brief MSC switch.
+
+**Fix:** Add ±0.2 kWh hysteresis to the R4 defer check, same as the
+Charge/Hold/Drain split uses:
+- Defer when `soc_kw < soc_keep - 0.2`
+- Release when `soc_kw >= soc_keep + 0.2`
+
+Stops single-sample wobbles at the threshold triggering mode changes.
+
 ## Bug 5: Diagnostic visibility gaps
 
 Post-incident analysis of today was harder than it needed to be. Several key
