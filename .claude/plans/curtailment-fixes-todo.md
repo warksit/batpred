@@ -19,6 +19,43 @@ MSC switch.
 - Defer when `soc_kw < soc_keep - 0.2`
 - Release when `soc_kw >= soc_keep + 0.2`
 
+### Bug 8: Relaxed soc_keep while PV covers load (one-way ratchet)
+
+**Rationale:** The purpose of `soc_keep` is to reserve battery for short-term
+load without grid import. When PV clearly exceeds load, that reservation
+isn't needed *right now* — we could use the capacity for overflow absorption.
+Once the battery has recovered the reserve, lock it.
+
+**Logic:**
+```python
+RELAXED_KEEP_KWH = 0.5
+PV_MARGIN_KW = 1.0  # PV must exceed load by this to be "clearly covering"
+
+# One-way ratchet: once battery reaches full reserve, lock it for rest of day
+if soc_kw >= soc_keep_base and not self._keep_recovered:
+    self._keep_recovered = True
+
+# Determine effective keep for the floor clamp
+if (actual_pv - actual_load) > PV_MARGIN_KW and not self._keep_recovered:
+    effective_keep = min(soc_keep_base, RELAXED_KEEP_KWH)
+else:
+    effective_keep = soc_keep_base
+
+floor = max(overflow_floor, max(effective_keep, reserve))
+```
+
+`_keep_recovered` persists via state file (R47), resets on day rollover.
+
+**Benefit on big-overflow days:** ~1 kWh of extra overflow absorption in the
+morning before battery reaches reserve. On today's overflow (~23 kWh vs
+~14 kWh absorbable room at 8% floor), that's meaningful.
+
+**Risk:** if PV crashes before battery recovers (PV spike then cloud),
+battery could be at 0.5 kWh with no reserve for evening load. Mitigations:
+the PV_MARGIN_KW hysteresis requires sustained PV > load, and the lock fires
+the moment SOC hits `soc_keep_base`. Still worth testing with cloudy-morning
+scenarios before deployment.
+
 ### Bug 4: `on_before_plan` clock-based heuristic
 
 Current: switch to tomorrow's forecast at 23:00 BST hardcoded. Fine in April,
