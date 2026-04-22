@@ -108,6 +108,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._safe_time_str = "none"
         self._floor_scale = 0.0
         self._safe_scale = 0.0
+        self._actual_scale = 0.0
+        self._last_decision = "init"
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
         # Export target published to HA automation (-2 = inactive)
@@ -417,6 +419,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Guard: no PV yet (pre-dawn / winter morning)
         if self._peak_pv < 0.1 and actual_pv < 0.1:
+            self._last_decision = "off: no PV yet"
             return soc_max, "off"
 
         # Track actual peak for scale calibration (R43)
@@ -435,6 +438,7 @@ class CurtailmentPlugin(PredBatPlugin):
         if p90_scale < 0.5:
             # No Solcast data and no yesterday's scale — cannot compute safely
             self._export_target = -2
+            self._last_decision = "off: p90_scale<0.5 (no Solcast)"
             return soc_max, "off"
 
         # Compute actual scale from observed peak (R43)
@@ -450,6 +454,8 @@ class CurtailmentPlugin(PredBatPlugin):
         #   - actual > p90 (sunnier than forecast) → bigger overflow, lower floor, safer
         #   - actual < p90 (cloudier) → keep p90_scale (afternoon could still clear)
         # Prevents DNO breach on days where reality exceeds the 90th percentile forecast.
+        self._actual_scale = actual_scale  # diagnostics (Bug 5)
+
         if actual_scale > p90_scale:
             floor_scale = actual_scale
         else:
@@ -526,12 +532,16 @@ class CurtailmentPlugin(PredBatPlugin):
         #     sun is still above threshold).
         if self.was_active:
             if past_safe_time or not will_fill:
+                reason = "past_safe_time" if past_safe_time else "will_fill=False (excess={:.1f}, room={:.1f})".format(total_excess, battery_headroom)
+                self._last_decision = "off: " + reason
                 self._floor_ratchet = None
                 self._export_target = -2
                 self._save_state()
                 return soc_max, "off"
         else:
             if remaining_overflow <= 0.1 or not will_fill:
+                reason = "overflow<=0.1" if remaining_overflow <= 0.1 else "will_fill=False (excess={:.1f}, room={:.1f})".format(total_excess, battery_headroom)
+                self._last_decision = "off: " + reason
                 self._export_target = -2
                 return soc_max, "off"
 
@@ -571,6 +581,8 @@ class CurtailmentPlugin(PredBatPlugin):
         # signals "active with this floor" — the automation handles fast-reaction phase
         # transitions on 5-sec cadence.
         self._export_target = dno_limit_kw
+
+        self._last_decision = "active: overflow={:.2f} floor={:.2f}kWh".format(remaining_overflow, floor)
 
         # Persist state so restarts recover (Bug 2 / R46)
         self._save_state()
@@ -790,8 +802,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 "floor_scale": round(self._floor_scale, 2),
                 "safe_scale": round(self._safe_scale, 2),
                 "p90_scale": round(self._p90_scale, 2),
+                "actual_scale": round(self._actual_scale, 2),
+                "peak_pv_kw": round(self._peak_pv, 2),
+                "peak_pv_time": self._peak_pv_time,
                 "overflow_kwh": round(self._remaining_overflow, 2),
                 "safe_time": self._safe_time_str,
+                "last_decision": self._last_decision,
             },
         )
 
