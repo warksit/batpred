@@ -63,8 +63,12 @@ PREDBAT_PV_TODAY = "sensor.predbat_pv_today"
 SOLCAST_TODAY = "sensor.solcast_pv_forecast_forecast_today"
 SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 
-# Safety factor: 25% buffer on overflow headroom (R9)
-OVERFLOW_SAFETY_FACTOR = 1.1
+# Safety factor: 20% extra headroom on overflow estimate (R9).
+# 1.2 provides ~1.8 kWh of additional buffer beyond R45's 10% cap, giving
+# ~3.6 kWh total protection against LoadML over-prediction errors (~2 kW of
+# phantom load over a 2h window). Yesterday's LoadML contamination was ~6 kWh
+# — this doesn't fully cover that but substantially reduces breach probability.
+OVERFLOW_SAFETY_FACTOR = 1.2
 
 # State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
 # _floor_ratchet across plugin restarts within the same day.

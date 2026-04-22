@@ -65,7 +65,9 @@ reserved cannot be reclaimed.
 - **R9**: `remaining_overflow = ∫ max(0, scale × sin(elev(t)) - effective_load(t) - DNO) dt`
   integrated from now to safe_time (R19). Evaluated each 5-minute plugin cycle.
   `overflow_floor = (soc_max × 0.9) - remaining_overflow × OVERFLOW_SAFETY_FACTOR`
-  Safety factor = 1.1: reserves 10% extra headroom for forecast error.
+  Safety factor = 1.2: reserves 20% extra headroom for forecast error.
+  Combined with R45's 10% cap = ~3.6 kWh total buffer for LoadML over-prediction
+  (matches the magnitude of one day's contamination from a day like an EV charge).
   Formula targets peak SOC = 90% (not 100%), matching R45's intent — reserves room
   only up to 90% so the last 10% stays as an uncommitted safety buffer absorbing
   forecast error that R9a/R43 don't catch. Post-safe-time MSC fills 90→100%

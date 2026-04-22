@@ -31,7 +31,7 @@ STEP_MINUTES = 5
 START_SOC_PCT = 0.40
 
 # v18 constants (match curtailment_plugin.py)
-OVERFLOW_SAFETY_FACTOR = 1.1
+OVERFLOW_SAFETY_FACTOR = 1.2
 SOC_CAP_FACTOR = 0.95
 SOC_MARGIN_KWH = 0.2  # HA automation hysteresis for Charge/Hold/Drain split
 
