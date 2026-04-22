@@ -65,6 +65,38 @@ conditions must flip to False for relax to end; but `_keep_recovered`
 effectively latches the restored 1.5 once SOC reaches it. Worth testing
 cloudy-morning and mid-day-cloud scenarios before deploy.
 
+### Bug 9: LoadML reliability monitoring
+
+**Motivation:** Curtailment formula (R9a) trusts LoadML for per-slot load
+prediction. Multiple safety layers protect against LoadML errors (R45 cap,
+1.1 safety factor, R43 max-scale) but we currently have NO visibility when
+LoadML is going sideways. The ~3 kW flip between yesterday's and today's
+afternoon forecast was only caught because the user spotted it.
+
+**Minimum: a "LoadML trust" sensor**
+
+Publish `sensor.predbat_load_ml_accuracy` with attributes:
+- `yesterday_mae_kwh` — mean absolute error between yesterday morning's
+  LoadML forecast and yesterday's actual load, bucketed per hour
+- `yesterday_peak_error_kwh` — worst single-slot error
+- `forecast_vs_historical_divergence_pct` — today's forecast vs a simple
+  rolling 7-day average (exposes when ML drifts away from typical pattern)
+- `status` — string: "normal" | "elevated_error" | "suspicious" based on
+  thresholds (e.g. MAE > 0.5 kWh/slot → suspicious)
+
+**Nice-to-have: automatic safety factor bump**
+
+If `status != "normal"`, curtailment plugin auto-increases
+`OVERFLOW_SAFETY_FACTOR` from 1.1 → 1.3 for the day. Self-healing — when
+LoadML is unreliable the floor gets more conservative automatically.
+
+**Implementation notes:**
+- Error computation: store yesterday's LoadML forecast snapshot at
+  end-of-day, compare to actual load history today.
+- Divergence: don't need to re-implement rolling average — Predbat already
+  uses `days_previous` averaging internally; query that.
+- Alert via HA notification when status flips to "suspicious".
+
 ### Bug 4: `on_before_plan` clock-based heuristic
 
 Current: switch to tomorrow's forecast at 23:00 BST hardcoded. Fine in April,
