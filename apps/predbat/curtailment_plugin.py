@@ -30,7 +30,7 @@
 import json
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from curtailment_calc import (
     compute_morning_gap,
@@ -396,9 +396,13 @@ class CurtailmentPlugin(PredBatPlugin):
         if lat == 0 and lon == 0:
             return soc_max, "off"
 
-        now_utc = getattr(self.base, "now_utc", None)
-        if now_utc is None:
+        # NOTE: base.now_utc is misnamed in Predbat — it's a *local-tz-aware*
+        # datetime (datetime.now(local_tz)), not UTC. `.hour` on it returns
+        # local hour. Convert to actual UTC before extracting components.
+        now_local_aware = getattr(self.base, "now_utc", None)
+        if now_local_aware is None:
             return soc_max, "off"
+        now_utc = now_local_aware.astimezone(timezone.utc)
 
         utc_hours = now_utc.hour + now_utc.minute / 60.0 + now_utc.second / 3600.0
         doy = now_utc.timetuple().tm_yday
@@ -650,8 +654,10 @@ class CurtailmentPlugin(PredBatPlugin):
         try:
             lat = float(self.base.get_state_wrapper("zone.home", attribute="latitude", default=0))
             lon = float(self.base.get_state_wrapper("zone.home", attribute="longitude", default=0))
-            now_utc = getattr(self.base, "now_utc", None)
-            if lat and lon and now_utc:
+            # base.now_utc is local-tz-aware (misnamed in Predbat). Convert to real UTC.
+            now_local_aware = getattr(self.base, "now_utc", None)
+            if lat and lon and now_local_aware:
+                now_utc = now_local_aware.astimezone(timezone.utc)
                 tomorrow_doy = (now_utc.timetuple().tm_yday % 365) + 1
                 utc_now = now_utc.hour + now_utc.minute / 60.0
                 local_offset = (minutes_now / 60.0) - utc_now
