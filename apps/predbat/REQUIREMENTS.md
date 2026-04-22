@@ -77,11 +77,14 @@ reserved cannot be reclaimed.
   1–2 kW × ~10 daylight hours on normal days, forcing unnecessary drain and lower
   sunset SOC. See also `feedback_use_loadml_for_floor.md`.
 - **R10**: `floor = max(floor, soc_keep, reserve)` — never drain below household needs.
-- **R11**: Floor ratchet — floor can only rise, never fall, EXCEPT when
-  `floor_scale` has increased from the previous cycle (R43 triggered).
-  Rationale: when actual PV exceeds p90, R43 wants to LOWER the floor to
-  reserve more headroom. R11 would normally block this; the exception lets
-  safety override the ratchet. Reset on deactivation.
+- **R11**: Floor ratchet applies to the OVERFLOW-DERIVED floor only, not the
+  final floor after soc_keep/reserve clamps. `soc_keep` and `reserve` are
+  DYNAMIC — when cold weather boost ends or on_before_plan reduces keep, the
+  final floor follows. Only the `soc_max - overflow × safety_factor` component
+  ratchets (the actual headroom reservation we've committed to).
+  Exception: ratchet is bypassed when `floor_scale` increased from previous
+  cycle (R43 triggered — sunnier than forecast, more headroom needed, allow
+  floor to drop). Reset on deactivation.
 - **R46**: Deactivation uses `safe_time`, not the forecast integral. Plugin goes
   Off only when `now >= safe_time` (solar geometry past overflow threshold) or
   when the battery-fill check fails. The LoadML-driven integral can under-

@@ -531,24 +531,31 @@ class CurtailmentPlugin(PredBatPlugin):
         soc_keep = getattr(self.base, "best_soc_keep", 0)
         reserve = getattr(self.base, "reserve", 0)
 
-        floor = soc_max - remaining_overflow * OVERFLOW_SAFETY_FACTOR
-        floor = max(floor, max(soc_keep, reserve))
-        floor = min(floor, soc_max)
+        # Two-stage floor: overflow_floor is the headroom reservation from the
+        # forecast integral (the thing the ratchet protects). soc_keep / reserve
+        # are DYNAMIC clamps applied after ratchet — so when cold weather boost
+        # ends or on_before_plan reduces keep, the final floor follows without
+        # being held up by yesterday's ratcheted value.
+        overflow_floor = soc_max - remaining_overflow * OVERFLOW_SAFETY_FACTOR
 
-        # Pre-safe-time cap (R45): never let floor exceed 90% while plugin is active.
-        # Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window overflow that
-        # forecast integral underestimates (LoadML over-prediction, PV above p90 curve).
-        # After safe_time plugin deactivates → MSC fills remaining from sub-DNO PV.
-        floor = min(floor, soc_max * 0.9)
+        # Pre-safe-time cap (R45): never let overflow reservation exceed 90% of
+        # battery. Preserves ~10% (~1.8 kWh) guaranteed headroom for late-window
+        # forecast errors (LoadML over-prediction, PV above p90 curve).
+        overflow_floor = min(overflow_floor, soc_max * 0.9)
+        overflow_floor = max(overflow_floor, 0.0)
 
-        # Floor ratchet (R11): floor can only rise within a day, EXCEPT when
-        # floor_scale has increased (R43 safety): actual PV sunnier than p90 → we
-        # need MORE headroom (lower floor), not less. Ratchet bypassed in that case.
+        # Overflow floor ratchet (R11): only the overflow reservation ratchets.
+        # Bypassed when floor_scale has increased (R43 safety path — sunnier than
+        # forecast means MORE headroom needed, so allow floor to drop).
         scale_rose = floor_scale > self._last_floor_scale + 0.01
         if self._floor_ratchet is not None and not scale_rose:
-            floor = max(floor, self._floor_ratchet)
-        self._floor_ratchet = floor
+            overflow_floor = max(overflow_floor, self._floor_ratchet)
+        self._floor_ratchet = overflow_floor
         self._last_floor_scale = floor_scale
+
+        # Final floor clamps: soc_keep / reserve are dynamic — no ratchet here.
+        floor = max(overflow_floor, max(soc_keep, reserve))
+        floor = min(floor, soc_max)
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase
         # (Charge/Hold/Drain) from SOC vs target with symmetric hysteresis. Plugin just
