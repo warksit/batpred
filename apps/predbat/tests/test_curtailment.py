@@ -1456,6 +1456,44 @@ def test_export_target_dno_when_active_regardless_of_soc():
     print(f"  test_export_target_dno_when_active_regardless_of_soc: PASSED (floor={floor/BATTERY_KWH*100:.0f}%, SOC=80%, export_target={plugin._export_target}kW)")
 
 
+def test_plugin_handles_local_tz_aware_now_utc():
+    """Predbat's base.now_utc is named 'now_utc' but is actually local-tz-aware.
+    Plugin must convert to real UTC via .astimezone(timezone.utc) — regression
+    guard for Bug 11 (timezone fix)."""
+    from datetime import datetime, timezone, timedelta
+
+    # Simulate BST: 12:00 BST = 11:00 UTC
+    bst_tz = timezone(timedelta(hours=1))
+    # base.now_utc is "now in BST" — .hour returns 12 (BST), not 11 (UTC)
+    fake_now_local_aware = datetime(2025, 7, 12, 12, 0, tzinfo=bst_tz)
+
+    pv, load = _make_overflow_pv(minutes_now=720)
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 5.0,
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors())
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=5.0,
+        minutes_now=720,   # 12:00 local BST
+        now_utc=fake_now_local_aware,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+
+    # local_offset must compute +1 for BST (not 0 — that would mean we treated
+    # local as UTC). safe_time should reflect correct geometry.
+    # We test this indirectly: with correct TZ handling, the safe_time string
+    # should be a reasonable late-afternoon time (17:00-20:00 BST range for July).
+    assert plugin._safe_time_str != "none", "safe_time should be computed"
+    hh = int(plugin._safe_time_str.split(":")[0])
+    assert 17 <= hh <= 22, f"safe_time {plugin._safe_time_str} should be late-afternoon BST (17-22h) for July overflow day — got hour {hh}"
+    print(f"  test_plugin_handles_local_tz_aware_now_utc: PASSED (safe_time={plugin._safe_time_str} BST)")
+
+
 # ============================================================================
 # Integration test — runs ACTUAL plugin.calculate() against CSV data
 # Physics simulation is independent of algorithm code.
@@ -2218,6 +2256,7 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_lower_with_more_overflow,
         test_export_target_at_dno_when_soc_above_floor,
         test_export_target_dno_when_active_regardless_of_soc,
+        test_plugin_handles_local_tz_aware_now_utc,
     ]
     print("  --- plugin integration tests ---")
     for test_fn in plugin_tests:
