@@ -110,6 +110,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._safe_scale = 0.0
         self._actual_scale = 0.0
         self._last_decision = "init"
+        # R4 hysteresis: True while deferring to charge window (Bug 6).
+        # Released only when SOC >= soc_keep + 0.2.
+        self._r4_deferring = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
         # Export target published to HA automation (-2 = inactive)
@@ -961,22 +964,42 @@ class CurtailmentPlugin(PredBatPlugin):
             floor, phase = self.calculate(dno_limit)
             soc_max = getattr(self.base, "soc_max", 10)
 
-            # Defer to Predbat charge windows when SOC below effective keep (R4)
+            # Defer to Predbat charge windows when SOC below effective keep (R4).
+            # ±0.2 kWh hysteresis via _r4_deferring flag (Bug 6): engage when SOC
+            # drops below keep-0.2, release only when SOC ≥ keep+0.2. Prevents
+            # 5-min flicker at the boundary.
             soc_kw = getattr(self.base, "soc_kw", 0)
             effective_keep = getattr(self.base, "best_soc_keep", 0)
-            if phase != "off" and soc_kw < effective_keep:
-                minutes_now = getattr(self.base, "minutes_now", 0)
-                charge_window_best = getattr(self.base, "charge_window_best", [])
-                charge_window_n = self.base.in_charge_window(charge_window_best, minutes_now)
-                if charge_window_n >= 0:
-                    charge_limit_best = getattr(self.base, "charge_limit_best", [])
-                    if charge_window_n < len(charge_limit_best):
-                        charge_limit = charge_limit_best[charge_window_n]
-                        if not self.base.is_freeze_charge(charge_limit):
-                            if self.last_phase != "off":
-                                self.log("Curtailment: deferring to charge window (SOC {:.1f} < keep {:.1f})".format(soc_kw, effective_keep))
-                            phase = "off"
-                            floor = soc_max
+            if phase != "off":
+                engage_threshold = effective_keep - 0.2
+                release_threshold = effective_keep + 0.2
+                should_defer = (soc_kw < release_threshold) if self._r4_deferring else (soc_kw < engage_threshold)
+
+                if should_defer:
+                    minutes_now = getattr(self.base, "minutes_now", 0)
+                    charge_window_best = getattr(self.base, "charge_window_best", [])
+                    charge_window_n = self.base.in_charge_window(charge_window_best, minutes_now)
+                    if charge_window_n >= 0:
+                        charge_limit_best = getattr(self.base, "charge_limit_best", [])
+                        if charge_window_n < len(charge_limit_best):
+                            charge_limit = charge_limit_best[charge_window_n]
+                            if not self.base.is_freeze_charge(charge_limit):
+                                if not self._r4_deferring:
+                                    self.log("Curtailment: deferring to charge window (SOC {:.1f} < keep-0.2 {:.1f})".format(soc_kw, engage_threshold))
+                                phase = "off"
+                                floor = soc_max
+                                self._last_decision = "off: R4 defer to charge window"
+                                self._r4_deferring = True
+                            else:
+                                self._r4_deferring = False
+                        else:
+                            self._r4_deferring = False
+                    else:
+                        self._r4_deferring = False
+                else:
+                    if self._r4_deferring:
+                        self.log("Curtailment: releasing R4 defer (SOC {:.1f} ≥ keep+0.2 {:.1f})".format(soc_kw, release_threshold))
+                    self._r4_deferring = False
 
             soc_pct = soc_kw / max(soc_max, 0.1) * 100
             floor_pct = floor / max(soc_max, 0.1) * 100
