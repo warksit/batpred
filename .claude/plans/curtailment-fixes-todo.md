@@ -19,42 +19,51 @@ MSC switch.
 - Defer when `soc_kw < soc_keep - 0.2`
 - Release when `soc_kw >= soc_keep + 0.2`
 
-### Bug 8: Relaxed soc_keep while PV covers load (one-way ratchet)
+### Bug 8: Relaxed soc_keep (two conditions, one-way ratchet)
 
-**Rationale:** The purpose of `soc_keep` is to reserve battery for short-term
-load without grid import. When PV clearly exceeds load, that reservation
-isn't needed *right now* — we could use the capacity for overflow absorption.
-Once the battery has recovered the reserve, lock it.
+**Rationale:** `soc_keep` reserves battery for short-term load without grid
+import. Safe to relax ONLY when BOTH:
+1. The forecast overflow won't fit in the available room → we NEED the room
+2. PV is currently above load → dropping keep won't force grid import
+
+Once SOC has recovered to base keep, lock it back for the rest of the day.
 
 **Logic:**
 ```python
 RELAXED_KEEP_KWH = 0.5
-PV_MARGIN_KW = 1.0  # PV must exceed load by this to be "clearly covering"
+PV_MARGIN_KW = 0.5  # PV must exceed load by this for "safe to relax"
 
-# One-way ratchet: once battery reaches full reserve, lock it for rest of day
-if soc_kw >= soc_keep_base and not self._keep_recovered:
+# Condition 1: forecast overflow exceeds room with normal keep + R45 cap
+room_with_base = (soc_max * 0.9) - soc_keep_base
+needs_room = remaining_overflow * OVERFLOW_SAFETY_FACTOR > room_with_base
+
+# Condition 2: PV currently covers load (dropping keep won't cause import)
+pv_covering = (actual_pv - actual_load) > PV_MARGIN_KW
+
+# One-way ratchet: once SOC reaches base keep, lock for rest of day
+if soc_kw >= soc_keep_base:
     self._keep_recovered = True
 
-# Determine effective keep for the floor clamp
-if (actual_pv - actual_load) > PV_MARGIN_KW and not self._keep_recovered:
-    effective_keep = min(soc_keep_base, RELAXED_KEEP_KWH)
+# Effective keep
+if needs_room and pv_covering and not self._keep_recovered:
+    effective_keep = RELAXED_KEEP_KWH
 else:
     effective_keep = soc_keep_base
 
 floor = max(overflow_floor, max(effective_keep, reserve))
 ```
 
-`_keep_recovered` persists via state file (R47), resets on day rollover.
+`_keep_recovered` persists via state file (R47); reset on day rollover.
 
-**Benefit on big-overflow days:** ~1 kWh of extra overflow absorption in the
-morning before battery reaches reserve. On today's overflow (~23 kWh vs
-~14 kWh absorbable room at 8% floor), that's meaningful.
+**Benefit:** On big overflow days, ~1 kWh extra headroom during the morning
+drain window. Zero effect on moderate/small days (needs_room=False) or
+pre-dawn (pv_covering=False).
 
-**Risk:** if PV crashes before battery recovers (PV spike then cloud),
-battery could be at 0.5 kWh with no reserve for evening load. Mitigations:
-the PV_MARGIN_KW hysteresis requires sustained PV > load, and the lock fires
-the moment SOC hits `soc_keep_base`. Still worth testing with cloudy-morning
-scenarios before deployment.
+**Risk:** if PV crashes right after the relax triggers and before SOC
+recovers, battery sits at 0.5 kWh with reduced afternoon cushion. Both
+conditions must flip to False for relax to end; but `_keep_recovered`
+effectively latches the restored 1.5 once SOC reaches it. Worth testing
+cloudy-morning and mid-day-cloud scenarios before deploy.
 
 ### Bug 4: `on_before_plan` clock-based heuristic
 
