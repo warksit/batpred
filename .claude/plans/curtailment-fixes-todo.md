@@ -112,6 +112,36 @@ Reset counter when PV returns.
 
 Not urgent — only matters in winter.
 
+## Bug 5: Diagnostic visibility gaps
+
+Post-incident analysis of today was harder than it needed to be. Several key
+values had to be reverse-engineered from cumulative sensors and indirect signals.
+
+**Add to `sensor.predbat_curtailment_phase` attributes:**
+- `peak_pv_kw` — observed daily peak (drives actual_scale)
+- `peak_pv_time` — minutes-since-midnight of observed peak
+- `actual_scale` — derived peak_pv / sin(elev_at_peak); shows R43's input
+- `last_decision` — short string like "active: overflow=4.2, will_fill=true" or
+  "off: past_safe_time"
+
+**Log line on phase transition:**
+Today's PHASE log line already has most of this, but add actual_scale,
+peak_pv, and the deactivation reason explicitly.
+
+**Rotate state file per day** (cheap postmortem data):
+Instead of overwriting `curtailment_state.json` each day, also write to
+`curtailment_state_{YYYY-MM-DD}.json`. Keep last N days. Lets us replay
+any day's scale/ratchet evolution later.
+
+**Daily summary sensor** (optional, nice-to-have):
+At safe_time, publish `sensor.predbat_curtailment_daily_summary` with
+`{peak_pv, actual_overflow, floor_max_reached, sunset_soc, activation_time,
+deactivation_time}`. Mirrors what `/curtailment-review` computes. Useful
+for at-a-glance daily report.
+
+None of this affects operation — pure visibility. Add after a few days of
+stable running so the diagnostics actually catch interesting behaviours.
+
 ## Key insight: never deploy mid-day
 
 Every restart resets in-memory state. Once state is persisted (Bug 2), this
