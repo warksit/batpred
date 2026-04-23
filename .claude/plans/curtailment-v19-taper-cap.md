@@ -96,34 +96,40 @@ Full 1.8 kWh CLS buffer plus 1.2× safety factor. No regression in drain depth.
 Add to `test_curtailment.py`:
 
 ### `test_cap_taper_at_peak_overflow`
-```
+
+```text
 remaining_overflow = 10 kWh → buffer = 1.8 (clamped) → max_target = 90%
 Drain depth matches today's behavior.
 ```
 
 ### `test_cap_taper_near_safe_time`
-```
+
+```text
 remaining_overflow = 0.5 kWh → buffer = 0.5 → max_target = soc_max - 0.5
 Floor rises to ~97% (not stuck at 90%).
 ```
 
 ### `test_cap_at_safe_time_hits_100`
-```
+
+```text
 remaining_overflow = 0 → buffer = 0 → max_target = soc_max
 Floor = 100%, battery tracks to 100%.
 ```
 
 ### `test_cap_taper_ratchet_noise_immune`
-```
+
+```text
 remaining sequence [1.0, 1.5, 1.0] → floor for cycle N+1 ≥ cycle N value.
 Ratchet holds against oscillation.
 ```
 
 ### Integration: sunset SOC on tomorrow-equivalent scenario
+
 Update/add an integration test matching tomorrow's profile (68 kWh total,
 ~12 kWh overflow, thin 2.8 kWh tail). Assert sunset SOC ≥ 98%.
 
 ### Regression test — current 90% cap behavior during peak
+
 Existing tests with `remaining > 1.8` should STILL PASS (drain depth unchanged).
 
 ## Deploy Order

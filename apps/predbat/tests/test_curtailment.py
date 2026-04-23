@@ -776,6 +776,43 @@ def test_plugin_publishes_active_not_phase():
     print("  test_plugin_publishes_active_not_phase: PASSED")
 
 
+def test_r48_triggers_after_overnight_100pct():
+    """R48 must trigger on a morning with a 100% overnight SOC.
+
+    Live regression 2026-04-23: battery at 100% overnight latched
+    _keep_recovered=True immediately at midnight rollover, because the naive
+    'if soc_kw >= soc_keep: recovered=True' check always fired before the
+    battery had a chance to drain. That defeated R48 entirely on big-overflow
+    mornings — SOC stayed clamped at soc_keep_base instead of being drained
+    to 0.5 kWh.
+
+    Fix: require the battery to have been observed BELOW soc_keep this day
+    before allowing the recovered latch to fire.
+    """
+    pv, load = _make_overflow_pv(minutes_now=360)  # 06:00 local — early morning
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 2.0,  # PV rising, pv_covering will be True
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors())
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 1.0,  # 100% overnight — the crash case
+        minutes_now=360,
+        best_soc_keep=1.5,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+
+    # R48 must apply: big overflow + pv_covering → effective_keep = 0.5 kWh.
+    # Floor must not be clamped at 1.5 (base keep) just because overnight SOC was high.
+    assert floor < 1.5, f"R48 must trigger with 100%-overnight + big morning overflow, " f"but floor clamped to base keep ({floor:.2f} ≥ 1.5). " f"_keep_recovered latched incorrectly at rollover."
+    print(f"  test_r48_triggers_after_overnight_100pct: PASSED (floor={floor:.2f} < base keep 1.5)")
+
+
 def test_plugin_floor_clamped_by_soc_keep():
     """With big overflow that needs room, Bug 8 relaxes keep to 0.5 kWh; otherwise clamps to soc_keep."""
     pv, load = _make_overflow_pv(minutes_now=720)
@@ -827,7 +864,9 @@ def test_plugin_active_high_soc():
 
 
 def test_floor_clamped_above_soc_keep():
-    """Floor must never go below best_soc_keep."""
+    """On a big-overflow day with needs_room + pv_covering, R48 correctly
+    relaxes keep to 0.5 kWh (not to soc_keep). Floor lower bound is RELAXED_KEEP.
+    """
     pv, load = _make_overflow_pv(minutes_now=720)
     soc_keep = 8.0
     sensor_overrides = {
@@ -847,8 +886,11 @@ def test_floor_clamped_above_soc_keep():
     plugin = CurtailmentPlugin(base)
 
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert floor >= soc_keep, f"Floor {floor:.2f} should be >= soc_keep {soc_keep:.2f}"
-    print(f"  test_floor_clamped_above_soc_keep: PASSED (floor={floor:.2f}kWh >= keep={soc_keep:.2f}kWh)")
+    # R48 relaxes keep on a big-overflow + pv_covering scenario — floor
+    # clamps to RELAXED_KEEP_KWH (0.5), not soc_keep_base (8).
+    assert floor >= 0.5, f"Floor {floor:.2f} should be >= RELAXED_KEEP (0.5)"
+    assert floor < soc_keep, f"R48 must relax keep on big overflow: floor {floor:.2f} < soc_keep {soc_keep:.2f} expected"
+    print(f"  test_floor_clamped_above_soc_keep: PASSED (floor={floor:.2f}kWh; R48 relaxed below keep={soc_keep:.2f})")
 
 
 def test_floor_clamped_above_reserve():
@@ -2354,6 +2396,7 @@ def run_curtailment_tests(my_predbat=None):
         test_plugin_stays_off_no_overflow,
         test_plugin_publishes_active_not_phase,
         test_plugin_floor_clamped_by_soc_keep,
+        test_r48_triggers_after_overnight_100pct,
         test_plugin_active_high_soc,
         test_floor_clamped_above_soc_keep,
         test_floor_clamped_above_reserve,

@@ -120,9 +120,12 @@ class CurtailmentPlugin(PredBatPlugin):
         # R4 hysteresis: True while deferring to charge window (Bug 6).
         # Released only when SOC >= soc_keep + 0.2.
         self._r4_deferring = False
-        # R48 (Bug 8): one-way ratchet for relaxed soc_keep. Once SOC reaches
-        # soc_keep_base, locks to True — prevents re-relaxing if SOC dips later.
-        # Reset on day rollover via _reset_for_new_day.
+        # R48 (Bug 8): one-way ratchet for relaxed soc_keep. Requires two-phase
+        # transition — battery must be observed BELOW soc_keep this day
+        # (_keep_drained_today) before _keep_recovered can latch on SOC rising
+        # back to soc_keep. Without the drain-first guard, the latch fires at
+        # midnight rollover when battery is at 100% overnight, defeating R48.
+        self._keep_drained_today = False
         self._keep_recovered = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
@@ -174,6 +177,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._floor_ratchet = float(ratchet) if ratchet is not None else None
         self._last_floor_scale = float(data.get("last_floor_scale", 0.0))
         self._keep_recovered = bool(data.get("keep_recovered", False))
+        self._keep_drained_today = bool(data.get("keep_drained_today", False))
         self._state_date = today
         try:
             self.log(
@@ -199,6 +203,7 @@ class CurtailmentPlugin(PredBatPlugin):
             "floor_ratchet": self._floor_ratchet,
             "last_floor_scale": self._last_floor_scale,
             "keep_recovered": self._keep_recovered,
+            "keep_drained_today": self._keep_drained_today,
         }
         try:
             with open(path, "w") as f:
@@ -214,6 +219,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._floor_ratchet = None
         self._last_floor_scale = 0.0
         self._keep_recovered = False
+        self._keep_drained_today = False
         self._state_date = datetime.now().strftime("%Y-%m-%d")
 
     def register_hooks(self, plugin_system):
@@ -611,7 +617,13 @@ class CurtailmentPlugin(PredBatPlugin):
         needs_room = remaining_overflow * OVERFLOW_SAFETY_FACTOR > room_with_base_keep
         pv_covering = (self._actual_pv_kw - actual_load) > PV_MARGIN_KW
 
-        if soc_kw >= soc_keep:
+        # R48 latch: only mark "recovered" after we've actually been drained
+        # below soc_keep this day. Without _keep_drained_today, the latch
+        # fires at midnight rollover (battery at 100% overnight → soc_kw >=
+        # soc_keep trivially) and R48 never triggers on a real morning.
+        if soc_kw < soc_keep:
+            self._keep_drained_today = True
+        if self._keep_drained_today and soc_kw >= soc_keep:
             self._keep_recovered = True
 
         if needs_room and pv_covering and not self._keep_recovered and soc_keep > RELAXED_KEEP_KWH:

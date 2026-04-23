@@ -89,10 +89,12 @@ reserved cannot be reclaimed.
 - **R48**: Relaxed soc_keep on big-overflow mornings. When BOTH (a) the forecast
   overflow × safety_factor exceeds room available with base keep, AND (b) PV
   currently exceeds load by ≥ 0.5 kW, use `effective_keep = 0.5 kWh` instead
-  of `soc_keep`. One-way ratchet: once SOC reaches `soc_keep`, flag
-  `_keep_recovered = True` for the rest of the day and effective_keep
-  reverts to base. Prevents wasted headroom in the morning drain window
-  without compromising evening reserve protection. Persisted via state file.
+  of `soc_keep`. **Two-phase latch** — battery must first be observed BELOW
+  `soc_keep` this day (sets `_keep_drained_today = True`) before
+  `_keep_recovered = True` can latch on SOC rising back to `soc_keep`. Without
+  the drain-first guard, the latch fires at midnight rollover when battery is
+  at 100% overnight, defeating R48 on every real morning. Both flags persisted
+  via state file; both reset on day rollover.
 - **R11**: Floor ratchet applies to the OVERFLOW-DERIVED floor only, not the
   final floor after soc_keep/reserve clamps. `soc_keep` and `reserve` are
   DYNAMIC — when cold weather boost ends or on_before_plan reduces keep, the
