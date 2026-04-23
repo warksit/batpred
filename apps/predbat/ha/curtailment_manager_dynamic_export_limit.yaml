@@ -7,10 +7,15 @@
 #   Hold:  force export = min(excess, DNO) — clamp at available PV
 #   Drain: force export = DNO — force battery discharge to grid
 #
-# Automation-decided phases (when manual = Off and plugin active):
-#   Charge: SOC < target_kwh - 0.2 → export = 0, battery charges
-#   Drain:  SOC > target_kwh + 0.2 → export = DNO
-#   Hold:   within ±0.2 kWh of target → export = min(excess, DNO)
+# Automation-decided phases (when manual = Off and plugin active).
+# Schmitt-trigger hysteresis uses current phase (input_text.curtailment_live_phase)
+# to decide the next phase:
+#   Drain:   exit → Hold at SOC ≤ target          (drain ALL the way to target)
+#   Charge:  exit → Hold at SOC ≥ target          (charge ALL the way to target)
+#   Hold:    exit → Drain at SOC > target + OUTER
+#            exit → Charge at SOC < target − OUTER
+#   OUTER_THRESHOLD_KWH = 0.18 kWh ≈ 1% of soc_max — robust to Sigen SOC 0.1% quantisation.
+# Bootstrap (current phase = Off/unknown/Hold from prior manual): symmetric ±OUTER pick.
 #
 # EMS mode management:
 #   Manual != Off OR plugin active → Command Discharging (ESS First)
@@ -23,7 +28,7 @@ id: "1773747411848"
 alias: "Curtailment Manager - Dynamic Export Limit"
 description: >-
   Export control with manual override (Off/Zero/Hold/Drain) and automation-decided phases.
-  Automation picks Charge/Drain/Hold from SOC vs target_kwh with ±0.2 kWh hysteresis.
+  Schmitt-trigger hysteresis: drain/charge runs all the way to target, Hold exits at ±0.18 kWh.
   Plugin publishes target and Active/Off; automation handles fast (5-sec) phase transitions.
   When both manual and plugin off, restores Maximum Self Consumption mode.
 mode: single
@@ -90,36 +95,52 @@ action:
       load: "{{ states('sensor.sigen_plant_consumed_power') | float(0) }}"
       excess: "{{ pv - load }}"
       dno: 4
+      outer_threshold: 0.18
       export_cap_raw: "{{ states('sensor.predbat_curtailment_export_target') | float(-2) }}"
       export_cap: "{% if export_cap_raw | float(-2) >= 0 %}{{ export_cap_raw | float(4) }}{% else %}{{ dno }}{% endif %}"
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
+      current_phase: "{{ states('input_text.curtailment_live_phase') }}"
+      # Schmitt-trigger phase selection. For automated phases (when not manual/Off), the
+      # next phase depends on both (soc vs target) AND the current phase.
       phase: >-
         {% if manual_mode == 'Zero' %}Manual Zero
         {% elif manual_mode == 'Hold' %}Manual Hold
         {% elif manual_mode == 'Drain' %}Manual Drain
         {% elif export_cap_raw < 0 %}Off
-        {% elif soc_kwh > target_kwh + 0.2 %}Drain
-        {% elif soc_kwh < target_kwh - 0.2 %}Charge
-        {% else %}Hold
+        {% elif current_phase == 'Drain' %}
+          {% if soc_kwh > target_kwh %}Drain{% else %}Hold{% endif %}
+        {% elif current_phase == 'Charge' %}
+          {% if soc_kwh < target_kwh %}Charge{% else %}Hold{% endif %}
+        {% elif current_phase == 'Hold' %}
+          {% if soc_kwh > target_kwh + outer_threshold %}Drain
+          {% elif soc_kwh < target_kwh - outer_threshold %}Charge
+          {% else %}Hold
+          {% endif %}
+        {% else %}
+          {# Bootstrap — prior state was Off / Manual / unknown. Pick symmetric. #}
+          {% if soc_kwh > target_kwh + outer_threshold %}Drain
+          {% elif soc_kwh < target_kwh - outer_threshold %}Charge
+          {% else %}Hold
+          {% endif %}
         {% endif %}
       new_limit: >-
-        {% if manual_mode == 'Zero' %}
+        {% if phase == 'Manual Zero' %}
           {{ 0 | round(1) }}
-        {% elif manual_mode == 'Hold' %}
+        {% elif phase == 'Manual Hold' %}
           {{ [[excess, 0] | max, dno] | min | round(1) }}
-        {% elif manual_mode == 'Drain' %}
+        {% elif phase == 'Manual Drain' %}
           {{ dno | round(1) }}
-        {% elif export_cap_raw < 0 %}
+        {% elif phase == 'Off' %}
           {{ dno | round(1) }}
-        {% elif soc_kwh > target_kwh + 0.2 %}
+        {% elif phase == 'Drain' %}
           {{ [[export_cap, 0] | max, dno] | min | round(1) }}
-        {% elif soc_kwh < target_kwh - 0.2 %}
+        {% elif phase == 'Charge' %}
           {{ 0 | round(1) }}
         {% else %}
+          {# Hold #}
           {{ [[excess, 0] | max, export_cap | float(4), dno] | min | round(1) }}
         {% endif %}
       current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
-      current_phase: "{{ states('input_text.curtailment_live_phase') }}"
 
   # Switch to D-ESS when manual override active
   - if:
