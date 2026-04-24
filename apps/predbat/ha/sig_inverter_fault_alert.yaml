@@ -70,8 +70,3 @@ action:
             name: "default"
             critical: "{{ 0 if is_protective else 1 }}"
             volume: 0.5
-
-  - action: notify.mobile_app_shona_s_ipad
-    data:
-      title: "SIG Inverter Alert"
-      message: "{{ fault_type }}\nSOC: {{ soc }}% | PV: {{ pv }} kW | V: {{ voltage }} | f: {{ freq }} Hz"
