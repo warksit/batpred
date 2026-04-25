@@ -1,0 +1,60 @@
+# Big Overflow Day Load Advice
+# At 09:00 BST, if curtailment manager forecasts more overflow than the battery
+# can absorb, send a gentle reminder to run discretionary loads (dishwasher,
+# washing machine, EV charging, immersion heater) to capture the extra solar.
+#
+# Triggers only when forecast > available battery room. Otherwise silent.
+#
+# Sent to both Andrew and Mum (Shona) since it's a friendly suggestion not a fault.
+
+id: "big_overflow_load_advice_v1"
+alias: "Big Overflow Day - Load Advice"
+description: >-
+  Daily 09:00 BST reminder when PV forecast exceeds battery absorption capacity.
+  Suggests running dishwasher/washing machine/EV/immersion to harvest extra solar.
+  Silent on normal days (forecast within battery capacity).
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: time
+    at: "09:00:00"
+
+condition:
+  # Curtailment must be active (PV forecast exceeds DNO somewhere today)
+  - condition: state
+    entity_id: sensor.predbat_curtailment_phase
+    state: "Active"
+
+action:
+  - variables:
+      overflow_kwh: "{{ state_attr('sensor.predbat_curtailment_phase', 'overflow_kwh') | float(0) }}"
+      soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(0) }}"
+      soc_max: 18.08
+      soc_kwh: "{{ (soc_pct / 100) * soc_max }}"
+      room_kwh: "{{ soc_max - soc_kwh }}"
+      shortfall_kwh: "{{ (overflow_kwh - room_kwh) | round(1) }}"
+      # Only alert if shortfall is meaningful (≥ 1 kWh)
+      should_alert: "{{ shortfall_kwh >= 1 }}"
+
+  - condition: template
+    value_template: "{{ should_alert }}"
+
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "Big PV day — run extra loads"
+      message: >-
+        Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
+        {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
+        will go unused unless we soak it up.
+        Good time to run: dishwasher, washing machine, EV charging, immersion.
+
+  - action: notify.mobile_app_shona_s_ipad
+    data:
+      title: "Big PV day — run extra loads"
+      message: >-
+        Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
+        {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
+        will go unused unless we soak it up.
+        Good time to run: dishwasher, washing machine, EV charging, immersion.
