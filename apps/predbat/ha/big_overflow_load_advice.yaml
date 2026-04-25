@@ -1,41 +1,73 @@
 # Big Overflow Day Load Advice
-# Reminder when PV forecast exceeds battery absorption capacity. Suggests
-# running discretionary loads (dishwasher, washing machine, EV charging,
-# immersion heater) to capture the extra solar.
+# Reminder when PV forecast overflow exceeds battery capacity for sustained period.
+# Suggests running discretionary loads to capture extra solar.
 #
-# Checks every 30 min during the overflow window (now < safe_time).
-# Fires at most ONCE per day — uses last_triggered comparison vs today_at()
-# to track. No helper entity needed.
-#
+# Triggers:
+#   - Morning (before 12:00): require 2h of sustained shortfall (≥1 kWh)
+#   - Afternoon (12:00 onwards): require 30 min of sustained shortfall
+# Fires at most ONCE per day.
 # Silent on normal days (forecast within battery capacity).
+#
+# Companion entities:
+#   binary_sensor.big_overflow_shortfall — template binary sensor
+#     ON when (overflow_kwh - battery_room) >= 1 kWh
+#     OFF otherwise
+#
 # Sent to both Andrew and Shona since it's a friendly suggestion.
 
 id: "big_overflow_load_advice_v1"
 alias: "Big Overflow Day - Load Advice"
 description: >-
-  Reminder when PV forecast exceeds battery absorption capacity.
-  Checks every 30 min during overflow window. Fires at most once per day.
-  Silent on normal days.
+  Alert when battery shortfall persists. Morning (<12:00): require 2h sustained
+  shortfall. Afternoon (>=12:00): require 30 min sustained. Once per day.
 
 mode: single
 max_exceeded: silent
 
 trigger:
-  - platform: time_pattern
-    minutes: "/30"
+  # Morning: 2h dwell on shortfall before alerting
+  - platform: state
+    entity_id: binary_sensor.big_overflow_shortfall
+    to: "on"
+    for:
+      hours: 2
+    id: morning_dwell
+  # Afternoon: only 30 min dwell — don't wait too long, day's running out
+  - platform: state
+    entity_id: binary_sensor.big_overflow_shortfall
+    to: "on"
+    for:
+      minutes: 30
+    id: afternoon_dwell
 
 condition:
   - condition: state
     entity_id: sensor.predbat_curtailment_phase
     state: "Active"
-  # Only before safe_time (no point alerting once curtailment has wound down)
+  # Only before safe_time
   - condition: template
     value_template: >-
       {{ now().strftime('%H:%M') < (state_attr('sensor.predbat_curtailment_phase', 'safe_time') or '23:59') }}
-  # Once per day max — last_triggered before today's midnight means we haven't fired today
+  # Once per day max
   - condition: template
     value_template: >-
       {{ this.attributes.last_triggered is none or as_timestamp(this.attributes.last_triggered) < as_timestamp(today_at()) }}
+  # Trigger-id matches time-of-day:
+  #   morning_dwell only fires before 12:00, afternoon_dwell only after 12:00
+  - condition: or
+    conditions:
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: morning_dwell
+          - condition: time
+            before: "12:00:00"
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: afternoon_dwell
+          - condition: time
+            after: "12:00:00"
 
 action:
   - variables:
@@ -46,10 +78,6 @@ action:
       room_kwh: "{{ soc_max - soc_kwh }}"
       shortfall_kwh: "{{ (overflow_kwh - room_kwh) | round(1) }}"
       safe_time: "{{ state_attr('sensor.predbat_curtailment_phase', 'safe_time') }}"
-      should_alert: "{{ shortfall_kwh >= 1 }}"
-
-  - condition: template
-    value_template: "{{ should_alert }}"
 
   - action: notify.mobile_app_andrew_iphone
     data:
