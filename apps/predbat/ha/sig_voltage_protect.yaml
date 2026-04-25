@@ -76,7 +76,7 @@ action:
           entity_id: input_boolean.sig_voltage_protect_active
       - action: notify.mobile_app_andrew_iphone
         data:
-          title: "SIG Voltage Protect ACTIVATED"
+          title: "⚠️ SIG Voltage Protect ACTIVATED (V={{ voltage }}V)"
           message: >-
             V={{ voltage }}V crossed 260V threshold.
             Throttling export to {{ voltage_cap_kw }} kW.
@@ -108,7 +108,8 @@ action:
           entity_id: input_boolean.sig_voltage_protect_active
       - action: notify.mobile_app_andrew_iphone
         data:
-          title: "SIG Voltage Protect released"
+          title: "✅ SIG Voltage Protect released (V={{ voltage }}V)"
           message: >-
             V={{ voltage }}V dropped below 258V.
-            Handing control back to curtailment/MSC.
+            SOC: {{ states('sensor.sigen_plant_battery_state_of_charge') }}%.
+            Resumed normal control.
