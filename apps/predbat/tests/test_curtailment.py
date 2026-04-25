@@ -813,6 +813,49 @@ def test_r48_triggers_after_overnight_100pct():
     print(f"  test_r48_triggers_after_overnight_100pct: PASSED (floor={floor:.2f} < base keep 1.5)")
 
 
+def test_r48_latches_once_engaged():
+    """R48 must latch once engaged for the day — don't toggle on flickering pv_covering.
+
+    Live regression 2026-04-25: R48 fired/un-fired 5 times in 4 hours
+    (06:11-09:58 BST) because actual_pv-actual_load oscillated around the
+    PV_MARGIN_KW=0.5 threshold in cloudy morning. Each flicker re-evaluated
+    pv_covering and toggled effective_keep between 0.5 and 1.5 kWh.
+
+    Fix: once R48 has fired today, latch _r48_engaged_today=True and keep
+    using RELAXED_KEEP_KWH until _keep_recovered fires (battery has
+    completed its drain cycle and risen back to base keep).
+    """
+    pv, load = _make_overflow_pv(minutes_now=420)  # 07:00 BST morning
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 1.0,  # >= 0.5+load: pv_covering
+        "sensor.sigen_plant_consumed_power": 0.4,
+    }
+    sensor_overrides.update(_make_p90_sensors())
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.05,  # below soc_keep — sets _keep_drained_today
+        minutes_now=420,
+        best_soc_keep=1.5,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+
+    # Cycle 1: pv_covering True (1.0 - 0.4 = 0.6 > 0.5) → R48 fires
+    floor1, _ = plugin.calculate(dno_limit_kw=4.0)
+    assert plugin._keep_drained_today, "Should be drained_today (soc < keep)"
+    assert plugin._r48_engaged_today, "R48 should have engaged"
+    assert floor1 < 1.0, f"R48 active should give relaxed keep, got floor={floor1}"
+
+    # Cycle 2: pv_covering becomes False (cloud passes, PV drops below load+0.5)
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.5  # 0.5 - 0.4 = 0.1, below margin
+    floor2, _ = plugin.calculate(dno_limit_kw=4.0)
+    # WITHOUT latch: floor would jump back to 1.5 (base keep)
+    # WITH latch: floor stays at relaxed 0.5
+    assert floor2 < 1.0, f"R48 latch must hold once engaged today: pv_covering flickered " f"to False, but floor jumped from {floor1:.2f} to {floor2:.2f}. " f"Latch broken — toggling again."
+    print(f"  test_r48_latches_once_engaged: PASSED (floor1={floor1:.2f}, floor2={floor2:.2f}, latch held)")
+
+
 def test_plugin_floor_clamped_by_soc_keep():
     """With big overflow that needs room, Bug 8 relaxes keep to 0.5 kWh; otherwise clamps to soc_keep."""
     pv, load = _make_overflow_pv(minutes_now=720)
@@ -2397,6 +2440,7 @@ def run_curtailment_tests(my_predbat=None):
         test_plugin_publishes_active_not_phase,
         test_plugin_floor_clamped_by_soc_keep,
         test_r48_triggers_after_overnight_100pct,
+        test_r48_latches_once_engaged,
         test_plugin_active_high_soc,
         test_floor_clamped_above_soc_keep,
         test_floor_clamped_above_reserve,

@@ -125,8 +125,11 @@ class CurtailmentPlugin(PredBatPlugin):
         # (_keep_drained_today) before _keep_recovered can latch on SOC rising
         # back to soc_keep. Without the drain-first guard, the latch fires at
         # midnight rollover when battery is at 100% overnight, defeating R48.
+        # _r48_engaged_today: once R48 has fired today, latch on so it doesn't
+        # toggle on flickering pv_covering threshold (cloudy morning).
         self._keep_drained_today = False
         self._keep_recovered = False
+        self._r48_engaged_today = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
         # Export target published to HA automation (-2 = inactive)
@@ -178,6 +181,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._last_floor_scale = float(data.get("last_floor_scale", 0.0))
         self._keep_recovered = bool(data.get("keep_recovered", False))
         self._keep_drained_today = bool(data.get("keep_drained_today", False))
+        self._r48_engaged_today = bool(data.get("r48_engaged_today", False))
         self._state_date = today
         try:
             self.log(
@@ -204,6 +208,7 @@ class CurtailmentPlugin(PredBatPlugin):
             "last_floor_scale": self._last_floor_scale,
             "keep_recovered": self._keep_recovered,
             "keep_drained_today": self._keep_drained_today,
+            "r48_engaged_today": self._r48_engaged_today,
         }
         try:
             with open(path, "w") as f:
@@ -220,6 +225,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._last_floor_scale = 0.0
         self._keep_recovered = False
         self._keep_drained_today = False
+        self._r48_engaged_today = False
         self._state_date = datetime.now().strftime("%Y-%m-%d")
 
     def register_hooks(self, plugin_system):
@@ -626,7 +632,16 @@ class CurtailmentPlugin(PredBatPlugin):
         if self._keep_drained_today and soc_kw >= soc_keep:
             self._keep_recovered = True
 
-        if needs_room and pv_covering and not self._keep_recovered and soc_keep > RELAXED_KEEP_KWH:
+        # R48 engagement latch: once R48 fires for the first time today,
+        # remember it via _r48_engaged_today. On subsequent cycles use the
+        # latch instead of re-evaluating pv_covering (which oscillates around
+        # the 0.5 kW threshold on cloudy mornings — caused 5 toggles on
+        # 2026-04-25 06:11-09:58 BST). Latch clears when _keep_recovered.
+        r48_should_engage = needs_room and pv_covering and not self._keep_recovered and soc_keep > RELAXED_KEEP_KWH
+        if r48_should_engage:
+            self._r48_engaged_today = True
+
+        if self._r48_engaged_today and not self._keep_recovered and soc_keep > RELAXED_KEEP_KWH:
             effective_keep = RELAXED_KEEP_KWH
         else:
             effective_keep = soc_keep

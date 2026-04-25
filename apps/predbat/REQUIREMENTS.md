@@ -89,12 +89,18 @@ reserved cannot be reclaimed.
 - **R48**: Relaxed soc_keep on big-overflow mornings. When BOTH (a) the forecast
   overflow × safety_factor exceeds room available with base keep, AND (b) PV
   currently exceeds load by ≥ 0.5 kW, use `effective_keep = 0.5 kWh` instead
-  of `soc_keep`. **Two-phase latch** — battery must first be observed BELOW
-  `soc_keep` this day (sets `_keep_drained_today = True`) before
+  of `soc_keep`. **Two-phase recovered latch** — battery must first be observed
+  BELOW `soc_keep` this day (sets `_keep_drained_today = True`) before
   `_keep_recovered = True` can latch on SOC rising back to `soc_keep`. Without
   the drain-first guard, the latch fires at midnight rollover when battery is
-  at 100% overnight, defeating R48 on every real morning. Both flags persisted
-  via state file; both reset on day rollover.
+  at 100% overnight, defeating R48 on every real morning.
+  **Engagement latch** (`_r48_engaged_today`) — once R48's first-fire conditions
+  are met today, latch on so subsequent cycles use relaxed keep regardless of
+  pv_covering oscillation around the 0.5 kW threshold. Avoids effective_keep
+  toggling 0.5 ↔ 1.5 kWh in cloudy mornings (5 toggles observed 2026-04-25
+  06:11–09:58 BST before this fix). Engagement latch clears when
+  `_keep_recovered = True` (drain cycle complete). All three flags persisted
+  via state file; reset on day rollover.
 - **R11**: Floor ratchet applies to the OVERFLOW-DERIVED floor only, not the
   final floor after soc_keep/reserve clamps. `soc_keep` and `reserve` are
   DYNAMIC — when cold weather boost ends or on_before_plan reduces keep, the
