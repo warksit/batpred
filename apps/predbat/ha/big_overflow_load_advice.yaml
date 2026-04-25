@@ -1,31 +1,41 @@
 # Big Overflow Day Load Advice
-# At 09:00 BST, if curtailment manager forecasts more overflow than the battery
-# can absorb, send a gentle reminder to run discretionary loads (dishwasher,
-# washing machine, EV charging, immersion heater) to capture the extra solar.
+# Reminder when PV forecast exceeds battery absorption capacity. Suggests
+# running discretionary loads (dishwasher, washing machine, EV charging,
+# immersion heater) to capture the extra solar.
 #
-# Triggers only when forecast > available battery room. Otherwise silent.
+# Checks every 30 min during the overflow window (now < safe_time).
+# Fires at most ONCE per day — uses last_triggered comparison vs today_at()
+# to track. No helper entity needed.
 #
-# Sent to both Andrew and Mum (Shona) since it's a friendly suggestion not a fault.
+# Silent on normal days (forecast within battery capacity).
+# Sent to both Andrew and Shona since it's a friendly suggestion.
 
 id: "big_overflow_load_advice_v1"
 alias: "Big Overflow Day - Load Advice"
 description: >-
-  Daily 09:00 BST reminder when PV forecast exceeds battery absorption capacity.
-  Suggests running dishwasher/washing machine/EV/immersion to harvest extra solar.
-  Silent on normal days (forecast within battery capacity).
+  Reminder when PV forecast exceeds battery absorption capacity.
+  Checks every 30 min during overflow window. Fires at most once per day.
+  Silent on normal days.
 
 mode: single
 max_exceeded: silent
 
 trigger:
-  - platform: time
-    at: "09:00:00"
+  - platform: time_pattern
+    minutes: "/30"
 
 condition:
-  # Curtailment must be active (PV forecast exceeds DNO somewhere today)
   - condition: state
     entity_id: sensor.predbat_curtailment_phase
     state: "Active"
+  # Only before safe_time (no point alerting once curtailment has wound down)
+  - condition: template
+    value_template: >-
+      {{ now().strftime('%H:%M') < (state_attr('sensor.predbat_curtailment_phase', 'safe_time') or '23:59') }}
+  # Once per day max — last_triggered before today's midnight means we haven't fired today
+  - condition: template
+    value_template: >-
+      {{ this.attributes.last_triggered is none or as_timestamp(this.attributes.last_triggered) < as_timestamp(today_at()) }}
 
 action:
   - variables:
@@ -35,7 +45,7 @@ action:
       soc_kwh: "{{ (soc_pct / 100) * soc_max }}"
       room_kwh: "{{ soc_max - soc_kwh }}"
       shortfall_kwh: "{{ (overflow_kwh - room_kwh) | round(1) }}"
-      # Only alert if shortfall is meaningful (≥ 1 kWh)
+      safe_time: "{{ state_attr('sensor.predbat_curtailment_phase', 'safe_time') }}"
       should_alert: "{{ shortfall_kwh >= 1 }}"
 
   - condition: template
@@ -43,18 +53,18 @@ action:
 
   - action: notify.mobile_app_andrew_iphone
     data:
-      title: "Big PV day — run extra loads"
+      title: "Big PV day - run extra loads"
       message: >-
         Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
         {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
-        will go unused unless we soak it up.
+        will go unused (until safe_time {{ safe_time }}) unless we soak it up.
         Good time to run: dishwasher, washing machine, EV charging, immersion.
 
   - action: notify.mobile_app_shona_s_ipad
     data:
-      title: "Big PV day — run extra loads"
+      title: "Big PV day - run extra loads"
       message: >-
         Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
         {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
-        will go unused unless we soak it up.
+        will go unused (until safe_time {{ safe_time }}) unless we soak it up.
         Good time to run: dishwasher, washing machine, EV charging, immersion.
