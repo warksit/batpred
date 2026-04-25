@@ -53,18 +53,18 @@ action:
 
   - action: notify.mobile_app_andrew_iphone
     data:
-      title: "Big PV day - run extra loads"
+      title: "☀️ Big PV day — run extra loads"
       message: >-
-        Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
-        {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
-        will go unused (until safe_time {{ safe_time }}) unless we soak it up.
-        Good time to run: dishwasher, washing machine, EV charging, immersion.
+        ☀️ Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
+        🔋 {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
+        going to waste (until safe_time {{ safe_time }}) unless we soak it up.
+        Good time to run: 🍽️ dishwasher, 🧺 washing machine, 🚗 EV, ♨️ immersion.
 
   - action: notify.mobile_app_shona_s_ipad
     data:
-      title: "Big PV day - run extra loads"
+      title: "☀️ Big PV day — run extra loads"
       message: >-
-        Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
-        {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
-        will go unused (until safe_time {{ safe_time }}) unless we soak it up.
-        Good time to run: dishwasher, washing machine, EV charging, immersion.
+        ☀️ Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
+        🔋 {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
+        going to waste (until safe_time {{ safe_time }}) unless we soak it up.
+        Good time to run: 🍽️ dishwasher, 🧺 washing machine, 🚗 EV, ♨️ immersion.
