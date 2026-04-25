@@ -1,14 +1,16 @@
 # Big Overflow Day Load Advice
-# Reminder when PV forecast overflow exceeds battery capacity for sustained period.
+# Reminder when PV forecast overflow exceeds battery capacity for a sustained period.
 # Suggests running discretionary loads to capture extra solar.
 #
-# Triggers:
-#   - Morning (before 12:00): require 2h of sustained shortfall (≥1 kWh)
-#   - Afternoon (12:00 onwards): require 30 min of sustained shortfall
+# Behaviour: polls every 15 min during the curtailment window. Alerts when
+# binary_sensor.big_overflow_shortfall has been continuously `on` for:
+#   - 120 min (2h dwell) if before 12:00 — high confidence required, plenty
+#     of time to run loads
+#   - 30 min if 12:00 onwards — day's running out, can't wait
 # Fires at most ONCE per day.
 # Silent on normal days (forecast within battery capacity).
 #
-# Companion entities:
+# Companion entity:
 #   binary_sensor.big_overflow_shortfall — template binary sensor
 #     ON when (overflow_kwh - battery_room) >= 1 kWh
 #     OFF otherwise
@@ -18,32 +20,23 @@
 id: "big_overflow_load_advice_v1"
 alias: "Big Overflow Day - Load Advice"
 description: >-
-  Alert when battery shortfall persists. Morning (<12:00): require 2h sustained
-  shortfall. Afternoon (>=12:00): require 30 min sustained. Once per day.
+  Alert when battery shortfall has persisted long enough to be confident:
+  2h before noon, 30 min after. Once per day max.
 
 mode: single
 max_exceeded: silent
 
 trigger:
-  # Morning: 2h dwell on shortfall before alerting
-  - platform: state
-    entity_id: binary_sensor.big_overflow_shortfall
-    to: "on"
-    for:
-      hours: 2
-    id: morning_dwell
-  # Afternoon: only 30 min dwell — don't wait too long, day's running out
-  - platform: state
-    entity_id: binary_sensor.big_overflow_shortfall
-    to: "on"
-    for:
-      minutes: 30
-    id: afternoon_dwell
+  - platform: time_pattern
+    minutes: "/15"
 
 condition:
   - condition: state
     entity_id: sensor.predbat_curtailment_phase
     state: "Active"
+  - condition: state
+    entity_id: binary_sensor.big_overflow_shortfall
+    state: "on"
   # Only before safe_time
   - condition: template
     value_template: >-
@@ -52,22 +45,13 @@ condition:
   - condition: template
     value_template: >-
       {{ this.attributes.last_triggered is none or as_timestamp(this.attributes.last_triggered) < as_timestamp(today_at()) }}
-  # Trigger-id matches time-of-day:
-  #   morning_dwell only fires before 12:00, afternoon_dwell only after 12:00
-  - condition: or
-    conditions:
-      - condition: and
-        conditions:
-          - condition: trigger
-            id: morning_dwell
-          - condition: time
-            before: "12:00:00"
-      - condition: and
-        conditions:
-          - condition: trigger
-            id: afternoon_dwell
-          - condition: time
-            after: "12:00:00"
+  # Dynamic dwell: require 2h before noon, 30 min after
+  - condition: template
+    value_template: >-
+      {% set sensor = states.binary_sensor.big_overflow_shortfall %}
+      {% set on_for_min = (now() - sensor.last_changed).total_seconds() / 60 %}
+      {% set required_min = 120 if now().hour < 12 else 30 %}
+      {{ on_for_min >= required_min }}
 
 action:
   - variables:
