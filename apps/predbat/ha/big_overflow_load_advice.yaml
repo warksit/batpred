@@ -1,27 +1,32 @@
 # Big Overflow Day Load Advice
-# Reminder when PV forecast overflow exceeds battery capacity for a sustained period.
-# Suggests running discretionary loads to capture extra solar.
+# Reminder when battery shortfall is GENUINELY too big for absorption.
+# Only fires on the rare days when extra loads are absolutely necessary.
 #
-# Behaviour: polls every 15 min during the curtailment window. Alerts when
-# binary_sensor.big_overflow_shortfall has been continuously `on` for:
-#   - 120 min (2h dwell) if before 12:00 — high confidence required, plenty
-#     of time to run loads
-#   - 30 min if 12:00 onwards — day's running out, can't wait
+# Behaviour: AM/PM split with timing windows.
+#
+#   Morning (09:00-13:00): shortfall ≥ 3 kWh sustained 2h
+#     - High threshold: forecast still wobbly, plenty of time later
+#     - Quiet 13:00-14:30: DHW running anyway, no point alerting
+#
+#   Afternoon (14:30+): shortfall ≥ 1 kWh sustained 30 min
+#     - Lower threshold: DHW done, day is short, even small loss matters
+#
 # Fires at most ONCE per day.
-# Silent on normal days (forecast within battery capacity).
 #
-# Companion entity:
-#   binary_sensor.big_overflow_shortfall — template binary sensor
-#     ON when (overflow_kwh - battery_room) >= 1 kWh
-#     OFF otherwise
+# Companion sensors:
+#   binary_sensor.big_overflow_shortfall      — ON when shortfall ≥ 1 kWh (afternoon signal)
+#   binary_sensor.big_overflow_shortfall_high — ON when shortfall ≥ 3 kWh (morning signal)
+#   shortfall = (overflow_kwh - battery_room) where battery_room = (1 - soc/100) × 18.08
 #
 # Sent to both Andrew and Shona since it's a friendly suggestion.
 
 id: "big_overflow_load_advice_v1"
 alias: "Big Overflow Day - Load Advice"
 description: >-
-  Alert when battery shortfall has persisted long enough to be confident:
-  2h before noon, 30 min after. Once per day max.
+  Alert when battery shortfall is genuinely too big for absorption.
+  Morning (09:00-13:00): shortfall ≥ 3 kWh sustained 2h.
+  Afternoon (14:30+): shortfall ≥ 1 kWh sustained 30 min.
+  Once per day. Quiet 13:00-14:30 (DHW window).
 
 mode: single
 max_exceeded: silent
@@ -34,9 +39,6 @@ condition:
   - condition: state
     entity_id: sensor.predbat_curtailment_phase
     state: "Active"
-  - condition: state
-    entity_id: binary_sensor.big_overflow_shortfall
-    state: "on"
   # Only before safe_time
   - condition: template
     value_template: >-
@@ -45,13 +47,32 @@ condition:
   - condition: template
     value_template: >-
       {{ this.attributes.last_triggered is none or as_timestamp(this.attributes.last_triggered) < as_timestamp(today_at()) }}
-  # Dynamic dwell: require 2h before noon, 30 min after
-  - condition: template
-    value_template: >-
-      {% set sensor = states.binary_sensor.big_overflow_shortfall %}
-      {% set on_for_min = (now() - sensor.last_changed).total_seconds() / 60 %}
-      {% set required_min = 120 if now().hour < 12 else 30 %}
-      {{ on_for_min >= required_min }}
+  # Either morning (high bar, 09:00-13:00, 2h dwell) OR afternoon (low bar, post-DHW, 30min dwell)
+  - condition: or
+    conditions:
+      - condition: and
+        conditions:
+          - condition: time
+            after: "09:00:00"
+            before: "13:00:00"
+          - condition: state
+            entity_id: binary_sensor.big_overflow_shortfall_high
+            state: "on"
+          - condition: template
+            value_template: >-
+              {% set s = states.binary_sensor.big_overflow_shortfall_high %}
+              {{ (now() - s.last_changed).total_seconds() >= 7200 }}
+      - condition: and
+        conditions:
+          - condition: time
+            after: "14:30:00"
+          - condition: state
+            entity_id: binary_sensor.big_overflow_shortfall
+            state: "on"
+          - condition: template
+            value_template: >-
+              {% set s = states.binary_sensor.big_overflow_shortfall %}
+              {{ (now() - s.last_changed).total_seconds() >= 1800 }}
 
 action:
   - variables:
