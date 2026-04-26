@@ -1,11 +1,11 @@
 # Curtailment Manager - Dynamic Export Limit
 # HA automation: event-driven export control for curtailment system.
 #
-# Manual override: input_select.curtailment_manual_hold — Off / Zero / Hold / Drain
-#   Off:   plugin controls export (default)
-#   Zero:  force export = 0 — battery absorbs all PV (emergency curtailment)
-#   Hold:  force export = min(excess, DNO) — clamp at available PV
-#   Drain: force export = DNO — force battery discharge to grid
+# Manual override: input_select.curtailment_manual_hold — Off / Charge / Hold / Drain
+#   Off:    plugin controls export (default)
+#   Charge: force export = 0 — battery absorbs all PV (emergency curtailment)
+#   Hold:   force export = min(excess, DNO) — clamp at available PV
+#   Drain:  force export = DNO — force battery discharge to grid
 #
 # Automation-decided phases (when manual = Off and plugin active).
 # Schmitt-trigger hysteresis uses current phase (input_text.curtailment_live_phase)
@@ -27,7 +27,7 @@
 id: "1773747411848"
 alias: "Curtailment Manager - Dynamic Export Limit"
 description: >-
-  Export control with manual override (Off/Zero/Hold/Drain) and automation-decided phases.
+  Export control with manual override (Off/Charge/Hold/Drain) and automation-decided phases.
   Schmitt-trigger hysteresis: drain/charge runs all the way to target, Hold exits at ±0.18 kWh.
   Plugin publishes target and Active/Off; automation handles fast (5-sec) phase transitions.
   When both manual and plugin off, restores Maximum Self Consumption mode.
@@ -103,7 +103,7 @@ action:
       # Schmitt-trigger phase selection. For automated phases (when not manual/Off), the
       # next phase depends on both (soc vs target) AND the current phase.
       phase: >-
-        {% if manual_mode == 'Zero' %}Manual Zero
+        {% if manual_mode == 'Charge' %}Manual Charge
         {% elif manual_mode == 'Hold' %}Manual Hold
         {% elif manual_mode == 'Drain' %}Manual Drain
         {% elif export_cap_raw < 0 %}Off
@@ -124,7 +124,7 @@ action:
           {% endif %}
         {% endif %}
       new_limit: >-
-        {% if phase == 'Manual Zero' %}
+        {% if phase == 'Manual Charge' %}
           {{ 0 | round(1) }}
         {% elif phase == 'Manual Hold' %}
           {{ [[excess, 0] | max, dno] | min | round(1) }}
