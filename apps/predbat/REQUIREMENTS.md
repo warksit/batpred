@@ -123,19 +123,46 @@ reserved cannot be reclaimed.
   from losing observed peak_pv (and therefore actual_scale → safe_scale →
   safe_time) mid-day. Test environments without `config_root` skip
   persistence to avoid cross-test pollution.
-- **R45** (v19): Reserved headroom = `min(MAX_RESERVED_KWH, remaining_overflow)`.
+- **R45** (v19): Reserved headroom = `min(effective_max_reserved, remaining_overflow)`.
   `MAX_RESERVED_KWH = 1.8` (10% of soc_max) — same ceiling as the previous
-  hardcoded 90% cap. The reservation tapers with `remaining_overflow`:
-    - Peak overflow (`remaining ≥ 1.8 kWh`): buffer clamps at 1.8 kWh, target is
-    90%. Full CLS safety during the window where LoadML over-prediction could
+  hardcoded 90% cap. `effective_max_reserved` is normally `MAX_RESERVED_KWH`
+  but may be reduced by R49 on confirmed-cloudy afternoons. The reservation
+  tapers with `remaining_overflow`:
+    - Peak overflow (`remaining ≥ effective_max_reserved`): buffer clamps at
+    `effective_max_reserved`, target is `soc_max - effective_max_reserved`.
+    Full CLS safety during the window where LoadML over-prediction could
     inflate real overflow.
-    - Tail of overflow (`remaining < 1.8 kWh`): buffer = `remaining`, target rises
-    toward 100%. Physical PV is already near DNO+load so LoadML surprise is
-    bounded by the PV curve itself.
+    - Tail of overflow (`remaining < effective_max_reserved`): buffer =
+    `remaining`, target rises toward 100%. Physical PV is already near
+    DNO+load so LoadML surprise is bounded by the PV curve itself.
     - At safe_time (`remaining = 0`): buffer = 0, target = soc_max. Battery full
     before MSC handoff. Avoids the old trade-off of ending 92–95% on thin
     post-release tail days where MSC can't refill the 10% reserve from sparse
     evening PV.
+- **R49** (v20 dynamic buffer reduction): on confirmed-cloudy afternoons,
+  scale `effective_max_reserved` down to `max(0.5, MAX_RESERVED_KWH × 0.7)`
+  = 1.26 kWh. Reduction fires only when ALL hold:
+    1. `minutes_now ≥ 14:00 local` — DHW typically done, peak likely past.
+    2. `solcast_so_far > 10 kWh` — enough sunlight elapsed to make ratios
+       statistically meaningful.
+    3. `cumulative_ratio = SIG_DAILY_PV / (SOLCAST_TODAY − SOLCAST_REMAINING)
+       < 0.9` — actual PV tracking ≥10% under forecast for the whole day.
+    4. `recent_ratio = (Δ actual PV last 60 min) / (Δ solcast_so_far last
+       60 min) < 0.95` — the most recent hour confirms the trend. Without
+       this gate, the reduction would mis-fire when clouds clear after 15:00
+       (cumulative still low, but afternoon will deliver).
+  Why: Solcast over-forecasted today → the headroom we're reserving for an
+  overflow that isn't materialising is wasted SOC. Reducing buffer raises
+  max_target_soc by ~3%, letting the battery aim higher rather than ending
+  the day with avoidable shortfall. The 0.7× factor (not 0.5×) and the 0.5
+  kWh floor keep some safety margin against late-afternoon clearing. Reason
+  for codifying: 2026-04-26 the day under-delivered on PV; with full 1.8
+  kWh buffer the plugin held at ~93% target while battery was actually
+  going to fill to 100% — user manually overrode to Charge. This rule lets
+  the plugin decide automatically.
+  PV history is kept in-memory only (rolling 75-min window) — after a plugin
+  restart we wait one hour before recent_ratio is available. Cumulative
+  ratio still works immediately on restart, but the gate requires both.
 - **R12**: At safe_time, remaining_overflow = 0, floor = soc_max. Plugin deactivates.
 - **R13**: Floor rises naturally each cycle as the integral shrinks (time passing,
   sin(elev) falling). Rises faster on cloudy days (actual peak < p90 → scale updates

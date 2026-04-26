@@ -570,6 +570,133 @@ def test_cap_taper_ratchet_noise_immune():
     print(f"  test_cap_taper_ratchet_noise_immune: PASSED (floors={[f'{f:.2f}' for f in floors_seen]})")
 
 
+def _build_cloudy_afternoon_base(cumulative_actual, cumulative_solcast, solcast_remaining):
+    """Build a MockBase at 15:00 BST with given cumulative PV state.
+
+    Sets SOLCAST_TODAY = cumulative_solcast + solcast_remaining (so so-far = cumulative_solcast)
+    and SIG_DAILY_PV = cumulative_actual. Plugin reads these to compute the
+    cumulative_ratio used by the dynamic buffer-reduction logic.
+    """
+    from datetime import datetime, timezone
+
+    minutes_now = 900  # 15:00 BST
+    pv = {m: 4.5 for m in range(0, 540, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 540, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 4.5,
+        "sensor.sigen_plant_consumed_power": 1.0,
+        SIG_DAILY_PV: cumulative_actual,
+    }
+    # Inject Solcast: today=total, remaining→solcast_so_far derived
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=solcast_remaining))
+    sensor_overrides[SOLCAST_TODAY] = {
+        "state": cumulative_solcast + solcast_remaining,
+        "detailedForecast": [{"period_start": "2025-07-12T11:00:00+00:00", "pv_estimate90": 10.0}],
+    }
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.55,
+        minutes_now=minutes_now,
+        now_utc=datetime(2025, 7, 12, 14, 0, tzinfo=timezone.utc),  # 15:00 BST
+        sensor_overrides=sensor_overrides,
+    )
+    return base
+
+
+def test_buffer_reduces_on_cloudy_afternoon():
+    """v20: confirmed-cloudy afternoon (post-14:00, cumulative <0.9, recent <0.95) → buffer 0.7×.
+
+    Cloudy days where actual PV is tracking ≥10% under Solcast forecast and the
+    last hour confirms the trend should reduce effective_max_reserved from 1.8 to
+    max(0.5, 1.8×0.7) = 1.26 kWh, raising max_target_soc and the floor so the
+    battery aims higher rather than reserving headroom we won't need.
+    """
+    # Cloudy state: 24 kWh actual vs 30 kWh forecast (so-far) → ratio 0.80 (<0.9)
+    base = _build_cloudy_afternoon_base(cumulative_actual=24.0, cumulative_solcast=30.0, solcast_remaining=15.0)
+    plugin = CurtailmentPlugin(base)
+    # Seed the plugin's PV history to simulate a 60-min lookback showing
+    # cumulative_solcast 24 kWh / actual 19 kWh at 14:00 BST. With current
+    # snapshot 30/24 → delta_solcast=6, delta_actual=5, recent_ratio≈0.83 (<0.95).
+    plugin._pv_history.append((840, 24.0, 19.0))
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Plugin must reach floor logic to test buffer; got phase={phase}"
+
+    remaining = plugin._remaining_overflow
+    # Reduction only matters if remaining > effective_max_reserved (else taper unaffected)
+    assert remaining > 1.3, f"Test scenario must have remaining_overflow > 1.3 kWh for the cap to bind, got {remaining:.2f}"
+
+    # Expected: effective_max_reserved = 1.26, so max_target = 18.08 - 1.26 = 16.82
+    # Compared with control (no reduction): max_target = 18.08 - 1.8 = 16.28
+    # The floor should be ≥ 0.5 kWh higher than the un-reduced case.
+    expected_lift = MAX_RESERVED_KWH - max(0.5, MAX_RESERVED_KWH * 0.7)
+    control_max_target = BATTERY_KWH - MAX_RESERVED_KWH
+    control_floor = max(0.0, control_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
+    assert floor - control_floor >= expected_lift * 0.9, f"Buffer reduction should lift floor by ≈{expected_lift:.2f} kWh above control ({control_floor:.2f}), got floor={floor:.2f}"
+    print(f"  test_buffer_reduces_on_cloudy_afternoon: PASSED (remaining={remaining:.2f}, floor={floor:.2f}, lift={floor-control_floor:.2f}kWh)")
+
+
+def test_buffer_unchanged_on_clear_afternoon():
+    """v20: clear afternoon (cumulative ratio ≥0.9) → no reduction, buffer stays at MAX_RESERVED_KWH."""
+    # On-track state: 28 kWh actual vs 30 kWh forecast → ratio 0.93 (>0.9), no reduction
+    base = _build_cloudy_afternoon_base(cumulative_actual=28.0, cumulative_solcast=30.0, solcast_remaining=15.0)
+    plugin = CurtailmentPlugin(base)
+    plugin._pv_history.append((840, 24.0, 22.5))  # recent_ratio = 5.5/6 = 0.92
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Plugin must reach floor logic; got phase={phase}"
+
+    remaining = plugin._remaining_overflow
+    assert remaining > 1.3, f"Test scenario must have remaining_overflow > 1.3 kWh, got {remaining:.2f}"
+
+    # Floor should match the un-reduced taper formula (within ratchet noise tolerance)
+    expected_max_target = BATTERY_KWH - MAX_RESERVED_KWH
+    expected_floor = max(0.0, expected_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
+    assert abs(floor - expected_floor) < 0.05, f"Clear-afternoon floor should match un-reduced taper {expected_floor:.2f}, got {floor:.2f}"
+    print(f"  test_buffer_unchanged_on_clear_afternoon: PASSED (floor={floor:.2f}, expected={expected_floor:.2f})")
+
+
+def test_buffer_unchanged_before_14_00():
+    """v20: before 14:00 local, cumulative-ratio guard does NOT apply — full buffer reserved."""
+    from datetime import datetime, timezone
+
+    # 12:00 BST, cloudy state — would qualify after 14:00 but morning gate blocks it
+    minutes_now = 720  # 12:00 BST
+    pv = {m: 4.5 for m in range(0, 720, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 720, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 4.5,
+        "sensor.sigen_plant_consumed_power": 1.0,
+        SIG_DAILY_PV: 8.0,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=30.0))
+    sensor_overrides[SOLCAST_TODAY] = {
+        "state": 40.0,
+        "detailedForecast": [{"period_start": "2025-07-12T11:00:00+00:00", "pv_estimate90": 10.0}],
+    }
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.55,
+        minutes_now=minutes_now,
+        now_utc=datetime(2025, 7, 12, 11, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._pv_history.append((660, 6.0, 4.5))  # cumulative 8/10=0.8 (would qualify after 14:00)
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Plugin must reach floor logic; got phase={phase}"
+    remaining = plugin._remaining_overflow
+    if remaining > 1.3:
+        # Buffer should be the full MAX_RESERVED_KWH — no morning reduction
+        expected_max_target = BATTERY_KWH - MAX_RESERVED_KWH
+        expected_floor = max(0.0, expected_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
+        assert abs(floor - expected_floor) < 0.05, f"Pre-14:00 floor should match un-reduced taper {expected_floor:.2f}, got {floor:.2f}"
+    print(f"  test_buffer_unchanged_before_14_00: PASSED (remaining={remaining:.2f}, floor={floor:.2f})")
+
+
 # ============================================================================
 # v10 phase tests
 # ============================================================================
@@ -606,7 +733,7 @@ def test_phase_managed_above_floor():
 # Plugin integration tests
 # ============================================================================
 
-from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP
+from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY
 
 
 class MockBase:
@@ -657,8 +784,14 @@ class MockBase:
     def get_state_wrapper(self, entity, default=None, attribute=None):
         if entity in self._sensor_overrides:
             val = self._sensor_overrides[entity]
-            if attribute and isinstance(val, dict):
-                return val.get(attribute, default)
+            if isinstance(val, dict):
+                if attribute:
+                    return val.get(attribute, default)
+                # No attribute: return "state" key if present (mimics HA semantics
+                # where states('x') returns state and state_attr('x','y') returns attr).
+                # Falls back to default rather than the dict itself so a plugin's
+                # float() of the result doesn't crash.
+                return val.get("state", default)
             return val
         if entity == "input_boolean.curtailment_manager_enable":
             return "on"
@@ -2410,6 +2543,10 @@ def run_curtailment_tests(my_predbat=None):
         test_cap_at_safe_time_hits_100,
         test_plugin_cap_taper_near_safe_time,
         test_cap_taper_ratchet_noise_immune,
+        # v20 dynamic buffer reduction
+        test_buffer_reduces_on_cloudy_afternoon,
+        test_buffer_unchanged_on_clear_afternoon,
+        test_buffer_unchanged_before_14_00,
     ]
     print("  --- v10 floor tests ---")
     for test_fn in floor_tests:

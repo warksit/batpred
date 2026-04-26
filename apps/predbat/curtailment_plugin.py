@@ -30,6 +30,7 @@
 import json
 import math
 import os
+from collections import deque
 from datetime import datetime, timezone
 
 from curtailment_calc import (
@@ -76,6 +77,22 @@ OVERFLOW_SAFETY_FACTOR = 1.2
 # approaches soc_max — battery reaches ~100% before handoff to MSC, rather than
 # capping at 90% and relying on post-release MSC to fill 90→100%.
 MAX_RESERVED_KWH = 1.8
+
+# v20 dynamic buffer reduction (R49): on confirmed-cloudy afternoons, scale the
+# reserved buffer down. Solcast over-forecasted the day → less true overflow
+# headroom is needed → battery aims higher.
+#   Trigger gate: minutes_now >= 14:00 local (post-DHW, peak likely past)
+#   Cumulative ratio: SIG_DAILY_PV / (SOLCAST_TODAY - SOLCAST_REMAINING) < 0.9
+#   Recent ratio:    last-hour delta_actual / delta_solcast_so_far < 0.95
+#   Both must hold — recent_ratio guards against clouds clearing late afternoon.
+# When triggered, effective_max_reserved = max(0.5, MAX_RESERVED_KWH × 0.7) = 1.26.
+BUFFER_REDUCE_FACTOR = 0.7
+BUFFER_REDUCE_FLOOR_KWH = 0.5
+BUFFER_REDUCE_MIN_LOCAL_HOUR = 14
+BUFFER_REDUCE_CUMULATIVE_RATIO = 0.9
+BUFFER_REDUCE_RECENT_RATIO = 0.95
+BUFFER_REDUCE_MIN_SOLCAST_KWH = 10.0
+PV_HISTORY_LEN = 15  # 15 × 5 min = 75 min — enough room for 60-min lookback
 
 # State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
 # _floor_ratchet across plugin restarts within the same day.
@@ -144,6 +161,14 @@ class CurtailmentPlugin(PredBatPlugin):
         self._tomorrow_cache_at = 0
         # Floor scale from previous cycle (for R11-over-R43 precedence, Bug 3)
         self._last_floor_scale = 0.0
+        # PV history for v20 dynamic buffer reduction (R49). Tuples of
+        # (minutes_now, solcast_so_far_kwh, sig_daily_pv_kwh) appended each
+        # cycle so we can compute a 60-min recent ratio. Not persisted — after
+        # plugin restart we wait one cycle window to re-establish.
+        self._pv_history = deque(maxlen=PV_HISTORY_LEN)
+        # Diagnostics for buffer reduction decision
+        self._buffer_reduced = False
+        self._effective_max_reserved = MAX_RESERVED_KWH
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
@@ -593,7 +618,46 @@ class CurtailmentPlugin(PredBatPlugin):
         # peak overflow. At the tail, buffer tapers with remaining_overflow, so
         # max_target_soc approaches soc_max as safe_time nears — battery fills
         # to ~100% with MSC only picking up any residual.
-        buffer_kwh = min(MAX_RESERVED_KWH, max(0.0, remaining_overflow))
+        #
+        # R49 (v20 dynamic reduction): on confirmed-cloudy afternoons, reduce
+        # the cap. If actual PV is tracking ≥10% under forecast (cumulative)
+        # AND the most recent hour confirms it (recent ratio < 0.95), the day
+        # won't deliver as much overflow as p90 anticipated. Reducing buffer
+        # from 1.8 → 1.26 kWh raises max_target_soc by ~3% so the battery
+        # aims higher rather than reserving headroom we won't need. The recent
+        # ratio gate prevents reduction firing when clouds clear late.
+        try:
+            solcast_today_kwh = float(self.base.get_state_wrapper(SOLCAST_TODAY, default=0))
+        except (ValueError, TypeError):
+            solcast_today_kwh = 0.0
+        try:
+            sig_daily_pv = float(self.base.get_state_wrapper(SIG_DAILY_PV, default=0))
+        except (ValueError, TypeError):
+            sig_daily_pv = 0.0
+        solcast_so_far = max(0.0, solcast_today_kwh - solcast_remaining)
+
+        effective_max_reserved = MAX_RESERVED_KWH
+        self._buffer_reduced = False
+        if minutes_now >= BUFFER_REDUCE_MIN_LOCAL_HOUR * 60 and solcast_so_far > BUFFER_REDUCE_MIN_SOLCAST_KWH:
+            cumulative_ratio = sig_daily_pv / solcast_so_far if solcast_so_far > 0 else 1.0
+            target_past = minutes_now - 60
+            oldest = None
+            for entry in self._pv_history:
+                if abs(entry[0] - target_past) <= 10:
+                    oldest = entry
+                    break
+            if oldest is not None:
+                delta_solcast = solcast_so_far - oldest[1]
+                delta_actual = sig_daily_pv - oldest[2]
+                recent_ratio = delta_actual / delta_solcast if delta_solcast > 0.1 else 1.0
+                if cumulative_ratio < BUFFER_REDUCE_CUMULATIVE_RATIO and recent_ratio < BUFFER_REDUCE_RECENT_RATIO:
+                    effective_max_reserved = max(BUFFER_REDUCE_FLOOR_KWH, MAX_RESERVED_KWH * BUFFER_REDUCE_FACTOR)
+                    self._buffer_reduced = True
+        # Append after the lookup so the current sample doesn't match itself
+        self._pv_history.append((minutes_now, solcast_so_far, sig_daily_pv))
+        self._effective_max_reserved = effective_max_reserved
+
+        buffer_kwh = min(effective_max_reserved, max(0.0, remaining_overflow))
         max_target_soc = soc_max - buffer_kwh
         overflow_floor = max_target_soc - remaining_overflow * OVERFLOW_SAFETY_FACTOR
         overflow_floor = max(overflow_floor, 0.0)
@@ -881,6 +945,8 @@ class CurtailmentPlugin(PredBatPlugin):
                 "peak_pv_time": self._peak_pv_time,
                 "overflow_kwh": round(self._remaining_overflow, 2),
                 "safe_time": self._safe_time_str,
+                "buffer_reduced": self._buffer_reduced,
+                "effective_max_reserved": round(self._effective_max_reserved, 2),
                 "last_decision": self._last_decision,
             },
         )
