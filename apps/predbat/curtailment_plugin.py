@@ -194,7 +194,11 @@ class CurtailmentPlugin(PredBatPlugin):
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            try:
+                self.log("Curtailment: state file invalid/corrupt at {} — ignoring ({})".format(path, exc))
+            except Exception:
+                pass
             return
         today = datetime.now().strftime("%Y-%m-%d")
         if data.get("date") != today:
@@ -207,20 +211,39 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_recovered = bool(data.get("keep_recovered", False))
         self._keep_drained_today = bool(data.get("keep_drained_today", False))
         self._r48_engaged_today = bool(data.get("r48_engaged_today", False))
+        # Restore _pv_history (R49) — without this, every restart kills v20
+        # buffer-reduction for the rest of the day until 60 min of fresh
+        # samples accumulate.
+        history = data.get("pv_history") or []
+        self._pv_history.clear()
+        for entry in history:
+            if isinstance(entry, list) and len(entry) == 3:
+                try:
+                    self._pv_history.append((int(entry[0]), float(entry[1]), float(entry[2])))
+                except (ValueError, TypeError):
+                    continue
         self._state_date = today
         try:
             self.log(
-                "Curtailment: restored state from {} (peak={:.2f}kW, ratchet={})".format(
+                "Curtailment: restored state from {} (peak={:.2f}kW, ratchet={}, pv_history={} entries)".format(
                     path,
                     self._peak_pv,
                     self._floor_ratchet,
+                    len(self._pv_history),
                 )
             )
         except Exception:
             pass
 
     def _save_state(self):
-        """Persist state to disk so a restart doesn't lose peak_pv / ratchet (Bug 2)."""
+        """Persist state to disk atomically (tmp + rename).
+
+        The write goes to `path.tmp` first; only on full success do we rename
+        over the main file. A crash mid-write leaves the .tmp file (which may
+        be partial/corrupt) but the main file is untouched. POSIX rename is
+        atomic, so readers always see either the old or the new file, never
+        a torn one.
+        """
         path = self._state_file_path()
         if path is None:
             return
@@ -234,13 +257,21 @@ class CurtailmentPlugin(PredBatPlugin):
             "keep_recovered": self._keep_recovered,
             "keep_drained_today": self._keep_drained_today,
             "r48_engaged_today": self._r48_engaged_today,
+            "pv_history": [list(entry) for entry in self._pv_history],
         }
+        tmp_path = path + ".tmp"
         try:
-            with open(path, "w") as f:
+            with open(tmp_path, "w") as f:
                 json.dump(data, f)
+            os.replace(tmp_path, path)
             self._state_date = today
         except OSError:
-            pass
+            # Best-effort cleanup of any partial tmp file
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
     def _reset_for_new_day(self):
         """Reset in-memory daily state. Called when calculate() detects day rollover."""

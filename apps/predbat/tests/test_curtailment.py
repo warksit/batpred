@@ -10,6 +10,7 @@ import math
 import os
 import re
 import sys
+from datetime import datetime
 
 # Ensure apps/predbat is on the path when run standalone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2481,6 +2482,121 @@ def test_activation_requires_will_fill():
 
 
 # ============================================================================
+# State file persistence tests (atomic write, _pv_history)
+# ============================================================================
+
+
+def _state_test_base(config_root, **kwargs):
+    """MockBase that uses a real temp dir as config_root so persistence is exercised."""
+    base = MockBase(**kwargs)
+    base.config_root = config_root
+    return base
+
+
+def test_save_state_atomic_against_partial_write():
+    """Atomic guarantee: a failed write must NOT corrupt the prior state file.
+
+    Simulates a crash mid-write by patching json.dump to raise after the file
+    is opened. With the old non-atomic implementation, the main file is
+    truncated and _load_state silently returns None, losing peak_pv/ratchet.
+    With the atomic .tmp+rename pattern, the main file is untouched.
+    """
+    import tempfile
+    import json as json_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = _state_test_base(tmp, soc_kw=10.0)
+        plugin = CurtailmentPlugin(base)
+        # Save a known-good state
+        plugin._peak_pv = 7.5
+        plugin._floor_ratchet = 12.34
+        plugin._save_state()
+
+        # Verify file exists and contains the data
+        path = os.path.join(tmp, "curtailment_state.json")
+        assert os.path.exists(path), "Initial save did not produce a state file"
+        with open(path) as f:
+            saved_first = json_mod.load(f)
+        assert saved_first["peak_pv_kw"] == 7.5
+
+        # Simulate a crash mid-write by monkey-patching json.dump
+        plugin._peak_pv = 99.9  # different value we DON'T want persisted
+
+        import curtailment_plugin as plugin_mod
+
+        original_dump = plugin_mod.json.dump
+
+        def crashing_dump(*args, **kwargs):
+            # Truncate the target file mid-write to simulate partial write,
+            # then raise. With atomic implementation this hits the .tmp file
+            # (and the .tmp gets discarded), not the main state file.
+            args[1].write('{"date":"2099-01-01","peak_pv_kw":99.9')  # partial JSON
+            raise OSError("simulated disk full")
+
+        plugin_mod.json.dump = crashing_dump
+        try:
+            plugin._save_state()
+        finally:
+            plugin_mod.json.dump = original_dump
+
+        # Main file must still contain the FIRST save's data, not partial garbage.
+        with open(path) as f:
+            content = f.read()
+        try:
+            saved_after_crash = json_mod.loads(content)
+        except json_mod.JSONDecodeError:
+            raise AssertionError(f"State file was corrupted by failed write — atomicity violated. Content: {content!r}")
+        assert saved_after_crash["peak_pv_kw"] == 7.5, f"Atomic-write regression: failed write corrupted main file. Got peak_pv_kw={saved_after_crash.get('peak_pv_kw')}, expected 7.5"
+    print("  test_save_state_atomic_against_partial_write: PASSED")
+
+
+def test_save_state_round_trip_with_pv_history():
+    """_pv_history must round-trip through save→load so R49 keeps working post-restart."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = _state_test_base(tmp, soc_kw=10.0)
+        plugin = CurtailmentPlugin(base)
+
+        # Force today's date so _load_state accepts it
+        today = datetime.now().strftime("%Y-%m-%d")
+        plugin._peak_pv = 6.2
+        plugin._pv_history.append((780, 12.0, 10.5))
+        plugin._pv_history.append((840, 18.0, 15.0))
+        plugin._pv_history.append((900, 24.0, 19.5))
+        plugin._save_state()
+
+        # Fresh plugin should restore the deque
+        base2 = _state_test_base(tmp, soc_kw=10.0)
+        plugin2 = CurtailmentPlugin(base2)
+        assert plugin2._peak_pv == 6.2, "peak_pv did not survive round-trip"
+        assert len(plugin2._pv_history) == 3, f"_pv_history did not round-trip — got {len(plugin2._pv_history)} entries, expected 3"
+        history_list = list(plugin2._pv_history)
+        assert history_list[0] == (780, 12.0, 10.5), f"oldest entry wrong: {history_list[0]}"
+        assert history_list[-1] == (900, 24.0, 19.5), f"newest entry wrong: {history_list[-1]}"
+    print("  test_save_state_round_trip_with_pv_history: PASSED")
+
+
+def test_load_state_logs_corruption():
+    """A corrupted state file should log, not silently return — visibility matters."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Pre-write a corrupted file
+        path = os.path.join(tmp, "curtailment_state.json")
+        with open(path, "w") as f:
+            f.write("{not valid json")
+
+        base = _state_test_base(tmp, soc_kw=10.0)
+        plugin = CurtailmentPlugin(base)
+        # Plugin should NOT crash; should fall back to default state
+        assert plugin._peak_pv == 0.0, "Default state should apply when file is corrupt"
+        # And should have logged the corruption (visibility for ops)
+        assert any("state" in msg.lower() and ("corrupt" in msg.lower() or "decode" in msg.lower() or "invalid" in msg.lower()) for msg in base.logs), f"Expected a log line about corrupted state file, got logs: {base.logs}"
+    print("  test_load_state_logs_corruption: PASSED")
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -2705,6 +2821,20 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- v17 solar geometry tests ---")
     for test_fn in v17_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # State file persistence tests
+    state_tests = [
+        test_save_state_atomic_against_partial_write,
+        test_save_state_round_trip_with_pv_history,
+        test_load_state_logs_corruption,
+    ]
+    print("  --- state persistence tests ---")
+    for test_fn in state_tests:
         try:
             test_fn()
         except Exception as e:

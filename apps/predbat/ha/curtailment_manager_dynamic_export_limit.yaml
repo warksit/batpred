@@ -97,7 +97,7 @@ action:
       dno: 4
       outer_threshold: 0.18
       export_cap_raw: "{{ states('sensor.predbat_curtailment_export_target') | float(-2) }}"
-      export_cap: "{% if export_cap_raw | float(-2) >= 0 %}{{ export_cap_raw | float(4) }}{% else %}{{ dno }}{% endif %}"
+      export_cap: "{% if export_cap_raw | float(-2) >= 0 %}{{ export_cap_raw | float(dno) }}{% else %}{{ dno }}{% endif %}"
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
       # Schmitt-trigger phase selection. For automated phases (when not manual/Off), the
@@ -138,7 +138,7 @@ action:
           {{ 0 | round(1) }}
         {% else %}
           {# Hold #}
-          {{ [[excess, 0] | max, export_cap | float(4), dno] | min | round(1) }}
+          {{ [[excess, 0] | max, export_cap | float(dno), dno] | min | round(1) }}
         {% endif %}
       current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
 

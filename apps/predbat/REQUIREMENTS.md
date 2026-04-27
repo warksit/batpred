@@ -170,21 +170,43 @@ reserved cannot be reclaimed.
 
 ## Control — Three Phases (HA automation, 5-second cycle)
 
-- **R14**: **Drain** (SOC > floor + 0.5kWh): export = DNO. SIG discharges battery
-  toward floor. Creates headroom before overflow window.
-- **R15**: **Hold** (SOC within 0.5kWh of floor): export = min(excess, DNO). Battery
-  absorbs overflow above DNO naturally. Sub-DNO PV is exported, not stored.
-- **R16**: **Charge** (SOC < floor − 0.5kWh): export = 0. Battery charges from
-  sub-DNO PV toward floor. Plugin sets export_target=0 to signal Charge.
-  Charge is safe because the p90-based floor is already a worst-case estimate —
-  there is no risk of overcrowding the battery before overflow arrives.
+Phase selection uses **Schmitt-trigger hysteresis**: the OUT transition (entering
+Drain or Charge from Hold) requires SOC to exceed an outer threshold;
+the IN transition (returning to Hold) only requires SOC to cross the target.
+Drain and Charge therefore run **all the way to target**, not just to the
+hysteresis edge — this avoids stopping short of target and re-entering on the
+next minor SOC drift.
+
+- **R14**: **Drain** (active when current_phase=Drain): export = DNO. SIG
+  discharges to grid toward `target_kwh`. Exit to Hold when `SOC ≤ target`
+  (drains all the way to target before yielding).
+- **R15**: **Hold** (entry / steady state): export = min(excess, DNO). Battery
+  absorbs overflow above DNO naturally.
+    - Exit to Drain when `SOC > target + OUTER_THRESHOLD_KWH`
+    - Exit to Charge when `SOC < target − OUTER_THRESHOLD_KWH`
+- **R16**: **Charge** (active when current_phase=Charge): export = 0.
+  Battery charges from sub-DNO PV toward `target_kwh`. Exit to Hold when
+  `SOC ≥ target` (charges all the way to target).
+- **R16a**: `OUTER_THRESHOLD_KWH = 0.18 kWh` (≈1% of soc_max). Sized to be
+  robust to Sigen SOC 0.1% quantisation (~0.018 kWh), so SOC noise alone
+  cannot pop us out of Hold. Tighter than the original 0.5 kWh design — the
+  Schmitt run-to-target behaviour means tighter outer threshold no longer
+  causes flap, because once Drain/Charge is engaged it commits to the target.
 - **R17**: All active states use D-ESS mode. MSC only when off (R6).
 - **R18**: HA automation (5-sec) handles real-time export control AND publishes live
-  phase (Charge/Drain/Hold) to `input_text.curtailment_live_phase`. Plugin (5-min)
-  computes floor, sets D-ESS mode, publishes Active/Off. Plugin sets live phase to Off
-  on deactivation.
-- **R38**: Plugin export_target signal: 0.0 = Charge phase (SOC < floor−0.5);
-  DNO = Drain or Hold (HA automation splits by SOC vs floor+0.5).
+  phase (Charge/Drain/Hold/Off, plus Manual Charge/Hold/Drain when override is set)
+  to `input_text.curtailment_live_phase`. Plugin (5-min) computes floor, sets
+  D-ESS mode, publishes Active/Off. Plugin sets live phase to Off on deactivation.
+- **R38**: Plugin `export_target` sensor publishes:
+    - `-2` when plugin is Off (signals MSC handoff to yaml).
+    - `dno_limit_kw` when plugin is Active.
+  The yaml uses this as the cap fed into the Hold/Drain `new_limit` calc and
+  uses `< 0` as the Off detector. Plugin does NOT publish 0.0 to signal Charge:
+  the yaml Hold path would interpret `export_cap=0` as "clamp Hold to 0",
+  defeating Hold semantics. Charge/Hold/Drain phase selection is done in the
+  yaml from SOC vs target (Schmitt-trigger, R14-R16) — plugin has no
+  override on phase. Plugin's role is "publish the cap the yaml should
+  enforce when it decides to export".
 
 ## Solar Geometry — Safe Time
 
