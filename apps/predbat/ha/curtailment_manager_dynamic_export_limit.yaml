@@ -21,6 +21,14 @@
 #   Manual != Off OR plugin active → Command Discharging (ESS First)
 #   Both off → Maximum Self Consumption (normal operation)
 #
+# Voltage-based cap (sensor.sig_voltage_max_export_kw):
+#   Continuous proportional throttle from a template sensor that reads phase A
+#   voltage and the input_number helpers (voltage_throttle_upper_v,
+#   voltage_throttle_range_v). At normal voltage = dno (no effect). At upper
+#   threshold drops to 0. Min'd into every active path so it overrides phase
+#   intent during overvoltage. Replaces the old separate-writer voltage_protect
+#   automation — voltage_protect now only emits notifications.
+#
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 # Deploy: paste into HA automation editor (raw config mode).
 
@@ -47,6 +55,11 @@ trigger:
     id: target_change
     platform: state
   - entity_id: input_select.curtailment_manual_hold
+    platform: state
+  # Re-evaluate when the voltage-based cap changes — the proportional
+  # throttle replaces the old voltage_protect's separate writer pattern.
+  - entity_id: sensor.sig_voltage_max_export_kw
+    id: voltage_cap_change
     platform: state
 
 condition:
@@ -98,6 +111,11 @@ action:
       outer_threshold: 0.18
       export_cap_raw: "{{ states('sensor.predbat_curtailment_export_target') | float(-2) }}"
       export_cap: "{% if export_cap_raw | float(-2) >= 0 %}{{ export_cap_raw | float(dno) }}{% else %}{{ dno }}{% endif %}"
+      # Voltage-based cap (sensor.sig_voltage_max_export_kw): continuous ramp
+      # 0..dno based on phase A voltage. At normal voltage = dno (no effect).
+      # As voltage rises past upper-range threshold, this drops toward 0,
+      # forcing export down to absorb into battery and unload the feeder.
+      voltage_cap: "{{ states('sensor.sig_voltage_max_export_kw') | float(dno) }}"
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
       # Schmitt-trigger phase selection. For automated phases (when not manual/Off), the
@@ -124,21 +142,25 @@ action:
           {% endif %}
         {% endif %}
       new_limit: >-
+        {# voltage_cap is a continuous proportional throttle (0..dno) tied to
+           grid voltage. min'd into every active path so an overvoltage event
+           clamps export regardless of what phase the system is in. Manual
+           Charge / explicit Charge stay at 0 (already at floor). #}
         {% if phase == 'Manual Charge' %}
           {{ 0 | round(1) }}
         {% elif phase == 'Manual Hold' %}
-          {{ [[excess, 0] | max, dno] | min | round(1) }}
+          {{ [[excess, 0] | max, voltage_cap, dno] | min | round(1) }}
         {% elif phase == 'Manual Drain' %}
-          {{ dno | round(1) }}
+          {{ [voltage_cap, dno] | min | round(1) }}
         {% elif phase == 'Off' %}
-          {{ dno | round(1) }}
+          {{ [voltage_cap, dno] | min | round(1) }}
         {% elif phase == 'Drain' %}
-          {{ [[export_cap, 0] | max, dno] | min | round(1) }}
+          {{ [[export_cap, 0] | max, voltage_cap, dno] | min | round(1) }}
         {% elif phase == 'Charge' %}
           {{ 0 | round(1) }}
         {% else %}
           {# Hold #}
-          {{ [[excess, 0] | max, export_cap | float(dno), dno] | min | round(1) }}
+          {{ [[excess, 0] | max, export_cap | float(dno), voltage_cap, dno] | min | round(1) }}
         {% endif %}
       current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
 

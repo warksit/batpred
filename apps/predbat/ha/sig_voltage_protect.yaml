@@ -1,115 +1,80 @@
-# SIG Voltage Protect
-# Proactive protection against SIG Over-Voltage (G99) trips by throttling
-# export when grid voltage climbs toward the SIG trip threshold.
+# SIG Voltage Protect — notifications only (v2)
 #
-# SIG observed behaviour: mean voltage 255-258V tolerated indefinitely under
-# normal DNO-capped export. G99 spec trips at 253V/10s or 264.5V instant.
-# Observed SIG tolerates ~260V in practice (higher than G99 nominal).
+# As of 2026-04-27, the proportional voltage throttle moved out of this
+# automation. The actual export cap is now produced by a template sensor
+# (sensor.sig_voltage_max_export_kw) reading phase A voltage and the helpers
+# input_number.voltage_throttle_upper_v / voltage_throttle_range_v. The
+# curtailment automation (curtailment_manager_dynamic_export_limit) reads
+# that sensor and min's it into every export decision — single writer, no
+# race with this automation.
 #
-# Strategy: linear proportional throttle of export between 260V and 263V.
-# Below 258V the automation releases (2V hysteresis).
+# This automation now exists only for notifications:
+#   - Alert Andrew when the cap drops below 3.5 kW (throttle engaging)
+#   - Alert Andrew when the cap returns to ~DNO (throttle releasing)
+#   - Toggle input_boolean.sig_voltage_protect_active for dashboard visibility
 #
-# Operation:
-#   V ≤ 260V: inactive, no effect (input_boolean off)
-#   V = 260V: activate, cap = DNO (no throttle yet, but protection on)
-#   V = 261.5V: cap = 2.0 kW
-#   V ≥ 263V: cap = 0 kW (full stop)
-#   V drops ≤ 258V: deactivate, cap removed
+# Tuning the throttle curve:
+#   input_number.voltage_throttle_upper_v   — voltage at which cap → 0
+#                                              (default 263V)
+#   input_number.voltage_throttle_range_v   — span of linear ramp from cap=DNO
+#                                              up to cap=0
+#                                              (default 7V → engagement at 256V)
 #
-# Coordination with curtailment automation:
-#   - Both write to number.sigen_plant_grid_export_limitation
-#   - Voltage-protect re-asserts on every voltage tick while active
-#   - If curtailment raises limit mid-voltage-event, voltage-protect lowers
-#     it on next voltage tick (~seconds later)
-#
-# Notifications: one alert at activation, one at release. No spam between.
-#
-# Helper required: input_boolean.sig_voltage_protect_active
-# IMPORTANT: create the helper in HA before deploying this automation.
+# IMPORTANT: Update and commit this file before changing the automation in HA.
 
 id: "sig_voltage_protect_v1"
 alias: "SIG Voltage Protect"
 description: >-
-  Proactive G99 over-voltage protection. Linear throttles export between
-  260V (no effect) and 263V (full stop). 2V release hysteresis.
-  Alerts Andrew on activate and release.
+  Notifications only. Watches sensor.sig_voltage_max_export_kw. Alerts on
+  engagement (cap < 3.5 kW) and release (cap ≥ 3.95 kW). The actual export
+  throttle is produced by the template sensor and applied by the curtailment
+  automation.
 mode: single
 max_exceeded: silent
 
 trigger:
   - platform: state
-    entity_id: sensor.sigen_inverter_phase_a_voltage
+    entity_id: sensor.sig_voltage_max_export_kw
 
 condition:
-  # Skip obvious noise
   - condition: template
     value_template: >-
       {{ trigger.to_state.state not in ('unavailable', 'unknown', 'none') }}
 
 action:
   - variables:
-      voltage: "{{ trigger.to_state.state | float(240) }}"
+      cap: "{{ trigger.to_state.state | float(4) }}"
+      voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
       was_active: "{{ is_state('input_boolean.sig_voltage_protect_active', 'on') }}"
-      # Entry 260V, full cut 263V, release 258V (2V hysteresis below 260)
-      entry_threshold: 260
-      full_cut_threshold: 263
-      release_threshold: 258
-      # Proportional cap: linear from 4 kW at entry to 0 kW at full_cut
-      voltage_cap_kw: >-
-        {% if voltage >= full_cut_threshold %}0.0
-        {% elif voltage <= entry_threshold %}4.0
-        {% else %}
-        {{ ((full_cut_threshold - voltage) * 4 / (full_cut_threshold - entry_threshold)) | round(1) }}
-        {% endif %}
-      # State transitions
-      should_activate: "{{ voltage >= entry_threshold and not was_active }}"
-      should_release: "{{ voltage <= release_threshold and was_active }}"
-      is_active: "{{ voltage >= entry_threshold or (was_active and voltage > release_threshold) }}"
+      # Engage notification when cap drops meaningfully below DNO.
+      # Release notification when cap returns to ~DNO (allow tiny rounding margin).
+      engage: "{{ cap < 3.5 and not was_active }}"
+      release: "{{ cap >= 3.95 and was_active }}"
+      soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
 
-  # Activation: flip helper on, notify
   - if:
       - condition: template
-        value_template: "{{ should_activate }}"
+        value_template: "{{ engage }}"
     then:
       - action: input_boolean.turn_on
         target:
           entity_id: input_boolean.sig_voltage_protect_active
       - action: notify.mobile_app_andrew_iphone
         data:
-          title: "⚠️ SIG Voltage Protect ACTIVATED (V={{ voltage }}V)"
+          title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
           message: >-
-            V={{ voltage }}V crossed 260V threshold.
-            Throttling export to {{ voltage_cap_kw }} kW.
-            SOC: {{ states('sensor.sigen_plant_battery_state_of_charge') }}%
+            Cap dropped to {{ cap }} kW. Curtailment automation clamping
+            export. SOC: {{ soc }}%
 
-  # Apply cap (only while active, rewrite on every tick — re-asserts against curtailment)
   - if:
       - condition: template
-        value_template: "{{ is_active }}"
-    then:
-      - variables:
-          current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
-      # Only write if the cap is LOWER than current (don't raise limits via this path)
-      - condition: template
-        value_template: "{{ (voltage_cap_kw | float) < current_limit }}"
-      - action: number.set_value
-        target:
-          entity_id: number.sigen_plant_grid_export_limitation
-        data:
-          value: "{{ voltage_cap_kw }}"
-
-  # Release: flip helper off, notify
-  - if:
-      - condition: template
-        value_template: "{{ should_release }}"
+        value_template: "{{ release }}"
     then:
       - action: input_boolean.turn_off
         target:
           entity_id: input_boolean.sig_voltage_protect_active
       - action: notify.mobile_app_andrew_iphone
         data:
-          title: "✅ SIG Voltage Protect released (V={{ voltage }}V)"
+          title: "✅ Voltage throttle released (V={{ voltage }}V)"
           message: >-
-            V={{ voltage }}V dropped below 258V.
-            SOC: {{ states('sensor.sigen_plant_battery_state_of_charge') }}%.
-            Resumed normal control.
+            Cap back to {{ cap }} kW. Normal export resumed. SOC: {{ soc }}%
