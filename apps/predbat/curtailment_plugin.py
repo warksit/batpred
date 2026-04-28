@@ -569,6 +569,11 @@ class CurtailmentPlugin(PredBatPlugin):
             actual_pv = 0.0
         self._actual_pv_kw = actual_pv
 
+        # R50 (v21): always refresh confidence so the published value reflects
+        # current Solcast (e.g., tomorrow's confidence at midnight) even when
+        # the plugin returns early. Otherwise the dashboard shows stale default.
+        self._confidence = round(self._get_solcast_confidence(), 2)
+
         # Guard: no PV yet (pre-dawn / winter morning)
         if self._peak_pv < 0.1 and actual_pv < 0.1:
             self._last_decision = "off: no PV yet"
