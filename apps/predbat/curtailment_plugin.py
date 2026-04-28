@@ -515,6 +515,35 @@ class CurtailmentPlugin(PredBatPlugin):
             pass
         return CONFIDENCE_DEFAULT
 
+    def _publish_forecast_overflow(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw):
+        """Update self._overflow_p10/p50/p90 from current Solcast forecast.
+
+        Called from Off paths (e.g. pre-dawn) so the dashboard reflects the
+        forecast even before activation. Silently no-ops if Solcast data is
+        unavailable or geometry won't compute — values stay at previous cycle.
+        """
+        try:
+            p10_scale, p50_scale, p90_scale = self._get_p_scales(lat, lon, doy, local_offset)
+            if p90_scale < 0.5:
+                return
+            threshold_kw = dno_limit_kw + MIN_BASE_LOAD_KW
+            safe_mins, safe_utc = compute_release_time(p90_scale, lat, lon, doy, threshold_kw, utc_hours)
+            if not safe_mins or safe_mins <= 0:
+                return
+            load_step = getattr(self.base, "load_minutes_step", {})
+            step_hours = PREDICT_STEP / 60.0
+            to_kw = 1.0 / step_hours
+            safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
+            load_fc = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
+            p10_eff = max(p10_scale, self._actual_scale)
+            p50_eff = max(p50_scale, self._actual_scale)
+            p90_eff = max(p90_scale, self._actual_scale)
+            self._overflow_p10 = round(compute_solar_overflow(p10_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_fc) if p10_eff > 0 else 0.0, 2)
+            self._overflow_p50 = round(compute_solar_overflow(p50_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_fc) if p50_eff > 0 else 0.0, 2)
+            self._overflow_p90 = round(compute_solar_overflow(p90_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_fc) if p90_eff > 0 else 0.0, 2)
+        except Exception:
+            pass
+
     def calculate(self, dno_limit_kw):
         """Compute floor using v17 solar geometry model.
 
@@ -576,6 +605,9 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Guard: no PV yet (pre-dawn / winter morning)
         if self._peak_pv < 0.1 and actual_pv < 0.1:
+            # Compute forecast integrals from current Solcast so dashboard
+            # shows expected overflow before activation.
+            self._publish_forecast_overflow(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
             self._last_decision = "off: no PV yet"
             return soc_max, "off"
 
