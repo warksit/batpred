@@ -37,7 +37,9 @@ from curtailment_calc import (
     compute_morning_gap,
     compute_remaining_overflow,
     compute_solar_overflow,
+    compute_expected_overflow,
     p90_scale_from_forecast,
+    p_scales_from_forecast,
     simulate_soc_trajectory,
     solar_elevation,
     compute_release_time,
@@ -93,6 +95,18 @@ BUFFER_REDUCE_CUMULATIVE_RATIO = 0.9
 BUFFER_REDUCE_RECENT_RATIO = 0.95
 BUFFER_REDUCE_MIN_SOLCAST_KWH = 10.0
 PV_HISTORY_LEN = 15  # 15 × 5 min = 75 min — enough room for 60-min lookback
+
+# v21 confidence-weighted overflow (R50): blend three forecast bands by Solcast
+# analysis.confidence. Tunable via input_number helpers.
+CONFIDENCE_HIGH_DEFAULT = 0.85  # ≥ this → use overflow_p90 (current pre-R50)
+CONFIDENCE_LOW_DEFAULT = 0.60  # < this → blend toward overflow_p10
+# Default to HIGH when Solcast doesn't expose confidence — preserves
+# pre-R50 behaviour (always-p90) on environments without the attribute
+# (tests, integrations that don't pass it through). Real Solcast always
+# provides analysis.confidence, so this default is rarely used in prod.
+CONFIDENCE_DEFAULT = 0.9
+HA_CONFIDENCE_HIGH = "input_number.curtailment_confidence_high"
+HA_CONFIDENCE_LOW = "input_number.curtailment_confidence_low"
 
 # State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
 # _floor_ratchet across plugin restarts within the same day.
@@ -169,6 +183,11 @@ class CurtailmentPlugin(PredBatPlugin):
         # Diagnostics for buffer reduction decision
         self._buffer_reduced = False
         self._effective_max_reserved = MAX_RESERVED_KWH
+        # R50 diagnostics: three overflow bands and confidence used to blend
+        self._overflow_p10 = 0.0
+        self._overflow_p50 = 0.0
+        self._overflow_p90 = 0.0
+        self._confidence = CONFIDENCE_DEFAULT
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
@@ -452,6 +471,50 @@ class CurtailmentPlugin(PredBatPlugin):
         # Fallback: yesterday's scale (changes ~1° elevation per day, R44)
         return self._p90_scale, self._p90_peak_kw, 0.0
 
+    def _get_p_scales(self, lat, lon, doy, local_offset):
+        """R50: get all three forecast band scales (p10/p50/p90).
+
+        Returns (p10_scale, p50_scale, p90_scale). Any band whose peak < 0.5 kW
+        or with a parse error yields 0.0 for that band — caller should guard.
+        Falls back gracefully: if Solcast unavailable, returns (0, 0, p90_cached).
+        """
+        try:
+            detailed = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="detailedForecast", default=[])
+            if detailed:
+                p10, p50, p90 = p_scales_from_forecast(detailed, lat, lon, doy, local_offset)
+                # At least p90 should be valid on a normal day; missing p10/p50
+                # is unusual but not fatal (we'll treat their integrals as p90's).
+                return p10, p50, p90
+        except Exception:
+            pass
+        # Fallback: use cached p90 for all three (degenerates to current pre-R50)
+        return 0.0, 0.0, self._p90_scale
+
+    def _get_confidence_thresholds(self):
+        """Read R50 input_number helpers; fall back to defaults if missing/invalid."""
+        try:
+            high = float(self.base.get_state_wrapper(HA_CONFIDENCE_HIGH, default=CONFIDENCE_HIGH_DEFAULT))
+        except (ValueError, TypeError):
+            high = CONFIDENCE_HIGH_DEFAULT
+        try:
+            low = float(self.base.get_state_wrapper(HA_CONFIDENCE_LOW, default=CONFIDENCE_LOW_DEFAULT))
+        except (ValueError, TypeError):
+            low = CONFIDENCE_LOW_DEFAULT
+        # Sanity: ensure 0 <= low < high <= 1
+        high = max(0.05, min(1.0, high))
+        low = max(0.0, min(high - 0.05, low))
+        return low, high
+
+    def _get_solcast_confidence(self):
+        """Read Solcast analysis.confidence; fall back to CONFIDENCE_DEFAULT."""
+        try:
+            analysis = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="analysis", default={}) or {}
+            if isinstance(analysis, dict) and "confidence" in analysis:
+                return float(analysis["confidence"])
+        except (ValueError, TypeError, KeyError):
+            pass
+        return CONFIDENCE_DEFAULT
+
     def calculate(self, dno_limit_kw):
         """Compute floor using v17 solar geometry model.
 
@@ -594,8 +657,36 @@ class CurtailmentPlugin(PredBatPlugin):
         safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
         load_forecast_kw = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
 
-        # Compute remaining overflow from solar geometry (R9) with LoadML-informed load.
-        remaining_overflow = compute_solar_overflow(floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw)
+        # Compute three overflow integrals (R50): one per forecast band.
+        # Each band uses max(p_X_scale, actual_scale) so once actual exceeds
+        # forecast, R43-style ratchet up still happens per-band.
+        p10_scale, p50_scale, _p90_check = self._get_p_scales(lat, lon, doy, local_offset)
+        p10_eff = max(p10_scale, actual_scale)
+        p50_eff = max(p50_scale, actual_scale)
+        # p90_eff is just floor_scale (already max(p90, actual) from R43 above)
+        overflow_p10 = compute_solar_overflow(p10_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw) if p10_eff > 0 else 0.0
+        overflow_p50 = compute_solar_overflow(p50_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw) if p50_eff > 0 else 0.0
+        overflow_p90 = compute_solar_overflow(floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw)
+
+        # Read confidence and tunable thresholds from helpers
+        confidence = self._get_solcast_confidence()
+        conf_low, conf_high = self._get_confidence_thresholds()
+
+        # R50 blend: confidence-weighted expected overflow.
+        # Replaces the always-p90 single-integral approach.
+        remaining_overflow = compute_expected_overflow(
+            p10=overflow_p10,
+            p50=overflow_p50,
+            p90=overflow_p90,
+            confidence=confidence,
+            low=conf_low,
+            high=conf_high,
+        )
+        # Diagnostics
+        self._overflow_p10 = round(overflow_p10, 2)
+        self._overflow_p50 = round(overflow_p50, 2)
+        self._overflow_p90 = round(overflow_p90, 2)
+        self._confidence = round(confidence, 2)
         self._remaining_overflow = round(remaining_overflow, 2)
 
         # Activation check (R5): overflow predicted AND battery would fill
@@ -975,6 +1066,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 "peak_pv_kw": round(self._peak_pv, 2),
                 "peak_pv_time": self._peak_pv_time,
                 "overflow_kwh": round(self._remaining_overflow, 2),
+                "overflow_p10": self._overflow_p10,
+                "overflow_p50": self._overflow_p50,
+                "overflow_p90": self._overflow_p90,
+                "confidence": self._confidence,
                 "safe_time": self._safe_time_str,
                 "buffer_reduced": self._buffer_reduced,
                 "effective_max_reserved": round(self._effective_max_reserved, 2),

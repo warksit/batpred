@@ -395,6 +395,99 @@ def p90_scale_from_forecast(detailed_forecast, lat_deg, lon_deg, day_of_year, lo
     return scale, best_kw, best_utc
 
 
+def p_scales_from_forecast(detailed_forecast, lat_deg, lon_deg, day_of_year, local_offset_hours=0):
+    """R50: derive (p10, p50, p90) clear-sky scales from each forecast band's peak.
+
+    Solcast publishes pv_estimate10 / pv_estimate (P50) / pv_estimate90 per slot.
+    Each band's peak gives a different worst-/best-case scale. The plugin uses
+    these three scales to compute three overflow integrals which are then
+    blended by confidence (compute_expected_overflow).
+
+    Args:
+        detailed_forecast: list of dicts with 'period_start',
+                           'pv_estimate10', 'pv_estimate', 'pv_estimate90' (kW)
+        lat_deg, lon_deg, day_of_year, local_offset_hours: as p90_scale_from_forecast
+
+    Returns:
+        (p10_scale, p50_scale, p90_scale). Any band whose peak < 0.5 kW or
+        elevation too low yields 0.0 for that band.
+    """
+    if not detailed_forecast:
+        return 0.0, 0.0, 0.0
+
+    def best_peak(key):
+        best_kw = 0.0
+        best_utc = 0.0
+        for slot in detailed_forecast:
+            kw = slot.get(key, 0.0) or 0.0
+            if kw <= best_kw:
+                continue
+            try:
+                ps = slot["period_start"]
+                time_part = ps[11:16]
+                h, m = int(time_part[:2]), int(time_part[3:5])
+                local_h = h + m / 60.0 + 0.25
+                utc_h = local_h - local_offset_hours
+            except (ValueError, IndexError, KeyError):
+                continue
+            best_kw = kw
+            best_utc = utc_h
+        return best_kw, best_utc
+
+    def scale_from_peak(peak_kw, peak_utc):
+        if peak_kw < 0.5:
+            return 0.0
+        elev = solar_elevation(lat_deg, lon_deg, peak_utc, day_of_year)
+        sin_elev = math.sin(math.radians(elev))
+        if sin_elev < 0.05:
+            return 0.0
+        return peak_kw / sin_elev
+
+    p10_peak, p10_utc = best_peak("pv_estimate10")
+    p50_peak, p50_utc = best_peak("pv_estimate")
+    p90_peak, p90_utc = best_peak("pv_estimate90")
+
+    return (
+        scale_from_peak(p10_peak, p10_utc),
+        scale_from_peak(p50_peak, p50_utc),
+        scale_from_peak(p90_peak, p90_utc),
+    )
+
+
+def compute_expected_overflow(p10, p50, p90, confidence, low, high):
+    """R50: blend three overflow integrals by Solcast confidence.
+
+    Confidence (0..1) selects between bands:
+      c >= high: pure p90 (current pre-R50 behaviour)
+      low <= c < high: linear blend p50 → p90
+      c < low: linear blend p10 → p50
+      c <= 0: pure p10 (most pessimistic)
+
+    Args:
+        p10, p50, p90: kWh overflow integrals at each scale
+        confidence: Solcast analysis.confidence (clamped to [0, 1])
+        low, high: tunable thresholds, must satisfy 0 <= low < high <= 1
+
+    Returns:
+        Expected overflow in kWh. Always in [min(p10..p90), max(p10..p90)].
+    """
+    c = max(0.0, min(1.0, confidence))
+    # Defensive: degenerate threshold pair → fall back to p50
+    if high <= low:
+        return p50
+
+    if c >= high:
+        return p90
+    if c >= low:
+        t = (c - low) / (high - low)
+        return (1.0 - t) * p50 + t * p90
+    # c < low
+    if low <= 0:
+        return p10
+    t = c / low
+    return (1.0 - t) * p10 + t * p50
+
+
 def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, current_utc_hours):
     """
     Compute minutes from now until PV drops below threshold (safe time).

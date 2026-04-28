@@ -21,6 +21,8 @@ from curtailment_calc import (
     solar_elevation,
     compute_release_time,
     compute_tomorrow_forecast,
+    p_scales_from_forecast,
+    compute_expected_overflow,
 )
 
 # Battery constants (Mum's SIG system)
@@ -696,6 +698,97 @@ def test_buffer_unchanged_before_14_00():
         expected_floor = max(0.0, expected_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
         assert abs(floor - expected_floor) < 0.05, f"Pre-14:00 floor should match un-reduced taper {expected_floor:.2f}, got {floor:.2f}"
     print(f"  test_buffer_unchanged_before_14_00: PASSED (remaining={remaining:.2f}, floor={floor:.2f})")
+
+
+# ============================================================================
+# R50 confidence-weighted overflow tests
+# ============================================================================
+
+
+def test_R50_p_scales_from_forecast():
+    """p_scales_from_forecast returns three scales derived from p10/p50/p90 peaks."""
+    # July noon at 55.86°N — sin(elev) ≈ 0.83
+    forecast = [
+        {"period_start": "2025-07-12T11:00:00+01:00", "pv_estimate10": 4.0, "pv_estimate": 8.0, "pv_estimate90": 10.0},
+        {"period_start": "2025-07-12T11:30:00+01:00", "pv_estimate10": 5.0, "pv_estimate": 9.0, "pv_estimate90": 11.0},
+        {"period_start": "2025-07-12T12:00:00+01:00", "pv_estimate10": 4.5, "pv_estimate": 8.5, "pv_estimate90": 10.5},
+    ]
+    p10, p50, p90 = p_scales_from_forecast(forecast, lat_deg=55.86, lon_deg=-3.2, day_of_year=193, local_offset_hours=1.0)
+
+    assert p90 > p50 > p10, f"Expected p90 > p50 > p10, got p10={p10}, p50={p50}, p90={p90}"
+    # All scales use the same peak slot (11:30 here, highest in each band).
+    # sin(elev) at peak ~ 0.83 for July noon at 55.86°N.
+    # p10 scale ≈ 5/0.83 ≈ 6.0; p50 ≈ 9/0.83 ≈ 10.8; p90 ≈ 11/0.83 ≈ 13.3
+    assert 5.5 < p10 < 6.5, f"p10_scale out of range: {p10}"
+    assert 10.0 < p50 < 11.5, f"p50_scale out of range: {p50}"
+    assert 12.5 < p90 < 14.0, f"p90_scale out of range: {p90}"
+    print(f"  test_R50_p_scales_from_forecast: PASSED (p10={p10:.2f}, p50={p50:.2f}, p90={p90:.2f})")
+
+
+def test_R50_compute_expected_overflow_high_confidence():
+    """High confidence (≥ HIGH threshold) → use overflow_p90 (current behaviour)."""
+    expected = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.9, low=0.6, high=0.85)
+    assert abs(expected - 14.0) < 0.01, f"At c=0.9, expected p90 (14.0), got {expected}"
+    print(f"  test_R50_compute_expected_overflow_high_confidence: PASSED (expected=14.0)")
+
+
+def test_R50_compute_expected_overflow_mid_confidence():
+    """Mid confidence (LOW..HIGH) → linear blend p50→p90."""
+    # c=0.7, low=0.6, high=0.85 → t = (0.7-0.6)/0.25 = 0.4
+    # expected = 0.6*p50 + 0.4*p90 = 0.6*5 + 0.4*14 = 3.0 + 5.6 = 8.6
+    expected = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.7, low=0.6, high=0.85)
+    assert abs(expected - 8.6) < 0.01, f"At c=0.7, expected blend 8.6, got {expected}"
+    print(f"  test_R50_compute_expected_overflow_mid_confidence: PASSED (expected=8.6)")
+
+
+def test_R50_compute_expected_overflow_low_confidence():
+    """Low confidence (< LOW threshold) → linear blend p10→p50."""
+    # c=0.3, low=0.6 → t = 0.3/0.6 = 0.5
+    # expected = 0.5*p10 + 0.5*p50 = 0.5*0 + 0.5*5 = 2.5
+    expected = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.3, low=0.6, high=0.85)
+    assert abs(expected - 2.5) < 0.01, f"At c=0.3, expected blend 2.5, got {expected}"
+    print(f"  test_R50_compute_expected_overflow_low_confidence: PASSED (expected=2.5)")
+
+
+def test_R50_compute_expected_overflow_zero_confidence():
+    """Zero confidence → pure p10 (most pessimistic)."""
+    expected = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.0, low=0.6, high=0.85)
+    assert abs(expected - 0.0) < 0.01, f"At c=0.0, expected p10 (0.0), got {expected}"
+    print(f"  test_R50_compute_expected_overflow_zero_confidence: PASSED (expected=0.0)")
+
+
+def test_R50_compute_expected_overflow_apr_28_incident():
+    """Apr 28 2026 incident: c=0.69, p50_overflow≈5, p90_overflow≈14 → expected ≈8.2 (drain to ~36%, not 8%)."""
+    expected = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.69, low=0.6, high=0.85)
+    # c=0.69, low=0.6, high=0.85 → t = (0.69-0.6)/0.25 = 0.36
+    # expected = 0.64*5 + 0.36*14 = 3.2 + 5.04 = 8.24
+    assert 7.5 < expected < 9.0, f"Apr 28 case: expected ~8.2, got {expected}"
+    # Verify floor calculation would produce reasonable target
+    floor_kwh = BATTERY_KWH - MAX_RESERVED_KWH - expected * OVERFLOW_SAFETY_FACTOR
+    floor_pct = floor_kwh / BATTERY_KWH * 100
+    assert floor_pct > 30, f"Apr 28 case: floor should be >30%, got {floor_pct:.1f}%"
+    assert floor_pct < 50, f"Apr 28 case: floor should be <50% (still meaningful drain), got {floor_pct:.1f}%"
+    print(f"  test_R50_compute_expected_overflow_apr_28_incident: PASSED (expected={expected:.2f}, floor={floor_pct:.1f}%)")
+
+
+def test_R50_compute_expected_overflow_clamps_confidence():
+    """Confidence outside [0, 1] is clamped — defensive against bad sensor values."""
+    # confidence > 1 → treated as 1 (or HIGH) → use p90
+    e_high = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=1.5, low=0.6, high=0.85)
+    assert abs(e_high - 14.0) < 0.01, f"Clamp >1: expected p90, got {e_high}"
+    # confidence < 0 → treated as 0 → use p10
+    e_low = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=-0.5, low=0.6, high=0.85)
+    assert abs(e_low - 0.0) < 0.01, f"Clamp <0: expected p10, got {e_low}"
+    print(f"  test_R50_compute_expected_overflow_clamps_confidence: PASSED")
+
+
+def test_R50_compute_expected_overflow_at_boundaries():
+    """At c=LOW exactly → expected = p50; at c=HIGH exactly → expected = p90."""
+    e_at_low = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.6, low=0.6, high=0.85)
+    assert abs(e_at_low - 5.0) < 0.01, f"At c=LOW exactly: expected p50, got {e_at_low}"
+    e_at_high = compute_expected_overflow(p10=0.0, p50=5.0, p90=14.0, confidence=0.85, low=0.6, high=0.85)
+    assert abs(e_at_high - 14.0) < 0.01, f"At c=HIGH exactly: expected p90, got {e_at_high}"
+    print(f"  test_R50_compute_expected_overflow_at_boundaries: PASSED")
 
 
 # ============================================================================
@@ -2835,6 +2928,25 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- state persistence tests ---")
     for test_fn in state_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # R50 confidence-weighted overflow tests
+    r50_tests = [
+        test_R50_p_scales_from_forecast,
+        test_R50_compute_expected_overflow_high_confidence,
+        test_R50_compute_expected_overflow_mid_confidence,
+        test_R50_compute_expected_overflow_low_confidence,
+        test_R50_compute_expected_overflow_zero_confidence,
+        test_R50_compute_expected_overflow_apr_28_incident,
+        test_R50_compute_expected_overflow_clamps_confidence,
+        test_R50_compute_expected_overflow_at_boundaries,
+    ]
+    print("  --- R50 confidence-weighted overflow tests ---")
+    for test_fn in r50_tests:
         try:
             test_fn()
         except Exception as e:

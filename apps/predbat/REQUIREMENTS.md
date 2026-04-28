@@ -139,6 +139,56 @@ reserved cannot be reclaimed.
     before MSC handoff. Avoids the old trade-off of ending 92–95% on thin
     post-release tail days where MSC can't refill the 10% reserve from sparse
     evening PV.
+- **R50** (v21 confidence-weighted overflow): the floor formula uses a
+  confidence-weighted blend of three forecast bands instead of always-p90.
+  Solcast publishes pv_estimate10 / pv_estimate (P50) / pv_estimate90 per
+  slot, plus an `analysis.confidence` value (0..1). The plugin computes
+  three overflow integrals using each band's scale, then blends them by
+  confidence:
+
+  ```text
+  p10_scale = max(p10_peak / sin(elev_at_peak), actual_scale)   # R43 still applies
+  p50_scale = max(p50_peak / sin(elev_at_peak), actual_scale)
+  p90_scale = max(p90_peak / sin(elev_at_peak), actual_scale)
+
+  overflow_p10 = ∫ max(0, p10_scale × sin(elev) − load − DNO) dt
+  overflow_p50 = ∫ max(0, p50_scale × sin(elev) − load − DNO) dt
+  overflow_p90 = ∫ max(0, p90_scale × sin(elev) − load − DNO) dt
+
+  c = clamp(confidence, 0, 1)
+  HIGH = input_number.curtailment_confidence_high   (default 0.85)
+  LOW  = input_number.curtailment_confidence_low    (default 0.60)
+
+  if c >= HIGH:           expected = overflow_p90        # pre-R50 behaviour
+  elif c >= LOW:          t = (c − LOW) / (HIGH − LOW)
+                          expected = (1−t)*p50 + t*p90
+  else:                   t = c / LOW
+                          expected = (1−t)*p10 + t*p50
+  ```
+
+  `expected` then substitutes for `remaining_overflow` in R9's floor
+  formula. R45 buffer, R49 buffer reduction, R11 ratchet, R43 actual_scale
+  promotion all still apply on top of the blended estimate.
+
+  Why: at low confidence, the p90 forecast isn't trustworthy and committing
+  to p90 drain wastes battery on round-trip losses. The blend leans toward
+  pessimistic estimates when forecast quality is low.
+
+  Reference incident: 2026-04-28. Plugin drained ~9.5 kWh on a forecast
+  where Solcast reported confidence 0.69 and spread 25 kWh (P10=14, P50=31,
+  P90=49). Day delivered ~5 kWh PV. Round-trip loss ~1.4 kWh + import cost.
+  Battery hit 1.9%. Under R50 with c=0.69, expected ≈ 0.36 × p90 + 0.64 ×
+  p50 — drains modestly, doesn't bottom-out battery.
+
+  Default fallback: when Solcast doesn't expose `analysis.confidence`
+  (test environments, data unavailable), treat as 0.9 → use overflow_p90
+  exactly as pre-R50. R50 only changes behaviour when real confidence data
+  is present and below HIGH threshold.
+
+  Tunable thresholds via two input_number helpers (curtailment_confidence
+  _high, curtailment_confidence_low) exposed on the dashboard. Constraint
+  enforced in plugin: 0 ≤ low < high ≤ 1.
+
 - **R49** (v20 dynamic buffer reduction): on confirmed-cloudy afternoons,
   scale `effective_max_reserved` down to `max(0.5, MAX_RESERVED_KWH × 0.7)`
   = 1.26 kWh. Reduction fires only when ALL hold:
