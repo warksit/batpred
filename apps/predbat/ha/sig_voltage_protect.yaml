@@ -25,11 +25,11 @@
 id: "sig_voltage_protect_v1"
 alias: "SIG Voltage Protect"
 description: >-
-  Notifications only. Numeric_state triggers with 60s sustained thresholds:
-  engage when cap < 3 kW for 60s, release when cap ≥ 4 kW for 60s.
-  Eliminates flap during voltage transitions (2026-04-28 morning saw 71
-  raw toggles without debounce). Actual export throttle is produced by
-  sensor.sig_voltage_max_export_kw and applied by the curtailment automation.
+  Notifications only. Numeric_state triggers with 60s sustained thresholds.
+  Engage: cap < 3.5 kW for 60s (= ≥0.5 kW throttle = ≥12% of DNO sustained).
+  Release: cap ≥ 4 kW for 60s AND boolean was on (avoids ghost release
+  notifications when engage never fired). Actual export throttle is produced
+  by sensor.sig_voltage_max_export_kw and applied by the curtailment automation.
 mode: queued
 max: 4
 max_exceeded: silent
@@ -37,7 +37,7 @@ max_exceeded: silent
 trigger:
   - platform: numeric_state
     entity_id: sensor.sig_voltage_max_export_kw
-    below: 3.0
+    below: 3.5
     for: "00:01:00"
     id: engage
   - platform: numeric_state
@@ -69,6 +69,12 @@ action:
       - conditions:
           - condition: trigger
             id: release
+          # Only fire release notification if engage previously latched the
+          # boolean. Avoids ghost "released" alerts when cap dipped briefly
+          # without ever crossing the engage threshold for 60s.
+          - condition: state
+            entity_id: input_boolean.sig_voltage_protect_active
+            state: "on"
         sequence:
           - action: input_boolean.turn_off
             target:
