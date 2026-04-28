@@ -589,7 +589,15 @@ class CurtailmentPlugin(PredBatPlugin):
 
         utc_hours = now_utc.hour + now_utc.minute / 60.0 + now_utc.second / 3600.0
         doy = now_utc.timetuple().tm_yday
-        local_offset = (minutes_now / 60.0) - utc_hours  # hours ahead of UTC
+        # Use tz-aware datetime offset so midnight rollover works.
+        # The naive (minutes_now / 60 − utc_hours) breaks across midnight: at
+        # 00:30 BST = 23:30 UTC of previous day, minutes_now ≈ 30 but utc_hours
+        # ≈ 23.5, giving local_offset ≈ −23 instead of +1.
+        utc_offset = now_local_aware.utcoffset()
+        if utc_offset is not None:
+            local_offset = utc_offset.total_seconds() / 3600.0
+        else:
+            local_offset = (minutes_now / 60.0) - utc_hours  # legacy fallback
 
         # Read actual PV
         try:
@@ -969,7 +977,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 now_utc = now_local_aware.astimezone(timezone.utc)
                 tomorrow_doy = (now_utc.timetuple().tm_yday % 365) + 1
                 utc_now = now_utc.hour + now_utc.minute / 60.0
-                local_offset = (minutes_now / 60.0) - utc_now
+                # tz-aware utcoffset (midnight-safe); see calculate() for context
+                utc_offset = now_local_aware.utcoffset()
+                if utc_offset is not None:
+                    local_offset = utc_offset.total_seconds() / 3600.0
+                else:
+                    local_offset = (minutes_now / 60.0) - utc_now
 
                 # Get p90 scale for tomorrow from detailedForecast of tomorrow sensor
                 try:
