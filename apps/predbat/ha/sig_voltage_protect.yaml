@@ -25,56 +25,57 @@
 id: "sig_voltage_protect_v1"
 alias: "SIG Voltage Protect"
 description: >-
-  Notifications only. Watches sensor.sig_voltage_max_export_kw. Alerts on
-  engagement (cap < 3.5 kW) and release (cap ≥ 3.95 kW). The actual export
-  throttle is produced by the template sensor and applied by the curtailment
-  automation.
-mode: single
+  Notifications only. Numeric_state triggers with 60s sustained thresholds:
+  engage when cap < 3 kW for 60s, release when cap ≥ 4 kW for 60s.
+  Eliminates flap during voltage transitions (2026-04-28 morning saw 71
+  raw toggles without debounce). Actual export throttle is produced by
+  sensor.sig_voltage_max_export_kw and applied by the curtailment automation.
+mode: queued
+max: 4
 max_exceeded: silent
 
 trigger:
-  - platform: state
+  - platform: numeric_state
     entity_id: sensor.sig_voltage_max_export_kw
-
-condition:
-  - condition: template
-    value_template: >-
-      {{ trigger.to_state.state not in ('unavailable', 'unknown', 'none') }}
+    below: 3.0
+    for: "00:01:00"
+    id: engage
+  - platform: numeric_state
+    entity_id: sensor.sig_voltage_max_export_kw
+    above: 3.99
+    for: "00:01:00"
+    id: release
 
 action:
   - variables:
-      cap: "{{ trigger.to_state.state | float(4) }}"
+      cap: "{{ states('sensor.sig_voltage_max_export_kw') | float(4) }}"
       voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
-      was_active: "{{ is_state('input_boolean.sig_voltage_protect_active', 'on') }}"
-      # Engage notification when cap drops meaningfully below DNO.
-      # Release notification when cap returns to ~DNO (allow tiny rounding margin).
-      engage: "{{ cap < 3.5 and not was_active }}"
-      release: "{{ cap >= 3.95 and was_active }}"
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
 
-  - if:
-      - condition: template
-        value_template: "{{ engage }}"
-    then:
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.sig_voltage_protect_active
-      - action: notify.mobile_app_andrew_iphone
-        data:
-          title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
-          message: >-
-            Cap dropped to {{ cap }} kW. Curtailment automation clamping
-            export. SOC: {{ soc }}%
-
-  - if:
-      - condition: template
-        value_template: "{{ release }}"
-    then:
-      - action: input_boolean.turn_off
-        target:
-          entity_id: input_boolean.sig_voltage_protect_active
-      - action: notify.mobile_app_andrew_iphone
-        data:
-          title: "✅ Voltage throttle released (V={{ voltage }}V)"
-          message: >-
-            Cap back to {{ cap }} kW. Normal export resumed. SOC: {{ soc }}%
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: engage
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sig_voltage_protect_active
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
+              message: >-
+                Cap at {{ cap }} kW for 1 min. Curtailment automation clamping
+                export. SOC: {{ soc }}%
+      - conditions:
+          - condition: trigger
+            id: release
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.sig_voltage_protect_active
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "✅ Voltage throttle released (V={{ voltage }}V)"
+              message: >-
+                Cap back to {{ cap }} kW for 1 min. Normal export resumed.
+                SOC: {{ soc }}%
