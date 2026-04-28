@@ -25,26 +25,36 @@
 id: "sig_voltage_protect_v1"
 alias: "SIG Voltage Protect"
 description: >-
-  Notifications only. Numeric_state triggers with 60s sustained thresholds.
-  Engage: cap < 3.5 kW for 60s (= ≥0.5 kW throttle = ≥12% of DNO sustained).
-  Release: cap ≥ 4 kW for 60s AND boolean was on (avoids ghost release
-  notifications when engage never fired). Actual export throttle is produced
-  by sensor.sig_voltage_max_export_kw and applied by the curtailment automation.
+  Two-stage. input_boolean.sig_voltage_protect_active reflects real-time
+  throttle state (immediate, no debounce). Notifications fire only when
+  the boolean has been sustained on/off for 10s, gated by an "alerted"
+  flag so release alerts don't fire without a preceding engage.
+
 mode: queued
-max: 4
+max: 6
 max_exceeded: silent
 
 trigger:
+  # Real-time boolean toggle — immediate when cap drops or recovers
   - platform: numeric_state
     entity_id: sensor.sig_voltage_max_export_kw
-    below: 3.5
-    for: "00:01:00"
-    id: engage
+    below: 3.95
+    id: throttle_start
   - platform: numeric_state
     entity_id: sensor.sig_voltage_max_export_kw
     above: 3.99
-    for: "00:01:00"
-    id: release
+    id: throttle_end
+  # Notification triggers — debounced via state-with-for on the boolean
+  - platform: state
+    entity_id: input_boolean.sig_voltage_protect_active
+    to: "on"
+    for: "00:00:10"
+    id: notify_engage
+  - platform: state
+    entity_id: input_boolean.sig_voltage_protect_active
+    to: "off"
+    for: "00:00:10"
+    id: notify_release
 
 action:
   - variables:
@@ -53,35 +63,56 @@ action:
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
 
   - choose:
+      # Throttle started — flip boolean ON immediately, no notification yet
       - conditions:
           - condition: trigger
-            id: engage
+            id: throttle_start
         sequence:
           - action: input_boolean.turn_on
             target:
               entity_id: input_boolean.sig_voltage_protect_active
-          - action: notify.mobile_app_andrew_iphone
-            data:
-              title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
-              message: >-
-                Cap at {{ cap }} kW for 1 min. Curtailment automation clamping
-                export. SOC: {{ soc }}%
+
+      # Throttle ended — flip boolean OFF immediately, no notification yet
       - conditions:
           - condition: trigger
-            id: release
-          # Only fire release notification if engage previously latched the
-          # boolean. Avoids ghost "released" alerts when cap dipped briefly
-          # without ever crossing the engage threshold for 60s.
-          - condition: state
-            entity_id: input_boolean.sig_voltage_protect_active
-            state: "on"
+            id: throttle_end
         sequence:
           - action: input_boolean.turn_off
             target:
               entity_id: input_boolean.sig_voltage_protect_active
+
+      # Boolean has been ON sustained 10s — fire engage notification once
+      - conditions:
+          - condition: trigger
+            id: notify_engage
+          - condition: state
+            entity_id: input_boolean.sig_voltage_protect_alerted
+            state: "off"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sig_voltage_protect_alerted
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
+              message: >-
+                Cap at {{ cap }} kW (sustained 10s). Curtailment automation
+                clamping export. SOC: {{ soc }}%
+
+      # Boolean has been OFF sustained 10s AFTER an engage — fire release
+      - conditions:
+          - condition: trigger
+            id: notify_release
+          - condition: state
+            entity_id: input_boolean.sig_voltage_protect_alerted
+            state: "on"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.sig_voltage_protect_alerted
           - action: notify.mobile_app_andrew_iphone
             data:
               title: "✅ Voltage throttle released (V={{ voltage }}V)"
               message: >-
-                Cap back to {{ cap }} kW for 1 min. Normal export resumed.
-                SOC: {{ soc }}%
+                Cap back to {{ cap }} kW (sustained 10s). Normal export
+                resumed. SOC: {{ soc }}%
