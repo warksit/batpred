@@ -63,7 +63,9 @@ action:
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
 
   - choose:
-      # Throttle started — flip boolean ON immediately, no notification yet
+      # Throttle started — flip boolean ON immediately, count every event
+      # (sub-10s flickers also do real work clamping voltage spikes).
+      # Notification still gated by 10s sustained via notify_engage.
       - conditions:
           - condition: trigger
             id: throttle_start
@@ -71,6 +73,9 @@ action:
           - action: input_boolean.turn_on
             target:
               entity_id: input_boolean.sig_voltage_protect_active
+          - action: counter.increment
+            target:
+              entity_id: counter.voltage_throttle_activations_today
 
       # Throttle ended — flip boolean OFF immediately, no notification yet
       - conditions:
@@ -92,9 +97,6 @@ action:
           - action: input_boolean.turn_on
             target:
               entity_id: input_boolean.sig_voltage_protect_alerted
-          - action: counter.increment
-            target:
-              entity_id: counter.voltage_throttle_activations_today
           - action: notify.mobile_app_andrew_iphone
             data:
               title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
