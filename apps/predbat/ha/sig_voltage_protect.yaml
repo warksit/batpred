@@ -86,7 +86,9 @@ action:
             target:
               entity_id: input_boolean.sig_voltage_protect_active
 
-      # Boolean has been ON sustained 10s — fire engage notification once
+      # Boolean has been ON sustained 10s — fire engage notification once,
+      # snapshot the lost-energy meter so release can compute the session's
+      # delta.
       - conditions:
           - condition: trigger
             id: notify_engage
@@ -97,6 +99,11 @@ action:
           - action: input_boolean.turn_on
             target:
               entity_id: input_boolean.sig_voltage_protect_alerted
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.voltage_throttle_engage_lost_start
+            data:
+              value: "{{ states('sensor.sig_voltage_throttle_lost_energy') | float(0) }}"
           - action: notify.mobile_app_andrew_iphone
             data:
               title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
@@ -112,6 +119,20 @@ action:
             entity_id: input_boolean.sig_voltage_protect_alerted
             state: "on"
         sequence:
+          - variables:
+              # Duration since alerted went on (= since notify_engage fired)
+              alerted_since: >-
+                {{ as_timestamp(states.input_boolean.sig_voltage_protect_alerted.last_changed) }}
+              elapsed_seconds: >-
+                {{ (as_timestamp(now()) - alerted_since) | int }}
+              duration_str: >-
+                {%- set m = elapsed_seconds // 60 -%}
+                {%- set s = elapsed_seconds % 60 -%}
+                {%- if m > 0 -%}{{ m }}m {{ s }}s{%- else -%}{{ s }}s{%- endif -%}
+              # Energy lost during this session (kWh delta)
+              lost_now: "{{ states('sensor.sig_voltage_throttle_lost_energy') | float(0) }}"
+              lost_start: "{{ states('input_number.voltage_throttle_engage_lost_start') | float(0) }}"
+              lost_session_kwh: "{{ (lost_now - lost_start) | round(2) }}"
           - action: input_boolean.turn_off
             target:
               entity_id: input_boolean.sig_voltage_protect_alerted
@@ -119,5 +140,5 @@ action:
             data:
               title: "✅ Voltage throttle released (V={{ voltage }}V)"
               message: >-
-                Cap back to {{ cap }} kW (sustained 10s). Normal export
-                resumed. SOC: {{ soc }}%
+                Active {{ duration_str }}. Lost ~{{ lost_session_kwh }} kWh
+                export. Cap back to {{ cap }} kW. SOC: {{ soc }}%
