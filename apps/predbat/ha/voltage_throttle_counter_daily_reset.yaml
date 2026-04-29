@@ -1,0 +1,21 @@
+# Voltage Throttle Counter — Daily Reset
+#
+# Resets counter.voltage_throttle_activations_today at local midnight so the
+# count reflects today's voltage_protect engage notifications only.
+#
+# The counter is incremented by the SIG Voltage Protect automation each time
+# the engage path fires (cap < 3.5 kW sustained 10s, alerted=off → on).
+
+alias: "Voltage Throttle Counter — Daily Reset"
+description: >-
+  Reset counter.voltage_throttle_activations_today at local midnight.
+mode: single
+
+trigger:
+  - platform: time
+    at: "00:00:00"
+
+action:
+  - action: counter.reset
+    target:
+      entity_id: counter.voltage_throttle_activations_today

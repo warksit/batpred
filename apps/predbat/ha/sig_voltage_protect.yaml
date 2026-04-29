@@ -92,6 +92,9 @@ action:
           - action: input_boolean.turn_on
             target:
               entity_id: input_boolean.sig_voltage_protect_alerted
+          - action: counter.increment
+            target:
+              entity_id: counter.voltage_throttle_activations_today
           - action: notify.mobile_app_andrew_iphone
             data:
               title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
