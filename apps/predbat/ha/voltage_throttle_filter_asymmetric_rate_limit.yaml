@@ -1,10 +1,10 @@
 # Voltage Throttle Filter — Asymmetric Rate Limit
 #
 # Filters sensor.sig_voltage_max_export_kw with asymmetric response:
-#   - Drops are immediate (snap down on voltage spike — safety-critical)
-#   - Rises capped at 0.5 kW per 5s tick. Typical real drop is ~2 kW
-#     (cap dips from 4 to 2 then recovers), so recovery takes ~20s.
-#     Full 0→4 kW recovery would take 40s.
+#   - Drops snap to raw value at each 15s tick (caveat: 15s lag worst-case)
+#   - Rises capped at 0.1 kW per 15s tick = 0.4 kW/min
+#     Typical 2 kW drop recovers in ~5 minutes
+#     Full 4 kW recovery in ~10 minutes
 #
 # The filtered value lives in input_number.voltage_throttle_filtered_cap and
 # is consumed by the curtailment automation as voltage_cap. The raw cap
@@ -25,23 +25,23 @@
 
 alias: "Voltage Throttle Filter — Asymmetric Rate Limit"
 description: >-
-  Asymmetric rate limiter on sensor.sig_voltage_max_export_kw. Drops snap
-  down immediately, rises crawl up at 0.5 kW per 5s. Typical 2 kW drop
-  recovers in ~20s; full 4 kW recovery in 40s. Output goes to
-  input_number.voltage_throttle_filtered_cap which the curtailment
-  automation reads as voltage_cap.
+  Asymmetric rate limiter on sensor.sig_voltage_max_export_kw. Tick every
+  15s. Drops snap to raw, rises crawl up at 0.1 kW per tick (= 0.4 kW/min).
+  Typical 2 kW drop recovers in ~5 min; full 4 kW recovery in 10 min.
+  Output goes to input_number.voltage_throttle_filtered_cap which the
+  curtailment automation reads as voltage_cap.
 mode: single
 max_exceeded: silent
 
 trigger:
   - platform: time_pattern
-    seconds: "/5"
+    seconds: "/15"
 
 action:
   - variables:
       raw: "{{ states('sensor.sig_voltage_max_export_kw') | float(4) }}"
       prev: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
-      step_per_tick: 0.5  # 0.5 kW per 5s tick — typical 2 kW recovery in 20s
+      step_per_tick: 0.1  # 0.1 kW per 15s tick = 0.4 kW/min
       new_value: >-
         {{ raw if raw < prev else [raw, prev + step_per_tick] | min }}
 
