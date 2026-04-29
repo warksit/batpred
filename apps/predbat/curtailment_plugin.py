@@ -1249,6 +1249,36 @@ class CurtailmentPlugin(PredBatPlugin):
             },
         )
 
+        # R50 diagnostics promoted to dedicated sensors so HA recorder retains
+        # statistics (state_class=measurement) for trend graphs and forecast-vs-actual
+        # analysis. Same values as the corresponding overflow_p* attributes on
+        # sensor.{prefix}_curtailment_phase.
+        for suffix, value, friendly in (
+            ("overflow_p10", self._overflow_p10, "Curtailment Overflow P10"),
+            ("overflow_p50", self._overflow_p50, "Curtailment Overflow P50"),
+            ("overflow_p90", self._overflow_p90, "Curtailment Overflow P90"),
+        ):
+            self.base.dashboard_item(
+                "sensor.{}_curtailment_{}".format(prefix, suffix),
+                value,
+                {
+                    "friendly_name": friendly,
+                    "unit_of_measurement": "kWh",
+                    "device_class": "energy",
+                    "state_class": "measurement",
+                    "icon": "mdi:solar-power-variant",
+                },
+            )
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_confidence".format(prefix),
+            self._confidence,
+            {
+                "friendly_name": "Curtailment Forecast Confidence",
+                "state_class": "measurement",
+                "icon": "mdi:gauge",
+            },
+        )
+
         # Set live phase to Off when plugin is off
         if state == "Off":
             try:
