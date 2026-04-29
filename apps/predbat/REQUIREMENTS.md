@@ -189,6 +189,60 @@ reserved cannot be reclaimed.
   _high, curtailment_confidence_low) exposed on the dashboard. Constraint
   enforced in plugin: 0 ≤ low < high ≤ 1.
 
+- **R52** (v22 pre-PV drain timing): activate the plugin BEFORE sunrise on
+  confirmed-overflow days so we drain at full DNO rate while drain capacity
+  is uncontested by PV. Two-stage drain:
+    - Pre-PV: target = `soc_keep + buffer_pct × soc_max` (default 20%)
+    - Post-PV: target = R50 floor (existing behaviour)
+
+  Decision flow inside the existing "no PV yet" early return:
+
+  ```text
+  if input_boolean.gshp_ch_active is on:
+      # Winter — protect overnight battery for heat pump load
+      Off
+  if overflow_p90 < 1 kWh:
+      # No meaningful overflow forecast → no need to drain
+      Off
+  if SOC ≤ target_at_pv_start:
+      # Already at/below pre-PV target
+      Off
+
+  pv_start_utc = compute_pv_start_time(p90_scale, ..., threshold=0.5 kW)
+  drain_amount_kwh = SOC_now − target_at_pv_start
+  drain_minutes = drain_amount / DNO × 60
+  drain_start_utc = pv_start_utc − drain_minutes
+
+  if now < drain_start_utc:
+      Off (waiting; not enough time would have been wasted)
+  else:
+      Active, target = target_at_pv_start (pre-PV drain phase)
+  ```
+
+  After PV starts (`actual_pv ≥ 0.1`), normal flow resumes — R50 floor calc
+  applies and battery drains further to the deeper R50 floor. The pre-PV
+  drain only handles the FIRST stage (high SOC → target_at_pv_start).
+
+  Why two-stage: pre-PV drain rate is 4 kW (DNO uncontested). Post-PV drain
+  rate falls as PV ramps (PV uses DNO bandwidth). Splitting the drain target
+  exploits this — coarse drain pre-PV, fine drain post-PV.
+
+  Helpers:
+    - `input_boolean.gshp_ch_active` — central heating active flag (manual
+      toggle in pump room, or HA dashboard tile).
+    - `input_number.curtailment_pre_pv_buffer_pct` — buffer above soc_keep
+      (default 20, range 0-50).
+
+  Reference incident: 2026-04-29. Plugin activated only at first PV (~05:12
+  BST), drained from 70% → 24% during 05:12-08:12 BST. Should have started
+  ~03:30 BST and finished pre-PV drain at PV start (~05:00 BST), with
+  remainder draining post-PV — overall same total drain but no wasted
+  capacity in the first 1.5 hours.
+
+  Why the buffer (not drain to 0% pre-PV): if PV is delayed by clouds,
+  battery has 3.6 kWh = 7h of base load buffer. Without it, plugin could
+  drain to 0% then bleed via base load before sun arrives.
+
 - **R49** (v20 dynamic buffer reduction): on confirmed-cloudy afternoons,
   scale `effective_max_reserved` down to `max(0.5, MAX_RESERVED_KWH × 0.7)`
   = 1.26 kWh. Reduction fires only when ALL hold:

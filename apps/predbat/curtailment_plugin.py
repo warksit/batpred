@@ -38,6 +38,7 @@ from curtailment_calc import (
     compute_remaining_overflow,
     compute_solar_overflow,
     compute_expected_overflow,
+    compute_pv_start_time,
     p90_scale_from_forecast,
     p_scales_from_forecast,
     simulate_soc_trajectory,
@@ -107,6 +108,15 @@ CONFIDENCE_LOW_DEFAULT = 0.60  # < this → blend toward overflow_p10
 CONFIDENCE_DEFAULT = 0.9
 HA_CONFIDENCE_HIGH = "input_number.curtailment_confidence_high"
 HA_CONFIDENCE_LOW = "input_number.curtailment_confidence_low"
+
+# v22 R52 pre-PV drain: activate before sunrise on confirmed-overflow days
+# so we drain at full DNO rate while drain capacity is uncontested by PV.
+# Two-stage drain: pre-PV target = soc_keep + buffer%; post-PV target = R50 floor.
+HA_GSHP_CH_ACTIVE = "input_boolean.gshp_ch_active"
+HA_PRE_PV_BUFFER_PCT = "input_number.curtailment_pre_pv_buffer_pct"
+PRE_PV_BUFFER_PCT_DEFAULT = 20.0
+PRE_PV_OVERFLOW_THRESHOLD_KWH = 1.0  # Min forecast overflow to bother with pre-PV drain
+PV_START_THRESHOLD_KW = 0.5  # PV "started" when scale × sin(elev) ≥ this
 
 # State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
 # _floor_ratchet across plugin restarts within the same day.
@@ -515,6 +525,81 @@ class CurtailmentPlugin(PredBatPlugin):
             pass
         return CONFIDENCE_DEFAULT
 
+    def _is_gshp_ch_active(self):
+        """R52: read input_boolean.gshp_ch_active. Default True (winter) if missing."""
+        try:
+            state = self.base.get_state_wrapper(HA_GSHP_CH_ACTIVE, default="on")
+            return str(state).lower() in ("on", "true", "1")
+        except (ValueError, TypeError):
+            return True  # default safe — no pre-PV drain
+
+    def _pre_pv_buffer_pct(self):
+        """R52: read input_number.curtailment_pre_pv_buffer_pct (0-50%)."""
+        try:
+            v = float(self.base.get_state_wrapper(HA_PRE_PV_BUFFER_PCT, default=PRE_PV_BUFFER_PCT_DEFAULT))
+            return max(0.0, min(50.0, v))
+        except (ValueError, TypeError):
+            return PRE_PV_BUFFER_PCT_DEFAULT
+
+    def _pre_pv_drain_decision(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw):
+        """R52: should plugin activate pre-PV drain? Returns (target_kwh, str) or None.
+
+        Conditions for pre-PV drain (all must hold):
+        1. CH off (input_boolean.gshp_ch_active = off) — overnight battery free.
+        2. Forecast overflow > threshold — meaningful drain target.
+        3. p90_scale derivable + pv_start_time computable.
+        4. SOC > target_at_pv_start — there's something to drain.
+        5. now ≥ drain_start_time — late enough that finishing at PV-start is feasible.
+
+        Returns the target SOC (in kWh) and a diagnostic string when active,
+        or None when plugin should stay Off.
+        """
+        if self._is_gshp_ch_active():
+            return None
+        # Forecast overflow must justify the drain — uses self._overflow_p90 from
+        # _publish_forecast_overflow earlier in this cycle.
+        if self._overflow_p90 < PRE_PV_OVERFLOW_THRESHOLD_KWH:
+            return None
+
+        p10_scale, p50_scale, p90_scale = self._get_p_scales(lat, lon, doy, local_offset)
+        if p90_scale < 0.5:
+            return None
+
+        # Update self._p90_scale / self._floor_scale so dashboard reflects state
+        # even before the post-PV path runs.
+        self._p90_scale = p90_scale
+        self._floor_scale = p90_scale
+        self._safe_scale = p90_scale
+
+        _minutes, pv_start_utc = compute_pv_start_time(p90_scale, lat, lon, doy, PV_START_THRESHOLD_KW, utc_hours)
+        if pv_start_utc is None:
+            return None
+        if pv_start_utc <= utc_hours:
+            return None  # PV crossing was earlier today — should be on post-PV path
+
+        soc_kw = float(getattr(self.base, "soc_kw", 0))
+        soc_max = float(getattr(self.base, "soc_max", 18.08))
+        soc_keep = float(getattr(self.base, "best_soc_keep", 0))
+
+        buffer_pct = self._pre_pv_buffer_pct()
+        target_kwh = soc_keep + (buffer_pct / 100.0) * soc_max
+
+        if soc_kw <= target_kwh + 0.1:
+            return None  # already at/below pre-PV target
+
+        drain_amount = soc_kw - target_kwh
+        drain_minutes = drain_amount / dno_limit_kw * 60.0
+        drain_start_utc = pv_start_utc - drain_minutes / 60.0
+
+        if utc_hours < drain_start_utc:
+            return None  # too early — wait
+
+        # Safe-time string for dashboard
+        pv_start_local = pv_start_utc + local_offset
+        pv_start_str = "{:02d}:{:02d}".format(int(pv_start_local) % 24, int((pv_start_local % 1) * 60))
+        decision = "pre-PV drain target={:.2f}kWh pv_start={} drain_start≈{:.0f}min ago".format(target_kwh, pv_start_str, max(0.0, (utc_hours - drain_start_utc) * 60))
+        return target_kwh, decision
+
     def _publish_forecast_overflow(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw):
         """Update self._overflow_p10/p50/p90 from current Solcast forecast.
 
@@ -616,6 +701,20 @@ class CurtailmentPlugin(PredBatPlugin):
             # Compute forecast integrals from current Solcast so dashboard
             # shows expected overflow before activation.
             self._publish_forecast_overflow(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
+
+            # R52: pre-PV drain — if forecast says big overflow + CH off + we
+            # have time to drain at DNO before PV starts, activate now.
+            pre_pv = self._pre_pv_drain_decision(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
+            if pre_pv is not None:
+                target_kwh, decision_str = pre_pv
+                self._last_decision = "active (pre-PV): " + decision_str
+                self._floor_ratchet = target_kwh
+                self._last_floor_scale = 0.0
+                self._export_target = dno_limit_kw
+                self.was_active = True
+                self._save_state()
+                return target_kwh, "active"
+
             self._last_decision = "off: no PV yet"
             return soc_max, "off"
 

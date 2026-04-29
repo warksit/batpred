@@ -535,3 +535,58 @@ def compute_release_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, cur
 
     minutes_until = (crossing_utc - current_utc_hours) * 60.0
     return minutes_until, crossing_utc
+
+
+def compute_pv_start_time(scale, lat_deg, lon_deg, day_of_year, threshold_kw, current_utc_hours):
+    """R52: find when PV first crosses ABOVE threshold today (rising side).
+
+    Mirror of compute_release_time but on the ascending side of the solar curve.
+    Models clear-sky PV as scale × sin(elevation). Finds the earliest UTC hour
+    today where this exceeds threshold_kw.
+
+    Args:
+        scale: float kW — clear-sky scale
+        lat_deg, lon_deg: location
+        day_of_year: 1-366
+        threshold_kw: PV level we consider "PV started" (e.g., 0.5 kW)
+        current_utc_hours: decimal UTC hours now
+
+    Returns:
+        (minutes_until_crossing, crossing_utc_hours) or (None, None) if:
+            - peak PV today won't reach threshold (won't cross)
+            - it's already past today's PV start window (we're post-noon and
+              still above threshold means PV started earlier; but the function
+              still returns the crossing for early-morning callers).
+        If we're already past the morning crossing (current > crossing time on
+        the rising side), the function returns the crossing time as past with
+        negative minutes — caller should handle.
+    """
+    # Find solar noon
+    B2 = math.radians((360.0 / 364.0) * (day_of_year - 81))
+    eot = 9.87 * math.sin(2 * B2) - 7.53 * math.cos(B2) - 1.5 * math.sin(B2)
+    solar_noon_utc = 12.0 - lon_deg / 15.0 - eot / 60.0
+
+    # If peak is below threshold, never crosses
+    noon_elev = solar_elevation(lat_deg, lon_deg, solar_noon_utc, day_of_year)
+    peak_pv = scale * max(0.0, math.sin(math.radians(noon_elev)))
+    if peak_pv < threshold_kw:
+        return None, None
+
+    # Scan from sunrise (or earlier) up to solar noon — rising side only.
+    # Start from 0:00 to find today's first crossing regardless of current_utc_hours.
+    crossing_utc = None
+    for minute_offset in range(0, int(solar_noon_utc * 60) + 60):
+        t = minute_offset / 60.0
+        if t > solar_noon_utc:
+            break
+        elev = solar_elevation(lat_deg, lon_deg, t, day_of_year)
+        predicted = scale * max(0.0, math.sin(math.radians(elev)))
+        if predicted >= threshold_kw:
+            crossing_utc = t
+            break
+
+    if crossing_utc is None:
+        return None, None
+
+    minutes_until = (crossing_utc - current_utc_hours) * 60.0
+    return minutes_until, crossing_utc

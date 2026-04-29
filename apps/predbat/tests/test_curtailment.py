@@ -23,6 +23,7 @@ from curtailment_calc import (
     compute_tomorrow_forecast,
     p_scales_from_forecast,
     compute_expected_overflow,
+    compute_pv_start_time,
 )
 
 # Battery constants (Mum's SIG system)
@@ -792,6 +793,133 @@ def test_R50_compute_expected_overflow_at_boundaries():
 
 
 # ============================================================================
+# R52 pre-PV drain tests
+# ============================================================================
+
+
+def test_R52_compute_pv_start_time_summer():
+    """compute_pv_start_time finds sunrise crossing on a summer day."""
+    # July 12, 55.86°N: sunrise ~04:20 UTC (BST 05:20). With scale=12 and threshold=0.5,
+    # sin(elev) > 0.0417 needed → elev > 2.4°. Crosses ~10-15 min after geometric sunrise.
+    # current=00:00 UTC → minutes_until > 0.
+    minutes, crossing_utc = compute_pv_start_time(scale=12.0, lat_deg=55.86, lon_deg=-3.2, day_of_year=193, threshold_kw=0.5, current_utc_hours=0.0)
+    assert crossing_utc is not None, "Should find PV start on a summer day with high scale"
+    # Expect crossing roughly 03:30-04:45 UTC (BST 04:30-05:45)
+    assert 3.0 < crossing_utc < 5.0, f"Crossing should be early morning UTC, got {crossing_utc:.2f}"
+    assert minutes > 0, f"Minutes_until should be positive when called pre-dawn, got {minutes}"
+    print(f"  test_R52_compute_pv_start_time_summer: PASSED (crossing at {crossing_utc:.2f} UTC, {minutes:.0f} min from 00:00)")
+
+
+def test_R52_compute_pv_start_time_winter_low_scale():
+    """compute_pv_start_time returns None if peak can't reach threshold (deep winter low scale)."""
+    # Dec 21 at 55.86°N: solar noon elev ~10.6°, sin ≈ 0.184. With scale=2, peak PV = 0.37 kW.
+    # threshold 0.5 kW — won't cross.
+    minutes, crossing_utc = compute_pv_start_time(scale=2.0, lat_deg=55.86, lon_deg=-3.2, day_of_year=355, threshold_kw=0.5, current_utc_hours=0.0)
+    assert crossing_utc is None, f"Should return None when peak won't reach threshold; got {crossing_utc}"
+    assert minutes is None
+    print(f"  test_R52_compute_pv_start_time_winter_low_scale: PASSED (no crossing, peak too weak)")
+
+
+def test_R52_compute_pv_start_time_called_post_crossing():
+    """If called after the morning crossing, returns negative minutes_until."""
+    # July noon: sun is above threshold by midday. Calling at 12:00 UTC = post-crossing.
+    minutes, crossing_utc = compute_pv_start_time(scale=12.0, lat_deg=55.86, lon_deg=-3.2, day_of_year=193, threshold_kw=0.5, current_utc_hours=12.0)
+    assert crossing_utc is not None
+    assert minutes < 0, f"Crossing was earlier today; minutes_until should be negative. Got {minutes}"
+    print(f"  test_R52_compute_pv_start_time_called_post_crossing: PASSED (negative minutes={minutes:.0f})")
+
+
+def test_R52_compute_pv_start_time_threshold_at_dno():
+    """High threshold (e.g., DNO+load) gives later crossing than low threshold."""
+    # Same day, two thresholds
+    _, low_crossing = compute_pv_start_time(scale=12.0, lat_deg=55.86, lon_deg=-3.2, day_of_year=193, threshold_kw=0.5, current_utc_hours=0.0)
+    _, high_crossing = compute_pv_start_time(scale=12.0, lat_deg=55.86, lon_deg=-3.2, day_of_year=193, threshold_kw=4.5, current_utc_hours=0.0)
+    assert low_crossing < high_crossing, f"Higher threshold should cross later: low={low_crossing:.2f}, high={high_crossing:.2f}"
+    print(f"  test_R52_compute_pv_start_time_threshold_at_dno: PASSED (low={low_crossing:.2f}, high={high_crossing:.2f})")
+
+
+def _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", buffer_pct=20, hour=2, p90_peak=8.58):
+    """Build MockBase for pre-PV drain tests at given local hour (UTC=local for tz=0)."""
+    from datetime import datetime, timezone
+
+    minutes_now = int(hour * 60)
+    pv = {m: 0 for m in range(0, 1440 - minutes_now, PLUGIN_STEP)}
+    load = {m: 0.5 * (PLUGIN_STEP / 60) for m in range(0, 1440 - minutes_now, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 0.0,
+        "sensor.sigen_plant_consumed_power": 0.5,
+        "input_boolean.gshp_ch_active": gshp_ch,
+        "input_number.curtailment_pre_pv_buffer_pct": buffer_pct,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=p90_peak, solcast_remaining=40.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * soc_pct,
+        minutes_now=minutes_now,
+        now_utc=datetime(2025, 7, 12, hour, 0, tzinfo=timezone.utc),
+        best_soc_keep=1.5,
+        sensor_overrides=sensor_overrides,
+    )
+    return base
+
+
+def test_R52_pre_pv_drain_blocked_by_ch_active():
+    """When GSHP CH is on, no pre-PV drain — protect overnight battery."""
+    base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="on", hour=2)  # 02:00 local, CH on
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"CH-active should block pre-PV drain, got phase={phase}"
+    assert floor == base.soc_max, f"Floor should be soc_max when off, got {floor}"
+    print("  test_R52_pre_pv_drain_blocked_by_ch_active: PASSED")
+
+
+def test_R52_pre_pv_drain_too_early():
+    """Before drain_start_time, plugin stays off even with CH off + high SOC."""
+    # 01:00 local, summer day, sunrise ~04:30 local (= same UTC since tz=0).
+    # Even at 70% SOC drain_amount=12.78-(1.5+3.6)=7.7 kWh → drain_minutes=115.
+    # drain_start = 04:30 - 1:55 = 02:35. At 01:00, too early.
+    base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", hour=1)
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"Pre-drain-start should keep plugin off, got phase={phase}"
+    print("  test_R52_pre_pv_drain_too_early: PASSED")
+
+
+def test_R52_pre_pv_drain_active_at_drain_start():
+    """At drain_start time with CH off + high SOC + big overflow forecast: Active."""
+    # 03:30 local (after drain_start ≈ 02:35 for 70% SOC). Plugin should be Active.
+    base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", hour=4)  # 04:00 local
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Pre-PV drain window should be Active, got phase={phase}"
+    # Target = soc_keep + 20% = 1.5 + 3.62 = 5.12 kWh = 28.3%
+    expected_target = 1.5 + 0.20 * BATTERY_KWH
+    assert abs(floor - expected_target) < 0.05, f"Pre-PV target should be ≈{expected_target:.2f}kWh, got {floor:.2f}"
+    print(f"  test_R52_pre_pv_drain_active_at_drain_start: PASSED (target={floor:.2f}kWh)")
+
+
+def test_R52_pre_pv_drain_already_below_target():
+    """SOC already below pre-PV target → no drain needed → off."""
+    # Target = 1.5 + 20% = 5.12 kWh. SOC at 4 kWh (22%) < target.
+    base = _make_pre_pv_base(soc_pct=0.22, gshp_ch="off", hour=4)
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"SOC below target should be off, got {phase}"
+    print("  test_R52_pre_pv_drain_already_below_target: PASSED")
+
+
+def test_R52_pre_pv_drain_low_overflow_forecast():
+    """Small overflow forecast (winter day) → no pre-PV drain regardless of SOC."""
+    # Low p90 peak so overflow_p90 < threshold
+    base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", hour=4, p90_peak=2.0)
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"Low-overflow forecast should not trigger pre-PV drain, got {phase}"
+    print("  test_R52_pre_pv_drain_low_overflow_forecast: PASSED")
+
+
+# ============================================================================
 # v10 phase tests
 # ============================================================================
 
@@ -1016,6 +1144,8 @@ def test_r48_triggers_after_overnight_100pct():
     Fix: require the battery to have been observed BELOW soc_keep this day
     before allowing the recovered latch to fire.
     """
+    from datetime import datetime, timezone
+
     pv, load = _make_overflow_pv(minutes_now=360)  # 06:00 local — early morning
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 2.0,  # PV rising, pv_covering will be True
@@ -1027,6 +1157,9 @@ def test_r48_triggers_after_overnight_100pct():
         load_step=load,
         soc_kw=BATTERY_KWH * 1.0,  # 100% overnight — the crash case
         minutes_now=360,
+        # Match minutes_now=360 (06:00 local). With UTC tz, local_offset=0 so
+        # period_start "+00:00" is treated as UTC — peak slot at 12:00 UTC.
+        now_utc=datetime(2025, 7, 12, 6, 0, tzinfo=timezone.utc),
         best_soc_keep=1.5,
         sensor_overrides=sensor_overrides,
     )
@@ -1052,17 +1185,23 @@ def test_r48_latches_once_engaged():
     using RELAXED_KEEP_KWH until _keep_recovered fires (battery has
     completed its drain cycle and risen back to base keep).
     """
-    pv, load = _make_overflow_pv(minutes_now=420)  # 07:00 BST morning
+    from datetime import datetime, timezone
+
+    pv, load = _make_overflow_pv(minutes_now=420)  # 07:00 local morning
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 1.0,  # >= 0.5+load: pv_covering
         "sensor.sigen_plant_consumed_power": 0.4,
     }
-    sensor_overrides.update(_make_p90_sensors())
+    # Big-PV-day fixture: solcast_remaining must exceed (soc_max − soc_kw + load) so
+    # R5 will_fill gate passes (battery would overfill — R48 needed for headroom).
+    sensor_overrides.update(_make_p90_sensors(solcast_remaining=40.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
         soc_kw=BATTERY_KWH * 0.05,  # below soc_keep — sets _keep_drained_today
         minutes_now=420,
+        # Match minutes_now=420 (07:00 local) with UTC tz so local_offset=0
+        now_utc=datetime(2025, 7, 12, 7, 0, tzinfo=timezone.utc),
         best_soc_keep=1.5,
         sensor_overrides=sensor_overrides,
     )
@@ -1855,7 +1994,8 @@ def test_export_target_dno_when_active_regardless_of_soc():
         load_step=load,
         soc_kw=soc_kw,
         minutes_now=1020,
-        now_utc=datetime(2025, 7, 12, 16, 0, tzinfo=timezone.utc),
+        # Match minutes_now=1020 (17:00 local) with UTC tz so local_offset=0
+        now_utc=datetime(2025, 7, 12, 17, 0, tzinfo=timezone.utc),
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
@@ -2947,6 +3087,26 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- R50 confidence-weighted overflow tests ---")
     for test_fn in r50_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # R52 pre-PV drain tests
+    r52_tests = [
+        test_R52_compute_pv_start_time_summer,
+        test_R52_compute_pv_start_time_winter_low_scale,
+        test_R52_compute_pv_start_time_called_post_crossing,
+        test_R52_compute_pv_start_time_threshold_at_dno,
+        test_R52_pre_pv_drain_blocked_by_ch_active,
+        test_R52_pre_pv_drain_too_early,
+        test_R52_pre_pv_drain_active_at_drain_start,
+        test_R52_pre_pv_drain_already_below_target,
+        test_R52_pre_pv_drain_low_overflow_forecast,
+    ]
+    print("  --- R52 pre-PV drain tests ---")
+    for test_fn in r52_tests:
         try:
             test_fn()
         except Exception as e:
