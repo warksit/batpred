@@ -17,6 +17,15 @@
 #   OUTER_THRESHOLD_KWH = 0.18 kWh ≈ 1% of soc_max — robust to Sigen SOC 0.1% quantisation.
 # Bootstrap (current phase = Off/unknown/Hold from prior manual): symmetric ±OUTER pick.
 #
+# Charge phase — soft (rate-paced): export = max(0, excess − rate) where
+#   rate = max(0, target_kwh − soc_kwh) / hours_until_safe_time
+# rate is the slowest charge that closes the SOC-vs-target gap by safe_time.
+# It self-adjusts to forecast error: if PV under-forecasts or load over-
+# forecasts, the gap grows and the rate grows in lockstep. During active
+# overflow (excess > DNO) the DNO clamp dominates and battery passively
+# absorbs excess-DNO — no aggressive charging mid-overflow (which would
+# overshoot target and reduce safety headroom against SIG voltage faults).
+#
 # EMS mode management:
 #   Manual != Off OR plugin active → Command Discharging (ESS First)
 #   Both off → Maximum Self Consumption (normal operation)
@@ -122,6 +131,23 @@ action:
       voltage_cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(dno) }}"
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
+      # Soft-charge controller: rate to track target_kwh by safe_time. Slowest
+      # sufficient pace. Compensates for the 10% safety margin in target plus
+      # any actual-vs-forecast divergence (lower PV / higher load → bigger gap
+      # → bigger rate). During active overflow (excess > DNO) the DNO clamp
+      # below dominates, so battery passively absorbs excess-DNO — no
+      # aggressive charging while overflow is happening (which would overshoot
+      # target and reduce safety headroom).
+      gap_kwh: "{{ [target_kwh - soc_kwh, 0] | max }}"
+      hours_remaining: >-
+        {%- set safe_str = state_attr('sensor.predbat_curtailment_phase', 'safe_time') -%}
+        {%- if safe_str and safe_str not in ['none', 'unknown', 'unavailable'] -%}
+          {{ ((today_at(safe_str) - now()).total_seconds() / 3600) | round(3) }}
+        {%- else -%}-1{%- endif -%}
+      charge_rate_kw: >-
+        {%- if hours_remaining | float(-1) > 0 and gap_kwh | float(0) > 0 -%}
+          {{ (gap_kwh / (hours_remaining | float)) | round(2) }}
+        {%- else -%}0{%- endif -%}
       # Schmitt-trigger phase selection. For automated phases (when not manual/Off), the
       # next phase depends on both (soc vs target) AND the current phase.
       phase: >-
@@ -161,7 +187,16 @@ action:
         {% elif phase == 'Drain' %}
           {{ [[export_cap, 0] | max, voltage_cap, dno] | min | round(1) }}
         {% elif phase == 'Charge' %}
-          {{ 0 | round(1) }}
+          {# Soft-charge: leave charge_rate_kw of excess for battery, export
+             the rest. Capped by voltage_cap and DNO. During active overflow
+             (excess > DNO) the DNO clamp dominates and battery passively
+             absorbs excess-DNO. If safe_time is invalid, fall back to legacy
+             export=0 behaviour. #}
+          {% if hours_remaining | float(-1) <= 0 %}
+            {{ [voltage_cap, 0] | min | round(1) }}
+          {% else %}
+            {{ [[excess - charge_rate_kw, 0] | max, voltage_cap, dno] | min | round(1) }}
+          {% endif %}
         {% else %}
           {# Hold #}
           {{ [[excess, 0] | max, export_cap | float(dno), voltage_cap, dno] | min | round(1) }}
