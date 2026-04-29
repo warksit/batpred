@@ -1,0 +1,49 @@
+# Voltage Throttle Filter — Asymmetric Rate Limit
+#
+# Filters sensor.sig_voltage_max_export_kw with asymmetric response:
+#   - Drops are immediate (snap down on voltage spike — safety-critical)
+#   - Rises capped at 0.667 kW per 5s tick (full 0→4 kW recovery in 30s)
+#
+# The filtered value lives in input_number.voltage_throttle_filtered_cap and
+# is consumed by the curtailment automation as voltage_cap. The raw cap
+# sensor (sensor.sig_voltage_max_export_kw) stays untouched — voltage_protect
+# notification triggers and the activations counter still track the raw cap.
+#
+# Why: 2026-04-29 13:14-13:21 BST showed a 5-second bang-bang oscillation
+# (V swung 253↔259, cap swung 2↔4) with no SIG fault but constant inverter
+# rewriting. SIG's absorption-based throttle responds in seconds, so when
+# cap snaps back to 4 kW, voltage spikes immediately and cap drops again.
+#
+# Slow recovery breaks the loop: SIG export stays clamped low for 30s after
+# a voltage spike, giving the system time to settle. If voltage spikes again
+# during recovery, cap snaps down immediately (safety preserved).
+#
+# Trigger: time_pattern every 5s. Self-healing — if a tick is missed, next
+# tick catches up.
+
+alias: "Voltage Throttle Filter — Asymmetric Rate Limit"
+description: >-
+  Asymmetric rate limiter on sensor.sig_voltage_max_export_kw. Drops snap
+  down immediately, rises crawl up at 0.667 kW per 5s (full 0→4 kW in 30s).
+  Output goes to input_number.voltage_throttle_filtered_cap which the
+  curtailment automation reads as voltage_cap.
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: time_pattern
+    seconds: "/5"
+
+action:
+  - variables:
+      raw: "{{ states('sensor.sig_voltage_max_export_kw') | float(4) }}"
+      prev: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
+      step_per_tick: 0.667  # 4 kW / 30 s × 5 s per tick
+      new_value: >-
+        {{ raw if raw < prev else [raw, prev + step_per_tick] | min }}
+
+  - action: input_number.set_value
+    target:
+      entity_id: input_number.voltage_throttle_filtered_cap
+    data:
+      value: "{{ new_value | round(2) }}"

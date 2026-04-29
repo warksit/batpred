@@ -56,9 +56,11 @@ trigger:
     platform: state
   - entity_id: input_select.curtailment_manual_hold
     platform: state
-  # Re-evaluate when the voltage-based cap changes — the proportional
-  # throttle replaces the old voltage_protect's separate writer pattern.
-  - entity_id: sensor.sig_voltage_max_export_kw
+  # Re-evaluate when the asymmetrically rate-limited cap changes — drops are
+  # immediate (snap down on voltage spike) but rises are limited to ~0.667 kW
+  # per 5s tick (full 0→4 kW recovery in 30s). Breaks the 5s bang-bang
+  # oscillation observed when reading the raw cap directly.
+  - entity_id: input_number.voltage_throttle_filtered_cap
     id: voltage_cap_change
     platform: state
 
@@ -115,7 +117,9 @@ action:
       # 0..dno based on phase A voltage. At normal voltage = dno (no effect).
       # As voltage rises past upper-range threshold, this drops toward 0,
       # forcing export down to absorb into battery and unload the feeder.
-      voltage_cap: "{{ states('sensor.sig_voltage_max_export_kw') | float(dno) }}"
+      # Asymmetric rate-limited cap — drops are immediate, rises capped at
+      # 0.667 kW per 5s (full recovery in 30s). Breaks tight oscillation.
+      voltage_cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(dno) }}"
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
       # Schmitt-trigger phase selection. For automated phases (when not manual/Off), the
