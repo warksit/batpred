@@ -35,5 +35,6 @@ After changing in HA, pull the updated config and commit it so the file stays in
 
 - `pre-commit run --all-files`
 - `cd apps/predbat && python3 tests/test_curtailment.py`
+- `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the HA automation YAML
 - `cd coverage && python3 ../apps/predbat/unit_test.py --quick`
 - **Commit before deploying** — always `git commit` before `scp`/deploy so deployed code is always in git history
