@@ -1408,6 +1408,60 @@ def test_on_update_full_flow():
     print(f"  test_on_update_full_flow: PASSED (phase={phase}, target={target_pct:.0f}%)")
 
 
+def test_on_update_publishes_phase_before_writing_ems():
+    """Active-edge ordering: phase sensor publish must precede EMS service write.
+
+    The HA automation has a Restore-MSC branch that fires when
+    (manual=Off, phase sensor=Off, EMS!=MSC). If the plugin writes EMS=D-ESS
+    BEFORE publishing phase=Active, the automation can reverse our EMS write
+    in the race window — observed live on 2026-04-30, drain stalled 1h57m.
+
+    Lock in publish-before-apply ordering by capturing call order through
+    instrumented dashboard_item and call_service_wrapper.
+    """
+    pv, load = _make_overflow_pv(minutes_now=720)
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 8.0,
+        "sensor.sigen_plant_consumed_power": 1.0,
+    }
+    sensor_overrides.update(_make_p90_sensors())
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        minutes_now=720,
+        sensor_overrides=sensor_overrides,
+    )
+
+    call_order = []
+    orig_dashboard = base.dashboard_item
+    orig_service = base.call_service_wrapper
+
+    def tracked_dashboard(entity, value, attrs=None):
+        call_order.append(("publish", entity))
+        return orig_dashboard(entity, value, attrs)
+
+    def tracked_service(service, **kwargs):
+        call_order.append(("service", service, kwargs.get("entity_id"), kwargs.get("option")))
+        return orig_service(service, **kwargs)
+
+    base.dashboard_item = tracked_dashboard
+    base.call_service_wrapper = tracked_service
+
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+
+    # Find first phase sensor publish and first EMS service write.
+    phase_idx = next((i for i, c in enumerate(call_order) if c[0] == "publish" and c[1] == "sensor.predbat_curtailment_phase"), None)
+    ems_idx = next((i for i, c in enumerate(call_order) if c[0] == "service" and c[1] == "select/select_option" and c[2] == "select.sigen_plant_remote_ems_control_mode"), None)
+
+    assert phase_idx is not None, "phase sensor was never published"
+    assert ems_idx is not None, "EMS mode was never written"
+    assert phase_idx < ems_idx, "phase sensor publish (idx {}) must precede EMS write (idx {}); preserves ordering required to avoid the HA automation Restore-MSC race".format(phase_idx, ems_idx)
+
+    print("  test_on_update_publishes_phase_before_writing_ems: PASSED (phase@{} before EMS@{})".format(phase_idx, ems_idx))
+
+
 def test_on_update_stays_off_low_pv():
     """Low PV day: plugin stays off."""
     pv = {}
@@ -2949,6 +3003,7 @@ def run_curtailment_tests(my_predbat=None):
         test_apply_already_active_no_export_write,
         test_apply_off_restores_msc,
         test_on_update_full_flow,
+        test_on_update_publishes_phase_before_writing_ems,
         test_on_update_stays_off_low_pv,
         test_deactivation_at_safe_time,
         test_manual_hold_maintains_dess_after_deactivation,

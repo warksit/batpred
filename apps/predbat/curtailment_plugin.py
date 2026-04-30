@@ -1475,8 +1475,15 @@ class CurtailmentPlugin(PredBatPlugin):
                     self.publish("off", floor, dno_limit, export_target=self._export_target)
                     return
 
-            self.apply(phase)
+            # Publish HA-side sensors BEFORE writing SIG entities. The order
+            # matters because the HA automation has a Restore-MSC branch that
+            # fires when (manual=Off, phase sensor=Off, EMS!=MSC). If apply()
+            # ran first on the active edge, EMS becomes D-ESS while phase is
+            # still Off — the automation reverses our EMS write within seconds.
+            # Publishing first means phase=Active is visible by the time EMS
+            # changes, so branch 3's condition no longer matches.
             self.publish(phase, floor, dno_limit, export_target=self._export_target)
+            self.apply(phase)
 
             # Tomorrow forecast (separate try/except — don't break today's control)
             try:
