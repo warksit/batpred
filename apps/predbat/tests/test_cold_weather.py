@@ -205,6 +205,7 @@ def test_before_plan_injects_alert_keep():
     """on_before_plan should inject tapered alert_keep during cheap rate only."""
     plugin = _make_plugin_with_history([])
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base._states["input_boolean.gshp_ch_active"] = "on"
     plugin.base.minutes_now = 720  # Noon → target tomorrow
     plugin.base.all_active_keep = {}
 
@@ -233,6 +234,7 @@ def test_before_plan_morning_targets_today():
     """Before noon, should target today's cheap rate window (04:00-07:00)."""
     plugin = _make_plugin_with_history([])
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base._states["input_boolean.gshp_ch_active"] = "on"
     plugin.base.minutes_now = 180  # 03:00 → target today
     plugin.base.all_active_keep = {}
 
@@ -251,6 +253,7 @@ def test_before_plan_respects_existing_keep():
     """Should not lower existing all_active_keep entries."""
     plugin = _make_plugin_with_history([])
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base._states["input_boolean.gshp_ch_active"] = "on"
     plugin.base.minutes_now = 180  # 03:00
     plugin.base.all_active_keep = {240: 99.0}  # Existing high keep at 04:00
 
@@ -266,6 +269,7 @@ def test_before_plan_below_threshold():
     plugin = _make_plugin_with_history([])
     plugin.coefficients = (2.0, 0, 0, 0)  # Constant model: always 2.0 kWh
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base._states["input_boolean.gshp_ch_active"] = "on"
     plugin.base.minutes_now = 720
     plugin.base.all_active_keep = {}
 
@@ -295,11 +299,34 @@ def test_before_plan_disabled():
     print("  test_before_plan_disabled: PASSED")
 
 
+def test_before_plan_ch_inactive():
+    """on_before_plan should produce zero boost when input_boolean.gshp_ch_active is off,
+    even with the cold-weather master switch on. CH-off nights need no GSHP prep."""
+    plugin = _make_plugin_with_history([])
+    plugin.coefficients = (5.0, 0, 0, 0)
+    plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base._states["input_boolean.gshp_ch_active"] = "off"
+    plugin.base.minutes_now = 1320  # 22:00 — within boost window
+    plugin.base.all_active_keep = {}
+    plugin._get_tonight_prediction = lambda: 5.0
+
+    context = {"best_soc_keep": 3.0}
+    result = plugin.on_before_plan(context)
+
+    assert result["best_soc_keep"] == 3.0, "best_soc_keep should be unchanged when CH inactive, got {}".format(result["best_soc_keep"])
+    assert len(plugin.base.all_active_keep) == 0, "Should not inject alert_keep when CH inactive"
+    boost_sensor = plugin.base.published.get("sensor.predbat_cold_weather_soc_keep_boost", {})
+    assert boost_sensor.get("value") == 0.0, "Boost sensor should be 0.0, got {}".format(boost_sensor.get("value"))
+    assert boost_sensor.get("attrs", {}).get("reason") == "ch_inactive", "Boost reason should be 'ch_inactive', got {}".format(boost_sensor.get("attrs", {}).get("reason"))
+    print("  test_before_plan_ch_inactive: PASSED")
+
+
 def test_before_plan_with_model_prediction():
     """With a trained model, should inject during cheap rate with GSHP-window taper."""
     plugin = _make_plugin_with_history([])
     plugin.coefficients = (5.0, 0, 0, 0)  # Constant model: always 5.0 kWh
     plugin.base._states["input_boolean.cold_weather_gshp_heating"] = "on"
+    plugin.base._states["input_boolean.gshp_ch_active"] = "on"
     plugin.base.minutes_now = 720
     plugin.base.all_active_keep = {}
 
@@ -351,6 +378,7 @@ def run_cold_weather_tests():
         test_before_plan_respects_existing_keep,
         test_before_plan_below_threshold,
         test_before_plan_disabled,
+        test_before_plan_ch_inactive,
         test_before_plan_with_model_prediction,
     ]
 

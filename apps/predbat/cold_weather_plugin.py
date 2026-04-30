@@ -18,6 +18,7 @@ from plugin_system import PredBatPlugin
 
 # HA entity IDs
 HA_GSHP_HEATING = "input_boolean.cold_weather_gshp_heating"
+HA_GSHP_CH_ACTIVE = "input_boolean.gshp_ch_active"
 HA_GSHP_ENERGY = "sensor.heat_pump_energy_meter_energy"
 HA_WEATHER = "weather.forecast_home"
 
@@ -412,6 +413,11 @@ class ColdWeatherPlugin(PredBatPlugin):
         enabled = str(self.base.get_state_wrapper(HA_GSHP_HEATING, default="off")).lower() in ("on", "true")
         if not enabled:
             self._publish_boost(0.0, context, reason="disabled")
+            return context
+
+        ch_active = str(self.base.get_state_wrapper(HA_GSHP_CH_ACTIVE, default="off")).lower() in ("on", "true")
+        if not ch_active:
+            self._publish_boost(0.0, context, reason="ch_inactive")
             return context
 
         if self.coefficients is None:
