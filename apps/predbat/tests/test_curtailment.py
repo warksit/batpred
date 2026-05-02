@@ -1254,6 +1254,90 @@ def test_R53_real_last_10_days_no_crash_and_sane():
         print(f"    {day}: day total P50={total:.1f} kWh, overflow P50={ov50:.2f} kWh, P90={ov90:.2f} kWh")
 
 
+def test_R58_calibration_ratio_one_is_identity():
+    """calibration_ratio=1.0 → output identical to no-calibration."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 7.0, 5.0, 9.0), (11, 30, 7.0, 5.0, 9.0)])
+    common = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=11.0,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 12,
+    )
+    base = compute_solcast_overflow(**common)
+    cal = compute_solcast_overflow(calibration_ratio=1.0, **common)
+    assert abs(base - cal) < 1e-9, f"ratio=1.0 should be identity, base={base} cal={cal}"
+    print("  test_R58_calibration_ratio_one_is_identity: PASSED")
+
+
+def test_R58_calibration_ratio_only_affects_window():
+    """ratio=1.5, window=0.5h → multiplies first 30 min only, rest unchanged."""
+    from curtailment_calc import compute_solcast_overflow
+
+    # Two slots, both 7 kW. Integration covers both. Calibration window = first slot.
+    slots = _make_solcast_slots([(11, 0, 7.0, 5.0, 9.0), (11, 30, 7.0, 5.0, 9.0)])
+    common = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=11.0,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 12,
+    )
+    base = compute_solcast_overflow(**common)
+    boost = compute_solcast_overflow(calibration_ratio=1.5, calibration_window_hours=0.5, **common)
+    # Slot 1 (calibrated): pv = 7 × 1.5 = 10.5; overflow = (10.5 − 0.5 − 4) × 0.5 = 3.0
+    # Slot 2 (not calibrated): overflow = (7 − 0.5 − 4) × 0.5 = 1.25
+    # boost = 4.25; base = 1.25 + 1.25 = 2.5
+    assert abs(boost - 4.25) < 0.01, f"Expected boost=4.25, got {boost:.3f}"
+    assert abs(base - 2.5) < 0.01, f"Expected base=2.5, got {base:.3f}"
+    print(f"  test_R58_calibration_ratio_only_affects_window: PASSED (base={base:.2f}, boost={boost:.2f})")
+
+
+def test_R58_calibration_ratio_capped_at_15x():
+    """A wildly-high ratio (e.g. 5x) is capped at 1.5x to prevent runaway."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 7.0, 5.0, 9.0)])
+    common = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 6,
+    )
+    cap = compute_solcast_overflow(calibration_ratio=1.5, calibration_window_hours=0.5, **common)
+    runaway = compute_solcast_overflow(calibration_ratio=5.0, calibration_window_hours=0.5, **common)
+    assert abs(cap - runaway) < 1e-9, f"Should cap at 1.5x, got cap={cap} runaway={runaway}"
+    print(f"  test_R58_calibration_ratio_capped_at_15x: PASSED (cap={cap:.2f})")
+
+
+def test_R58_calibration_below_one_attenuates_window():
+    """ratio<1.0 attenuates next-30-min PV (cloudier than forecast caught live)."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 7.0, 5.0, 9.0)])
+    common = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 6,
+    )
+    base = compute_solcast_overflow(**common)
+    attenuated = compute_solcast_overflow(calibration_ratio=0.5, calibration_window_hours=0.5, **common)
+    # base: pv=7, overflow = (7 − 0.5 − 4) × 0.5 = 1.25
+    # attenuated: pv=3.5, overflow = max(0, 3.5 − 0.5 − 4) × 0.5 = 0
+    assert abs(base - 1.25) < 0.01, f"base expected 1.25, got {base:.3f}"
+    assert attenuated == 0.0, f"attenuated expected 0 (pv below DNO), got {attenuated:.3f}"
+    print(f"  test_R58_calibration_below_one_attenuates_window: PASSED (base={base:.2f}, attenuated={attenuated:.2f})")
+
+
 def test_R53_compute_solcast_overflow_band_selection():
     """band='pv_estimate10' / 'pv_estimate90' read different fields (R53 enables R50)."""
     from curtailment_calc import compute_solcast_overflow
@@ -3618,6 +3702,10 @@ def run_curtailment_tests(my_predbat=None):
         test_R53_real_2026_05_02_shape_preserved,
         test_R53_real_last_10_days_no_crash_and_sane,
         test_R53_compute_solcast_overflow_band_selection,
+        test_R58_calibration_ratio_one_is_identity,
+        test_R58_calibration_ratio_only_affects_window,
+        test_R58_calibration_ratio_capped_at_15x,
+        test_R58_calibration_below_one_attenuates_window,
     ]
     print("  --- R53 per-slot Solcast integral tests ---")
     for test_fn in r53_tests:

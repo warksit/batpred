@@ -300,6 +300,9 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 
+CALIBRATION_RATIO_MAX = 1.5
+
+
 def compute_solcast_overflow(
     detailed_forecast,
     from_utc_hours,
@@ -310,6 +313,8 @@ def compute_solcast_overflow(
     base_load=MIN_BASE_LOAD_KW,
     step_minutes=5,
     band="pv_estimate",
+    calibration_ratio=1.0,
+    calibration_window_hours=0.5,
 ):
     """
     Integrate overflow energy from Solcast per-slot forecast (R53, v20).
@@ -321,6 +326,13 @@ def compute_solcast_overflow(
     For each integration step, looks up the Solcast 30-min slot containing
     that UTC time, takes the band's kW value, then:
         overflow_step = max(0, pv_kw - effective_load_kw - dno_limit) × step_h
+
+    R58 live calibration: pv_kw is multiplied by min(CALIBRATION_RATIO_MAX,
+    calibration_ratio) for the first calibration_window_hours of integration
+    only. Lets the plugin apply a "we're tracking 1.2× ahead of Solcast right
+    now" multiplier to the next 30 min only — beyond that, raw shape is
+    preserved (no global override of remaining-day Solcast). Replaces R43's
+    `max(p_scale, actual_scale)` global collapse.
 
     Args:
         detailed_forecast: list of dicts with 'period_start' (ISO local-time),
@@ -335,6 +347,10 @@ def compute_solcast_overflow(
         base_load: floor for effective load (R9a)
         step_minutes: integration step (default 5)
         band: which Solcast field to read
+        calibration_ratio: live actual_pv / forecast_pv ratio over the recent
+                           past (R58). 1.0 = no calibration. Capped at 1.5.
+        calibration_window_hours: how far forward the calibration applies.
+                                  Default 0.5 (= one Solcast slot).
 
     Returns:
         float kWh — total overflow over the window
@@ -360,6 +376,7 @@ def compute_solcast_overflow(
     slots.sort(key=lambda x: x[0])
 
     step_hours = step_minutes / 60.0
+    capped_calibration = min(CALIBRATION_RATIO_MAX, max(0.0, calibration_ratio))
     total = 0.0
     t = from_utc_hours
     i = 0
@@ -376,6 +393,9 @@ def compute_solcast_overflow(
             pv_kw = 0.0
         else:
             pv_kw = s_pv
+        # R58 live calibration: scale only within the calibration window
+        if (t - from_utc_hours) < calibration_window_hours and capped_calibration != 1.0:
+            pv_kw = pv_kw * capped_calibration
         forecast_load = load_forecast_kw[i] if load_forecast_kw and i < len(load_forecast_kw) else 0.0
         load_kw = max(base_load, forecast_load)
         total += max(0.0, pv_kw - load_kw - dno_limit) * step_hours
