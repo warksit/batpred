@@ -42,6 +42,7 @@ from curtailment_calc import (
     p90_scale_from_forecast,
     p_scales_from_forecast,
     simulate_soc_trajectory,
+    smooth_load_forecast,
     solar_elevation,
     compute_release_time,
     MIN_BASE_LOAD_KW,
@@ -620,6 +621,7 @@ class CurtailmentPlugin(PredBatPlugin):
             to_kw = 1.0 / step_hours
             safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
             load_fc = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
+            load_fc = smooth_load_forecast(load_fc, window_minutes=60, step_minutes=PREDICT_STEP)
             p10_eff = max(p10_scale, self._actual_scale)
             p50_eff = max(p50_scale, self._actual_scale)
             p90_eff = max(p90_scale, self._actual_scale)
@@ -800,6 +802,7 @@ class CurtailmentPlugin(PredBatPlugin):
         to_kw = 1.0 / step_hours
         safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
         load_forecast_kw = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
+        load_forecast_kw = smooth_load_forecast(load_forecast_kw, window_minutes=60, step_minutes=PREDICT_STEP)
 
         # Compute three overflow integrals (R50): one per forecast band.
         # Each band uses max(p_X_scale, actual_scale) so once actual exceeds

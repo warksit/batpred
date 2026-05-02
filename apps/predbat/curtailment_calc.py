@@ -300,6 +300,37 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 
+def smooth_load_forecast(load_kw_list, window_minutes=60, step_minutes=5):
+    """
+    Centered rolling-mean smoothing of a load forecast list (R9a).
+
+    LoadML produces per-slot forecasts that can spike on phantom predictions
+    (the v5 failure mode that broke per-slot integration). Smoothing with a
+    60-min window distributes single-slot spikes across neighbours so the
+    overflow integral isn't dominated by noise. v20 (R53) reintroduces
+    per-slot Solcast integration, which only works safely with smoothed load.
+
+    Args:
+        load_kw_list: list of kW values per step
+        window_minutes: smoothing window size in minutes (default 60)
+        step_minutes: step size of the list (default 5)
+
+    Returns:
+        list of smoothed kW values, same length as input
+    """
+    if not load_kw_list:
+        return []
+    half_window = max(1, window_minutes // (2 * step_minutes))
+    n = len(load_kw_list)
+    smoothed = []
+    for i in range(n):
+        lo = max(0, i - half_window)
+        hi = min(n, i + half_window + 1)
+        window = load_kw_list[lo:hi]
+        smoothed.append(sum(window) / len(window))
+    return smoothed
+
+
 def compute_solar_overflow(scale, lat_deg, lon_deg, day_of_year, from_utc_hours, to_utc_hours, dno_limit, base_load=MIN_BASE_LOAD_KW, step_minutes=5, load_forecast_kw=None):
     """
     Integrate overflow energy from the solar geometry curve between two UTC times.

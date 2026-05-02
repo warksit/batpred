@@ -920,6 +920,72 @@ def test_R52_pre_pv_drain_low_overflow_forecast():
 
 
 # ============================================================================
+# R9a: LoadML smoothing tests (v20)
+# ============================================================================
+
+
+def test_R9a_smooth_load_forecast_constant_input():
+    """Constant input → constant output (smoothing identity)."""
+    from curtailment_calc import smooth_load_forecast
+
+    flat = [0.5] * 24  # 2 hours of 0.5 kW
+    smoothed = smooth_load_forecast(flat, window_minutes=60, step_minutes=5)
+    assert len(smoothed) == len(flat), f"Length mismatch: {len(smoothed)} vs {len(flat)}"
+    for v in smoothed:
+        assert abs(v - 0.5) < 1e-9, f"Constant 0.5 input should yield 0.5 out, got {v}"
+    print("  test_R9a_smooth_load_forecast_constant_input: PASSED")
+
+
+def test_R9a_smooth_load_forecast_attenuates_single_spike():
+    """Single 5 kW transient in 0.5 kW background → attenuated by ~12× (60-min window)."""
+    from curtailment_calc import smooth_load_forecast
+
+    # 24 slots of 0.5 kW with a single spike of 5 kW at slot 12
+    load = [0.5] * 24
+    load[12] = 5.0  # single 5 kW transient
+    smoothed = smooth_load_forecast(load, window_minutes=60, step_minutes=5)
+
+    # At slot 12, smoothed value ≈ (0.5 × 12 + 5.0) / 13 ≈ 0.85 kW
+    # (window = ±6 slots = 13 slots total, since centered)
+    assert abs(smoothed[12] - 0.85) < 0.05, f"Spike at slot 12 should attenuate to ~0.85 kW, got {smoothed[12]:.3f}"
+    # Far from spike (slot 0), value should be ≈ 0.5 kW (spike out of window)
+    assert abs(smoothed[0] - 0.5) < 0.05, f"Slot 0 (out of spike window) should stay ~0.5 kW, got {smoothed[0]:.3f}"
+    print("  test_R9a_smooth_load_forecast_attenuates_single_spike: PASSED")
+
+
+def test_R9a_smoothed_integral_stable_against_load_noise():
+    """Overflow integral with smoothed load resists single-slot LoadML noise (≤5% drift).
+
+    This is the v5 failure mode test: a phantom 1 kW transient in LoadML must not
+    swing the overflow integral by more than 5%. With unsmoothed load, the spike
+    momentarily suppresses overflow at that slot. Smoothing distributes the spike
+    so the integral barely moves.
+    """
+    from curtailment_calc import compute_solar_overflow, smooth_load_forecast
+
+    # Simple noon-centered overflow window (6 hours, step 5 min, lat 52, summer)
+    n_steps = 72  # 6 hours
+    flat_load = [0.5] * n_steps  # baseline
+    noisy_load = list(flat_load)
+    noisy_load[36] = 1.5  # 1 kW transient mid-window
+
+    common = dict(scale=10.0, lat_deg=52.0, lon_deg=-1.5, day_of_year=140, from_utc_hours=8.0, to_utc_hours=14.0, dno_limit=4.0, step_minutes=5)
+
+    base_integral = compute_solar_overflow(load_forecast_kw=flat_load, **common)
+    noisy_integral_unsmoothed = compute_solar_overflow(load_forecast_kw=noisy_load, **common)
+    smoothed_load = smooth_load_forecast(noisy_load, window_minutes=60, step_minutes=5)
+    noisy_integral_smoothed = compute_solar_overflow(load_forecast_kw=smoothed_load, **common)
+
+    # Sanity: the unsmoothed noisy integral should differ from baseline (proves the spike has effect)
+    assert abs(base_integral - noisy_integral_unsmoothed) > 0.0001, "Test setup invalid: spike should change unsmoothed integral"
+
+    # Smoothed integral within 5% of baseline
+    pct_drift = abs(noisy_integral_smoothed - base_integral) / max(0.001, base_integral)
+    assert pct_drift < 0.05, f"Smoothed integral drifted {pct_drift*100:.1f}% from baseline " f"(base={base_integral:.3f}, smoothed_noisy={noisy_integral_smoothed:.3f}); " f"R9a requires ≤5%"
+    print(f"  test_R9a_smoothed_integral_stable_against_load_noise: PASSED " f"(base={base_integral:.3f} kWh, smoothed drift={pct_drift*100:.2f}%)")
+
+
+# ============================================================================
 # v10 phase tests
 # ============================================================================
 
@@ -3142,6 +3208,20 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- R50 confidence-weighted overflow tests ---")
     for test_fn in r50_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # R9a load smoothing tests (v20)
+    r9a_tests = [
+        test_R9a_smooth_load_forecast_constant_input,
+        test_R9a_smooth_load_forecast_attenuates_single_spike,
+        test_R9a_smoothed_integral_stable_against_load_noise,
+    ]
+    print("  --- R9a load smoothing tests ---")
+    for test_fn in r9a_tests:
         try:
             test_fn()
         except Exception as e:
