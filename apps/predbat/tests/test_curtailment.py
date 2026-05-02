@@ -2415,6 +2415,84 @@ def test_R55_overnight_target_published_when_no_overflow():
     print(f"  test_R55_overnight_target_published_when_no_overflow: PASSED (value={pub['value']} kWh)")
 
 
+def test_R55_overnight_target_published_from_calculate_with_real_pv_step():
+    """The live architecture: pv_forecast_minute_step is populated when
+    calculate() runs (via on_update hook AFTER calculate_plan), but EMPTY
+    when on_before_plan runs (BEFORE calculate_plan, predbat wipes pv_step
+    at end of each update_pred cycle).
+
+    Verifies: overnight_target sensor publishes morning_gap > 0 when
+    calculate() runs with populated pv_step.
+    """
+    from datetime import datetime, timezone
+
+    pv = {}
+    load = {}
+    # PV ramp down to 0, then 0 until tomorrow's morning ramp.
+    for m in range(0, 1440, PLUGIN_STEP):
+        if m < 300:
+            pv[m] = 1.5
+        elif m < 1080:
+            pv[m] = 0.0
+        else:
+            pv[m] = 1.5
+        load[m] = 0.5
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 1.5, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=2.0, solcast_remaining=4.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.50,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.calculate(dno_limit_kw=4.0)
+
+    entity = "sensor.predbat_curtailment_overnight_target"
+    assert entity in base.published, "R55 sensor must publish from calculate()"
+    pub = base.published[entity]
+    morning_gap = pub["attrs"]["morning_gap_kwh"]
+    assert morning_gap > 0.5, f"R55 must compute morning_gap from calculate() with pv_step populated. Got morning_gap={morning_gap}"
+    assert pub["attrs"]["source"] == "calculate", f"source should be 'calculate', got {pub['attrs']['source']}"
+    print(f"  test_R55_overnight_target_published_from_calculate_with_real_pv_step: PASSED (morning_gap={morning_gap:.2f}, target={pub['value']:.2f})")
+
+
+def test_R55_overnight_target_no_plan_yet_fallback():
+    """Pre-startup case: no plan computed yet, pv_forecast_minute_step empty.
+    Should still publish the sensor (with soc_keep value, source=no_plan_yet)
+    so the dashboard isn't blank.
+    """
+    from datetime import datetime, timezone
+
+    base = MockBase(
+        pv_step={},  # empty — pre-startup
+        load_step={},
+        soc_kw=BATTERY_KWH * 0.50,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+    )
+    plugin = CurtailmentPlugin(base)
+    # calculate() returns early on lat/lon=0 since no zone.home overrides — but
+    # _refresh_overnight_target runs FIRST and should publish.
+    try:
+        plugin.calculate(dno_limit_kw=4.0)
+    except Exception:
+        pass
+
+    entity = "sensor.predbat_curtailment_overnight_target"
+    assert entity in base.published, "Sensor must publish even pre-startup (no_plan_yet fallback)"
+    pub = base.published[entity]
+    assert pub["attrs"]["source"] == "no_plan_yet", f"Expected no_plan_yet source, got {pub['attrs']['source']}"
+    assert pub["attrs"]["morning_gap_kwh"] == 0.0
+    print(f"  test_R55_overnight_target_no_plan_yet_fallback: PASSED (target={pub['value']:.2f}, source=no_plan_yet)")
+
+
 def test_R55_safety_pct_helper_clamps_range():
     """HA helper input_number.curtailment_overnight_safety_pct clamped to [0, 200]."""
     pv = {}
@@ -3994,6 +4072,8 @@ def run_curtailment_tests(my_predbat=None):
         test_R55_overnight_target_formula_components,
         test_R55_overnight_target_window_extended_to_tomorrow,
         test_R55_overnight_target_published_when_no_overflow,
+        test_R55_overnight_target_published_from_calculate_with_real_pv_step,
+        test_R55_overnight_target_no_plan_yet_fallback,
         test_R55_safety_pct_helper_clamps_range,
         test_R55_overnight_target_raises_effective_keep_in_calculate,
     ]

@@ -213,6 +213,9 @@ class CurtailmentPlugin(PredBatPlugin):
         # R55: overnight_target cached from on_before_plan, used by calculate()
         # as the effective_keep floor. None until first plan cycle has run.
         self._overnight_target_kwh = None
+        # Cached (value, attrs) tuple for republishing overnight_target on
+        # cache-hit paths in on_before_plan.
+        self._cached_overnight = None
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
@@ -345,22 +348,11 @@ class CurtailmentPlugin(PredBatPlugin):
 
         minutes_now = getattr(self.base, "minutes_now", 720)
 
-        # Caching: morning (06:00-12:00) recalculate each cycle, other times every 30 min
-        if self._cached_keep is not None:
-            minutes_since = minutes_now - self._cached_at
-            if minutes_since < 0:
-                minutes_since += 1440  # wrapped past midnight
-            if 360 <= minutes_now < 720:
-                pass  # morning: always recalculate
-            elif minutes_since < 30:
-                context["best_soc_keep"] = min(context["best_soc_keep"], self._cached_keep)
-                if self._cached_offset is not None:
-                    self.base.dashboard_item(
-                        "sensor.{}_curtailment_solar_offset".format(self.base.prefix),
-                        self._cached_offset[0],
-                        self._cached_offset[1],
-                    )
-                return context
+        # v20: cache early-return removed. Morning_gap and Solcast slot calls
+        # are cheap, and the 30-min cache was masking stale overnight_target
+        # values when pv_forecast_minute_step transitioned from empty (first
+        # plan after restart) to populated (subsequent plans). Recompute
+        # every plan cycle so the sensor always reflects current state.
 
         pv_step = getattr(self.base, "pv_forecast_minute_step", {})
         load_step = getattr(self.base, "load_minutes_step", {})
@@ -369,6 +361,24 @@ class CurtailmentPlugin(PredBatPlugin):
         forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
 
         if not pv_step:
+            # R55: still publish overnight_target so dashboard isn't blank.
+            # No morning_gap available (pv_forecast_minute_step is set inside
+            # calculate_plan, which runs AFTER on_before_plan), fall back to
+            # soc_keep alone. Safety pct still applied to morning_gap=0 → 0.
+            keep_in = float(context.get("best_soc_keep", 0.0))
+            target_kwh = max(min(keep_in, soc_max), float(reserve or 0.0))
+            self._overnight_target_kwh = target_kwh
+            soc_pct = (target_kwh / soc_max * 100.0) if soc_max else 0.0
+            self._publish_overnight_target(
+                round(target_kwh, 2),
+                {
+                    "morning_gap_kwh": 0.0,
+                    "safety_pct": round(self._get_overnight_safety_pct(), 1),
+                    "soc_keep_kwh": round(keep_in, 2),
+                    "soc_pct": round(soc_pct, 1),
+                    "source": "no_pv_forecast",
+                },
+            )
             self._publish_offset(0.0, {"original_keep": round(context["best_soc_keep"], 2), "reason": "no_pv_forecast"})
             return context
 
@@ -531,6 +541,65 @@ class CurtailmentPlugin(PredBatPlugin):
             }
         )
         self.base.dashboard_item("sensor.{}_curtailment_overnight_target".format(self.base.prefix), value_kwh, attrs)
+        self._cached_overnight = (value_kwh, attrs)
+
+    def _refresh_overnight_target(self):
+        """R55: compute morning_gap → overnight_target and publish.
+
+        Called from calculate() (on_update hook) where
+        pv_forecast_minute_step IS populated (it's set by calculate_plan
+        which runs earlier in update_pred). on_before_plan runs BEFORE
+        calculate_plan so pv_step is empty there.
+        """
+        try:
+            pv_step = getattr(self.base, "pv_forecast_minute_step", {}) or {}
+            load_step = getattr(self.base, "load_minutes_step", {}) or {}
+            soc_max = getattr(self.base, "soc_max", 10)
+            reserve = getattr(self.base, "reserve", 0)
+            soc_keep = float(getattr(self.base, "best_soc_keep", 0) or 0)
+            forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
+            if not pv_step or not soc_max:
+                # Pre-startup: no plan yet. Publish soc_keep as fallback so
+                # the dashboard isn't blank — but don't cache morning_gap.
+                target = max(min(soc_keep, soc_max), float(reserve or 0.0)) if soc_max else 0.0
+                self._publish_overnight_target(
+                    round(target, 2),
+                    {
+                        "morning_gap_kwh": 0.0,
+                        "safety_pct": round(self._get_overnight_safety_pct(), 1),
+                        "soc_keep_kwh": round(soc_keep, 2),
+                        "soc_pct": round((target / soc_max * 100.0) if soc_max else 0.0, 1),
+                        "source": "no_plan_yet",
+                    },
+                )
+                return
+            morning_gap = compute_morning_gap(
+                pv_step,
+                load_step,
+                start_minute=PREDICT_STEP,
+                end_minute=forecast_minutes,
+                step_minutes=PREDICT_STEP,
+                values_are_kwh=True,
+                skip_initial_surplus=True,
+            )
+            safety_pct = self._get_overnight_safety_pct()
+            target = morning_gap * (1.0 + safety_pct / 100.0) + soc_keep
+            target = max(target, float(reserve or 0.0))
+            target = min(target, float(soc_max or 0.0))
+            self._overnight_target_kwh = target
+            soc_pct = (target / soc_max * 100.0) if soc_max else 0.0
+            self._publish_overnight_target(
+                round(target, 2),
+                {
+                    "morning_gap_kwh": round(morning_gap, 2),
+                    "safety_pct": round(safety_pct, 1),
+                    "soc_keep_kwh": round(soc_keep, 2),
+                    "soc_pct": round(soc_pct, 1),
+                    "source": "calculate",
+                },
+            )
+        except Exception:
+            pass
 
     def _get_p90_scale(self, lat, lon, doy, local_offset):
         """Get clear-sky scale from Solcast p90 forecast (R42).
@@ -806,6 +875,13 @@ class CurtailmentPlugin(PredBatPlugin):
         today = datetime.now().strftime("%Y-%m-%d")
         if self._state_date is not None and self._state_date != today:
             self._reset_for_new_day()
+
+        # R55: refresh overnight_target sensor every cycle. calculate() runs
+        # via on_update which fires AFTER calculate_plan in update_pred, so
+        # pv_forecast_minute_step is populated here (unlike on_before_plan
+        # which runs BEFORE calculate_plan). Done early so the sensor still
+        # publishes even when we return early (off paths below).
+        self._refresh_overnight_target()
 
         soc_kw = getattr(self.base, "soc_kw", 0)
         soc_max = getattr(self.base, "soc_max", 10)
