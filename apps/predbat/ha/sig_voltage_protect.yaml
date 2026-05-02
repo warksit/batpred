@@ -27,8 +27,8 @@ alias: "SIG Voltage Protect"
 description: >-
   Two-stage. input_boolean.sig_voltage_protect_active reflects real-time
   throttle state (immediate, no debounce). Notifications fire only when
-  the boolean has been sustained on/off for 10s, gated by an "alerted"
-  flag so release alerts don't fire without a preceding engage.
+  the boolean has been sustained on/off for 1 minute, gated by an
+  "alerted" flag so release alerts don't fire without a preceding engage.
 
 mode: queued
 max: 6
@@ -48,12 +48,12 @@ trigger:
   - platform: state
     entity_id: input_boolean.sig_voltage_protect_active
     to: "on"
-    for: "00:00:10"
+    for: "00:01:00"
     id: notify_engage
   - platform: state
     entity_id: input_boolean.sig_voltage_protect_active
     to: "off"
-    for: "00:00:10"
+    for: "00:01:00"
     id: notify_release
 
 action:
@@ -108,7 +108,7 @@ action:
             data:
               title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
               message: >-
-                Cap at {{ cap }} kW (sustained 10s). Curtailment automation
+                Cap at {{ cap }} kW (sustained 1 min). Curtailment automation
                 clamping export. SOC: {{ soc }}%
 
       # Boolean has been OFF sustained 10s AFTER an engage — fire release
