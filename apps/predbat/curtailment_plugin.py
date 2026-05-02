@@ -845,10 +845,9 @@ class CurtailmentPlugin(PredBatPlugin):
             self._peak_pv = actual_pv
             self._peak_pv_time = minutes_now
 
-        # Reset peak tracking at end of day
-        if actual_pv < 0.1 and minutes_now > 1200:
-            self._peak_pv = 0.0
-            self._peak_pv_time = 0
+        # R56 (v20): peak reset moved to AFTER sundown check below so the
+        # sundown detector can compare today's observed peak against the
+        # current PV level without the end-of-day reset wiping it out first.
 
         # Get p90 scale from Solcast (R42)
         p90_scale, _p90_peak_kw, _p90_peak_utc = self._get_p90_scale(lat, lon, doy, local_offset)
@@ -903,13 +902,14 @@ class CurtailmentPlugin(PredBatPlugin):
             safe_mins = 720
             self._safe_time_str = "none"
         elif safe_mins <= 0:
-            # Past safe_time → deactivate (R6/R12)
+            # R56 (v20): past safe_time no longer deactivates — plugin keeps
+            # running to drain SOC to effective_keep through the late
+            # afternoon. Set integration window to a small slice so overflow
+            # integral returns ~0; R54 then makes floor = effective_keep.
             safe_local = safe_utc + local_offset
             self._safe_time_str = "{:02d}:{:02d}".format(int(safe_local) % 24, int((safe_local % 1) * 60))
-            self._floor_ratchet = None
-            self._export_target = -2
-            self._remaining_overflow = 0.0
-            return soc_max, "off"
+            safe_utc = utc_hours + 0.1
+            safe_mins = 6
         else:
             safe_local = safe_utc + local_offset
             self._safe_time_str = "{:02d}:{:02d}".format(int(safe_local) % 24, int((safe_local % 1) * 60))
@@ -979,27 +979,25 @@ class CurtailmentPlugin(PredBatPlugin):
         will_fill = total_excess > battery_headroom
         past_safe_time = utc_hours >= safe_utc
 
-        # Activation (R5) vs deactivation (R6) use different gates:
-        #   - When currently Off: need the forecast integral > 0.1 kWh to activate
-        #     (otherwise we're just seeing a single-slot blip).
-        #   - When currently Active: stay active until safe_time reached — solar
-        #     geometry is ground truth (R25). The LoadML-driven integral can under-
-        #     estimate (phantom load pushes predicted overflow to zero even though
-        #     sun is still above threshold).
-        if self.was_active:
-            if past_safe_time or not will_fill:
-                reason = "past_safe_time" if past_safe_time else "will_fill=False (excess={:.1f}, room={:.1f})".format(total_excess, battery_headroom)
-                self._last_decision = "off: " + reason
-                self._floor_ratchet = None
-                self._export_target = -2
-                self._save_state()
-                return soc_max, "off"
-        else:
-            if remaining_overflow <= 0.1 or not will_fill:
-                reason = "overflow<=0.1" if remaining_overflow <= 0.1 else "will_fill=False (excess={:.1f}, room={:.1f})".format(total_excess, battery_headroom)
-                self._last_decision = "off: " + reason
-                self._export_target = -2
-                return soc_max, "off"
+        # R56: deactivate at sundown (PV ≤ 0.1 after peak observed). Pre-PV
+        # path is handled earlier; reaching here means PV is currently active
+        # OR we're seeing a brief PV gap mid-day. The "peak observed" guard
+        # ensures we don't deactivate just because PV momentarily dipped on a
+        # cloudy morning before any real PV happened today.
+        sundown = self._peak_pv > 0.5 and actual_pv < 0.1
+        if sundown:
+            self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
+            self._floor_ratchet = None
+            self._export_target = -2
+            # End-of-day reset: clear peak so tomorrow starts fresh
+            if minutes_now > 1200:
+                self._peak_pv = 0.0
+                self._peak_pv_time = 0
+            self._save_state()
+            return soc_max, "off"
+        # past_safe_time stays as a diagnostic only (R19). Plugin runs through
+        # late-afternoon to drain SOC down to overnight target via R54.
+        _ = past_safe_time
 
         # Active: compute floor (R9/R10)
         soc_keep = getattr(self.base, "best_soc_keep", 0)
@@ -1108,8 +1106,15 @@ class CurtailmentPlugin(PredBatPlugin):
         else:
             effective_keep = soc_keep
 
-        # Final floor clamps: effective_keep / reserve are dynamic — no ratchet here.
-        floor = max(overflow_floor, max(effective_keep, reserve))
+        # R54 (v20): single drain-target rule.
+        # Both overflow_floor and effective_keep are "drain TO this level" —
+        # the lower one wins (more drain). reserve is a hard floor.
+        # On big-overflow days: overflow_floor < effective_keep → drain to
+        #   overflow_floor (curtailment wins, R48 latch already relaxed
+        #   effective_keep so this is safe).
+        # On no/small-overflow days: overflow_floor → soc_max → drain only
+        #   to effective_keep (overnight target, replaces R45 100% chase).
+        floor = max(min(overflow_floor, effective_keep), reserve)
         floor = min(floor, soc_max)
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase

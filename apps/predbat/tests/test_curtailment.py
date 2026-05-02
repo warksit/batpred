@@ -515,44 +515,39 @@ def test_cap_at_safe_time_hits_100():
 
 
 def test_plugin_cap_taper_near_safe_time():
-    """Plugin integration: late in day with tiny remaining overflow, cap tapers toward 100%.
-
-    minutes_now=1020 (17:00 local, 16:00 UTC for July), now_utc matched. p90 peak
-    at noon, so by 17:00 the remaining solar geometry integral is small. Taper
-    should raise the floor above the old hardcoded 90% cap.
+    """v20 R57 supersedes R45 cap taper toward 100%. Plugin no longer chases
+    soc_max — once overflow integral falls, the floor is capped at
+    effective_keep (the overnight target) instead of tapering up to 100%.
+    Test now verifies the new behaviour: late in day with tiny remaining
+    overflow, floor equals effective_keep (or below if overflow_floor lower).
     """
     from datetime import datetime, timezone
 
     minutes_now = 1020  # 17:00 local
-    # PV/load for the short remaining tail
     pv = {m: 4.5 for m in range(0, 120, PLUGIN_STEP)}
     load = {m: 1.0 for m in range(0, 120, PLUGIN_STEP)}
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 4.5,
         "sensor.sigen_plant_consumed_power": 1.0,
     }
-    # p90 peak ~9 kW → small overflow by 17:00 (elev declining fast)
     sensor_overrides.update(_make_p90_sensors(p90_peak_kw=9.0, solcast_remaining=3.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=BATTERY_KWH * 0.95,  # near full already
+        soc_kw=BATTERY_KWH * 0.95,
         minutes_now=minutes_now,
-        now_utc=datetime(2025, 7, 12, 16, 0, tzinfo=timezone.utc),  # 17:00 BST
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 16, 0, tzinfo=timezone.utc),
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
-
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     remaining = plugin._remaining_overflow
-
-    # The taper raises the floor by exactly (MAX_RESERVED_KWH - remaining_overflow) above
-    # what the old hardcoded 90% cap would produce — provided remaining < MAX_RESERVED.
-    assert remaining < MAX_RESERVED_KWH, f"Test scenario must have small remaining_overflow, got {remaining:.2f}"
-    old_formula_floor = BATTERY_KWH * 0.9 - remaining * OVERFLOW_SAFETY_FACTOR
-    expected_lift = MAX_RESERVED_KWH - remaining
-    assert floor - old_formula_floor > expected_lift * 0.95, f"Taper should lift floor by ≈{expected_lift:.2f} kWh above old formula " f"({old_formula_floor:.2f}), got floor={floor:.2f} (lift={floor-old_formula_floor:.2f})"
-    print(f"  test_plugin_cap_taper_near_safe_time: PASSED (remaining={remaining:.2f}, floor={floor/BATTERY_KWH*100:.1f}%, lift={floor-old_formula_floor:.2f}kWh)")
+    assert remaining < MAX_RESERVED_KWH, f"Tiny remaining expected, got {remaining:.2f}"
+    # R57: floor must be ≤ best_soc_keep (no chase to soc_max). With a small
+    # remaining overflow, overflow_floor is high → min() takes effective_keep.
+    assert floor <= 4.0 + 0.01, f"R57: floor must not exceed effective_keep (4.0 kWh), got {floor:.2f}"
+    print(f"  test_plugin_cap_taper_near_safe_time: PASSED (R57 — floor={floor:.2f}, capped at effective_keep)")
 
 
 def test_cap_taper_ratchet_noise_immune():
@@ -609,56 +604,37 @@ def _build_cloudy_afternoon_base(cumulative_actual, cumulative_solcast, solcast_
 
 
 def test_buffer_reduces_on_cloudy_afternoon():
-    """v20: confirmed-cloudy afternoon (post-14:00, cumulative <0.9, recent <0.95) → buffer 0.7×.
+    """v20 R49: confirmed-cloudy afternoon → effective_max_reserved drops to 0.7×.
 
-    Cloudy days where actual PV is tracking ≥10% under Solcast forecast and the
-    last hour confirms the trend should reduce effective_max_reserved from 1.8 to
-    max(0.5, 1.8×0.7) = 1.26 kWh, raising max_target_soc and the floor so the
-    battery aims higher rather than reserving headroom we won't need.
+    Tests the diagnostic (plugin._effective_max_reserved) directly because
+    under v20 R54 the floor is min(overflow_floor, effective_keep) so the
+    buffer reduction's effect on the live target is masked by effective_keep.
+    R49 still runs internally and adjusts overflow_floor — we just verify
+    the diagnostic.
     """
-    # Cloudy state: 24 kWh actual vs 30 kWh forecast (so-far) → ratio 0.80 (<0.9)
     base = _build_cloudy_afternoon_base(cumulative_actual=24.0, cumulative_solcast=30.0, solcast_remaining=15.0)
     plugin = CurtailmentPlugin(base)
-    # Seed the plugin's PV history to simulate a 60-min lookback showing
-    # cumulative_solcast 24 kWh / actual 19 kWh at 14:00 BST. With current
-    # snapshot 30/24 → delta_solcast=6, delta_actual=5, recent_ratio≈0.83 (<0.95).
-    plugin._pv_history.append((840, 24.0, 19.0))
+    plugin._pv_history.append((840, 24.0, 19.0))  # recent_ratio ≈ 0.83 (<0.95)
 
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"Plugin must reach floor logic to test buffer; got phase={phase}"
-
-    remaining = plugin._remaining_overflow
-    # Reduction only matters if remaining > effective_max_reserved (else taper unaffected)
-    assert remaining > 1.3, f"Test scenario must have remaining_overflow > 1.3 kWh for the cap to bind, got {remaining:.2f}"
-
-    # Expected: effective_max_reserved = 1.26, so max_target = 18.08 - 1.26 = 16.82
-    # Compared with control (no reduction): max_target = 18.08 - 1.8 = 16.28
-    # The floor should be ≥ 0.5 kWh higher than the un-reduced case.
-    expected_lift = MAX_RESERVED_KWH - max(0.5, MAX_RESERVED_KWH * 0.7)
-    control_max_target = BATTERY_KWH - MAX_RESERVED_KWH
-    control_floor = max(0.0, control_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
-    assert floor - control_floor >= expected_lift * 0.9, f"Buffer reduction should lift floor by ≈{expected_lift:.2f} kWh above control ({control_floor:.2f}), got floor={floor:.2f}"
-    print(f"  test_buffer_reduces_on_cloudy_afternoon: PASSED (remaining={remaining:.2f}, floor={floor:.2f}, lift={floor-control_floor:.2f}kWh)")
+    assert phase == "active", f"Plugin must reach floor logic; got phase={phase}"
+    assert plugin._buffer_reduced, "R49 should have fired on cloudy state"
+    expected_max_reserved = max(0.5, MAX_RESERVED_KWH * 0.7)
+    assert abs(plugin._effective_max_reserved - expected_max_reserved) < 0.01, f"Expected effective_max_reserved={expected_max_reserved:.2f}, got {plugin._effective_max_reserved:.2f}"
+    print(f"  test_buffer_reduces_on_cloudy_afternoon: PASSED (effective_max_reserved={plugin._effective_max_reserved:.2f}, floor={floor:.2f})")
 
 
 def test_buffer_unchanged_on_clear_afternoon():
-    """v20: clear afternoon (cumulative ratio ≥0.9) → no reduction, buffer stays at MAX_RESERVED_KWH."""
-    # On-track state: 28 kWh actual vs 30 kWh forecast → ratio 0.93 (>0.9), no reduction
+    """v20 R49: clear afternoon (cumulative ratio ≥0.9) → no buffer reduction."""
     base = _build_cloudy_afternoon_base(cumulative_actual=28.0, cumulative_solcast=30.0, solcast_remaining=15.0)
     plugin = CurtailmentPlugin(base)
     plugin._pv_history.append((840, 24.0, 22.5))  # recent_ratio = 5.5/6 = 0.92
 
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"Plugin must reach floor logic; got phase={phase}"
-
-    remaining = plugin._remaining_overflow
-    assert remaining > 1.3, f"Test scenario must have remaining_overflow > 1.3 kWh, got {remaining:.2f}"
-
-    # Floor should match the un-reduced taper formula (within ratchet noise tolerance)
-    expected_max_target = BATTERY_KWH - MAX_RESERVED_KWH
-    expected_floor = max(0.0, expected_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
-    assert abs(floor - expected_floor) < 0.05, f"Clear-afternoon floor should match un-reduced taper {expected_floor:.2f}, got {floor:.2f}"
-    print(f"  test_buffer_unchanged_on_clear_afternoon: PASSED (floor={floor:.2f}, expected={expected_floor:.2f})")
+    assert not plugin._buffer_reduced, "R49 should NOT fire on clear state"
+    assert abs(plugin._effective_max_reserved - MAX_RESERVED_KWH) < 0.01, f"Expected effective_max_reserved={MAX_RESERVED_KWH:.2f}, got {plugin._effective_max_reserved:.2f}"
+    print(f"  test_buffer_unchanged_on_clear_afternoon: PASSED (effective_max_reserved={plugin._effective_max_reserved:.2f})")
 
 
 def test_buffer_unchanged_before_14_00():
@@ -1985,10 +1961,14 @@ def test_on_update_stays_off_low_pv():
 
 
 def test_deactivation_at_safe_time():
-    """Plugin deactivates when past safe_time, restoring MSC (R6/R12)."""
+    """v20 R56 supersedes R6/R12 safe_time deactivation. Plugin now keeps
+    running past safe_time so it can drain SOC to overnight target via Drain
+    mode in late afternoon. Test renamed-in-spirit to verify R56 sundown
+    deactivation: plugin only goes off when actual PV drops to ~0 (sundown),
+    NOT at safe_time.
+    """
     from datetime import datetime, timezone
 
-    # Activate at noon
     pv, load = _make_overflow_pv(minutes_now=720)
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 8.0,
@@ -2000,6 +1980,7 @@ def test_deactivation_at_safe_time():
         load_step=load,
         soc_kw=BATTERY_KWH * 0.40,
         minutes_now=720,
+        best_soc_keep=4.0,
         now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
         sensor_overrides=sensor_overrides,
     )
@@ -2007,18 +1988,27 @@ def test_deactivation_at_safe_time():
     plugin.on_update()
     assert base.set_read_only is True, "Should activate at noon"
 
-    # Jump past safe_time (~18:30 UTC for scale=10.35, threshold=4.5 kW)
-    base.minutes_now = 18 * 60 + 30  # 18:30 local (=UTC with local_offset=0)
+    # Jump past safe_time but PV still 0.3 kW — R56 says STAY ACTIVE so we
+    # can drain SOC to overnight target through the late afternoon.
+    base.minutes_now = 18 * 60 + 30
     base.now_utc = datetime(2025, 7, 12, 18, 30, tzinfo=timezone.utc)
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.3
     base.services.clear()
     plugin.base = base
     plugin.on_update()
+    assert base.set_read_only is True, "R56: stay active past safe_time while PV>0"
 
-    assert base.set_read_only is False, "Should deactivate after safe_time"
+    # Now sundown — actual PV drops to ~0 with peak observed → off
+    base.minutes_now = 21 * 60
+    base.now_utc = datetime(2025, 7, 12, 21, 0, tzinfo=timezone.utc)
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.05
+    base.services.clear()
+    plugin.base = base
+    plugin.on_update()
+    assert base.set_read_only is False, "R56: deactivate at sundown (PV ~0 after peak observed)"
     msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
-    assert msc_called, "Should restore MSC at safe_time"
-    print("  test_deactivation_at_safe_time: PASSED")
+    assert msc_called, "Should restore MSC at sundown"
+    print("  test_deactivation_at_safe_time: PASSED (R56: active past safe_time, off at sundown)")
 
 
 def test_manual_hold_maintains_dess_after_deactivation():
@@ -2175,6 +2165,162 @@ def test_before_plan_disabled():
     result = plugin.on_before_plan(context)
     assert result["best_soc_keep"] == 6.0, f"Expected unchanged when disabled, got {result['best_soc_keep']:.2f}"
     print("  test_before_plan_disabled: PASSED")
+
+
+# ============================================================================
+# R54 / R56 / R57: target = max(min(curt, keep), reserve), runs until PV=0,
+# no 100% chase (v20)
+# ============================================================================
+
+
+def test_R54_target_uses_keep_when_lower_than_overflow_floor():
+    """R54: target = min(overflow_floor, effective_keep). When overflow is
+    small (overflow_floor high), target falls to effective_keep — replaces
+    R45 100% chase.
+    """
+    # Small overflow scenario: cloudy day with low Solcast peak
+    pv = {m: 3.0 for m in range(0, 240, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 240, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 3.0,
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=4.0, solcast_remaining=15.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=10.0,
+        minutes_now=720,
+        best_soc_keep=4.0,  # 22% — well below overflow_floor
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Should be active, got {phase}"
+    # overflow_floor would be ~14-18 kWh on this cloudy day; effective_keep=4
+    # min() takes 4. Target should be 4.0 ± small drift from R48 latching.
+    assert floor <= 4.0 + 0.01, f"R54: target should equal effective_keep (4 kWh), got {floor:.2f}"
+    print(f"  test_R54_target_uses_keep_when_lower_than_overflow_floor: PASSED (floor={floor:.2f} = keep)")
+
+
+def test_R54_target_uses_overflow_when_lower_than_keep():
+    """R54: when overflow_floor < effective_keep (big-overflow day), target
+    follows overflow_floor (curtailment wins, with R48 latch relaxing keep).
+    """
+    pv = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 8.0,
+        "sensor.sigen_plant_consumed_power": 1.0,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=30.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=2.0,  # below soc_keep so R48 latch can engage on this morning
+        minutes_now=720,
+        best_soc_keep=6.0,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Should be active, got {phase}"
+    # R48 should engage (big overflow + pv covering load), relaxing keep to
+    # 0.5 kWh. R54 then min(overflow_floor, 0.5) = ~0.5 because overflow
+    # is huge → overflow_floor is very low.
+    assert floor <= 0.5 + 0.01, f"R54+R48: target should be ~0.5 kWh on huge-overflow day, got {floor:.2f}"
+    print(f"  test_R54_target_uses_overflow_when_lower_than_keep: PASSED (floor={floor:.2f})")
+
+
+def test_R57_no_chase_to_soc_max_late_in_day():
+    """R57: late in PV window with overflow nearly done, plugin no longer
+    chases soc_max via the R45 taper. Floor stays at effective_keep.
+    """
+    from datetime import datetime, timezone
+
+    minutes_now = 1080  # 18:00 BST = 17:00 UTC, near end of PV
+    pv = {m: 1.5 for m in range(0, 90, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 90, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 1.5,
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=2.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.92,
+        minutes_now=minutes_now,
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 17, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"R56: plugin still active after safe_time, got {phase}"
+    assert floor < BATTERY_KWH * 0.5, f"R57: floor must NOT chase soc_max, got {floor:.2f} (>50% of soc_max)"
+    print(f"  test_R57_no_chase_to_soc_max_late_in_day: PASSED (floor={floor:.2f} kWh = {floor / BATTERY_KWH * 100:.0f}%)")
+
+
+def test_R56_active_after_safe_time_when_soc_above_keep():
+    """R56: plugin stays active past safe_time so it can drain SOC down to
+    overnight target via Drain mode in the late afternoon. Pre-R56 it would
+    deactivate at safe_time.
+    """
+    from datetime import datetime, timezone
+
+    pv = {m: 1.0 for m in range(0, 60, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 1.0,
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=1.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.85,  # above overnight target — Drain territory
+        minutes_now=1140,  # 19:00 BST
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 18, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5  # earlier today there was real PV, so not pre-PV path
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"R56: plugin must stay active past safe_time, got {phase}"
+    assert plugin._export_target == 4.0, f"R56: export_target should be DNO so HA can Drain, got {plugin._export_target}"
+    print(f"  test_R56_active_after_safe_time_when_soc_above_keep: PASSED (active, floor={floor:.2f})")
+
+
+def test_R56_off_at_sundown():
+    """R56: when peak PV was observed today AND actual PV is now ~0, plugin
+    deactivates (sundown). Hands back to Predbat MSC for overnight.
+    """
+    from datetime import datetime, timezone
+
+    pv = {m: 0.0 for m in range(0, 60, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 0.0,  # PV is gone
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=0.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        minutes_now=1260,  # 21:00 BST
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5  # had PV earlier today
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"R56: sundown (peak observed, actual PV=0) → off, got {phase}"
+    assert plugin._export_target == -2, f"R56: export_target=-2 to signal MSC handoff, got {plugin._export_target}"
+    print("  test_R56_off_at_sundown: PASSED (off, MSC handoff signaled)")
 
 
 # ============================================================================
@@ -2550,16 +2696,19 @@ def test_floor_lower_with_more_overflow():
 
     # Scenario 1: lower p90 peak → smaller overflow integral → higher floor
     pv = {m: 8.0 for m in range(0, 120, PLUGIN_STEP)}
+    # v20: tests overflow_floor sensitivity. With R54 the floor is
+    # min(overflow_floor, effective_keep). Use a high best_soc_keep so the
+    # min() is pinned by overflow_floor (i.e. effective_keep > overflow_floor)
+    # and the test exercises the overflow_floor sensitivity directly.
     sensor1 = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
     sensor1.update(_make_p90_sensors(p90_peak_kw=6.0, solcast_remaining=12.0))
-    base1 = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=sensor1)
+    base1 = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, best_soc_keep=15.0, sensor_overrides=sensor1)
     plugin1 = CurtailmentPlugin(base1)
     floor1, _ = plugin1.calculate(dno_limit_kw=4.0)
 
-    # Scenario 2: higher p90 peak → larger overflow integral → lower floor
     sensor2 = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
     sensor2.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=20.0))
-    base2 = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, sensor_overrides=sensor2)
+    base2 = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=720, best_soc_keep=15.0, sensor_overrides=sensor2)
     plugin2 = CurtailmentPlugin(base2)
     floor2, _ = plugin2.calculate(dno_limit_kw=4.0)
 
@@ -2612,11 +2761,14 @@ def test_export_target_dno_when_active_regardless_of_soc():
         "sensor.sigen_plant_consumed_power": 0.5,
     }
     sensor_overrides.update(_make_p90_sensors(solcast_remaining=5.5))
+    # v20: high best_soc_keep so floor = min(overflow_floor, effective_keep)
+    # ends up high (below SOC=80%) — recreates pre-v20 "SOC below floor" case.
     base = MockBase(
         pv_step=pv,
         load_step=load,
         soc_kw=soc_kw,
         minutes_now=1020,
+        best_soc_keep=16.0,
         # Match minutes_now=1020 (17:00 local) with UTC tz so local_offset=0
         now_utc=datetime(2025, 7, 12, 17, 0, tzinfo=timezone.utc),
         sensor_overrides=sensor_overrides,
@@ -2674,7 +2826,7 @@ def test_plugin_handles_local_tz_aware_now_utc():
 # ============================================================================
 
 
-def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_scale=1.0, forecast_scale_fn=None, min_sunset_soc=80):
+def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_scale=1.0, forecast_scale_fn=None, min_sunset_soc=80, best_soc_keep=4.0):
     """Run a CSV day through the ACTUAL plugin.calculate() + independent physics.
 
     Algorithm decisions come from plugin.calculate() (the real code).
@@ -2747,6 +2899,7 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
             soc_max=BATTERY_KWH,
             minutes_now=m,
             forecast_minutes=1440 - m,
+            best_soc_keep=best_soc_keep,
             now_utc=datetime(2025, 7, 12, max(0, int(utc_hour)), int((utc_hour % 1) * 60) if utc_hour >= 0 else 0, tzinfo=timezone.utc),
             sensor_overrides={
                 "sensor.sigen_plant_pv_power": actual_pv,
@@ -2859,14 +3012,14 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
     if initial_overflow > 0.5 and total_curtailed > max_curtailment:
         errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f} for {initial_overflow:.1f}kWh overflow)")
 
-    # v17 R16: No Charge mode. Sub-DNO PV is exported, not stored.
-    # In production, on_before_plan sets overnight SOC so battery starts
-    # at the correct level. Integration tests start at fixed 40% which
-    # is conservative — marginal days may not fill to 90% from this point.
-    if initial_overflow > 8.0 and sunset_soc_pct < 95:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >95% for {initial_overflow:.0f}kWh overflow)")
-    elif initial_overflow > 0.5 and sunset_soc_pct < min_sunset_soc:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >{min_sunset_soc}%)")
+    # v20 R57: plugin no longer chases 100% by sunset. Sunset SOC may end
+    # near best_soc_keep on no-overflow days, well above on big-overflow
+    # days, or below on cloudy evenings where PV stops while battery is
+    # still serving load (sunset_soc is captured at the LAST PV slot, so
+    # evening drain through to that slot is reflected). The old "≥80% /
+    # ≥95%" checks are gone — they were artefacts of R45.
+    # Safety properties enforced above (max_export ≤ DNO; curtailment
+    # bounded) are what matters for v20.
 
     soc_label = f" start={start_soc_pct:.0%}" if start_soc_pct != START_SOC_PCT else ""
     tag = f"  integration {label}{soc_label}"
@@ -2972,6 +3125,7 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
             soc_max=BATTERY_KWH,
             minutes_now=m,
             forecast_minutes=1440 - m,
+            best_soc_keep=4.0,
             now_utc=datetime(2026, 4, 6, max(0, int(utc_hour)), int((utc_hour % 1) * 60) if utc_hour >= 0 else 0, tzinfo=timezone.utc),
             sensor_overrides={
                 "sensor.sigen_plant_pv_power": actual_pv,
@@ -3066,10 +3220,10 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
     max_curtailment = 2.0
     if initial_overflow > 0.5 and total_curtailed > max_curtailment:
         errors.append(f"curtailment={total_curtailed:.2f}kWh (should be <{max_curtailment:.1f})")
-    if initial_overflow > 8.0 and sunset_soc_pct < 95:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >95%)")
-    elif initial_overflow > 0.5 and sunset_soc_pct < 75:
-        errors.append(f"sunset_soc={sunset_soc_pct:.0f}% (should be >75%)")
+    # v20 R57: no chase to 100%. Sunset SOC may be near best_soc_keep on
+    # cloudy days (drained to overnight target) or higher on big-overflow
+    # days where PV refilled the battery faster than evening drain. The
+    # old hardcoded "≥75% / ≥95%" thresholds are gone.
 
     tag = f"  integration {label} start={start_soc_pct:.0%}"
     if errors:
@@ -3307,17 +3461,15 @@ def test_same_p90_same_floor():
 
 
 def test_activation_requires_will_fill():
-    """Plugin stays off if battery won't reach 100% even with all PV (R5 condition 2).
-
-    If solcast_remaining - load_remaining ≤ (soc_max - soc_kw), the overflow energy
-    is needed for charging — don't activate (would curtail PV needlessly).
+    """v20 R56 supersedes the will_fill activation gate. Plugin runs whenever
+    PV is producing AND there is work to do (target < soc_max). Stays off
+    only at sundown (peak observed AND PV ~0). Test now verifies new
+    behaviour: with PV active mid-day, plugin is active regardless of how
+    much energy will fill the battery.
     """
     pv = {m: 5.0 for m in range(0, 120, PLUGIN_STEP)}
     load = {m: 1.0 for m in range(0, 120, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.10  # battery nearly empty
-
-    # Solcast remaining = 4 kWh. Battery headroom = 18.08 × 0.90 = 16.27 kWh.
-    # total_excess = max(0, 4 - load_remaining) ≪ 16.27 → will_fill=False → off
+    soc_kw = BATTERY_KWH * 0.10
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 5.0,
         "sensor.sigen_plant_consumed_power": 1.0,
@@ -3328,13 +3480,13 @@ def test_activation_requires_will_fill():
         load_step=load,
         soc_kw=soc_kw,
         minutes_now=720,
+        best_soc_keep=4.0,
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
     _, phase = plugin.calculate(dno_limit_kw=4.0)
-
-    assert phase == "off", f"Should be off — battery won't fill even with all PV (will_fill=False), got {phase}"
-    print(f"  test_activation_requires_will_fill: PASSED (off because battery won't fill)")
+    assert phase == "active", f"R56: plugin active during PV (was 'off' under pre-R56 will_fill gate), got {phase}"
+    print("  test_activation_requires_will_fill: PASSED (R56 — active during PV regardless of will_fill)")
 
 
 # ============================================================================
@@ -3725,6 +3877,22 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- R9a load smoothing tests ---")
     for test_fn in r9a_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # R54 / R56 / R57 plugin behaviour tests (v20)
+    r54_56_57_tests = [
+        test_R54_target_uses_keep_when_lower_than_overflow_floor,
+        test_R54_target_uses_overflow_when_lower_than_keep,
+        test_R57_no_chase_to_soc_max_late_in_day,
+        test_R56_active_after_safe_time_when_soc_above_keep,
+        test_R56_off_at_sundown,
+    ]
+    print("  --- R54/R56/R57 plugin behaviour tests ---")
+    for test_fn in r54_56_57_tests:
         try:
             test_fn()
         except Exception as e:
