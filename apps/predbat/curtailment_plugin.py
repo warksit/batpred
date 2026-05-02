@@ -92,6 +92,12 @@ MAX_RESERVED_KWH = 1.8
 # When triggered, effective_max_reserved = max(0.5, MAX_RESERVED_KWH × 0.7) = 1.26.
 BUFFER_REDUCE_FACTOR = 0.7
 BUFFER_REDUCE_FLOOR_KWH = 0.5
+
+# R55 (v20): margin added on top of compute_morning_gap to set overnight_target.
+# overnight_target = max(morning_gap + R55_MARGIN_KWH, reserve). Published as a
+# sensor so the dashboard shows the SOC the plugin will drain to during the
+# evening (replacing the old "always charge to 100%" behaviour, R57).
+R55_MARGIN_KWH = 0.5
 BUFFER_REDUCE_MIN_LOCAL_HOUR = 14
 BUFFER_REDUCE_CUMULATIVE_RATIO = 0.9
 BUFFER_REDUCE_RECENT_RATIO = 0.95
@@ -387,6 +393,28 @@ class CurtailmentPlugin(PredBatPlugin):
             solar_end = today_solar_end
             using_tomorrow = False
 
+        # R55: compute morning_gap once, unconditional, and publish overnight_target.
+        # Same call is reused below for soc_keep adjustment so we don't pay twice.
+        morning_gap = compute_morning_gap(
+            pv_step,
+            load_step,
+            start_minute=solar_start,
+            end_minute=solar_end,
+            step_minutes=PREDICT_STEP,
+            values_are_kwh=True,
+        )
+        overnight_target_kwh = max(morning_gap + R55_MARGIN_KWH, reserve)
+        soc_pct = (overnight_target_kwh / soc_max * 100.0) if soc_max > 0 else 0.0
+        self._publish_overnight_target(
+            round(overnight_target_kwh, 2),
+            {
+                "morning_gap_kwh": round(morning_gap, 2),
+                "margin_kwh": R55_MARGIN_KWH,
+                "soc_pct": round(soc_pct, 1),
+                "source": "tomorrow" if using_tomorrow else "today",
+            },
+        )
+
         # Use trajectory to check if battery will fill
         peak_soc, net_charge, last_danger = simulate_soc_trajectory(
             pv_step,
@@ -409,17 +437,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._cached_at = minutes_now
             return context
 
-        morning_gap = compute_morning_gap(
-            pv_step,
-            load_step,
-            start_minute=solar_start,
-            end_minute=solar_end,
-            step_minutes=PREDICT_STEP,
-            values_are_kwh=True,
-        )
-
-        margin = 0.5
-        solar_adjusted_keep = max(morning_gap + margin, reserve)
+        solar_adjusted_keep = overnight_target_kwh
 
         remaining_overflow_total = compute_remaining_overflow(
             pv_step,
@@ -462,6 +480,17 @@ class CurtailmentPlugin(PredBatPlugin):
         attrs.update({"friendly_name": "Curtailment Solar SOC Keep Offset", "unit_of_measurement": "kWh", "icon": "mdi:solar-power"})
         self.base.dashboard_item("sensor.{}_curtailment_solar_offset".format(self.base.prefix), value, attrs)
         self._cached_offset = (value, attrs)
+
+    def _publish_overnight_target(self, value_kwh, attrs):
+        """R55: publish overnight_target sensor (morning_gap + R55_MARGIN_KWH)."""
+        attrs.update(
+            {
+                "friendly_name": "Curtailment Overnight Target",
+                "unit_of_measurement": "kWh",
+                "icon": "mdi:weather-night",
+            }
+        )
+        self.base.dashboard_item("sensor.{}_curtailment_overnight_target".format(self.base.prefix), value_kwh, attrs)
 
     def _get_p90_scale(self, lat, lon, doy, local_offset):
         """Get clear-sky scale from Solcast p90 forecast (R42).
