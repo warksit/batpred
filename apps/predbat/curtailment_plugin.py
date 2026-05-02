@@ -418,7 +418,7 @@ class CurtailmentPlugin(PredBatPlugin):
         #   on today's PV — we want the UPCOMING overnight deficit, not "what
         #   happens between now and the first sustained-PV slot" (which is now).
         gap_end = max(solar_end, forecast_minutes)
-        morning_gap = compute_morning_gap(
+        morning_gap_load = compute_morning_gap(
             pv_step,
             load_step,
             start_minute=solar_start,
@@ -427,23 +427,28 @@ class CurtailmentPlugin(PredBatPlugin):
             values_are_kwh=True,
             skip_initial_surplus=True,
         )
-        # R55 formula: load + buffer + optional extra margin. soc_keep is
-        # the forecast-error buffer (per-project memory); morning_gap is the
-        # load. They're additive. safety_pct (default 0) is OPTIONAL extra
-        # for users who want more conservative bridging.
+        # Translate load → battery drawdown (matches Predbat predict trajectory
+        # which applies inverter+battery discharge losses).
+        battery_loss_discharge = float(getattr(self.base, "battery_loss_discharge", 1.0) or 1.0)
+        inverter_loss = float(getattr(self.base, "inverter_loss", 1.0) or 1.0)
+        discharge_efficiency = max(0.5, battery_loss_discharge * inverter_loss)
+        morning_gap_battery = morning_gap_load / discharge_efficiency
+        # R55 formula: battery drawdown + soc_keep buffer + optional extra
+        # margin. soc_keep is the forecast-error buffer; morning_gap_battery
+        # is what we'll actually pull from the battery overnight.
         safety_pct = self._get_overnight_safety_pct()
         keep_in = float(context.get("best_soc_keep", 0.0))
-        overnight_target_kwh = morning_gap * (1.0 + safety_pct / 100.0) + keep_in
+        overnight_target_kwh = morning_gap_battery * (1.0 + safety_pct / 100.0) + keep_in
         overnight_target_kwh = max(overnight_target_kwh, reserve)
-        # Cap at soc_max — pathological cloudy days can produce a calc that
-        # exceeds battery capacity; treat that as "fill the battery".
         overnight_target_kwh = min(overnight_target_kwh, soc_max)
         self._overnight_target_kwh = overnight_target_kwh
         soc_pct = (overnight_target_kwh / soc_max * 100.0) if soc_max > 0 else 0.0
         self._publish_overnight_target(
             round(overnight_target_kwh, 2),
             {
-                "morning_gap_kwh": round(morning_gap, 2),
+                "morning_gap_kwh": round(morning_gap_battery, 2),
+                "morning_gap_load_kwh": round(morning_gap_load, 2),
+                "discharge_efficiency": round(discharge_efficiency, 3),
                 "safety_pct": round(safety_pct, 1),
                 "soc_keep_kwh": round(keep_in, 2),
                 "soc_pct": round(soc_pct, 1),
@@ -479,7 +484,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # morning_gap + tiny margin (the historical R26 value), NOT the larger
         # overnight_target (which is for live SOC management, not planning).
         R26_PLAN_MARGIN_KWH = 0.5
-        solar_adjusted_keep = max(morning_gap + R26_PLAN_MARGIN_KWH, reserve)
+        solar_adjusted_keep = max(morning_gap_load + R26_PLAN_MARGIN_KWH, reserve)
 
         remaining_overflow_total = compute_remaining_overflow(
             pv_step,
@@ -494,17 +499,17 @@ class CurtailmentPlugin(PredBatPlugin):
 
         headroom_with_current_keep = soc_max - current_keep
         if remaining_overflow_total * OVERFLOW_SAFETY_FACTOR <= headroom_with_current_keep:
-            self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap, 2), "overflow_kwh": round(remaining_overflow_total, 2), "original_keep": round(current_keep, 2), "reason": "overflow_fits_in_headroom"})
+            self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap_load, 2), "overflow_kwh": round(remaining_overflow_total, 2), "original_keep": round(current_keep, 2), "reason": "overflow_fits_in_headroom"})
             self._cached_keep = current_keep
             self._cached_at = minutes_now
             return context
 
         if solar_adjusted_keep < current_keep:
-            self.log("Curtailment: reducing best_soc_keep {:.2f} -> {:.2f} kWh (morning_gap={:.2f}, net_charge={:.2f})".format(current_keep, solar_adjusted_keep, morning_gap, net_charge))
+            self.log("Curtailment: reducing best_soc_keep {:.2f} -> {:.2f} kWh (morning_gap={:.2f}, net_charge={:.2f})".format(current_keep, solar_adjusted_keep, morning_gap_load, net_charge))
             context["best_soc_keep"] = solar_adjusted_keep
-            self._publish_offset(round(solar_adjusted_keep - current_keep, 2), {"morning_gap_kwh": round(morning_gap, 2), "net_charge_kwh": round(net_charge, 2), "original_keep": round(current_keep, 2), "adjusted_keep": round(solar_adjusted_keep, 2)})
+            self._publish_offset(round(solar_adjusted_keep - current_keep, 2), {"morning_gap_kwh": round(morning_gap_load, 2), "net_charge_kwh": round(net_charge, 2), "original_keep": round(current_keep, 2), "adjusted_keep": round(solar_adjusted_keep, 2)})
         else:
-            self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap, 2), "net_charge_kwh": round(net_charge, 2), "original_keep": round(current_keep, 2)})
+            self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap_load, 2), "net_charge_kwh": round(net_charge, 2), "original_keep": round(current_keep, 2)})
 
         self._cached_keep = context["best_soc_keep"]
         self._cached_at = minutes_now
@@ -573,7 +578,7 @@ class CurtailmentPlugin(PredBatPlugin):
                     },
                 )
                 return
-            morning_gap = compute_morning_gap(
+            morning_gap_load = compute_morning_gap(
                 pv_step,
                 load_step,
                 start_minute=PREDICT_STEP,
@@ -582,8 +587,19 @@ class CurtailmentPlugin(PredBatPlugin):
                 values_are_kwh=True,
                 skip_initial_surplus=True,
             )
+            # Translate load energy → battery drawdown by accounting for
+            # discharge inefficiency (battery_loss_discharge × inverter_loss).
+            # Predbat already applies these in its predict trajectory; without
+            # the same factor our morning_gap underestimates by the same %
+            # (e.g. 5.29 kWh load → 6.20 kWh battery drawdown for SIG with
+            # 12% inverter loss + 3% battery discharge loss).
+            battery_loss_discharge = float(getattr(self.base, "battery_loss_discharge", 1.0) or 1.0)
+            inverter_loss = float(getattr(self.base, "inverter_loss", 1.0) or 1.0)
+            discharge_efficiency = max(0.5, battery_loss_discharge * inverter_loss)
+            morning_gap_battery = morning_gap_load / discharge_efficiency
+
             safety_pct = self._get_overnight_safety_pct()
-            target = morning_gap * (1.0 + safety_pct / 100.0) + soc_keep
+            target = morning_gap_battery * (1.0 + safety_pct / 100.0) + soc_keep
             target = max(target, float(reserve or 0.0))
             target = min(target, float(soc_max or 0.0))
             self._overnight_target_kwh = target
@@ -591,7 +607,9 @@ class CurtailmentPlugin(PredBatPlugin):
             self._publish_overnight_target(
                 round(target, 2),
                 {
-                    "morning_gap_kwh": round(morning_gap, 2),
+                    "morning_gap_kwh": round(morning_gap_battery, 2),
+                    "morning_gap_load_kwh": round(morning_gap_load, 2),
+                    "discharge_efficiency": round(discharge_efficiency, 3),
                     "safety_pct": round(safety_pct, 1),
                     "soc_keep_kwh": round(soc_keep, 2),
                     "soc_pct": round(soc_pct, 1),
