@@ -94,11 +94,15 @@ MAX_RESERVED_KWH = 1.8
 BUFFER_REDUCE_FACTOR = 0.7
 BUFFER_REDUCE_FLOOR_KWH = 0.5
 
-# R55 (v20): margin added on top of compute_morning_gap to set overnight_target.
-# overnight_target = max(morning_gap + R55_MARGIN_KWH, reserve). Published as a
-# sensor so the dashboard shows the SOC the plugin will drain to during the
-# evening (replacing the old "always charge to 100%" behaviour, R57).
-R55_MARGIN_KWH = 0.5
+# R55 (v20): overnight_target = morning_gap × (1 + safety_pct/100) + soc_keep.
+#   morning_gap: forecast load deficit (Σ max(0, load-pv)) until tomorrow's PV
+#   safety_pct:  optional extra margin on the load forecast (default 0%)
+#   soc_keep:    the existing forecast-error buffer (set by Predbat planning,
+#                bumped by cold_weather_plugin on cold nights)
+# Published as a sensor; used as floor for effective_keep in calculate(),
+# replacing the old "always charge to 100%" behaviour (R57).
+HA_OVERNIGHT_SAFETY_PCT = "input_number.curtailment_overnight_safety_pct"
+OVERNIGHT_SAFETY_PCT_DEFAULT = 0.0  # default 0%; lean on soc_keep as buffer
 BUFFER_REDUCE_MIN_LOCAL_HOUR = 14
 BUFFER_REDUCE_CUMULATIVE_RATIO = 0.9
 BUFFER_REDUCE_RECENT_RATIO = 0.95
@@ -206,6 +210,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_p50 = 0.0
         self._overflow_p90 = 0.0
         self._confidence = CONFIDENCE_DEFAULT
+        # R55: overnight_target cached from on_before_plan, used by calculate()
+        # as the effective_keep floor. None until first plan cycle has run.
+        self._overnight_target_kwh = None
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
@@ -394,23 +401,41 @@ class CurtailmentPlugin(PredBatPlugin):
             solar_end = today_solar_end
             using_tomorrow = False
 
-        # R55: compute morning_gap once, unconditional, and publish overnight_target.
-        # Same call is reused below for soc_keep adjustment so we don't pay twice.
+        # R55 (v20): compute morning_gap and publish overnight_target.
+        # - Window extended to forecast_minutes so the walk reaches tomorrow's
+        #   PV (covers tonight's evening + overnight + dawn).
+        # - skip_initial_surplus=True so a midday call doesn't short-circuit
+        #   on today's PV — we want the UPCOMING overnight deficit, not "what
+        #   happens between now and the first sustained-PV slot" (which is now).
+        gap_end = max(solar_end, forecast_minutes)
         morning_gap = compute_morning_gap(
             pv_step,
             load_step,
             start_minute=solar_start,
-            end_minute=solar_end,
+            end_minute=gap_end,
             step_minutes=PREDICT_STEP,
             values_are_kwh=True,
+            skip_initial_surplus=True,
         )
-        overnight_target_kwh = max(morning_gap + R55_MARGIN_KWH, reserve)
+        # R55 formula: load + buffer + optional extra margin. soc_keep is
+        # the forecast-error buffer (per-project memory); morning_gap is the
+        # load. They're additive. safety_pct (default 0) is OPTIONAL extra
+        # for users who want more conservative bridging.
+        safety_pct = self._get_overnight_safety_pct()
+        keep_in = float(context.get("best_soc_keep", 0.0))
+        overnight_target_kwh = morning_gap * (1.0 + safety_pct / 100.0) + keep_in
+        overnight_target_kwh = max(overnight_target_kwh, reserve)
+        # Cap at soc_max — pathological cloudy days can produce a calc that
+        # exceeds battery capacity; treat that as "fill the battery".
+        overnight_target_kwh = min(overnight_target_kwh, soc_max)
+        self._overnight_target_kwh = overnight_target_kwh
         soc_pct = (overnight_target_kwh / soc_max * 100.0) if soc_max > 0 else 0.0
         self._publish_overnight_target(
             round(overnight_target_kwh, 2),
             {
                 "morning_gap_kwh": round(morning_gap, 2),
-                "margin_kwh": R55_MARGIN_KWH,
+                "safety_pct": round(safety_pct, 1),
+                "soc_keep_kwh": round(keep_in, 2),
                 "soc_pct": round(soc_pct, 1),
                 "source": "tomorrow" if using_tomorrow else "today",
             },
@@ -438,7 +463,13 @@ class CurtailmentPlugin(PredBatPlugin):
             self._cached_at = minutes_now
             return context
 
-        solar_adjusted_keep = overnight_target_kwh
+        # R26 (separate from R55): on big-overflow days, reduce best_soc_keep
+        # so Predbat doesn't plan unnecessary overnight import to reach a high
+        # keep — tomorrow's overflow PV will fill the battery anyway. Uses
+        # morning_gap + tiny margin (the historical R26 value), NOT the larger
+        # overnight_target (which is for live SOC management, not planning).
+        R26_PLAN_MARGIN_KWH = 0.5
+        solar_adjusted_keep = max(morning_gap + R26_PLAN_MARGIN_KWH, reserve)
 
         remaining_overflow_total = compute_remaining_overflow(
             pv_step,
@@ -482,8 +513,16 @@ class CurtailmentPlugin(PredBatPlugin):
         self.base.dashboard_item("sensor.{}_curtailment_solar_offset".format(self.base.prefix), value, attrs)
         self._cached_offset = (value, attrs)
 
+    def _get_overnight_safety_pct(self):
+        """R55: read curtailment_overnight_safety_pct helper (0-100, default 50)."""
+        try:
+            v = float(self.base.get_state_wrapper(HA_OVERNIGHT_SAFETY_PCT, default=OVERNIGHT_SAFETY_PCT_DEFAULT))
+        except (ValueError, TypeError):
+            v = OVERNIGHT_SAFETY_PCT_DEFAULT
+        return max(0.0, min(200.0, v))
+
     def _publish_overnight_target(self, value_kwh, attrs):
-        """R55: publish overnight_target sensor (morning_gap + R55_MARGIN_KWH)."""
+        """R55: publish overnight_target sensor (morning_gap × (1 + safety_pct/100))."""
         attrs.update(
             {
                 "friendly_name": "Curtailment Overnight Target",
@@ -1104,7 +1143,14 @@ class CurtailmentPlugin(PredBatPlugin):
         if self._r48_engaged_today and not self._keep_recovered and soc_keep > RELAXED_KEEP_KWH:
             effective_keep = RELAXED_KEEP_KWH
         else:
+            # R55 (v20): overnight_target_kwh (computed from morning_gap +
+            # safety_pct in on_before_plan) acts as a FLOOR on effective_keep.
+            # Without this raise, R26's reduce-only adjustment leaves keep
+            # too low to cover overnight on no-overflow days. Cold weather
+            # plugin already boosts soc_keep — max() preserves both.
             effective_keep = soc_keep
+            if self._overnight_target_kwh is not None:
+                effective_keep = max(effective_keep, self._overnight_target_kwh)
 
         # R54 (v20): single drain-target rule.
         # Both overflow_floor and effective_keep are "drain TO this level" —

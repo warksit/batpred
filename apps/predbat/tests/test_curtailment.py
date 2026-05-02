@@ -2329,30 +2329,29 @@ def test_R56_off_at_sundown():
 
 
 def test_R55_overnight_target_published_on_overflow_day():
-    """on_before_plan publishes overnight_target sensor with morning_gap + margin."""
-    # PV always 8 kW, load always 1 kW → morning_gap = 0 (PV always covers load
-    # at minute 0). overnight_target = max(0 + 0.5, reserve) = 0.5 kWh.
+    """on_before_plan publishes overnight_target with safety_pct + soc_keep attrs."""
     pv, load = _make_overflow_pv(minutes_now=720)
     base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
     plugin = CurtailmentPlugin(base)
-
     plugin.on_before_plan({"best_soc_keep": 6.0})
 
     entity = "sensor.predbat_curtailment_overnight_target"
     assert entity in base.published, f"R55 sensor must be published, got entities {list(base.published.keys())}"
     pub = base.published[entity]
-    assert "morning_gap_kwh" in pub["attrs"], f"morning_gap_kwh attr missing: {pub['attrs']}"
-    assert "margin_kwh" in pub["attrs"], f"margin_kwh attr missing: {pub['attrs']}"
-    assert "soc_pct" in pub["attrs"], f"soc_pct attr missing: {pub['attrs']}"
-    assert pub["attrs"]["margin_kwh"] == 0.5, f"R55_MARGIN_KWH should be 0.5, got {pub['attrs']['margin_kwh']}"
+    assert "morning_gap_kwh" in pub["attrs"]
+    assert "safety_pct" in pub["attrs"], f"safety_pct attr missing: {pub['attrs']}"
+    assert "soc_keep_kwh" in pub["attrs"], f"soc_keep_kwh attr missing: {pub['attrs']}"
+    assert "soc_pct" in pub["attrs"]
+    assert pub["attrs"]["safety_pct"] == 0.0, f"OVERNIGHT_SAFETY_PCT_DEFAULT should be 0, got {pub['attrs']['safety_pct']}"
     print(f"  test_R55_overnight_target_published_on_overflow_day: PASSED (value={pub['value']} kWh)")
 
 
-def test_R55_overnight_target_value_with_real_morning_gap():
-    """Forecast with morning load > PV until 4 hours in → morning_gap ≈ 2 kWh, target ≈ 2.5 kWh."""
-    # minutes_now=0 (midnight). For first 240 min: pv=0, load=0.5; then pv=6, load=0.5.
-    # morning_gap = ∫ max(0, load-pv) ≈ 0.5 kW × 4h = 2.0 kWh.
-    # overnight_target = max(2.0 + 0.5, reserve) = 2.5 kWh.
+def test_R55_overnight_target_formula_components():
+    """R55 formula: target = morning_gap × (1 + safety_pct/100) + soc_keep.
+
+    Realistic case: morning_gap≈2 kWh, soc_keep=6 kWh, safety_pct=0%.
+    Expected: 2.0 × 1.0 + 6.0 = 8.0 kWh.
+    """
     pv = {}
     load = {}
     for m in range(0, 1440, PLUGIN_STEP):
@@ -2360,26 +2359,46 @@ def test_R55_overnight_target_value_with_real_morning_gap():
         load[m] = 0.5
     base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=0, soc_max=18.08)
     plugin = CurtailmentPlugin(base)
-
     plugin.on_before_plan({"best_soc_keep": 6.0})
 
     entity = "sensor.predbat_curtailment_overnight_target"
-    assert entity in base.published
     pub = base.published[entity]
-    # Morning gap is approx 1.96 kWh (240 min @ 0.5 kW with PREDICT_STEP=5 from minute 5)
-    # Allow generous range — exact step alignment depends on PREDICT_STEP.
-    assert 1.5 < pub["value"] < 3.0, f"Expected overnight_target ~2.5 kWh, got {pub['value']:.2f}"
     morning_gap = pub["attrs"]["morning_gap_kwh"]
-    assert abs(pub["value"] - (morning_gap + 0.5)) < 0.01, f"value should be morning_gap ({morning_gap}) + 0.5 margin, got {pub['value']}"
-    expected_pct = pub["value"] / 18.08 * 100
-    assert abs(pub["attrs"]["soc_pct"] - expected_pct) < 0.5, f"soc_pct {pub['attrs']['soc_pct']} should match value/soc_max"
-    print(f"  test_R55_overnight_target_value_with_real_morning_gap: PASSED (target={pub['value']:.2f} kWh, gap={morning_gap:.2f} kWh)")
+    safety_pct = pub["attrs"]["safety_pct"]
+    soc_keep = pub["attrs"]["soc_keep_kwh"]
+    expected = morning_gap * (1 + safety_pct / 100.0) + soc_keep
+    assert abs(pub["value"] - expected) < 0.05, f"target should be morning_gap × (1 + {safety_pct}%) + soc_keep = {expected:.2f}, got {pub['value']:.2f}"
+    print(f"  test_R55_overnight_target_formula_components: PASSED (gap={morning_gap:.2f} + keep={soc_keep:.2f} = {pub['value']:.2f} kWh)")
+
+
+def test_R55_overnight_target_window_extended_to_tomorrow():
+    """Window extended to forecast_minutes (24h) so morning_gap covers tonight + overnight + dawn."""
+    # Set up a day where today_solar_end window misses overnight load:
+    # - now = 18:00 BST (1080 min = 18h). today_solar_end = 23:00 = 5h forward.
+    # - PV: 0 from now (sundown), forecast tomorrow 06:00 onwards.
+    # - Load: 0.5 kW constant.
+    # Old (window=today_solar_end): morning_gap ≈ 0.5 × 5h = 2.5 kWh
+    # New (window=forecast_minutes): morning_gap ≈ 0.5 × 12h = 6.0 kWh (tonight 5h + midnight to dawn 7h)
+    pv = {}
+    load = {}
+    # Forecast covers from "now" forward — minutes from now.
+    for m in range(0, 1440, PLUGIN_STEP):
+        # Tomorrow's PV starts at minute 720 (12h from now = 06:00 BST tomorrow)
+        pv[m] = 3.0 if m >= 720 else 0.0
+        load[m] = 0.5
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=1080, soc_max=18.08, forecast_minutes=1440)
+    plugin = CurtailmentPlugin(base)
+    plugin.on_before_plan({"best_soc_keep": 6.0})
+
+    pub = base.published["sensor.predbat_curtailment_overnight_target"]
+    morning_gap = pub["attrs"]["morning_gap_kwh"]
+    # 12 hours × 0.5 kW = 6 kWh deficit until tomorrow's PV catches up
+    assert morning_gap >= 5.0, f"Window extension: morning_gap should cover overnight ≥5 kWh, got {morning_gap:.2f}"
+    print(f"  test_R55_overnight_target_window_extended_to_tomorrow: PASSED (gap={morning_gap:.2f} kWh covers overnight)")
 
 
 def test_R55_overnight_target_published_when_no_overflow():
-    """Even on no-overflow days (will_fill=False), overnight_target is published."""
-    # Cloudy day: pv=2 kW, load=3 kW always — never fills, never needs drain.
-    # But we still need overnight_target so plugin knows where to drain TO.
+    """Even on no-overflow days, overnight_target is published."""
     pv = {}
     load = {}
     for m in range(0, 1440, PLUGIN_STEP):
@@ -2387,14 +2406,84 @@ def test_R55_overnight_target_published_when_no_overflow():
         load[m] = 3.0
     base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=0)
     plugin = CurtailmentPlugin(base)
-
     plugin.on_before_plan({"best_soc_keep": 6.0})
 
     entity = "sensor.predbat_curtailment_overnight_target"
-    assert entity in base.published, "R55 sensor must publish even on no-overflow days (will_fill=False)"
+    assert entity in base.published
     pub = base.published[entity]
     assert "morning_gap_kwh" in pub["attrs"]
     print(f"  test_R55_overnight_target_published_when_no_overflow: PASSED (value={pub['value']} kWh)")
+
+
+def test_R55_safety_pct_helper_clamps_range():
+    """HA helper input_number.curtailment_overnight_safety_pct clamped to [0, 200]."""
+    pv = {}
+    load = {}
+    for m in range(0, 1440, PLUGIN_STEP):
+        pv[m] = 0.0
+        load[m] = 0.5
+    for tested_pct, expected_pct in [(0.0, 0.0), (30.0, 30.0), (100.0, 100.0), (250.0, 200.0), (-10.0, 0.0)]:
+        base = MockBase(
+            pv_step=pv,
+            load_step=load,
+            soc_kw=10.0,
+            minutes_now=0,
+            sensor_overrides={"input_number.curtailment_overnight_safety_pct": tested_pct},
+        )
+        plugin = CurtailmentPlugin(base)
+        plugin.on_before_plan({"best_soc_keep": 6.0})
+        pub = base.published["sensor.predbat_curtailment_overnight_target"]
+        actual_pct = pub["attrs"]["safety_pct"]
+        assert abs(actual_pct - expected_pct) < 0.01, f"safety_pct={tested_pct} should clamp to {expected_pct}, got {actual_pct}"
+    print("  test_R55_safety_pct_helper_clamps_range: PASSED")
+
+
+def test_R55_overnight_target_raises_effective_keep_in_calculate():
+    """R55 (v20) integration: overnight_target acts as a floor on
+    effective_keep in plugin.calculate().
+    """
+    from datetime import datetime, timezone
+
+    # Realistic shape: PV during day, no PV at night, ~0.5 kW load.
+    # Morning gap will accumulate from sundown (~8h from now if minutes_now=720)
+    # through tomorrow's PV catching up.
+    pv = {}
+    load = {}
+    for m in range(0, 1440, PLUGIN_STEP):
+        # PV: 1.5 kW from now until ~5h forward, then nothing until tomorrow 6 AM
+        # tomorrow morning = roughly minute 1080 onwards from minutes_now=720
+        if m < 300:
+            pv[m] = 1.5
+        elif m < 1080:
+            pv[m] = 0.0
+        else:
+            pv[m] = 1.5
+        load[m] = 0.5
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 1.5, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=2.0, solcast_remaining=4.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.50,
+        minutes_now=720,
+        best_soc_keep=2.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+
+    # Run on_before_plan first so overnight_target gets cached
+    plugin.on_before_plan({"best_soc_keep": 2.0})
+    cached_target = plugin._overnight_target_kwh
+    assert cached_target is not None, "on_before_plan should cache overnight_target"
+    assert cached_target > 2.0, f"Test setup: overnight_target ({cached_target:.2f}) should exceed best_soc_keep (2.0). Increase load deficit duration."
+
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"Should be active, got {phase}"
+    # R55 should raise effective_keep above 2.0; floor reflects min(overflow_floor, raised_keep)
+    assert floor >= cached_target - 0.1, f"R55: floor must be raised by overnight_target ({cached_target:.2f}), got {floor:.2f}"
+    print(f"  test_R55_overnight_target_raises_effective_keep_in_calculate: PASSED (target={cached_target:.2f}, floor={floor:.2f})")
 
 
 # ============================================================================
@@ -3902,8 +3991,11 @@ def run_curtailment_tests(my_predbat=None):
     # R55 overnight_target sensor tests (v20)
     r55_tests = [
         test_R55_overnight_target_published_on_overflow_day,
-        test_R55_overnight_target_value_with_real_morning_gap,
+        test_R55_overnight_target_formula_components,
+        test_R55_overnight_target_window_extended_to_tomorrow,
         test_R55_overnight_target_published_when_no_overflow,
+        test_R55_safety_pct_helper_clamps_range,
+        test_R55_overnight_target_raises_effective_keep_in_calculate,
     ]
     print("  --- R55 overnight_target sensor tests ---")
     for test_fn in r55_tests:

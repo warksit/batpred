@@ -48,7 +48,7 @@ def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minu
     return total
 
 
-def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
+def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, skip_initial_surplus=False):
     """
     Compute energy deficit from now until PV consistently covers load.
 
@@ -66,6 +66,11 @@ def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1
         end_minute: int — last minute (exclusive)
         step_minutes: int — forecast step size
         values_are_kwh: bool — if True, values are kWh per step (Predbat format)
+        skip_initial_surplus: bool — if True, walk past leading slots where
+            PV >= load until first deficit slot is seen, then start
+            accumulating. Lets the function be called mid-day to find the
+            UPCOMING overnight deficit (today's PV doesn't short-circuit
+            the calculation). Default False preserves legacy behaviour.
 
     Returns:
         float — morning energy gap in kWh
@@ -76,10 +81,18 @@ def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1
 
     gap_kwh = 0.0
     consecutive_surplus = 0
+    in_deficit_window = not skip_initial_surplus
 
     for m in range(start_minute, end_minute, step_minutes):
         pv_kw = pv_forecast.get(m, 0.0) * to_kw
         load_kw = load_forecast.get(m, 0.0) * to_kw
+
+        if not in_deficit_window:
+            # Wait for the first deficit slot — skip today's surplus PV
+            if load_kw > pv_kw:
+                in_deficit_window = True
+                gap_kwh += (load_kw - pv_kw) * step_hours
+            continue
 
         if pv_kw >= load_kw:
             consecutive_surplus += 1
