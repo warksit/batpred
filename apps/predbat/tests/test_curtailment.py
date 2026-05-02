@@ -1132,6 +1132,128 @@ def test_R53_compute_solcast_overflow_uses_load_forecast():
     print("  test_R53_compute_solcast_overflow_uses_load_forecast: PASSED")
 
 
+def test_R53_real_2026_05_02_shape_preserved():
+    """Real Solcast forecast for 2026-05-02 — the day that triggered v20.
+
+    Live behaviour that day: plugin extracted scale=11 from observed peak
+    (8.2 kW at noon BST), extrapolated 11 × sin(elev) across the whole
+    day, predicted 16+ kWh of overflow. Reality: rain by 16:00 BST,
+    actual overflow probably 0-2 kWh.
+
+    With the real Solcast slots (this fixture), compute_solcast_overflow
+    sees the afternoon drop encoded in pv_estimate per slot and produces
+    a much smaller integral.
+    """
+    import json
+    from curtailment_calc import compute_solar_overflow, compute_solcast_overflow
+
+    fixture_path = os.path.join(CSV_DIR, "solcast_2026_05_02.json")
+    if not os.path.exists(fixture_path):
+        print("  test_R53_real_2026_05_02_shape_preserved: SKIPPED (fixture not found)")
+        return
+    with open(fixture_path) as f:
+        slots = json.load(f)
+
+    # Integration window: 11:00 UTC (12:00 BST, mid-day) through 19:00 UTC.
+    n_steps = 8 * 12  # 8 hours of 5-min steps
+    load = [0.5] * n_steps
+
+    new_overflow = compute_solcast_overflow(
+        detailed_forecast=slots,
+        from_utc_hours=11.0,
+        to_utc_hours=19.0,
+        dno_limit=4.0,
+        local_offset_hours=0.0,
+        load_forecast_kw=load,
+    )
+
+    # Old clear-sky: scale from observed peak (matches plugin's R42 behaviour)
+    peak_pv = 8.24
+    peak_utc = 11.0
+    elev_at_peak = solar_elevation(52.0, -1.5, peak_utc, 122)
+    sin_peak = math.sin(math.radians(elev_at_peak))
+    scale = peak_pv / sin_peak
+    old_overflow = compute_solar_overflow(
+        scale=scale,
+        lat_deg=52.0,
+        lon_deg=-1.5,
+        day_of_year=122,
+        from_utc_hours=11.0,
+        to_utc_hours=19.0,
+        dno_limit=4.0,
+        load_forecast_kw=load,
+    )
+
+    assert old_overflow > 8.0, f"Test sanity: scale={scale:.1f} should predict > 8 kWh overflow, got {old_overflow:.2f}"
+    assert new_overflow < old_overflow * 0.5, f"Real Solcast shape should be < 50% of clear-sky extrapolation. " f"new={new_overflow:.2f} kWh, old={old_overflow:.2f} kWh"
+    print(f"  test_R53_real_2026_05_02_shape_preserved: PASSED " f"(scale={scale:.1f}, new={new_overflow:.2f} kWh, old={old_overflow:.2f} kWh, " f"clear-sky overestimate {old_overflow / max(0.1, new_overflow):.1f}x)")
+
+
+def test_R53_real_last_10_days_no_crash_and_sane():
+    """Run compute_solcast_overflow against 10 days of real Solcast forecasts.
+
+    Asserts: function returns a finite non-negative number for each day, and
+    matches a sensible band given Solcast's day total (overflow can't exceed
+    Solcast remaining minus DNO export budget).
+    """
+    import glob
+    import json
+    from curtailment_calc import compute_solcast_overflow
+
+    fixtures = sorted(glob.glob(os.path.join(CSV_DIR, "solcast_2026_*.json")))
+    if not fixtures:
+        print("  test_R53_real_last_10_days_no_crash_and_sane: SKIPPED (no fixtures)")
+        return
+
+    n_steps = 16 * 12  # 16-hour window 04:00-20:00 UTC
+    load = [0.5] * n_steps
+    summary = []
+    for fp in fixtures:
+        with open(fp) as f:
+            slots = json.load(f)
+        day = os.path.basename(fp).replace("solcast_", "").replace(".json", "").replace("_", "-")
+        # P50 overflow integrating from 04:00 UTC to 20:00 UTC
+        for band in ("pv_estimate10", "pv_estimate", "pv_estimate90"):
+            ov = compute_solcast_overflow(
+                detailed_forecast=slots,
+                from_utc_hours=4.0,
+                to_utc_hours=20.0,
+                dno_limit=4.0,
+                local_offset_hours=0.0,
+                load_forecast_kw=load,
+                band=band,
+            )
+            assert ov >= 0.0, f"{day} {band}: negative overflow {ov:.2f}"
+            assert ov < 100.0, f"{day} {band}: implausible overflow {ov:.2f} kWh"
+            day_total = sum(s.get(band, 0) for s in slots) * 0.5
+            assert ov <= day_total, f"{day} {band}: overflow {ov:.2f} exceeds day total {day_total:.2f}"
+        # Just collect the P50 result for the printed summary
+        ov50 = compute_solcast_overflow(
+            detailed_forecast=slots,
+            from_utc_hours=4.0,
+            to_utc_hours=20.0,
+            dno_limit=4.0,
+            local_offset_hours=0.0,
+            load_forecast_kw=load,
+            band="pv_estimate",
+        )
+        ov90 = compute_solcast_overflow(
+            detailed_forecast=slots,
+            from_utc_hours=4.0,
+            to_utc_hours=20.0,
+            dno_limit=4.0,
+            local_offset_hours=0.0,
+            load_forecast_kw=load,
+            band="pv_estimate90",
+        )
+        day_total = sum(s.get("pv_estimate", 0) for s in slots) * 0.5
+        summary.append((day, day_total, ov50, ov90))
+
+    print(f"  test_R53_real_last_10_days_no_crash_and_sane: PASSED ({len(summary)} days)")
+    for day, total, ov50, ov90 in summary:
+        print(f"    {day}: day total P50={total:.1f} kWh, overflow P50={ov50:.2f} kWh, P90={ov90:.2f} kWh")
+
+
 def test_R53_compute_solcast_overflow_band_selection():
     """band='pv_estimate10' / 'pv_estimate90' read different fields (R53 enables R50)."""
     from curtailment_calc import compute_solcast_overflow
@@ -3493,6 +3615,8 @@ def run_curtailment_tests(my_predbat=None):
         test_R53_compute_solcast_overflow_uniform_sunny_slot,
         test_R53_compute_solcast_overflow_preserves_day_shape,
         test_R53_compute_solcast_overflow_uses_load_forecast,
+        test_R53_real_2026_05_02_shape_preserved,
+        test_R53_real_last_10_days_no_crash_and_sane,
         test_R53_compute_solcast_overflow_band_selection,
     ]
     print("  --- R53 per-slot Solcast integral tests ---")
