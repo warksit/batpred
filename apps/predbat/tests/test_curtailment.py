@@ -2493,6 +2493,57 @@ def test_R55_overnight_target_no_plan_yet_fallback():
     print(f"  test_R55_overnight_target_no_plan_yet_fallback: PASSED (target={pub['value']:.2f}, source=no_plan_yet)")
 
 
+def test_R55_target_soc_uses_overnight_when_off():
+    """When plugin is Off, target_soc sensor reports overnight_target instead
+    of soc_max (the placeholder). Phase tile already says Off so no info lost."""
+    from datetime import datetime, timezone
+
+    base = MockBase(
+        pv_step={},
+        load_step={},
+        soc_kw=BATTERY_KWH * 0.7,
+        minutes_now=1260,  # 21:00 BST
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc),
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._overnight_target_kwh = 7.0  # simulate cached overnight need
+    plugin.publish("off", BATTERY_KWH, dno_limit_kw=4.0, export_target=-2)
+
+    pub = base.published["sensor.predbat_curtailment_target_soc"]
+    expected_pct = 7.0 / BATTERY_KWH * 100
+    assert abs(pub["value"] - round(expected_pct, 1)) < 0.05, f"Expected target_soc≈{expected_pct:.1f}% (overnight target), got {pub['value']}"
+    assert abs(pub["attrs"]["target_kwh"] - 7.0) < 0.01, f"target_kwh attr should match overnight_target, got {pub['attrs']['target_kwh']}"
+    print(f"  test_R55_target_soc_uses_overnight_when_off: PASSED (target_soc={pub['value']}% / {pub['attrs']['target_kwh']} kWh)")
+
+
+def test_R55_target_soc_uses_floor_when_active():
+    """When plugin is Active, target_soc sensor reports the live floor (the
+    drain target for curtailment), not overnight_target."""
+    from datetime import datetime, timezone
+
+    base = MockBase(
+        pv_step={},
+        load_step={},
+        soc_kw=BATTERY_KWH * 0.5,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._overnight_target_kwh = 7.0
+    floor_kwh = 2.5  # active drain target (lower than overnight)
+    plugin.publish("active", floor_kwh, dno_limit_kw=4.0, export_target=4.0)
+
+    pub = base.published["sensor.predbat_curtailment_target_soc"]
+    expected_pct = floor_kwh / BATTERY_KWH * 100
+    assert abs(pub["value"] - round(expected_pct, 1)) < 0.05, f"Active: target_soc should equal floor%, got {pub['value']}"
+    assert abs(pub["attrs"]["target_kwh"] - floor_kwh) < 0.01
+    print(f"  test_R55_target_soc_uses_floor_when_active: PASSED (target_soc={pub['value']}% / {pub['attrs']['target_kwh']} kWh)")
+
+
 def test_R55_safety_pct_helper_clamps_range():
     """HA helper input_number.curtailment_overnight_safety_pct clamped to [0, 200]."""
     pv = {}
@@ -4074,6 +4125,8 @@ def run_curtailment_tests(my_predbat=None):
         test_R55_overnight_target_published_when_no_overflow,
         test_R55_overnight_target_published_from_calculate_with_real_pv_step,
         test_R55_overnight_target_no_plan_yet_fallback,
+        test_R55_target_soc_uses_overnight_when_off,
+        test_R55_target_soc_uses_floor_when_active,
         test_R55_safety_pct_helper_clamps_range,
         test_R55_overnight_target_raises_effective_keep_in_calculate,
     ]

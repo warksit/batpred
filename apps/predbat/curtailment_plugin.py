@@ -1457,7 +1457,15 @@ class CurtailmentPlugin(PredBatPlugin):
         prefix = self.base.prefix
         soc_max = getattr(self.base, "soc_max", 10)
 
-        floor_pct = round(floor_kwh / soc_max * 100, 1) if soc_max > 0 else 100
+        # When plugin is Off, the published target_soc reflects the overnight
+        # target (= what we'd drain to if we were active) instead of soc_max
+        # (the placeholder return value of calculate() for off paths).
+        # Phase tile already says "Off" so no info is lost.
+        target_kwh = floor_kwh
+        if phase != "active" and self._overnight_target_kwh is not None:
+            target_kwh = min(self._overnight_target_kwh, soc_max) if soc_max else self._overnight_target_kwh
+
+        floor_pct = round(target_kwh / soc_max * 100, 1) if soc_max > 0 else 100
         state = "Active" if phase == "active" else "Off"
 
         self.base.dashboard_item(
@@ -1492,7 +1500,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 "friendly_name": "Curtailment Target SOC",
                 "unit_of_measurement": "%",
                 "icon": "mdi:battery-charging-medium",
-                "target_kwh": round(floor_kwh, 2),
+                "target_kwh": round(target_kwh, 2),
             },
         )
 
