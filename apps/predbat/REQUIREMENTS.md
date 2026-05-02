@@ -354,3 +354,213 @@ next minor SOC drift.
   code. Never deploy a fix without a test that would have caught the bug.
 - **R37**: Never break production code to make tests pass. If tests fail but
   production is correct, fix the tests.
+
+---
+
+## v20 Redesign Delta (2026-05-02)
+
+This appendix supersedes parts of R1-R52 above. When in conflict, this
+section wins. Triggered by today's failure mode: clear morning + cloudy
+afternoon caused the plugin to extrapolate `actual_scale` over the whole
+day, predicting 16 kWh of overflow that wouldn't materialise (real
+forecast: rain by 16:00). Plugin drained battery to 2.8% target and
+"manage manually" was needed.
+
+Goals of v20:
+
+1. Use Solcast's day-shape forecast directly instead of clear-sky
+   geometry from a single scalar. Solcast already knows about the
+   afternoon clouds and rain.
+2. Stop chasing 100% SOC at end of day. Drain to overnight need
+   (= effective `soc_keep`) so end-of-day excess is exported in the
+   evening (high grid value) rather than sitting at 100%.
+3. Single drain-target rule: `target = min(curtailment_floor, soc_keep)`.
+   Both are "drain to" levels; lower wins.
+4. Plugin runs while PV > 0, not until safe_time. Evening drain to
+   `soc_keep` happens through the late afternoon.
+
+### Changed Goal
+
+> Prevent grid export exceeding 4kW DNO limit while delivering enough SOC
+> by sunset to cover overnight + tomorrow's morning gap. Excess above the
+> overnight requirement is exported during the PV window (preferring
+> evening for grid value).
+
+### Triage of R1-R52
+
+**Kept unchanged (✅):** R1, R2, R3, R4, R8, R14, R15, R16, R16a, R17, R18,
+R26, R27, R28, R29, R30, R34, R35, R36, R37, R38, R44, R47, R48, R49.
+
+**Amended (✏️):**
+
+- **R5** — activation condition becomes "is there work to do?". Plugin
+  is Active when `target_soc < soc_max` (i.e. drain target below full)
+  AND there is PV (or pre-PV drain conditions per R52 hold). Drop the
+  "battery won't reach 100% even with all PV" gate from old R5.
+- **R6** — deactivate at `PV ≤ 0.1 kW` (effective sundown), not at
+  `safe_time`. After overflow window, plugin continues running to drain
+  toward `soc_keep` through the evening.
+- **R7** — REMOVED — superseded by R53 (Solcast per-slot is the basis).
+- **R9** — same formula shape; `remaining_overflow` is now sourced from
+  R53 (Solcast per-slot integral) not solar geometry. Tapered-cap part
+  removed (R45 superseded by R57). Result: `curtailment_floor =
+  max(0, soc_max − remaining_overflow × OVERFLOW_SAFETY_FACTOR)`.
+- **R9a** — strengthened. `effective_load(t) = max(base_load,
+  smoothed_loadml(t))` where `smoothed_loadml = rolling_mean(loadml,
+  60min)`. The unsmoothed LoadML noise was the v5 failure mode; smoothing
+  it lets us safely use Solcast per-slot shape (R53) without re-breaking
+  v5.
+- **R10** — final clamp becomes
+  `target = max(min(curtailment_floor, effective_keep), reserve)` where
+  `effective_keep` is `soc_keep` after R26+R48 adjustment. soc_keep is
+  no longer added to the `max` clamp directly — it's inside the `min`.
+  Reason: on big-overflow days R48 already drops `soc_keep` to ~2.8%
+  so the inner `min` correctly drains low. On normal days `soc_keep`
+  caps the drain via the inner `min`.
+- **R11** — ratchet still applies, but to the OVERFLOW component only.
+  When overflow integral falls and `target` switches over to
+  `effective_keep` (curtailment_floor exceeds keep), no ratchet on the
+  keep component — it can rise/fall freely as Predbat plan changes.
+- **R13** — keep concept; integral is now Solcast-shaped (R53).
+- **R19** — safe_time now demoted from deactivation trigger to
+  diagnostic. Defined as "first time `remaining_overflow_integral = 0`".
+  Used for sensor display; not used for control.
+- **R20, R21** — keep semantics, but only relevant for the safe_time
+  diagnostic now (no functional consequence).
+- **R39** — keep concept; integral reference updated to R53.
+- **R42** — scale stops being structural. Kept only as a calibration
+  knob feeding R58 (live recalibration of next ~30 min of slots).
+- **R43** — REPLACED by R58. Old `floor_scale = max(p_scale,
+  actual_scale)` collapsed p10/p50/p90 into one number whenever actual
+  exceeded any band, destroying the spread that R50 needs.
+- **R46** — REMOVED — its purpose (LoadML phantom
+  underestimating overflow) is addressed at source by R9a smoothing
+    - R53 Solcast slots. Deactivation rule moves to R6 (PV ≤ 0.1).
+- **R50** — operates on per-slot Solcast bands (`pv_estimate10` /
+  `pv_estimate` / `pv_estimate90` summed per band), not three copies
+  of `max(p_scale, actual_scale)`. Confidence blending unchanged.
+- **R52** — pre-PV drain stays. Pre-PV target reformulated:
+  `min(soc_keep + buffer, effective_keep)`. The two-stage mechanic
+  (coarse pre-PV drain at full DNO, fine post-PV drain) is unchanged.
+
+**Removed (❌):**
+
+- **R7** — see above.
+- **R12** — "at safe_time, floor = soc_max, plugin deactivates". Both
+  parts gone: floor → effective_keep, plugin runs to PV ≤ 0.1.
+- **R45** — tapered cap to 100% at safe_time. The "fill battery before
+  MSC handoff" mechanism is exactly the behaviour we're removing.
+  Replaced by R57.
+- **R46** — see Amended.
+
+### New Requirements
+
+- **R53** (overflow integral source). The remaining-overflow integral
+  uses Solcast per-slot pv_estimate kWh, integrated forward from now to
+  end of PV. Form:
+
+  ```text
+  remaining_overflow = Σ_slots max(0,
+                          solcast_slot_kwh
+                          − effective_load_kwh(slot)
+                          − dno_kwh_per_slot)
+  ```
+
+  Per band (R50): the same integral with `pv_estimate10` /
+  `pv_estimate` / `pv_estimate90`. The clear-sky `scale × sin(elev)`
+  model is no longer used inside the integral. Solcast already encodes
+  the day-shape (cloud, rain, ramp), and discarding shape was the
+  v18 failure mode.
+
+- **R54** (single drain-target rule). At every plugin cycle:
+
+  ```text
+  target_soc = max(min(curtailment_floor, effective_keep), reserve)
+  ```
+
+    - `curtailment_floor` from R9 (Solcast-shaped via R53).
+    - `effective_keep` is `soc_keep` after R26 (plan-time reduction)
+    and R48 (live big-overflow relaxation latch).
+    - `reserve` is the absolute physical floor (battery/inverter limit).
+    - `min` because both numbers are "drain TO this level"; lower wins.
+    - `max` clamp guarantees we never request below `reserve`.
+
+  Trade-off: when `effective_keep < curtailment_floor` (modest overflow
+    - low overnight need), the rule drains slightly lower than curtailment
+  strictly requires. Accepted in exchange for a single uniform rule
+  across the day with no phase switch.
+
+- **R55** (overnight target sourced from morning gap).
+  `effective_keep` is set in `on_before_plan` (R26) to
+  `morning_gap + R55_MARGIN_KWH` where `morning_gap =
+  compute_morning_gap(tomorrow_pv, tomorrow_load)` and
+  `R55_MARGIN_KWH = 0.5`. R48 may further relax effective_keep on
+  big-overflow days via the existing latch (down to 0.5 kWh).
+  Published as a sensor (`sensor.predbat_curtailment_overnight_target`)
+  for dashboard visibility.
+
+- **R56** (plugin active while PV > 0). The plugin is Active for the
+  whole PV window (R52 pre-PV drain → through PV peak → through
+  late-afternoon drain to `effective_keep`) until `pv_power ≤ 0.1 kW`.
+  After PV stops, plugin deactivates and Predbat MSC takes over for
+  overnight. Drain mode through the late afternoon will pull from
+  battery to grid (round-trip cost) — accepted because evening kWh has
+  higher grid value than midday curtailment, so net positive.
+
+- **R57** (no 100% chase). Plugin never targets `soc_max` as the drain
+  target. End-of-day SOC ≈ `effective_keep` on most days. Battery only
+  reaches 100% if PV physically overcharges past the cap (e.g. a true
+  no-load mid-day with battery already at `effective_keep`). R45
+  superseded.
+
+- **R58** (actual_scale as live calibration only). `actual_scale` is
+  applied as a multiplier to the next 30 min of Solcast pv_estimate
+  slots, capped at 1.5×. Beyond 30 min, Solcast slots are used as-is
+  (preserving day-shape). Replaces R43's global override which
+  collapsed p10/p50/p90 to a single value whenever actual exceeded p90.
+
+  ```text
+  if actual_scale > 0 and within next 30 min:
+      slot_kwh_used = solcast_slot_kwh × min(1.5, actual_scale_ratio)
+  else:
+      slot_kwh_used = solcast_slot_kwh
+  ```
+
+  where `actual_scale_ratio = actual_pv_last_30min / solcast_last_30min`.
+
+### Order of work (TDD)
+
+For each item, write a FAILING test first (R36), then code, then
+verify all existing tests still pass (R37 — never break production).
+
+1. **R9a smoothing** (foundation for R53). Test: noisy LoadML with
+   1 kW transient should not change the integral by more than 5%.
+2. **R53 per-slot integral**. Test fixture: today's actual data
+   (clear morning, rain afternoon). Old code returns ~16 kWh;
+   new code should return < 2 kWh.
+3. **R55 overnight target sensor**. Test: with mild overnight forecast
+   `morning_gap = 4 kWh`, sensor publishes `4.5 kWh / 25%`.
+4. **R54 single rule**. Test matrix from triage examples 1-4:
+   target should be `min(curt, keep)` clamped above reserve.
+5. **R57 / R45 removal**. Test: plugin never targets `soc_max` after
+   `remaining_overflow → 0`. Target falls to `effective_keep`.
+6. **R56 plugin active until PV=0**. Test: at 16:00 with overflow=0,
+   plugin still Active and Drain mode if SOC > effective_keep.
+   Plugin Off at PV=0.
+7. **R58 actual_scale live calibration**. Test: `actual_scale=2.0`
+   only multiplies next 30 min of Solcast slots; remaining-day shape
+   preserved. Cap at 1.5× respected.
+8. **R50 per-slot bands**. Test: p10 / p50 / p90 overflow integrals
+   produce DIFFERENT values when fed Solcast bands with realistic
+   spread (not collapsed by R43, which is removed).
+
+### Items still flagged for discussion
+
+- **R49** kept for now (user decision). Re-evaluate after R53 +
+  R50-on-bands ship — if they fully address the "Solcast over-
+  forecasted today" failure mode, R49 becomes redundant.
+- **R48** kept for now (user decision). The relaxed-keep latch is
+  what makes target=2.8% work on huge-overflow days under R54.
+- **Round-trip loss in evening drain** (R56). Empirical question:
+  on a no-overflow but high-SOC day, is evening drain from battery
+  to grid actually net-positive? Worth instrumenting after deploy.
