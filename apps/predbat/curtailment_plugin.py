@@ -37,6 +37,7 @@ from curtailment_calc import (
     compute_morning_gap,
     compute_remaining_overflow,
     compute_solar_overflow,
+    compute_solcast_overflow,
     compute_expected_overflow,
     compute_pv_start_time,
     p90_scale_from_forecast,
@@ -511,6 +512,85 @@ class CurtailmentPlugin(PredBatPlugin):
         # Fallback: yesterday's scale (changes ~1° elevation per day, R44)
         return self._p90_scale, self._p90_peak_kw, 0.0
 
+    def _get_solcast_detailed(self):
+        """Return Solcast detailedForecast list, or [] if unavailable."""
+        try:
+            detailed = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="detailedForecast", default=[])
+            if isinstance(detailed, list):
+                return detailed
+        except Exception:
+            pass
+        return []
+
+    def _compute_calibration_ratio(self, minutes_now, solcast_remaining):
+        """R58 live calibration ratio: actual_pv_last_30min / solcast_last_30min.
+
+        Reads SIG_DAILY_PV and uses pv_history (which already tracks
+        (minutes_now, solcast_so_far_kwh, sig_daily_pv_kwh)) to derive a
+        recent ratio. Returns 1.0 if not enough history yet (need at least
+        one entry ~25-35 min old). Caller should pass the ratio to
+        compute_solcast_overflow which clamps at CALIBRATION_RATIO_MAX.
+        """
+        try:
+            sig_daily_pv = float(self.base.get_state_wrapper(SIG_DAILY_PV, default=0))
+        except (ValueError, TypeError):
+            return 1.0
+        try:
+            solcast_today_kwh = float(self.base.get_state_wrapper(SOLCAST_TODAY, default=0))
+        except (ValueError, TypeError):
+            return 1.0
+        solcast_so_far = max(0.0, solcast_today_kwh - solcast_remaining)
+        target_past = minutes_now - 30
+        oldest = None
+        for entry in self._pv_history:
+            if abs(entry[0] - target_past) <= 5:
+                oldest = entry
+                break
+        if oldest is None:
+            return 1.0
+        delta_solcast = solcast_so_far - oldest[1]
+        delta_actual = sig_daily_pv - oldest[2]
+        if delta_solcast < 0.05:
+            # Solcast says no PV in the last 30 min — calibration is not
+            # meaningful (could be sunrise/sunset edge). Don't scale.
+            return 1.0
+        return max(0.0, delta_actual / delta_solcast)
+
+    def _compute_overflow_band(self, band, scale_fallback, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed):
+        """R53/R50/R58: compute overflow integral for one Solcast band.
+
+        Uses compute_solcast_overflow when detailedForecast has 4+ slots
+        (i.e. at least 2 hours of forecast — enough for the integral to
+        make sense). Otherwise falls back to compute_solar_overflow with
+        the band's clear-sky scale.
+
+        scale_fallback is used only on the fallback path (e.g. integration
+        tests that supply only one Solcast slot for scale derivation).
+        """
+        if detailed and len(detailed) >= 4:
+            return compute_solcast_overflow(
+                detailed_forecast=detailed,
+                from_utc_hours=utc_hours,
+                to_utc_hours=safe_utc,
+                dno_limit=dno_limit_kw,
+                load_forecast_kw=load_fc,
+                local_offset_hours=0.0,
+                band=band,
+                calibration_ratio=calibration_ratio,
+            )
+        if scale_fallback <= 0:
+            return 0.0
+        return compute_solar_overflow(
+            scale_fallback,
+            lat,
+            lon,
+            doy,
+            utc_hours,
+            safe_utc,
+            dno_limit_kw,
+            load_forecast_kw=load_fc,
+        )
+
     def _get_p_scales(self, lat, lon, doy, local_offset):
         """R50: get all three forecast band scales (p10/p50/p90).
 
@@ -636,6 +716,9 @@ class CurtailmentPlugin(PredBatPlugin):
         Called from Off paths (e.g. pre-dawn) so the dashboard reflects the
         forecast even before activation. Silently no-ops if Solcast data is
         unavailable or geometry won't compute — values stay at previous cycle.
+
+        Uses the R53 per-slot Solcast integral when detailedForecast has
+        enough slots; falls back to the clear-sky model otherwise.
         """
         try:
             p10_scale, p50_scale, p90_scale = self._get_p_scales(lat, lon, doy, local_offset)
@@ -651,12 +734,20 @@ class CurtailmentPlugin(PredBatPlugin):
             safe_offset_mins = max(PREDICT_STEP, int((safe_utc - utc_hours) * 60))
             load_fc = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
             load_fc = smooth_load_forecast(load_fc, window_minutes=60, step_minutes=PREDICT_STEP)
-            p10_eff = max(p10_scale, self._actual_scale)
-            p50_eff = max(p50_scale, self._actual_scale)
-            p90_eff = max(p90_scale, self._actual_scale)
-            self._overflow_p10 = round(compute_solar_overflow(p10_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_fc) if p10_eff > 0 else 0.0, 2)
-            self._overflow_p50 = round(compute_solar_overflow(p50_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_fc) if p50_eff > 0 else 0.0, 2)
-            self._overflow_p90 = round(compute_solar_overflow(p90_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_fc) if p90_eff > 0 else 0.0, 2)
+            detailed = self._get_solcast_detailed()
+            try:
+                solcast_remaining = float(self.base.get_state_wrapper(SOLCAST_REMAINING, default=0))
+            except (ValueError, TypeError):
+                solcast_remaining = 0.0
+            minutes_now = getattr(self.base, "minutes_now", 720)
+            calibration_ratio = self._compute_calibration_ratio(minutes_now, solcast_remaining)
+            # R58: per-band, no R43 max(p_scale, actual_scale) collapse.
+            p10_fb = max(p10_scale, self._actual_scale)
+            p50_fb = max(p50_scale, self._actual_scale)
+            p90_fb = max(p90_scale, self._actual_scale)
+            self._overflow_p10 = round(self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed), 2)
+            self._overflow_p50 = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed), 2)
+            self._overflow_p90 = round(self._compute_overflow_band("pv_estimate90", p90_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed), 2)
         except Exception:
             pass
 
@@ -833,16 +924,25 @@ class CurtailmentPlugin(PredBatPlugin):
         load_forecast_kw = [load_step.get(m, 0) * to_kw for m in range(0, safe_offset_mins, PREDICT_STEP)]
         load_forecast_kw = smooth_load_forecast(load_forecast_kw, window_minutes=60, step_minutes=PREDICT_STEP)
 
-        # Compute three overflow integrals (R50): one per forecast band.
-        # Each band uses max(p_X_scale, actual_scale) so once actual exceeds
-        # forecast, R43-style ratchet up still happens per-band.
+        # R50/R53/R58: three overflow integrals, one per forecast band.
+        # Per-slot Solcast (R53) when detailedForecast available, falls back to
+        # clear-sky scale when Solcast is missing/short. R58 calibration ratio
+        # multiplies the next 30 min of Solcast slots only (capped at 1.5x) —
+        # replaces R43's global max(p_scale, actual_scale) collapse that broke
+        # band spread on sunny mornings.
         p10_scale, p50_scale, _p90_check = self._get_p_scales(lat, lon, doy, local_offset)
-        p10_eff = max(p10_scale, actual_scale)
-        p50_eff = max(p50_scale, actual_scale)
-        # p90_eff is just floor_scale (already max(p90, actual) from R43 above)
-        overflow_p10 = compute_solar_overflow(p10_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw) if p10_eff > 0 else 0.0
-        overflow_p50 = compute_solar_overflow(p50_eff, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw) if p50_eff > 0 else 0.0
-        overflow_p90 = compute_solar_overflow(floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw=load_forecast_kw)
+        p10_fb = max(p10_scale, actual_scale)
+        p50_fb = max(p50_scale, actual_scale)
+        # p90_fb is floor_scale (already max(p90, actual) from R43 above)
+        detailed = self._get_solcast_detailed()
+        try:
+            solcast_remaining_kwh = float(self.base.get_state_wrapper(SOLCAST_REMAINING, default=0))
+        except (ValueError, TypeError):
+            solcast_remaining_kwh = 0.0
+        calibration_ratio = self._compute_calibration_ratio(minutes_now, solcast_remaining_kwh)
+        overflow_p10 = self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw, calibration_ratio, detailed)
+        overflow_p50 = self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw, calibration_ratio, detailed)
+        overflow_p90 = self._compute_overflow_band("pv_estimate90", floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw, calibration_ratio, detailed)
 
         # Read confidence and tunable thresholds from helpers
         confidence = self._get_solcast_confidence()

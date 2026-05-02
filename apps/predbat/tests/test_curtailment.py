@@ -1316,6 +1316,58 @@ def test_R58_calibration_ratio_capped_at_15x():
     print(f"  test_R58_calibration_ratio_capped_at_15x: PASSED (cap={cap:.2f})")
 
 
+def test_R53_plugin_uses_solcast_slots_when_available():
+    """Plugin's _publish_forecast_overflow uses compute_solcast_overflow when
+    Solcast detailedForecast has 4+ slots. Bands no longer collapse to a
+    single value (R43 → R58 behaviour change).
+    """
+    import json
+    from datetime import datetime, timezone
+
+    fixture_path = os.path.join(CSV_DIR, "solcast_2026_05_02.json")
+    if not os.path.exists(fixture_path):
+        print("  test_R53_plugin_uses_solcast_slots_when_available: SKIPPED (fixture not found)")
+        return
+    with open(fixture_path) as f:
+        slots = json.load(f)
+
+    # MockBase at 11:00 UTC = 11:00 BST (we'll set timezone-naive UTC).
+    # Use minutes_now = 720 (12:00 BST) so calibration window = noon onwards.
+    base = MockBase(
+        soc_kw=4.0,
+        soc_max=18.08,
+        minutes_now=720,
+        now_utc=datetime(2026, 5, 2, 11, 0, tzinfo=timezone.utc),
+        sensor_overrides={
+            "sensor.solcast_pv_forecast_forecast_today": {
+                "detailedForecast": slots,
+                "state": 42.2,
+            },
+            "sensor.solcast_pv_forecast_forecast_remaining_today": 25.0,
+        },
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._publish_forecast_overflow(
+        lat=52.0,
+        lon=-1.5,
+        doy=122,
+        local_offset=1.0,
+        utc_hours=11.0,
+        dno_limit_kw=4.0,
+    )
+
+    p10 = plugin._overflow_p10
+    p50 = plugin._overflow_p50
+    p90 = plugin._overflow_p90
+    assert p10 < p50 < p90, f"R50 spread should be preserved (p10<{p50}<p90), got p10={p10} p50={p50} p90={p90}"
+    # On 2026-05-02 (clear morning + rain afternoon, integration from 11:00 UTC)
+    # the plugin should report SMALL overflow — not the 16+ kWh that the old
+    # clear-sky model produced from observed peak.
+    assert p90 < 12.0, f"Solcast slot model should give P90 < 12 kWh on this variable day, got {p90}"
+    assert p50 < 8.0, f"Solcast slot model should give P50 < 8 kWh on this variable day, got {p50}"
+    print(f"  test_R53_plugin_uses_solcast_slots_when_available: PASSED (p10={p10:.2f} p50={p50:.2f} p90={p90:.2f} kWh)")
+
+
 def test_R58_calibration_below_one_attenuates_window():
     """ratio<1.0 attenuates next-30-min PV (cloudier than forecast caught live)."""
     from curtailment_calc import compute_solcast_overflow
@@ -3706,6 +3758,7 @@ def run_curtailment_tests(my_predbat=None):
         test_R58_calibration_ratio_only_affects_window,
         test_R58_calibration_ratio_capped_at_15x,
         test_R58_calibration_below_one_attenuates_window,
+        test_R53_plugin_uses_solcast_slots_when_available,
     ]
     print("  --- R53 per-slot Solcast integral tests ---")
     for test_fn in r53_tests:
