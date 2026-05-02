@@ -986,6 +986,177 @@ def test_R9a_smoothed_integral_stable_against_load_noise():
 
 
 # ============================================================================
+# R53: per-slot Solcast integral tests (v20)
+# ============================================================================
+
+
+def _make_solcast_slots(slot_specs, date="2026-05-02", local_offset="+01:00"):
+    """Build a Solcast detailedForecast list from (hour, minute, pv50, pv10, pv90) tuples."""
+    slots = []
+    for hour, minute, pv50, pv10, pv90 in slot_specs:
+        slots.append(
+            {
+                "period_start": f"{date}T{hour:02d}:{minute:02d}:00{local_offset}",
+                "pv_estimate": pv50,
+                "pv_estimate10": pv10,
+                "pv_estimate90": pv90,
+            }
+        )
+    return slots
+
+
+def test_R53_compute_solcast_overflow_empty_returns_zero():
+    """Empty forecast → 0 kWh overflow."""
+    from curtailment_calc import compute_solcast_overflow
+
+    out = compute_solcast_overflow(
+        detailed_forecast=[],
+        from_utc_hours=8.0,
+        to_utc_hours=14.0,
+        dno_limit=4.0,
+    )
+    assert out == 0.0, f"Empty forecast should yield 0, got {out}"
+    print("  test_R53_compute_solcast_overflow_empty_returns_zero: PASSED")
+
+
+def test_R53_compute_solcast_overflow_uniform_sunny_slot():
+    """One 30-min slot at 8 kW (4 kW above DNO) → ~1.75 kWh overflow."""
+    from curtailment_calc import compute_solcast_overflow
+
+    # Single slot 11:00-11:30 BST = 10:00-10:30 UTC, 8 kW
+    slots = _make_solcast_slots([(11, 0, 8.0, 8.0, 8.0)])
+    out = compute_solcast_overflow(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 6,
+    )
+    # 30 min × (8 - 0.5 - 4) kW = 0.5h × 3.5 kW = 1.75 kWh
+    assert abs(out - 1.75) < 0.01, f"Expected ~1.75 kWh, got {out:.3f}"
+    print("  test_R53_compute_solcast_overflow_uniform_sunny_slot: PASSED")
+
+
+def test_R53_compute_solcast_overflow_preserves_day_shape():
+    """The 2026-05-02 failure case: clear morning + rainy afternoon → small overflow.
+
+    Old compute_solar_overflow with scale=11 returns much more because it
+    extrapolates the morning peak across the whole day (clear-sky model,
+    ignores Solcast shape). New compute_solcast_overflow returns less
+    because it sees the afternoon drop.
+    """
+    from curtailment_calc import compute_solar_overflow, compute_solcast_overflow
+
+    # Slots 09:00 BST through 17:00 BST (8 hours = 16 slots of 30 min each)
+    # Realistic 2026-05-02 shape: peak ~6.8 kW around 10:30 BST, then cloud,
+    # then rain by 14:00. Models a "clear morning + bad afternoon" day.
+    pv_curve = [
+        (9, 0, 4.0),
+        (9, 30, 5.5),
+        (10, 0, 6.5),
+        (10, 30, 6.8),
+        (11, 0, 6.5),
+        (11, 30, 5.0),
+        (12, 0, 3.5),
+        (12, 30, 2.5),
+        (13, 0, 1.5),
+        (13, 30, 1.0),
+        (14, 0, 0.8),
+        (14, 30, 0.5),
+        (15, 0, 0.3),
+        (15, 30, 0.3),
+        (16, 0, 0.2),
+        (16, 30, 0.2),
+    ]
+    slot_specs = [(h, m, pv, pv * 0.7, pv * 1.1) for h, m, pv in pv_curve]
+    slots = _make_solcast_slots(slot_specs)
+
+    n_steps = (16 - 8) * 12  # 96 five-min steps
+    load = [0.5] * n_steps
+
+    new_overflow = compute_solcast_overflow(
+        detailed_forecast=slots,
+        from_utc_hours=8.0,
+        to_utc_hours=16.0,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=load,
+    )
+
+    old_overflow = compute_solar_overflow(
+        scale=11.0,
+        lat_deg=52.0,
+        lon_deg=-1.5,
+        day_of_year=122,
+        from_utc_hours=8.0,
+        to_utc_hours=16.0,
+        dno_limit=4.0,
+        load_forecast_kw=load,
+    )
+
+    assert old_overflow > 10.0, f"Test sanity: clear-sky scale=11 should predict > 10 kWh, got {old_overflow:.2f}"
+    # Shape preservation: Solcast must produce significantly less overflow
+    # than the clear-sky model when afternoon goes cloudy/rainy.
+    ratio = new_overflow / max(0.1, old_overflow)
+    assert ratio < 0.4, f"Solcast slot integral should be < 40% of clear-sky integral on a variable day, " f"got {ratio*100:.0f}% (new={new_overflow:.2f} vs old={old_overflow:.2f})"
+    assert new_overflow < 5.0, f"On this realistic shape, new overflow should be < 5 kWh, got {new_overflow:.2f}"
+    print(f"  test_R53_compute_solcast_overflow_preserves_day_shape: PASSED " f"(new={new_overflow:.2f} kWh, old={old_overflow:.2f} kWh — {old_overflow / max(0.1, new_overflow):.1f}× clear-sky overestimate)")
+
+
+def test_R53_compute_solcast_overflow_uses_load_forecast():
+    """Load forecast reduces overflow per slot (PV partly absorbed by load)."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 8.0, 8.0, 8.0)])
+    no_load = compute_solcast_overflow(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 6,
+    )
+    with_load = compute_solcast_overflow(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[2.0] * 6,
+    )
+    # No load: 30 min × (8 − 0.5 − 4) = 1.75 kWh
+    # With 2 kW load: 30 min × (8 − 2 − 4) = 1.0 kWh
+    assert abs(no_load - 1.75) < 0.01, f"no-load expected 1.75, got {no_load:.3f}"
+    assert abs(with_load - 1.0) < 0.01, f"with-load expected 1.0, got {with_load:.3f}"
+    print("  test_R53_compute_solcast_overflow_uses_load_forecast: PASSED")
+
+
+def test_R53_compute_solcast_overflow_band_selection():
+    """band='pv_estimate10' / 'pv_estimate90' read different fields (R53 enables R50)."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 7.0, 5.0, 9.0)])
+    common = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 6,
+    )
+    p10 = compute_solcast_overflow(band="pv_estimate10", **common)
+    p50 = compute_solcast_overflow(band="pv_estimate", **common)
+    p90 = compute_solcast_overflow(band="pv_estimate90", **common)
+
+    assert abs(p10 - 0.25) < 0.01, f"P10 expected 0.25 kWh, got {p10:.3f}"
+    assert abs(p50 - 1.25) < 0.01, f"P50 expected 1.25 kWh, got {p50:.3f}"
+    assert abs(p90 - 2.25) < 0.01, f"P90 expected 2.25 kWh, got {p90:.3f}"
+    assert p10 < p50 < p90, "P10 < P50 < P90 spread should be preserved (R53 enables R50)"
+    print(f"  test_R53_compute_solcast_overflow_band_selection: PASSED (p10={p10:.2f} p50={p50:.2f} p90={p90:.2f})")
+
+
+# ============================================================================
 # v10 phase tests
 # ============================================================================
 
@@ -3222,6 +3393,22 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- R9a load smoothing tests ---")
     for test_fn in r9a_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # R53 per-slot Solcast integral tests (v20)
+    r53_tests = [
+        test_R53_compute_solcast_overflow_empty_returns_zero,
+        test_R53_compute_solcast_overflow_uniform_sunny_slot,
+        test_R53_compute_solcast_overflow_preserves_day_shape,
+        test_R53_compute_solcast_overflow_uses_load_forecast,
+        test_R53_compute_solcast_overflow_band_selection,
+    ]
+    print("  --- R53 per-slot Solcast integral tests ---")
+    for test_fn in r53_tests:
         try:
             test_fn()
         except Exception as e:

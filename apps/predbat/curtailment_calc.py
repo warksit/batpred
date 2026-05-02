@@ -300,6 +300,90 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 
+def compute_solcast_overflow(
+    detailed_forecast,
+    from_utc_hours,
+    to_utc_hours,
+    dno_limit,
+    load_forecast_kw=None,
+    local_offset_hours=0.0,
+    base_load=MIN_BASE_LOAD_KW,
+    step_minutes=5,
+    band="pv_estimate",
+):
+    """
+    Integrate overflow energy from Solcast per-slot forecast (R53, v20).
+
+    Replaces compute_solar_overflow's clear-sky `scale × sin(elev)` model.
+    Preserves Solcast's day-shape (cloud, rain, ramp) by reading per-slot
+    pv_estimate directly instead of fitting a single scalar to peak.
+
+    For each integration step, looks up the Solcast 30-min slot containing
+    that UTC time, takes the band's kW value, then:
+        overflow_step = max(0, pv_kw - effective_load_kw - dno_limit) × step_h
+
+    Args:
+        detailed_forecast: list of dicts with 'period_start' (ISO local-time),
+                           and the band field (default 'pv_estimate' kW averaged
+                           over 30 min). Bands: 'pv_estimate10' / 'pv_estimate' /
+                           'pv_estimate90' for R50 confidence percentiles.
+        from_utc_hours: integration start (decimal UTC hours)
+        to_utc_hours: integration end (decimal UTC hours)
+        dno_limit: float kW
+        load_forecast_kw: optional list of kW per step. Pre-smooth via R9a.
+        local_offset_hours: local time offset from UTC (e.g. 1.0 for BST)
+        base_load: floor for effective load (R9a)
+        step_minutes: integration step (default 5)
+        band: which Solcast field to read
+
+    Returns:
+        float kWh — total overflow over the window
+    """
+    if not detailed_forecast or to_utc_hours <= from_utc_hours:
+        return 0.0
+
+    # Parse slots into (utc_start, utc_end, pv_kw) triples
+    slots = []
+    for s in detailed_forecast:
+        try:
+            ps = s["period_start"]
+            time_part = ps[11:16]
+            h, m = int(time_part[:2]), int(time_part[3:5])
+            local_h = h + m / 60.0
+            utc_h = local_h - local_offset_hours
+            pv = float(s.get(band, 0.0) or 0.0)
+            slots.append((utc_h, utc_h + 0.5, pv))
+        except (ValueError, IndexError, KeyError, TypeError):
+            continue
+    if not slots:
+        return 0.0
+    slots.sort(key=lambda x: x[0])
+
+    step_hours = step_minutes / 60.0
+    total = 0.0
+    t = from_utc_hours
+    i = 0
+    slot_idx = 0
+    while t < to_utc_hours:
+        # Advance slot pointer to the slot containing t
+        while slot_idx < len(slots) and slots[slot_idx][1] <= t:
+            slot_idx += 1
+        if slot_idx >= len(slots):
+            break
+        s_start, s_end, s_pv = slots[slot_idx]
+        if t < s_start:
+            # Gap before next slot — assume 0 PV (no overflow)
+            pv_kw = 0.0
+        else:
+            pv_kw = s_pv
+        forecast_load = load_forecast_kw[i] if load_forecast_kw and i < len(load_forecast_kw) else 0.0
+        load_kw = max(base_load, forecast_load)
+        total += max(0.0, pv_kw - load_kw - dno_limit) * step_hours
+        t += step_hours
+        i += 1
+    return total
+
+
 def smooth_load_forecast(load_kw_list, window_minutes=60, step_minutes=5):
     """
     Centered rolling-mean smoothing of a load forecast list (R9a).
