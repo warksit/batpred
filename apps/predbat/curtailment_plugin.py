@@ -361,24 +361,14 @@ class CurtailmentPlugin(PredBatPlugin):
         forecast_minutes = getattr(self.base, "forecast_minutes", 1440)
 
         if not pv_step:
-            # R55: still publish overnight_target so dashboard isn't blank.
-            # No morning_gap available (pv_forecast_minute_step is set inside
-            # calculate_plan, which runs AFTER on_before_plan), fall back to
-            # soc_keep alone. Safety pct still applied to morning_gap=0 → 0.
-            keep_in = float(context.get("best_soc_keep", 0.0))
-            target_kwh = max(min(keep_in, soc_max), float(reserve or 0.0))
-            self._overnight_target_kwh = target_kwh
-            soc_pct = (target_kwh / soc_max * 100.0) if soc_max else 0.0
-            self._publish_overnight_target(
-                round(target_kwh, 2),
-                {
-                    "morning_gap_kwh": 0.0,
-                    "safety_pct": round(self._get_overnight_safety_pct(), 1),
-                    "soc_keep_kwh": round(keep_in, 2),
-                    "soc_pct": round(soc_pct, 1),
-                    "source": "no_pv_forecast",
-                },
-            )
+            # pv_forecast_minute_step is populated by calculate_plan which runs
+            # AFTER on_before_plan, so it's empty here on every cycle. The
+            # _refresh_overnight_target() call inside calculate() (on_update
+            # hook, runs after calculate_plan) is the canonical source of
+            # _overnight_target_kwh and the sensor — do not overwrite either
+            # here. Touching them with a soc_keep fallback clobbers the good
+            # value from the previous cycle's calculate() and corrupts the
+            # floor calc in the next cycle (drives target to ~5%).
             self._publish_offset(0.0, {"original_keep": round(context["best_soc_keep"], 2), "reason": "no_pv_forecast"})
             return context
 

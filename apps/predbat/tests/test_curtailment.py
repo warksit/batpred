@@ -2493,6 +2493,71 @@ def test_R55_overnight_target_no_plan_yet_fallback():
     print(f"  test_R55_overnight_target_no_plan_yet_fallback: PASSED (target={pub['value']:.2f}, source=no_plan_yet)")
 
 
+def test_R55_on_before_plan_does_not_clobber_calculate_overnight_target():
+    """Bug 2026-05-03 (live observation): on_before_plan's no_pv_forecast fallback
+    overwrites _overnight_target_kwh and the published sensor with soc_keep when
+    pv_step is empty, clobbering the correct value set by
+    calculate()/_refresh_overnight_target.
+
+    Predbat lifecycle: pv_step is wiped at end of update_pred. on_before_plan in
+    the next cycle ALWAYS sees empty pv_step. The fallback must NOT corrupt the
+    state from the previous calculate() — otherwise floor calc uses soc_keep
+    (e.g. 0.5 kWh) as the overnight target, draining the battery to ~5%."""
+    from datetime import datetime, timezone
+
+    pv = {}
+    load = {}
+    for m in range(0, 1440, PLUGIN_STEP):
+        if m < 300:
+            pv[m] = 1.5
+        elif m < 1080:
+            pv[m] = 0.0
+        else:
+            pv[m] = 1.5
+        load[m] = 0.5
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 1.5, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=2.0, solcast_remaining=4.0))
+
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.50,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+
+    # Step 1: calculate() runs with populated pv_step → publishes correct value.
+    plugin.calculate(dno_limit_kw=4.0)
+    target_after_calculate = plugin._overnight_target_kwh
+    sensor_after_calculate = base.published["sensor.predbat_curtailment_overnight_target"]
+    assert sensor_after_calculate["attrs"]["source"] == "calculate", (
+        f"calculate() must publish source='calculate', " f"got {sensor_after_calculate['attrs']['source']}"
+    )
+    assert target_after_calculate > 0.5, f"calculate() should set overnight_target > soc_keep_fallback (got {target_after_calculate})"
+
+    # Step 2: simulate Predbat wiping pv_step at end of update_pred.
+    base.pv_forecast_minute_step = {}
+
+    # Step 3: next cycle's on_before_plan runs with empty pv_step.
+    plugin.on_before_plan({"best_soc_keep": 4.0})
+
+    # In-memory state from calculate() must be preserved.
+    assert plugin._overnight_target_kwh == target_after_calculate, (
+        f"on_before_plan must not overwrite _overnight_target_kwh " f"(was {target_after_calculate}, now {plugin._overnight_target_kwh})"
+    )
+
+    # Published sensor must still reflect calculate()'s value.
+    pub = base.published["sensor.predbat_curtailment_overnight_target"]
+    assert pub["attrs"]["source"] == "calculate", (
+        f"on_before_plan's no_pv_forecast fallback must not republish over " f"calculate()'s value (source now '{pub['attrs']['source']}')"
+    )
+    print(f"  test_R55_on_before_plan_does_not_clobber_calculate_overnight_target: PASSED " f"(overnight_target preserved at {plugin._overnight_target_kwh:.2f} kWh)")
+
+
 def test_R55_target_soc_uses_overnight_when_off():
     """When plugin is Off, target_soc sensor reports overnight_target instead
     of soc_max (the placeholder). Phase tile already says Off so no info lost."""
@@ -4125,6 +4190,7 @@ def run_curtailment_tests(my_predbat=None):
         test_R55_overnight_target_published_when_no_overflow,
         test_R55_overnight_target_published_from_calculate_with_real_pv_step,
         test_R55_overnight_target_no_plan_yet_fallback,
+        test_R55_on_before_plan_does_not_clobber_calculate_overnight_target,
         test_R55_target_soc_uses_overnight_when_off,
         test_R55_target_soc_uses_floor_when_active,
         test_R55_safety_pct_helper_clamps_range,
