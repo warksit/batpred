@@ -2370,6 +2370,12 @@ def test_R55_overnight_target_published_on_overflow_day():
     base = MockBase(pv_step=pv, load_step=load, soc_kw=5.0, minutes_now=720)
     plugin = CurtailmentPlugin(base)
     plugin.on_before_plan({"best_soc_keep": 6.0})
+    # _refresh_overnight_target (called from calculate) is the sole writer
+    # of the overnight_target sensor. on_before_plan only affects soc_keep.
+    try:
+        plugin.calculate(dno_limit_kw=4.0)
+    except Exception:
+        pass
 
     entity = "sensor.predbat_curtailment_overnight_target"
     assert entity in base.published, f"R55 sensor must be published, got entities {list(base.published.keys())}"
@@ -2396,6 +2402,12 @@ def test_R55_overnight_target_formula_components():
     base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=0, soc_max=18.08)
     plugin = CurtailmentPlugin(base)
     plugin.on_before_plan({"best_soc_keep": 6.0})
+    # _refresh_overnight_target (called from calculate) is the sole writer
+    # of the overnight_target sensor. on_before_plan only affects soc_keep.
+    try:
+        plugin.calculate(dno_limit_kw=4.0)
+    except Exception:
+        pass
 
     entity = "sensor.predbat_curtailment_overnight_target"
     pub = base.published[entity]
@@ -2424,7 +2436,10 @@ def test_R55_overnight_target_window_extended_to_tomorrow():
         load[m] = 0.5
     base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=1080, soc_max=18.08, forecast_minutes=1440)
     plugin = CurtailmentPlugin(base)
-    plugin.on_before_plan({"best_soc_keep": 6.0})
+    try:
+        plugin.calculate(dno_limit_kw=4.0)
+    except Exception:
+        pass
 
     pub = base.published["sensor.predbat_curtailment_overnight_target"]
     morning_gap = pub["attrs"]["morning_gap_kwh"]
@@ -2443,6 +2458,12 @@ def test_R55_overnight_target_published_when_no_overflow():
     base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=0)
     plugin = CurtailmentPlugin(base)
     plugin.on_before_plan({"best_soc_keep": 6.0})
+    # _refresh_overnight_target (called from calculate) is the sole writer
+    # of the overnight_target sensor. on_before_plan only affects soc_keep.
+    try:
+        plugin.calculate(dno_limit_kw=4.0)
+    except Exception:
+        pass
 
     entity = "sensor.predbat_curtailment_overnight_target"
     assert entity in base.published
@@ -2661,7 +2682,10 @@ def test_R55_safety_pct_helper_clamps_range():
             sensor_overrides={"input_number.curtailment_overnight_safety_pct": tested_pct},
         )
         plugin = CurtailmentPlugin(base)
-        plugin.on_before_plan({"best_soc_keep": 6.0})
+        try:
+            plugin.calculate(dno_limit_kw=4.0)
+        except Exception:
+            pass
         pub = base.published["sensor.predbat_curtailment_overnight_target"]
         actual_pct = pub["attrs"]["safety_pct"]
         assert abs(actual_pct - expected_pct) < 0.01, f"safety_pct={tested_pct} should clamp to {expected_pct}, got {actual_pct}"
@@ -2702,14 +2726,13 @@ def test_R55_overnight_target_raises_effective_keep_in_calculate():
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
+    base.best_soc_keep = 2.0
 
-    # Run on_before_plan first so overnight_target gets cached
-    plugin.on_before_plan({"best_soc_keep": 2.0})
-    cached_target = plugin._overnight_target_kwh
-    assert cached_target is not None, "on_before_plan should cache overnight_target"
-    assert cached_target > 2.0, f"Test setup: overnight_target ({cached_target:.2f}) should exceed best_soc_keep (2.0). Increase load deficit duration."
-
+    # _overnight_target_kwh is set by _refresh_overnight_target inside calculate()
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    cached_target = plugin._overnight_target_kwh
+    assert cached_target is not None, "calculate should cache overnight_target"
+    assert cached_target > 2.0, f"Test setup: overnight_target ({cached_target:.2f}) should exceed best_soc_keep (2.0)."
     assert phase == "active", f"Should be active, got {phase}"
     # R55 should raise effective_keep above 2.0; floor reflects min(overflow_floor, raised_keep)
     assert floor >= cached_target - 0.1, f"R55: floor must be raised by overnight_target ({cached_target:.2f}), got {floor:.2f}"

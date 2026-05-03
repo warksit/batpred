@@ -56,75 +56,45 @@ def compute_morning_gap(
     step_minutes=5,
     values_are_kwh=False,
     skip_initial_surplus=None,
-    pv_off_threshold_kw=0.1,
-    pv_on_threshold_kw=0.3,
+    pv_threshold_kw=0.3,
 ):
-    """Compute load deficit during the upcoming overnight period.
+    """Energy deficit during sun-off slots in the forecast window.
 
-    Identifies the overnight window from PV magnitude alone (NOT a pv-vs-load
-    comparison, which collapsed on sparse forecast slots where both are zero):
+    For every slot in [start_minute, end_minute) where PV is below
+    pv_threshold_kw (the sun is off / hasn't reliably arrived), contribute
+    max(0, load - pv) to the gap. Slots with PV at or above the threshold
+    contribute nothing (solar is covering load).
 
-      - sunset: PV drops below pv_off_threshold_kw for 30 min sustained
-      - sunrise: PV rises above pv_on_threshold_kw for 30 min sustained
-
-    Asymmetric thresholds (off=0.1, on=0.3) give hysteresis so a brief cloud
-    blip doesn't flap the state.
-
-    Returns sum of max(0, load - pv) for slots between sunset and sunrise.
-    If the start slot is already below pv_off_threshold (called overnight),
-    accumulation begins immediately. If PV stays above pv_off_threshold for
-    the whole window (continuous daytime, e.g. mid-summer at high latitude
-    in test fixtures), gap = 0 — there is no overnight.
+    No state machine, no early-break detection. The caller bounds the
+    window via end_minute. This is robust to:
+      - Sparse forecast slots (pv=0, load=0 → contributes 0, doesn't
+        terminate accumulation)
+      - Cloudy mornings (pv stays low → contributes load deficit, no
+        false-takeover break)
+      - Mid-day calls (afternoon slots have pv>>threshold → zero, walk
+        naturally resumes accumulating at sunset)
 
     Args:
-        pv_forecast: dict {minute: value} — PV forecast
+        pv_forecast: dict {minute: value} — PV forecast (kW or kWh-per-step)
         load_forecast: dict {minute: value} — load forecast
         start_minute, end_minute: walk window (inclusive, exclusive)
         step_minutes: forecast step size
         values_are_kwh: if True, values are kWh per step (Predbat format)
-        skip_initial_surplus: deprecated, ignored. Phase detection is now
-            automatic from PV magnitude — accepts the parameter to keep
-            existing callers working but does not use it.
-        pv_off_threshold_kw: PV below this counts as "sun off".
-        pv_on_threshold_kw: PV above this counts as "sun on" (sunrise).
+        skip_initial_surplus: deprecated, ignored.
+        pv_threshold_kw: PV at or above this counts as "sun reliably on".
 
     Returns:
-        float — overnight energy gap in kWh.
+        float — overnight (sun-off) energy gap in kWh.
     """
     step_hours = step_minutes / 60.0
     to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
-    SUSTAINED_SLOTS = max(1, 30 // step_minutes)  # 30 min hysteresis
-
-    PHASE_DAY = 0
-    PHASE_NIGHT = 1
-
-    first_pv = pv_forecast.get(start_minute, 0.0) * to_kw
-    phase = PHASE_NIGHT if first_pv < pv_off_threshold_kw else PHASE_DAY
-
-    consecutive_off = 0
-    consecutive_on = 0
     gap_kwh = 0.0
 
     for m in range(start_minute, end_minute, step_minutes):
         pv_kw = pv_forecast.get(m, 0.0) * to_kw
         load_kw = load_forecast.get(m, 0.0) * to_kw
-
-        if phase == PHASE_DAY:
-            if pv_kw < pv_off_threshold_kw:
-                consecutive_off += 1
-                if consecutive_off >= SUSTAINED_SLOTS:
-                    phase = PHASE_NIGHT
-            else:
-                consecutive_off = 0
-            continue
-
-        gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
-        if pv_kw >= pv_on_threshold_kw:
-            consecutive_on += 1
-            if consecutive_on >= SUSTAINED_SLOTS:
-                break
-        else:
-            consecutive_on = 0
+        if pv_kw < pv_threshold_kw:
+            gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
 
     return gap_kwh
 
