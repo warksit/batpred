@@ -389,16 +389,20 @@ def test_morning_gap_solar_already_covers():
     print("  test_morning_gap_solar_already_covers: PASSED")
 
 
-def test_morning_gap_cloudy_never_covers():
-    """Cloudy day: PV never sustainably exceeds load."""
+def test_morning_gap_cloudy_dawn():
+    """Cloudy/late dawn: PV stays below sunrise threshold (0.3 kW) all
+    morning. With PV-magnitude state machine, walk starts in PHASE_NIGHT
+    (first slot pv=0 < 0.1) and never breaks (pv never sustained ≥ 0.3),
+    so we accumulate the full window's deficit."""
     pv = {}
     load = {}
     for m in range(0, 480, 5):
-        pv[m] = 0.5
+        pv[m] = 0.05  # below pv_off_threshold (0.1) → counted as night
         load[m] = 1.0
     gap = compute_morning_gap(pv, load, start_minute=0, end_minute=480, step_minutes=5)
-    assert 3.5 < gap < 4.5, f"Expected ~4kWh gap, got {gap:.2f}"
-    print("  test_morning_gap_cloudy_never_covers: PASSED (gap={:.2f}kWh)".format(gap))
+    # 8 hours * (1.0 - 0.05) = 7.6 kWh
+    assert 7.0 < gap < 8.0, f"Expected ~7.6 kWh gap (continuous night, no sunrise), got {gap:.2f}"
+    print("  test_morning_gap_cloudy_dawn: PASSED (gap={:.2f}kWh)".format(gap))
 
 
 def test_morning_gap_kwh_values():
@@ -3947,7 +3951,7 @@ def run_curtailment_tests(my_predbat=None):
     gap_tests = [
         test_morning_gap_pre_dawn,
         test_morning_gap_solar_already_covers,
-        test_morning_gap_cloudy_never_covers,
+        test_morning_gap_cloudy_dawn,
         test_morning_gap_kwh_values,
         test_morning_gap_zero_zero_slots_do_not_terminate_walk,
     ]

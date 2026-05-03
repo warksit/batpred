@@ -48,59 +48,83 @@ def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minu
     return total
 
 
-def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False, skip_initial_surplus=False):
-    """
-    Compute energy deficit from now until PV consistently covers load.
+def compute_morning_gap(
+    pv_forecast,
+    load_forecast,
+    start_minute=0,
+    end_minute=1440,
+    step_minutes=5,
+    values_are_kwh=False,
+    skip_initial_surplus=None,
+    pv_off_threshold_kw=0.1,
+    pv_on_threshold_kw=0.3,
+):
+    """Compute load deficit during the upcoming overnight period.
 
-    Walks forward through forecast slots, accumulating max(0, load - pv) per slot.
-    Stops when PV exceeds load for 6 consecutive slots (30 min sustained solar),
-    meaning solar has reliably taken over from battery.
+    Identifies the overnight window from PV magnitude alone (NOT a pv-vs-load
+    comparison, which collapsed on sparse forecast slots where both are zero):
 
-    This is the energy the battery needs to bridge the morning gap before solar
-    can sustain the house. Used to set best_soc_keep on sunny days.
+      - sunset: PV drops below pv_off_threshold_kw for 30 min sustained
+      - sunrise: PV rises above pv_on_threshold_kw for 30 min sustained
+
+    Asymmetric thresholds (off=0.1, on=0.3) give hysteresis so a brief cloud
+    blip doesn't flap the state.
+
+    Returns sum of max(0, load - pv) for slots between sunset and sunrise.
+    If the start slot is already below pv_off_threshold (called overnight),
+    accumulation begins immediately. If PV stays above pv_off_threshold for
+    the whole window (continuous daytime, e.g. mid-summer at high latitude
+    in test fixtures), gap = 0 — there is no overnight.
 
     Args:
         pv_forecast: dict {minute: value} — PV forecast
         load_forecast: dict {minute: value} — load forecast
-        start_minute: int — first minute to consider (inclusive)
-        end_minute: int — last minute (exclusive)
-        step_minutes: int — forecast step size
-        values_are_kwh: bool — if True, values are kWh per step (Predbat format)
-        skip_initial_surplus: bool — if True, walk past leading slots where
-            PV >= load until first deficit slot is seen, then start
-            accumulating. Lets the function be called mid-day to find the
-            UPCOMING overnight deficit (today's PV doesn't short-circuit
-            the calculation). Default False preserves legacy behaviour.
+        start_minute, end_minute: walk window (inclusive, exclusive)
+        step_minutes: forecast step size
+        values_are_kwh: if True, values are kWh per step (Predbat format)
+        skip_initial_surplus: deprecated, ignored. Phase detection is now
+            automatic from PV magnitude — accepts the parameter to keep
+            existing callers working but does not use it.
+        pv_off_threshold_kw: PV below this counts as "sun off".
+        pv_on_threshold_kw: PV above this counts as "sun on" (sunrise).
 
     Returns:
-        float — morning energy gap in kWh
+        float — overnight energy gap in kWh.
     """
     step_hours = step_minutes / 60.0
     to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
-    SUSTAINED_SLOTS = 6  # 30 min of PV > load = solar has taken over
+    SUSTAINED_SLOTS = max(1, 30 // step_minutes)  # 30 min hysteresis
 
+    PHASE_DAY = 0
+    PHASE_NIGHT = 1
+
+    first_pv = pv_forecast.get(start_minute, 0.0) * to_kw
+    phase = PHASE_NIGHT if first_pv < pv_off_threshold_kw else PHASE_DAY
+
+    consecutive_off = 0
+    consecutive_on = 0
     gap_kwh = 0.0
-    consecutive_surplus = 0
-    in_deficit_window = not skip_initial_surplus
 
     for m in range(start_minute, end_minute, step_minutes):
         pv_kw = pv_forecast.get(m, 0.0) * to_kw
         load_kw = load_forecast.get(m, 0.0) * to_kw
 
-        if not in_deficit_window:
-            # Wait for the first deficit slot — skip today's surplus PV
-            if load_kw > pv_kw:
-                in_deficit_window = True
-                gap_kwh += (load_kw - pv_kw) * step_hours
+        if phase == PHASE_DAY:
+            if pv_kw < pv_off_threshold_kw:
+                consecutive_off += 1
+                if consecutive_off >= SUSTAINED_SLOTS:
+                    phase = PHASE_NIGHT
+            else:
+                consecutive_off = 0
             continue
 
-        if pv_kw > 0 and pv_kw >= load_kw:
-            consecutive_surplus += 1
-            if consecutive_surplus >= SUSTAINED_SLOTS:
+        gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
+        if pv_kw >= pv_on_threshold_kw:
+            consecutive_on += 1
+            if consecutive_on >= SUSTAINED_SLOTS:
                 break
         else:
-            consecutive_surplus = 0
-            gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
+            consecutive_on = 0
 
     return gap_kwh
 
