@@ -94,13 +94,13 @@ def compute_morning_gap(pv_forecast, load_forecast, start_minute=0, end_minute=1
                 gap_kwh += (load_kw - pv_kw) * step_hours
             continue
 
-        if pv_kw >= load_kw:
+        if pv_kw > 0 and pv_kw >= load_kw:
             consecutive_surplus += 1
             if consecutive_surplus >= SUSTAINED_SLOTS:
                 break
         else:
             consecutive_surplus = 0
-            gap_kwh += (load_kw - pv_kw) * step_hours
+            gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
 
     return gap_kwh
 

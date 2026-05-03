@@ -415,6 +415,38 @@ def test_morning_gap_kwh_values():
     print("  test_morning_gap_kwh_values: PASSED (gap={:.2f}kWh)".format(gap))
 
 
+def test_morning_gap_zero_zero_slots_do_not_terminate_walk():
+    """Bug 2026-05-03 (live): when forecast slots have BOTH pv=0 and load=0
+    (e.g. sparse LoadML data overnight), the walk treats `pv >= load` as
+    'solar covering load' and breaks after 6 consecutive such slots.
+
+    Result on live: morning_gap collapsed to 0.39 kWh instead of full
+    overnight load (~5 kWh), driving target_soc to 5%.
+
+    Scenario: deficit, then 1h zero-zero (sparse data), then deficit again.
+    Walk must continue through zero-zero stretches and accumulate the
+    full deficit on either side."""
+    pv = {}
+    load = {}
+    # 0-2h: real deficit (load > pv)
+    # 2-3h: zero-zero (sparse forecast data)
+    # 3-5h: real deficit again
+    for m in range(0, 300, 5):
+        hour = m / 60.0
+        if 2 <= hour < 3:
+            pv[m] = 0.0
+            load[m] = 0.0
+        else:
+            pv[m] = 0.0
+            load[m] = 0.5
+    gap = compute_morning_gap(pv, load, start_minute=0, end_minute=300, step_minutes=5)
+
+    # Real deficit total: (2h + 2h) * 0.5 kW = 2.0 kWh.
+    # Buggy code breaks after the 2-3h zero-zero stretch, returning ~1.0 kWh.
+    assert gap > 1.5, f"Zero-zero slots must not terminate walk; got gap={gap:.2f} kWh (expected ≥ 2.0)"
+    print(f"  test_morning_gap_zero_zero_slots_do_not_terminate_walk: PASSED (gap={gap:.2f} kWh)")
+
+
 # ============================================================================
 # v10 activation tests
 # ============================================================================
@@ -3917,6 +3949,7 @@ def run_curtailment_tests(my_predbat=None):
         test_morning_gap_solar_already_covers,
         test_morning_gap_cloudy_never_covers,
         test_morning_gap_kwh_values,
+        test_morning_gap_zero_zero_slots_do_not_terminate_walk,
     ]
     print("  --- morning gap tests ---")
     for test_fn in gap_tests:
