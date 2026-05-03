@@ -48,6 +48,38 @@ def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minu
     return total
 
 
+def _scan_sustained(pv_forecast, start_minute, end_minute, step_minutes, threshold_kw, sustained_minutes, values_are_kwh, want_below):
+    """Walk pv_forecast and find the first minute starting a sustained run.
+
+    `want_below=True`: find first slot starting a `sustained_minutes` run of
+    pv < threshold_kw (sunset).
+    `want_below=False`: find first slot starting a run of pv >= threshold_kw
+    (sunrise).
+
+    Returns the START minute of the sustained run, or None if no such run
+    exists in the window.
+    """
+    step_hours = step_minutes / 60.0
+    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
+    sustained_slots = max(1, sustained_minutes // step_minutes)
+
+    consecutive = 0
+    run_start = None
+    for m in range(start_minute, end_minute, step_minutes):
+        pv_kw = pv_forecast.get(m, 0.0) * to_kw
+        match = (pv_kw < threshold_kw) if want_below else (pv_kw >= threshold_kw)
+        if match:
+            if run_start is None:
+                run_start = m
+            consecutive += 1
+            if consecutive >= sustained_slots:
+                return run_start
+        else:
+            consecutive = 0
+            run_start = None
+    return None
+
+
 def compute_morning_gap(
     pv_forecast,
     load_forecast,
@@ -57,45 +89,47 @@ def compute_morning_gap(
     values_are_kwh=False,
     skip_initial_surplus=None,
     pv_threshold_kw=0.3,
+    sustained_minutes=30,
 ):
-    """Energy deficit during sun-off slots in the forecast window.
+    """Energy deficit between today's effective sunset and tomorrow's sunrise.
 
-    For every slot in [start_minute, end_minute) where PV is below
-    pv_threshold_kw (the sun is off / hasn't reliably arrived), contribute
-    max(0, load - pv) to the gap. Slots with PV at or above the threshold
-    contribute nothing (solar is covering load).
+    Boundary detection:
+      - sunset = first minute starting a `sustained_minutes` run of pv < threshold
+      - sunrise = first minute after sunset starting a `sustained_minutes` run
+                  of pv >= threshold (or end_minute if no sunrise in window)
 
-    No state machine, no early-break detection. The caller bounds the
-    window via end_minute. This is robust to:
-      - Sparse forecast slots (pv=0, load=0 → contributes 0, doesn't
-        terminate accumulation)
-      - Cloudy mornings (pv stays low → contributes load deficit, no
-        false-takeover break)
-      - Mid-day calls (afternoon slots have pv>>threshold → zero, walk
-        naturally resumes accumulating at sunset)
+    Returns sum of max(0, load - pv) for minutes in [sunset, sunrise).
+    Returns 0 if no sunset is detected in the window (PV stays on throughout —
+    e.g. mid-summer at high latitude, or test fixtures with continuous PV).
 
     Args:
         pv_forecast: dict {minute: value} — PV forecast (kW or kWh-per-step)
         load_forecast: dict {minute: value} — load forecast
-        start_minute, end_minute: walk window (inclusive, exclusive)
+        start_minute, end_minute: scan window (inclusive, exclusive)
         step_minutes: forecast step size
         values_are_kwh: if True, values are kWh per step (Predbat format)
         skip_initial_surplus: deprecated, ignored.
         pv_threshold_kw: PV at or above this counts as "sun reliably on".
+        sustained_minutes: how long PV must be on/off to count as a transition.
 
     Returns:
         float — overnight (sun-off) energy gap in kWh.
     """
+    sunset = _scan_sustained(pv_forecast, start_minute, end_minute, step_minutes, pv_threshold_kw, sustained_minutes, values_are_kwh, want_below=True)
+    if sunset is None:
+        return 0.0
+
+    sunrise = _scan_sustained(pv_forecast, sunset, end_minute, step_minutes, pv_threshold_kw, sustained_minutes, values_are_kwh, want_below=False)
+    if sunrise is None:
+        sunrise = end_minute
+
     step_hours = step_minutes / 60.0
     to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
     gap_kwh = 0.0
-
-    for m in range(start_minute, end_minute, step_minutes):
+    for m in range(sunset, sunrise, step_minutes):
         pv_kw = pv_forecast.get(m, 0.0) * to_kw
         load_kw = load_forecast.get(m, 0.0) * to_kw
-        if pv_kw < pv_threshold_kw:
-            gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
-
+        gap_kwh += max(0.0, load_kw - pv_kw) * step_hours
     return gap_kwh
 
 

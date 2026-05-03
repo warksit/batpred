@@ -403,14 +403,14 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Compute morning_gap_load for R26 (best_soc_keep adjustment) only.
         # _overnight_target_kwh and the overnight_target sensor are set by
-        # _refresh_overnight_target() in calculate() (sole writer). Walk is
-        # bounded to 24h so we don't double-count tomorrow night.
-        walk_end = min(forecast_minutes, 24 * 60)
+        # _refresh_overnight_target() in calculate() (sole writer).
+        # compute_morning_gap finds sunset/sunrise itself, so we use the
+        # full forecast horizon as the upper bound.
         morning_gap_load = compute_morning_gap(
             pv_step,
             load_step,
             start_minute=solar_start,
-            end_minute=walk_end,
+            end_minute=forecast_minutes,
             step_minutes=PREDICT_STEP,
             values_are_kwh=True,
         )
@@ -537,15 +537,14 @@ class CurtailmentPlugin(PredBatPlugin):
                     },
                 )
                 return
-            # Bound walk to 24h: gap = energy from now until tomorrow's
-            # next sunset. Walking the full forecast (30-48h) would also
-            # include tomorrow night's start and double-count.
-            walk_end = min(forecast_minutes, 24 * 60)
+            # compute_morning_gap finds sunset and sunrise from pv_step
+            # (sustained low/high PV transitions) and integrates load deficit
+            # between them. No arbitrary horizon cap needed.
             morning_gap_load = compute_morning_gap(
                 pv_step,
                 load_step,
                 start_minute=PREDICT_STEP,
-                end_minute=walk_end,
+                end_minute=forecast_minutes,
                 step_minutes=PREDICT_STEP,
                 values_are_kwh=True,
             )
