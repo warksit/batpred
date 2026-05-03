@@ -214,6 +214,34 @@ action:
         data:
           option: "Command Discharging (ESS First)"
 
+  # Ensure SIG charge/discharge rates are at max during any active phase.
+  # Predbat owns these via input_number.charge_rate / discharge_rate, but goes
+  # read-only when the curtailment plugin activates. Whatever rate Predbat set
+  # immediately before the handoff (often 0 after exiting a charge or discharge
+  # window) sticks for the duration of curtailment control. With discharge_rate=0
+  # the SIG cannot actually discharge to grid even with EMS=Command Discharging
+  # — the YAML reports phase=Drain, export_limit=4 kW, but battery_power stays
+  # ~0 and only PV-load surplus exits. Symmetric for charge_rate=0 + Charge
+  # phase. Idempotent: only writes when the rate is below max.
+  - if:
+      - condition: template
+        value_template: "{{ phase != 'Off' and states('input_number.discharge_rate') | float(0) < 9200 }}"
+    then:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.discharge_rate
+        data:
+          value: 9200
+  - if:
+      - condition: template
+        value_template: "{{ phase != 'Off' and states('input_number.charge_rate') | float(0) < 9200 }}"
+    then:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.charge_rate
+        data:
+          value: 9200
+
   # Restore MSC when both manual and plugin off
   - if:
       - condition: template
