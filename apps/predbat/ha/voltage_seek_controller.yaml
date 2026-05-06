@@ -5,40 +5,41 @@
 # input_number.voltage_throttle_filtered_cap.
 #
 # Behaviour every 5s + on numeric_state above 253V (sub-second):
-#   - V >= (target + ramp_width_v)        : cap = 0
-#   - V > target                          : cap = min(cap, max(0, dno - ramp_slope_kw*(V-target)))
-#                                            ratchet down only — proportional ramp with
-#                                            configurable slope (default 0.5 kW/V):
-#                                            target+2→cap=3, target+4→2, target+6→1, target+8→0
-#   - V < (target - deadband)             : cap += step_up_kw (adaptive climb)
-#   - target-deadband <= V <= target      : hold
+#   - V >= (target + range_v)             : cap = 0
+#   - V > target                          : cap = min(cap, max(0, dno - (dno/range_v)*(V-target)))
+#                                            ratchet down only — proportional ramp tracks target.
+#                                            slope = dno/range_v (range=4 → 1 kW/V steep,
+#                                            range=8 → 0.5 kW/V gentle).
+#   - V < target                          : cap += step_up_kw (adaptive climb)
+#                                            no lower deadband — climb fires any time V is
+#                                            below target. Sensor reports 0.01V granularity
+#                                            so small V drift is meaningful signal.
+#   - V == target (rare)                  : hold
 #
-# Why hybrid: pure seek (proportional drop with drop_gain) was too slow on
+# Why this shape: pure seek (proportional drop with drop_gain) was too slow on
 # 8V-in-5s rises (multiple SIG OVP trips on 2026-05-06). Pure proportional
 # ramp from V was the old behaviour — instant response on every V change.
-# The hybrid uses the old's instant ramp on the way DOWN (cap can only
-# decrease via this path) and the seek's adaptive climb on the way UP
-# (no bang-bang oscillation).
+# This uses the old's instant ramp on the way DOWN (cap can only decrease
+# via this path) and the seek's adaptive climb on the way UP. Lower deadband
+# was removed 2026-05-06 — it left cap stuck at low values when V drifted
+# back into target range without going below the deadband edge.
 #
 # Tunables (live via input_number helpers):
-#   input_number.voltage_seek_target_v    — current hold target (default 252)
-#   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
+#   input_number.voltage_seek_target_v    — V where ramp starts (cap=DNO)
+#   input_number.voltage_seek_range_v     — V span until cap=0 (slope = dno/range_v)
+#
+# Note: input_number.voltage_seek_deadband_v helper exists but is no longer
+# referenced by the controller. Kept for potential reuse / dashboard cosmetics.
 #
 # Hard-coded constants (edit YAML to change):
-#   ramp_slope_kw = 0.5 kW/V — proportional drop per V over target.
-#                   At default slope, V=target+2 → cap=3, target+4 → 2, etc.
-#                   Tuned 2026-05-06 to be gentler than slope=1.0 (which over-
-#                   reacted to small V drift inside the ramp band).
-#   ramp_width_v  = 8V — width of the down-ramp from cap=DNO down to cap=0.
-#                   Must equal dno / ramp_slope_kw for consistency.
-#   step_up_base  = 0.05 kW/tick — minimum climb rate (near deadband edge)
-#   step_up_per_v = 0.05 kW/tick per V below (target-deadband-1) — adaptive
+#   step_up_base  = 0.05 kW/tick — minimum climb rate (near target)
+#   step_up_per_v = 0.05 kW/tick per V below (target - 1) — adaptive
 #   step_up_max   = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
 #   dno           = 4.0  kW (DNO export limit)
 #
 # Adaptive climb keeps motion gentle near target (avoids overshoot) but
-# recovers fast after a deep cut: v=251 → 0.05/tick, v=247 → 0.25/tick,
-# v ≤ 246 → 0.4/tick (4.8 kW/min, ~50s for 0→4 recovery).
+# recovers fast after a deep cut: v=target-1 → 0.05/tick, v=target-5 → 0.25/tick,
+# v ≤ target-7 → 0.4/tick clamped (4.8 kW/min, ~50s for 0→4 recovery).
 #
 # IMPORTANT: this is the sole writer to input_number.voltage_throttle_filtered_cap.
 # The old "Voltage Throttle Filter — Asymmetric Rate Limit" automation must be
@@ -75,24 +76,25 @@ action:
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
       target: "{{ states('input_number.voltage_seek_target_v') | float(250) }}"
       range_v: "{{ states('input_number.voltage_seek_range_v') | float(8) }}"
-      deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
       dno: 4.0
-      under_v: "{{ (target - deadband) - v }}"
+      under_v: "{{ target - v }}"
       step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
-      # Ramp tracks target, slope derived from range:
+      # Asymmetric: ramp DOWN tracks target, slope derived from range:
       #   cap_max = max(0, dno - (dno/range_v) × (V - target))
-      # Ramp starts at V=target (cap=DNO) and lands at cap=0 at V=target+range_v.
-      # Default target=250, range=8 → slope 0.5 kW/V.
-      # Ratchet (min with current cap) — never raises cap on this path.
+      # Ramp engages at V > target. cap=0 at V=target+range_v.
+      # Climb branch fires whenever V < target (no lower deadband, since
+      # sensor reads 0.01V granularity and we want cap to recover any time
+      # V is below target).
+      # Hold only when V == target exactly (rare).
       new_cap: >-
         {%- if v >= (target + range_v) -%}
           0.0
         {%- elif v > target -%}
           {{ [cap, [0.0, dno - (dno / range_v) * (v - target)] | max] | min }}
-        {%- elif v < (target - deadband) -%}
+        {%- elif v < target -%}
           {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}
           {{ cap }}
