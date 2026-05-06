@@ -4,14 +4,14 @@
 # its asymmetric output filter. Single writer to
 # input_number.voltage_throttle_filtered_cap.
 #
-# Behaviour every 5s + on numeric_state above 254V (sub-second):
-#   - V >= ramp_zero_v (257)              : cap = 0
-#   - V > ramp_full_v (253)               : cap = min(cap, ramp_zero_v - V)
-#                                            ratchet down only — instant
-#                                            proportional ramp (V=254→3,
-#                                            V=255→2, V=256→1, V=257→0)
+# Behaviour every 5s + on numeric_state above target+1 (sub-second):
+#   - V >= (target + ramp_width_v)        : cap = 0
+#   - V > target                          : cap = min(cap, max(0, dno - (V-target)))
+#                                            ratchet down only — proportional ramp
+#                                            relative to target (V=target+1→cap=3,
+#                                            V=target+2→2, V=target+3→1, V=target+4→0)
 #   - V < (target - deadband)             : cap += step_up_kw (adaptive climb)
-#   - in hold band                        : hold
+#   - target-deadband <= V <= target      : hold
 #
 # Why hybrid: pure seek (proportional drop with drop_gain) was too slow on
 # 8V-in-5s rises (multiple SIG OVP trips on 2026-05-06). Pure proportional
@@ -25,9 +25,8 @@
 #   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
 #
 # Hard-coded constants (edit YAML to change):
-#   ramp_zero_v   = 257V — at/above this, cap = 0
-#   ramp_full_v   = 253V — at this V, cap_max = 4 (DNO); above this, ratchet
-#                   linearly down to 0 at ramp_zero_v
+#   ramp_width_v  = 4V — width of the down-ramp from cap=DNO down to cap=0.
+#                   Tracks target: cap=4 at V=target, cap=0 at V=target+ramp_width_v.
 #   step_up_base  = 0.05 kW/tick — minimum climb rate (near deadband edge)
 #   step_up_per_v = 0.05 kW/tick per V below (target-deadband-1) — adaptive
 #   step_up_max   = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
@@ -56,12 +55,14 @@ trigger:
   - platform: time_pattern
     seconds: "/5"
   # Immediate emergency trigger — fast voltage spike, do not wait for tick.
-  # Reason: 2026-05-06 trips — V went 254→263V in 5s (faster than tick).
-  # With this trigger and mode: restart, any V crossing above 254V instantly
-  # re-runs the action which applies the down-ramp.
+  # Threshold 253 = where the down-ramp delivers a meaningful cut at the
+  # default target (252). numeric_state thresholds are static, so this
+  # doesn't track helper changes — if you raise target to 255 or higher,
+  # this trigger fires earlier than the ramp actually engages, but the
+  # action still computes cap correctly from the current V.
   - platform: numeric_state
     entity_id: sensor.sigen_inverter_phase_a_voltage
-    above: 254
+    above: 253
     id: voltage_spike
 
 action:
@@ -70,19 +71,21 @@ action:
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
       target: "{{ states('input_number.voltage_seek_target_v') | float(252) }}"
       deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
-      ramp_zero_v: 257.0
-      ramp_full_v: 253.0
+      ramp_width_v: 4.0
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
       dno: 4.0
       under_v: "{{ (target - deadband) - v }}"
       step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
+      # Ramp tracks target: cap_max = dno - (V - target). Engages immediately
+      # above target. V=target → 4, V=target+1 → 3, V=target+2 → 2, ..., V=target+4 → 0.
+      # Ratchet (min with current cap) — never raises cap on this path.
       new_cap: >-
-        {%- if v >= ramp_zero_v -%}
+        {%- if v >= (target + ramp_width_v) -%}
           0.0
-        {%- elif v > ramp_full_v -%}
-          {{ [cap, [0.0, ramp_zero_v - v] | max] | min }}
+        {%- elif v > target -%}
+          {{ [cap, [0.0, dno - (v - target)] | max] | min }}
         {%- elif v < (target - deadband) -%}
           {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}

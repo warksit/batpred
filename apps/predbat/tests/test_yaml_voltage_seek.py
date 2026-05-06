@@ -135,17 +135,18 @@ class Scenario:
 
 
 SCENARIOS = [
-    # Hold band (target=252, deadband=1, hold band = 251..253)
-    Scenario("hold band centre — cap unchanged", v=252.0, cap=3.5, expected=3.5),
-    Scenario("hold band lower edge — cap unchanged", v=251.0, cap=2.0, expected=2.0),
-    Scenario("hold band upper edge — cap unchanged", v=253.0, cap=4.0, expected=4.0),
-    # Down ramp (V > 253): cap = min(current, 257-V)
-    Scenario("V=254 → cap_max=3, ratchet down from 4", v=254.0, cap=4.0, expected=3.0),
-    Scenario("V=254 → cap stays if already < cap_max", v=254.0, cap=2.0, expected=2.0),
-    Scenario("V=255 → cap_max=2", v=255.0, cap=4.0, expected=2.0),
-    Scenario("V=256 → cap_max=1 (the bug case)", v=256.0, cap=3.16, expected=1.0),
-    Scenario("V=257 → cap=0", v=257.0, cap=4.0, expected=0.0),
-    Scenario("V=258 → cap=0", v=258.0, cap=4.0, expected=0.0),
+    # Hold band (target=252, deadband=1) — hold band = (251, 252]
+    Scenario("hold band centre — cap unchanged", v=251.5, cap=3.5, expected=3.5),
+    Scenario("hold band upper edge (V=target) — cap unchanged", v=252.0, cap=4.0, expected=4.0),
+    Scenario("hold band lower edge (target-deadband+ε) — cap unchanged", v=251.5, cap=2.0, expected=2.0),
+    # Down ramp tracks target: cap_max = max(0, dno - (V - target))
+    Scenario("V=target+0.5 → cap_max=3.5, ratchet from 4", v=252.5, cap=4.0, expected=3.5),
+    Scenario("V=target+1 → cap_max=3", v=253.0, cap=4.0, expected=3.0),
+    Scenario("V=target+1 → cap stays if already < cap_max", v=253.0, cap=2.0, expected=2.0),
+    Scenario("V=target+2 → cap_max=2", v=254.0, cap=4.0, expected=2.0),
+    Scenario("V=target+3 → cap_max=1", v=255.0, cap=4.0, expected=1.0),
+    Scenario("V=target+4 → cap=0 (ramp full)", v=256.0, cap=4.0, expected=0.0),
+    Scenario("V=target+5 → cap=0 (above ramp width)", v=257.0, cap=4.0, expected=0.0),
     Scenario("V=263 (real spike) → cap=0", v=263.0, cap=3.5, expected=0.0),
     # Climb (V < target-deadband=251)
     Scenario("V=250 climb base step from 0", v=250.0, cap=0.0, expected=0.05),
@@ -153,12 +154,13 @@ SCENARIOS = [
     Scenario("V=246 climb hits max", v=246.0, cap=0.0, expected=0.25),
     Scenario("V=240 climb clamped to step_up_max=0.4", v=240.0, cap=0.0, expected=0.4),
     Scenario("climb saturates at DNO", v=240.0, cap=4.0, expected=4.0),
-    # Adjustable target — note ramp_full_v=253 is FIXED for safety (independent
-    # of target). Higher targets don't move the safety ramp threshold.
-    Scenario("target=255 V=252 below band, climb (under_v=2 → step=0.10)", v=252.0, cap=3.0, expected=3.10, target=255.0),
-    Scenario("target=255 V=254 in hold band → cap unchanged", v=254.0, cap=3.0, expected=3.0, target=255.0),
-    Scenario("target=255 V=255 — fixed ramp still fires from 253", v=255.0, cap=3.0, expected=2.0, target=255.0),
-    Scenario("target=255 V=257 hard zero", v=257.0, cap=3.0, expected=0.0, target=255.0),
+    # Adjustable target — ramp NOW tracks target (V=target → cap=4, V=target+4 → 0)
+    Scenario("target=255 V=251 climb (under_v=3 → step=0.15)", v=251.0, cap=3.0, expected=3.15, target=255.0),
+    Scenario("target=255 V=255 (=target) hold → cap unchanged", v=255.0, cap=3.0, expected=3.0, target=255.0),
+    Scenario("target=255 V=256 (=target+1) → cap_max=3", v=256.0, cap=4.0, expected=3.0, target=255.0),
+    Scenario("target=255 V=259 (=target+4) → cap=0", v=259.0, cap=4.0, expected=0.0, target=255.0),
+    Scenario("target=250 V=251 (=target+1) → cap_max=3", v=251.0, cap=4.0, expected=3.0, target=250.0),
+    Scenario("target=250 V=254 (=target+4) → cap=0", v=254.0, cap=4.0, expected=0.0, target=250.0),
 ]
 
 
@@ -177,11 +179,11 @@ def test_bug_pattern_caught():
     set_value_tpl = load_set_value_template(YAML_PATH)
     states = build_states(v=256.0, cap=3.16)
 
-    # Reorder: move ramp_* constants to AFTER new_cap.
+    # Reorder: move ramp_width_v to AFTER new_cap.
     broken = {}
     moved = {}
     for k, v in variables.items():
-        if k in ("ramp_zero_v", "ramp_full_v"):
+        if k == "ramp_width_v":
             moved[k] = v
         else:
             broken[k] = v
