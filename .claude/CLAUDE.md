@@ -35,6 +35,25 @@ After changing in HA, pull the updated config and commit it so the file stays in
 
 - `pre-commit run --all-files`
 - `cd apps/predbat && python3 tests/test_curtailment.py`
-- `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the HA automation YAML
+- `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the curtailment HA automation YAML
+- `cd apps/predbat && python3 tests/test_yaml_voltage_seek.py` — Jinja harness for voltage_seek_controller YAML (catches variable-order bugs under StrictUndefined)
 - `cd coverage && python3 ../apps/predbat/unit_test.py --quick`
 - **Commit before deploying** — always `git commit` before `scp`/deploy so deployed code is always in git history
+
+## HA Automation Edits — MANDATORY workflow
+
+Editing an HA automation Jinja via MCP `python_transform` can silently
+reorder the `variables` dict. HA evaluates variables top-down, so a
+reordered dict can leave templates referencing Undefined values, falling
+through every branch silently. This caused a 2-hour controller outage on
+2026-05-06.
+
+Before any HA automation edit (`ha_config_set_automation`):
+
+1. Edit the YAML file in `apps/predbat/ha/` first, in repo
+2. Run the matching Jinja harness — it MUST pass with new behaviour asserted
+3. Apply the change to HA via `config:` (full replacement), NOT
+   `python_transform` (which reorders dict keys)
+4. After deploy, query the live entity and verify it produces an
+   expected value for a known input — never just check that the
+   automation is "on" or "running"
