@@ -1,24 +1,26 @@
-# SIG Voltage Protect — notifications only (v2)
+# SIG Voltage Protect — notifications only (v3)
 #
-# As of 2026-04-27, the proportional voltage throttle moved out of this
-# automation. The actual export cap is now produced by a template sensor
-# (sensor.sig_voltage_max_export_kw) reading phase A voltage and the helpers
-# input_number.voltage_throttle_upper_v / voltage_throttle_range_v. The
-# curtailment automation (curtailment_manager_dynamic_export_limit) reads
-# that sensor and min's it into every export decision — single writer, no
-# race with this automation.
+# As of 2026-05-06, the seek controller (automation.voltage_seek_controller)
+# is the active export-cap regulator. This automation is purely for alerting
+# and dashboard state — it triggers off grid voltage directly, not the
+# now-decoupled raw proportional cap sensor.
 #
-# This automation now exists only for notifications:
-#   - Alert Andrew when the cap drops below 3.5 kW (throttle engaging)
-#   - Alert Andrew when the cap returns to ~DNO (throttle releasing)
-#   - Toggle input_boolean.sig_voltage_protect_active for dashboard visibility
+# Behaviour:
+#   - V > 256V (target+deadband)   → boolean ON immediately, count event
+#   - V < 254V (target-deadband)   → boolean OFF immediately
+#   - Boolean ON sustained 1 min   → push engage notification
+#   - Boolean OFF sustained 1 min after engage → push release notification
 #
-# Tuning the throttle curve:
-#   input_number.voltage_throttle_upper_v   — voltage at which cap → 0
-#                                              (default 263V)
-#   input_number.voltage_throttle_range_v   — span of linear ramp from cap=DNO
-#                                              up to cap=0
-#                                              (default 7V → engagement at 256V)
+# Why voltage triggers, not cap:
+#   The seek controller adjusts cap continuously to track the target voltage.
+#   Cap dropping to 3.5 during normal operation is not a "throttle event" —
+#   it's just the controller responding to a grid up-tick. The real signal
+#   is voltage exceeding the deadband for sustained periods, which means the
+#   seek is actively dumping export to bring V back down.
+#
+# Note: the V thresholds (256/254) are hard-coded here, not read from the
+# seek target/deadband helpers. Keep in mind if the user retunes the seek
+# target — update these too.
 #
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 
@@ -26,23 +28,24 @@ id: "sig_voltage_protect_v1"
 alias: "SIG Voltage Protect"
 description: >-
   Two-stage. input_boolean.sig_voltage_protect_active reflects real-time
-  throttle state (immediate, no debounce). Notifications fire only when
-  the boolean has been sustained on/off for 1 minute, gated by an
-  "alerted" flag so release alerts don't fire without a preceding engage.
+  high-voltage state (V > 256V → on, V < 254V → off, immediate, no debounce).
+  Notifications fire only when the boolean has been sustained on/off for 1
+  minute, gated by an "alerted" flag so release alerts don't fire without a
+  preceding engage.
 
 mode: queued
 max: 6
 max_exceeded: silent
 
 trigger:
-  # Real-time boolean toggle — immediate when cap drops or recovers
+  # Real-time boolean toggle — immediate when V crosses thresholds
   - platform: numeric_state
-    entity_id: sensor.sig_voltage_max_export_kw
-    below: 3.95
+    entity_id: sensor.sigen_inverter_phase_a_voltage
+    above: 256
     id: throttle_start
   - platform: numeric_state
-    entity_id: sensor.sig_voltage_max_export_kw
-    above: 3.99
+    entity_id: sensor.sigen_inverter_phase_a_voltage
+    below: 254
     id: throttle_end
   # Notification triggers — debounced via state-with-for on the boolean
   - platform: state
@@ -58,14 +61,12 @@ trigger:
 
 action:
   - variables:
-      cap: "{{ states('sensor.sig_voltage_max_export_kw') | float(4) }}"
+      cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
       voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
 
   - choose:
-      # Throttle started — flip boolean ON immediately, count every event
-      # (sub-10s flickers also do real work clamping voltage spikes).
-      # Notification still gated by 10s sustained via notify_engage.
+      # V crossed up over 256V — flip boolean ON immediately, count every event
       - conditions:
           - condition: trigger
             id: throttle_start
@@ -77,7 +78,7 @@ action:
             target:
               entity_id: counter.voltage_throttle_activations_today
 
-      # Throttle ended — flip boolean OFF immediately, no notification yet
+      # V crossed back below 254V — flip boolean OFF immediately
       - conditions:
           - condition: trigger
             id: throttle_end
@@ -86,9 +87,7 @@ action:
             target:
               entity_id: input_boolean.sig_voltage_protect_active
 
-      # Boolean has been ON sustained 10s — fire engage notification once,
-      # snapshot the lost-energy meter so release can compute the session's
-      # delta.
+      # Boolean has been ON sustained 1 min — fire engage notification once
       - conditions:
           - condition: trigger
             id: notify_engage
@@ -108,10 +107,10 @@ action:
             data:
               title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
               message: >-
-                Cap at {{ cap }} kW (sustained 1 min). Curtailment automation
-                clamping export. SOC: {{ soc }}%
+                V > 256V sustained 1 min. Seek live cap: {{ cap }} kW.
+                SOC: {{ soc }}%
 
-      # Boolean has been OFF sustained 10s AFTER an engage — fire release
+      # Boolean has been OFF sustained 1 min AFTER an engage — fire release
       - conditions:
           - condition: trigger
             id: notify_release
@@ -120,7 +119,6 @@ action:
             state: "on"
         sequence:
           - variables:
-              # Duration since alerted went on (= since notify_engage fired)
               alerted_since: >-
                 {{ as_timestamp(states.input_boolean.sig_voltage_protect_alerted.last_changed) }}
               elapsed_seconds: >-
@@ -129,7 +127,6 @@ action:
                 {%- set m = elapsed_seconds // 60 -%}
                 {%- set s = elapsed_seconds % 60 -%}
                 {%- if m > 0 -%}{{ m }}m {{ s }}s{%- else -%}{{ s }}s{%- endif -%}
-              # Energy lost during this session (kWh delta)
               lost_now: "{{ states('sensor.sig_voltage_throttle_lost_energy') | float(0) }}"
               lost_start: "{{ states('input_number.voltage_throttle_engage_lost_start') | float(0) }}"
               lost_session_kwh: "{{ (lost_now - lost_start) | round(2) }}"
@@ -141,4 +138,4 @@ action:
               title: "✅ Voltage throttle released (V={{ voltage }}V)"
               message: >-
                 Active {{ duration_str }}. Lost ~{{ lost_session_kwh }} kWh
-                export. Cap back to {{ cap }} kW. SOC: {{ soc }}%
+                export. Live cap: {{ cap }} kW. SOC: {{ soc }}%

@@ -21,10 +21,16 @@
 #   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
 #
 # Hard-coded constants (edit YAML to change):
-#   hard_limit_v = 259V — above this, cap = 0 immediately
-#   step_up_kw   = 0.05 kW per 5s tick (1.2 kW/min seek rate)
-#   drop_gain    = 0.5  (kW reduction per V over upper deadband)
-#   dno          = 4.0  kW (DNO export limit)
+#   hard_limit_v   = 259V — above this, cap = 0 immediately
+#   step_up_base   = 0.05 kW/tick — minimum climb rate (in deadband edge)
+#   step_up_per_v  = 0.05 kW/tick per V below (target-deadband-1) — adaptive
+#   step_up_max    = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
+#   drop_gain      = 0.5  (kW reduction per V over upper deadband)
+#   dno            = 4.0  kW (DNO export limit)
+#
+# Adaptive climb keeps motion gentle near target (avoids overshoot) but
+# recovers fast after a deep cut. e.g. v=254 → 0.05/tick, v=250 → 0.25/tick,
+# v=246+ → 0.4/tick (4.8 kW/min, ~50s for 0→4 recovery).
 #
 # IMPORTANT: this is the sole writer to input_number.voltage_throttle_filtered_cap.
 # The old "Voltage Throttle Filter — Asymmetric Rate Limit" automation must be
@@ -52,16 +58,20 @@ action:
       target: "{{ states('input_number.voltage_seek_target_v') | float(255) }}"
       deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
       hard_limit_v: 259.0
-      step_up_kw: 0.05
+      step_up_base: 0.05
+      step_up_per_v: 0.05
+      step_up_max: 0.4
       drop_gain: 0.5
       dno: 4.0
+      under_v: "{{ (target - deadband) - v }}"
+      step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
       new_cap: >-
         {%- if v >= hard_limit_v -%}
           0.0
         {%- elif v > (target + deadband) -%}
           {{ [0.0, cap - drop_gain * (v - target - deadband)] | max }}
         {%- elif v < (target - deadband) -%}
-          {{ [dno, cap + step_up_kw] | min }}
+          {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}
           {{ cap }}
         {%- endif -%}
