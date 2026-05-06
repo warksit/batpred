@@ -24,6 +24,8 @@ from curtailment_calc import (
     p_scales_from_forecast,
     compute_expected_overflow,
     compute_pv_start_time,
+    compute_p10_recovery_floor,
+    compute_effective_export_cap,
 )
 
 # Battery constants (Mum's SIG system)
@@ -487,6 +489,167 @@ def test_activation_high_soc_low_overflow():
     overflow = 2.0
     assert overflow * OVERFLOW_SAFETY_FACTOR > headroom, f"Should activate: {overflow * OVERFLOW_SAFETY_FACTOR:.1f} > {headroom:.1f}"
     print("  test_activation_high_soc_low_overflow: PASSED")
+
+
+# ============================================================================
+# R59 — P10 recovery floor (proposed addition to R54)
+#
+# Lower-bound on floor: even on a P10 (worst-case PV) day the battery must
+# still recover to overnight_target by sundown. P10 = 90% chance actual PV
+# exceeds this, so it's the conservative-charging case.
+# ============================================================================
+
+
+def test_p10_recovery_floor_huge_pv_runway():
+    """Lots of P10 PV ahead → floor near zero (we'll easily recover)."""
+    floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=20.0, load_remaining_kwh=7.0)
+    # potential = 20-7 = 13, target - potential = -3.6 → clamped to 0
+    assert floor == 0.0, f"Expected 0.0 (huge runway), got {floor}"
+    print(f"  test_p10_recovery_floor_huge_pv_runway: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_no_pv_remaining():
+    """Sunset: no PV ahead → floor = overnight_target (must hold all of it now)."""
+    floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=0.0, load_remaining_kwh=2.0)
+    # potential = max(0, -2) = 0, floor = 9.4
+    assert abs(floor - 9.4) < 0.001, f"Expected 9.4 (no runway), got {floor}"
+    print(f"  test_p10_recovery_floor_no_pv_remaining: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_partial_charging():
+    """Mid-afternoon: P10 PV partly covers → floor = remainder."""
+    floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=10.0, load_remaining_kwh=5.0)
+    # potential = 5, floor = 9.4 - 5 = 4.4
+    assert abs(floor - 4.4) < 0.001, f"Expected 4.4 (partial), got {floor}"
+    print(f"  test_p10_recovery_floor_partial_charging: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_load_exceeds_pv():
+    """Defensive: load > P10 PV (low-light + DHW). Potential clamps to 0."""
+    floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0, load_remaining_kwh=5.0)
+    # potential = max(0, -3) = 0, floor = 9.4
+    assert abs(floor - 9.4) < 0.001, f"Expected 9.4, got {floor}"
+    print(f"  test_p10_recovery_floor_load_exceeds_pv: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_zero_target():
+    """Edge case: overnight_target=0 → floor=0 (always)."""
+    floor = compute_p10_recovery_floor(overnight_target_kwh=0.0, p10_pv_remaining_kwh=10.0, load_remaining_kwh=2.0)
+    assert floor == 0.0, f"Expected 0.0, got {floor}"
+    print(f"  test_p10_recovery_floor_zero_target: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_today_at_11_03():
+    """Today's actual numbers (2026-05-06 11:03 BST): P10 remaining 16, load
+    remaining ~7, overnight target 9.4 → floor ~0.4 kWh ≈ 2%.
+
+    Reference: when sized like this, even P10 day still recovers to overnight
+    target. Curtailment manager could have drained battery to ~2% this morning
+    with no overnight risk.
+    """
+    floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=16.0, load_remaining_kwh=7.0)
+    # potential = 9, floor = 9.4 - 9 = 0.4
+    assert abs(floor - 0.4) < 0.001, f"Today's case: expected 0.4 kWh, got {floor}"
+    print(f"  test_p10_recovery_floor_today_at_11_03: PASSED (floor={floor:.2f} kWh = {floor/BATTERY_KWH*100:.1f}%)")
+
+
+def test_p10_recovery_floor_combines_with_r54_min():
+    """In R54, the new floor is an OUTER MAX term (lower bound), alongside reserve.
+
+    target = max(reserve, p10_recovery, min(curt_floor, effective_keep))
+
+    Verifies the combined formula picks the right answer in two regimes:
+      - early day: p10_recovery≈0 → outer max = inner min (p10 inactive)
+      - late day:  p10_recovery=overnight_target → outer max binds (p10 active)
+    """
+    reserve = 0.0
+    curt_floor = 5.0
+    effective_keep = 4.0  # R55 morning-gap-based
+
+    # Early in day — lots of P10 PV ahead
+    p10_early = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=20.0, load_remaining_kwh=7.0)
+    target_early = max(reserve, p10_early, min(curt_floor, effective_keep))
+    assert target_early == 4.0, f"Early: expected min(5,4)=4, got {target_early}"
+
+    # Late in day — no P10 PV remaining
+    p10_late = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=0.0, load_remaining_kwh=2.0)
+    target_late = max(reserve, p10_late, min(curt_floor, effective_keep))
+    assert abs(target_late - 9.4) < 0.001, f"Late: expected 9.4 (overnight_target binds), got {target_late}"
+    print(f"  test_p10_recovery_floor_combines_with_r54_min: PASSED (early={target_early}, late={target_late})")
+
+
+# ============================================================================
+# R60 — effective export cap (proposed addition for overflow integral)
+#
+# Realistic DNO for forecast overflow: median of recent voltage-throttle cap,
+# falling back to yesterday's daytime mean (cold-start) or DNO (no history).
+# Used in compute_solcast_overflow's dno_limit parameter to size overflow
+# against what we can actually export, not the theoretical limit.
+# ============================================================================
+
+
+def test_effective_cap_no_history_returns_dno():
+    """Cold start: no today samples, no yesterday avg → use DNO."""
+    cap = compute_effective_export_cap(today_samples_kw=[], yesterday_avg_kw=None, dno_kw=4.0)
+    assert cap == 4.0, f"Expected DNO=4.0, got {cap}"
+    print(f"  test_effective_cap_no_history_returns_dno: PASSED ({cap})")
+
+
+def test_effective_cap_today_data_wins():
+    """≥ min_samples today samples → today's mean (yesterday ignored)."""
+    today = [3.5] * 12  # 12 samples, all at 3.5 kW
+    cap = compute_effective_export_cap(today_samples_kw=today, yesterday_avg_kw=2.5, dno_kw=4.0, min_samples=10)
+    assert abs(cap - 3.5) < 0.01, f"Expected today's mean=3.5, got {cap}"
+    print(f"  test_effective_cap_today_data_wins: PASSED ({cap})")
+
+
+def test_effective_cap_few_samples_falls_back_to_yesterday():
+    """Insufficient today samples → fall back to yesterday's avg."""
+    today = [3.5, 3.0]  # only 2 samples, below min_samples=10
+    cap = compute_effective_export_cap(today_samples_kw=today, yesterday_avg_kw=2.7, dno_kw=4.0, min_samples=10)
+    assert abs(cap - 2.7) < 0.01, f"Expected yesterday=2.7, got {cap}"
+    print(f"  test_effective_cap_few_samples_falls_back_to_yesterday: PASSED ({cap})")
+
+
+def test_effective_cap_no_today_with_yesterday():
+    """Pre-PV / first-cycle of day: only yesterday's avg available."""
+    cap = compute_effective_export_cap(today_samples_kw=[], yesterday_avg_kw=3.1, dno_kw=4.0)
+    assert abs(cap - 3.1) < 0.01, f"Expected yesterday=3.1, got {cap}"
+    print(f"  test_effective_cap_no_today_with_yesterday: PASSED ({cap})")
+
+
+def test_effective_cap_clamped_to_hard_floor():
+    """Many low samples (V high all hour) — clamp to hard_floor to avoid disaster."""
+    today = [0.5] * 20  # 20 samples at 0.5 kW
+    cap = compute_effective_export_cap(today_samples_kw=today, yesterday_avg_kw=None, dno_kw=4.0, hard_floor_kw=2.0)
+    assert cap == 2.0, f"Expected hard_floor=2.0, got {cap}"
+    print(f"  test_effective_cap_clamped_to_hard_floor: PASSED ({cap})")
+
+
+def test_effective_cap_clamped_to_dno_ceiling():
+    """Defensive: yesterday avg above DNO (bad data) → clamp to DNO."""
+    cap = compute_effective_export_cap(today_samples_kw=[], yesterday_avg_kw=5.5, dno_kw=4.0)
+    assert cap == 4.0, f"Expected DNO=4.0 ceiling, got {cap}"
+    print(f"  test_effective_cap_clamped_to_dno_ceiling: PASSED ({cap})")
+
+
+def test_effective_cap_today_30min_typical_day():
+    """Today's data, mixed throttling — gives realistic mean."""
+    # 30 min @ 5s sampling = 360 samples typical, but assume aggregator returns 1/min
+    # Mix: half hour with cap=4 (early morning), half hour throttled to 3
+    today = [4.0] * 15 + [3.0] * 15
+    cap = compute_effective_export_cap(today_samples_kw=today, yesterday_avg_kw=None, dno_kw=4.0, min_samples=10)
+    assert abs(cap - 3.5) < 0.01, f"Expected mean of mixed=3.5, got {cap}"
+    print(f"  test_effective_cap_today_30min_typical_day: PASSED ({cap})")
+
+
+def test_effective_cap_today_actual_last_hour():
+    """Reference: today's last-hour data (mean=2.92) — overflow integral should
+    use ~2.92 not 4.0, sizing curtailment forecast against actual ceiling."""
+    today = [2.92] * 60  # 60 samples at the observed mean
+    cap = compute_effective_export_cap(today_samples_kw=today, yesterday_avg_kw=None, dno_kw=4.0)
+    assert abs(cap - 2.92) < 0.01, f"Expected today's mean=2.92, got {cap}"
+    print(f"  test_effective_cap_today_actual_last_hour: PASSED ({cap})")
 
 
 # ============================================================================
@@ -4002,6 +4165,23 @@ def run_curtailment_tests(my_predbat=None):
 
     # v10 floor tests
     floor_tests = [
+        # R59 P10 recovery floor (proposed)
+        test_p10_recovery_floor_huge_pv_runway,
+        test_p10_recovery_floor_no_pv_remaining,
+        test_p10_recovery_floor_partial_charging,
+        test_p10_recovery_floor_load_exceeds_pv,
+        test_p10_recovery_floor_zero_target,
+        test_p10_recovery_floor_today_at_11_03,
+        test_p10_recovery_floor_combines_with_r54_min,
+        # R60 effective export cap (proposed)
+        test_effective_cap_no_history_returns_dno,
+        test_effective_cap_today_data_wins,
+        test_effective_cap_few_samples_falls_back_to_yesterday,
+        test_effective_cap_no_today_with_yesterday,
+        test_effective_cap_clamped_to_hard_floor,
+        test_effective_cap_clamped_to_dno_ceiling,
+        test_effective_cap_today_30min_typical_day,
+        test_effective_cap_today_actual_last_hour,
         test_floor_computation,
         test_floor_above_soc_keep,
         # v19 tapered-cap tests

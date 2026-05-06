@@ -564,3 +564,93 @@ verify all existing tests still pass (R37 — never break production).
 - **Round-trip loss in evening drain** (R56). Empirical question:
   on a no-overflow but high-SOC day, is evening drain from battery
   to grid actually net-positive? Worth instrumenting after deploy.
+
+---
+
+## Proposed additions (2026-05-06, pure functions tested, plugin wiring deferred)
+
+After investigating today's curtailment performance, two gaps identified
+in R54. Pure helper functions added to `curtailment_calc.py` with full
+unit-test coverage; plugin integration is a follow-up change.
+
+### R59 — P10 recovery floor (lower bound on R54 floor)
+
+The current R54 formula:
+```
+target = max(min(curt_floor, effective_keep), reserve)
+```
+ensures we drain to *at least* `reserve`, but doesn't ensure we'll
+actually recover to `overnight_target` by sundown on a worst-case (P10)
+PV day. R55 sources `effective_keep` from *tomorrow's* morning gap,
+not from *today's remaining* PV runway. So on a confirmed-overflow day
+where R48 relaxes effective_keep to 0.5 kWh, we drain to 0.5 and
+*assume* PV will refill — if the day delivers P10 instead of P50, we
+end below overnight target.
+
+**R59**: add a P10 recovery lower bound:
+```text
+p10_charging_potential = max(0, p10_pv_remaining_kwh - load_remaining_kwh)
+p10_recovery_floor = max(0, overnight_target_kwh - p10_charging_potential)
+
+target_soc = max(reserve, p10_recovery_floor, min(curt_floor, effective_keep))
+```
+
+Pure function `compute_p10_recovery_floor()` — passes seven unit
+tests covering huge-runway / no-runway / partial / load>PV / zero-target /
+today's actual data / combined-with-R54.
+
+Behaviour:
+- Sunrise (lots of P10 PV ahead): p10_recovery ≈ 0 → outer max yields
+  inner min (no change vs current)
+- Mid-afternoon (less ahead): rises, starts capping how low keep can go
+- Sunset (P10 PV → 0): p10_recovery → overnight_target → forces SOC up
+  to target by sunset (replaces R57's "drain to keep, hope PV refills")
+
+### R60 — effective export cap for overflow integral
+
+The overflow integral asks "how much PV will exceed our export ability?"
+and uses `dno_limit=4.0` as the export ceiling. But the voltage throttle
+constrains real export below DNO whenever grid voltage rises. Reference:
+on 2026-05-06 between 14:50 and 15:50 BST mean export was 2.92 kW —
+27% under DNO. Forecast overflow using DNO=4.0 understates actual
+curtailment by the same ratio.
+
+**R60**: feed the overflow integral a smoothed effective DNO instead:
+
+```text
+effective_dno = compute_effective_export_cap(
+    today_samples_kw,        # rolling 30-min cap readings during PV>load
+    yesterday_avg_kw,        # persisted across days
+    dno_kw=4.0,
+    min_samples=10,
+    hard_floor_kw=2.0,
+)
+```
+
+Three-regime fallback:
+1. ≥ min_samples today → today's mean (clamped [hard_floor, DNO])
+2. else yesterday's daytime mean
+3. else DNO (cold start, no persisted data)
+
+**Why both regimes**: at 06:00 BST we have no today data, so use
+yesterday's. By midday today's data dominates — yesterday is ignored.
+
+**Why hard_floor**: a single bad voltage hour shouldn't predict
+"no export at all" tomorrow. 2.0 kW floor preserves *some* DNO
+contribution to the forecast.
+
+Pure function `compute_effective_export_cap()` — passes eight unit tests
+covering all three regimes plus clamps.
+
+### Plugin wiring (deferred)
+
+Both functions are isolated and tested. Wiring into the plugin requires:
+- Maintaining a rolling cap-sample list (filtered to PV>load conditions)
+- Persisting yesterday's daytime mean across day rollover (state.json)
+- Computing p10_pv_remaining and load_remaining from existing forecasts
+- Threading `effective_dno` through three `compute_solcast_overflow` calls
+- Adding `p10_recovery_floor` term to R54 outer max
+- Integration tests against historical CSV data (R34)
+
+Recommend doing this in a calm session with TDD discipline (R36) and
+regression coverage against existing real-day fixtures.

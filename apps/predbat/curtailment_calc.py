@@ -133,6 +133,75 @@ def compute_morning_gap(
     return gap_kwh
 
 
+def compute_effective_export_cap(today_samples_kw, yesterday_avg_kw, dno_kw=4.0, min_samples=10, hard_floor_kw=2.0):
+    """R60: realistic export ceiling for the overflow integral.
+
+    The overflow integral asks "how much PV will exceed our export ability?".
+    Theoretical DNO (4.0) over-estimates the ceiling whenever the voltage
+    throttle is active — actual ceiling is whatever the throttle allows.
+
+    Falls back across three regimes:
+      1. ≥ min_samples of today's during-PV cap readings → today's mean
+      2. else yesterday's daytime mean (persisted across days) → yesterday's
+      3. else DNO (cold start, never had data)
+
+    Result is clamped to [hard_floor_kw, dno_kw]:
+      - Floor prevents a single bad hour predicting "no export at all" tomorrow
+      - Ceiling defensively guards against bad data above DNO
+
+    Args:
+        today_samples_kw: list of recent voltage_throttle_filtered_cap readings
+                          (kW). Caller maintains the rolling window — typically
+                          30 min of samples taken during PV > load conditions.
+        yesterday_avg_kw: yesterday's daytime mean effective cap (kW). None on
+                          first day or when state file unavailable.
+        dno_kw: theoretical DNO limit (kW). Used as ceiling and final fallback.
+        min_samples: today_samples must have ≥ this many to be trusted.
+        hard_floor_kw: minimum estimate (kW). Defensive against "throttle active
+                       all hour" → effective_dno=0 → integral predicts disaster.
+
+    Returns:
+        kW — effective DNO estimate for the overflow integral.
+    """
+    if today_samples_kw and len(today_samples_kw) >= min_samples:
+        estimate = sum(today_samples_kw) / len(today_samples_kw)
+    elif yesterday_avg_kw is not None and yesterday_avg_kw > 0:
+        estimate = yesterday_avg_kw
+    else:
+        estimate = dno_kw
+    return max(hard_floor_kw, min(dno_kw, estimate))
+
+
+def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh):
+    """R59: minimum SOC such that even on a P10 (worst-case PV) day the battery
+    still recovers to overnight_target by sundown.
+
+    Solcast convention: pv_estimate10 is the pessimistic forecast (90% chance
+    actual exceeds it). Sizing the floor against P10 means we're safe across
+    almost all PV outcomes without over-reserving on the typical day.
+
+    Pure function of three numbers — no time / forecast / state dependency.
+    The plugin computes p10_pv_remaining and load_remaining from its forecasts
+    and passes them in.
+
+    Args:
+        overnight_target_kwh: required SOC by end of day (typically
+                              effective_keep, possibly with extra margin).
+        p10_pv_remaining_kwh: Solcast P10 PV remaining today (kWh).
+        load_remaining_kwh: forecast load remaining today (kWh).
+
+    Returns:
+        kWh — minimum SOC the floor must hold to guarantee overnight recovery
+        on a P10 day. Lower bound is 0 when P10 charging potential exceeds
+        remaining need.
+
+    Used in R54's outer max as a lower-bound term (alongside `reserve`):
+        target = max(reserve, p10_recovery, min(curt_floor, effective_keep))
+    """
+    p10_charging_potential = max(0.0, p10_pv_remaining_kwh - load_remaining_kwh)
+    return max(0.0, overnight_target_kwh - p10_charging_potential)
+
+
 def compute_release_offset(pv_forecast, load_forecast, dno_limit=4.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """Find the release point: one slot after the last slot where PV-load > DNO.
 
