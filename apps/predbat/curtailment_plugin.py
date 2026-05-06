@@ -58,6 +58,7 @@ SIG_EXPORT_LIMIT = "number.sigen_plant_grid_export_limitation"
 SIG_CHARGE_LIMIT = "number.sigen_plant_ess_charge_cut_off_state_of_charge"
 SIG_PV_POWER = "sensor.sigen_plant_pv_power"
 SIG_LOAD_POWER = "sensor.sigen_plant_consumed_power"
+SIG_GRID_EXPORT_POWER = "sensor.sigen_plant_grid_export_power"
 
 # HA input helper entity IDs
 HA_ENABLE = "input_boolean.curtailment_manager_enable"
@@ -953,16 +954,23 @@ class CurtailmentPlugin(PredBatPlugin):
             actual_pv = 0.0
         self._actual_pv_kw = actual_pv
 
-        # R60: sample the live voltage-throttle cap to estimate effective DNO
-        # for the overflow integral. Theoretical DNO (4 kW) over-estimates what
-        # we can actually export when grid voltage is high. Filter to during-PV
-        # samples — at idle, cap is always 4 (no throttle active) and would
-        # dilute the daytime mean toward DNO.
-        if actual_pv > 0.5:
-            try:
-                vcap = float(self.base.get_state_wrapper("input_number.voltage_throttle_filtered_cap", default=dno_limit_kw))
-            except (ValueError, TypeError):
-                vcap = dno_limit_kw
+        # R60: sample the live voltage-throttle cap to estimate effective DNO.
+        # Only sample when we're ACTIVELY PUSHING against the cap (export within
+        # 0.3 kW of the cap). Sampling cap=4 when export is only 1 kW (because
+        # there's no surplus) tells us nothing about the real ceiling — we're
+        # not testing it. Sampling at-cap gives the realistic export limit
+        # that the overflow integral cares about.
+        try:
+            vcap = float(self.base.get_state_wrapper("input_number.voltage_throttle_filtered_cap", default=dno_limit_kw))
+        except (ValueError, TypeError):
+            vcap = dno_limit_kw
+        try:
+            actual_export = float(self.base.get_state_wrapper(SIG_GRID_EXPORT_POWER, default=0))
+        except (ValueError, TypeError):
+            actual_export = 0.0
+        # "At cap" = export within 0.3 kW of the live cap (allows for sub-second jitter)
+        at_cap = vcap > 0 and actual_export > (vcap - 0.3)
+        if at_cap:
             self._cap_samples.append(vcap)
             self._cap_samples_full_day.append(vcap)
         # Always recompute effective_dno (uses fallbacks when samples are sparse)
