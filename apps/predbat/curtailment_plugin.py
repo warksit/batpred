@@ -955,11 +955,17 @@ class CurtailmentPlugin(PredBatPlugin):
         self._actual_pv_kw = actual_pv
 
         # R60: sample the live voltage-throttle cap to estimate effective DNO.
-        # Only sample when we're ACTIVELY PUSHING against the cap (export within
-        # 0.3 kW of the cap). Sampling cap=4 when export is only 1 kW (because
-        # there's no surplus) tells us nothing about the real ceiling — we're
-        # not testing it. Sampling at-cap gives the realistic export limit
-        # that the overflow integral cares about.
+        # Two conditions BOTH required:
+        #   1. throttle actually active (vcap < DNO − 0.2). Sampling at 6am
+        #      when grid is empty and we're exporting 4 kW with cap=4 tells
+        #      us nothing about peak-PV conditions — voltage was low because
+        #      no one else was exporting. Mid-day on the same site, cap might
+        #      throttle to 2.5. Pre-peak samples dilute the mean toward DNO.
+        #   2. export pushing against the cap (export > vcap − 0.3). The cap
+        #      reading is only meaningful when we're testing it.
+        # If neither fires (no throttle today / no peak surplus), no samples
+        # are collected and effective_dno falls back to yesterday's mean →
+        # then DNO. That's correct: when nothing was throttled, use DNO.
         try:
             vcap = float(self.base.get_state_wrapper("input_number.voltage_throttle_filtered_cap", default=dno_limit_kw))
         except (ValueError, TypeError):
@@ -968,9 +974,9 @@ class CurtailmentPlugin(PredBatPlugin):
             actual_export = float(self.base.get_state_wrapper(SIG_GRID_EXPORT_POWER, default=0))
         except (ValueError, TypeError):
             actual_export = 0.0
-        # "At cap" = export within 0.3 kW of the live cap (allows for sub-second jitter)
+        throttle_active = vcap < (dno_limit_kw - 0.2)
         at_cap = vcap > 0 and actual_export > (vcap - 0.3)
-        if at_cap:
+        if throttle_active and at_cap:
             self._cap_samples.append(vcap)
             self._cap_samples_full_day.append(vcap)
         # Always recompute effective_dno (uses fallbacks when samples are sparse)
