@@ -39,6 +39,8 @@ from curtailment_calc import (
     compute_solar_overflow,
     compute_solcast_overflow,
     compute_expected_overflow,
+    compute_p10_recovery_floor,
+    compute_effective_export_cap,
     compute_pv_start_time,
     p90_scale_from_forecast,
     p_scales_from_forecast,
@@ -216,6 +218,16 @@ class CurtailmentPlugin(PredBatPlugin):
         # Cached (value, attrs) tuple for republishing overnight_target on
         # cache-hit paths in on_before_plan.
         self._cached_overnight = None
+        # R60: rolling cap samples for effective_dno (last 6 = 30 min @ 5-min cycles)
+        self._cap_samples = deque(maxlen=6)
+        # R60: full-day cap samples — averaged at day rollover into _yesterday_cap_avg
+        self._cap_samples_full_day = []
+        # R60: yesterday's daytime mean cap (kW) — persisted, used as fallback
+        self._yesterday_cap_avg = None
+        # R60: current cycle's effective DNO (diagnostic + use in overflow calls)
+        self._effective_dno = 4.0
+        # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
+        self._p10_recovery_floor = 0.0
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
@@ -269,6 +281,25 @@ class CurtailmentPlugin(PredBatPlugin):
                     self._pv_history.append((int(entry[0]), float(entry[1]), float(entry[2])))
                 except (ValueError, TypeError):
                     continue
+        # R60: yesterday's mean + today's accumulated samples
+        try:
+            yc = data.get("yesterday_cap_avg")
+            self._yesterday_cap_avg = float(yc) if yc is not None else None
+        except (ValueError, TypeError):
+            self._yesterday_cap_avg = None
+        cap_samples = data.get("cap_samples") or []
+        self._cap_samples.clear()
+        for s in cap_samples[-6:]:
+            try:
+                self._cap_samples.append(float(s))
+            except (ValueError, TypeError):
+                continue
+        self._cap_samples_full_day = []
+        for s in (data.get("cap_samples_full_day") or []):
+            try:
+                self._cap_samples_full_day.append(float(s))
+            except (ValueError, TypeError):
+                continue
         self._state_date = today
         try:
             self.log(
@@ -305,6 +336,9 @@ class CurtailmentPlugin(PredBatPlugin):
             "keep_drained_today": self._keep_drained_today,
             "r48_engaged_today": self._r48_engaged_today,
             "pv_history": [list(entry) for entry in self._pv_history],
+            "yesterday_cap_avg": self._yesterday_cap_avg,
+            "cap_samples": list(self._cap_samples),
+            "cap_samples_full_day": list(self._cap_samples_full_day),
         }
         tmp_path = path + ".tmp"
         try:
@@ -322,6 +356,13 @@ class CurtailmentPlugin(PredBatPlugin):
 
     def _reset_for_new_day(self):
         """Reset in-memory daily state. Called when calculate() detects day rollover."""
+        # R60: roll today's full-day mean into yesterday's avg for tomorrow.
+        # Filtered to during-PV samples means this represents the typical
+        # effective ceiling under PV/voltage conditions, not idle hours.
+        if self._cap_samples_full_day:
+            self._yesterday_cap_avg = sum(self._cap_samples_full_day) / len(self._cap_samples_full_day)
+        self._cap_samples_full_day = []
+        self._cap_samples.clear()
         self._peak_pv = 0.0
         self._peak_pv_time = 0
         self._floor_ratchet = None
@@ -832,9 +873,14 @@ class CurtailmentPlugin(PredBatPlugin):
             p10_fb = max(p10_scale, self._actual_scale)
             p50_fb = max(p50_scale, self._actual_scale)
             p90_fb = max(p90_scale, self._actual_scale)
-            self._overflow_p10 = round(self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed), 2)
-            self._overflow_p50 = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed), 2)
-            self._overflow_p90 = round(self._compute_overflow_band("pv_estimate90", p90_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed), 2)
+            # R60: use effective_dno (realistic export ceiling) instead of theoretical
+            # dno_limit_kw for the overflow integral. The threshold for safe_time
+            # (above) keeps full DNO — that's a geometric "when does PV drop below
+            # ceiling" marker, not a control threshold.
+            eff_dno = getattr(self, "_effective_dno", dno_limit_kw)
+            self._overflow_p10 = round(self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
+            self._overflow_p50 = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
+            self._overflow_p90 = round(self._compute_overflow_band("pv_estimate90", p90_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
         except Exception:
             pass
 
@@ -906,6 +952,27 @@ class CurtailmentPlugin(PredBatPlugin):
         except (ValueError, TypeError):
             actual_pv = 0.0
         self._actual_pv_kw = actual_pv
+
+        # R60: sample the live voltage-throttle cap to estimate effective DNO
+        # for the overflow integral. Theoretical DNO (4 kW) over-estimates what
+        # we can actually export when grid voltage is high. Filter to during-PV
+        # samples — at idle, cap is always 4 (no throttle active) and would
+        # dilute the daytime mean toward DNO.
+        if actual_pv > 0.5:
+            try:
+                vcap = float(self.base.get_state_wrapper("input_number.voltage_throttle_filtered_cap", default=dno_limit_kw))
+            except (ValueError, TypeError):
+                vcap = dno_limit_kw
+            self._cap_samples.append(vcap)
+            self._cap_samples_full_day.append(vcap)
+        # Always recompute effective_dno (uses fallbacks when samples are sparse)
+        self._effective_dno = compute_effective_export_cap(
+            today_samples_kw=list(self._cap_samples),
+            yesterday_avg_kw=self._yesterday_cap_avg,
+            dno_kw=dno_limit_kw,
+            min_samples=3,
+            hard_floor_kw=2.0,
+        )
 
         # R50 (v21): always refresh confidence so the published value reflects
         # current Solcast (e.g., tomorrow's confidence at midnight) even when
@@ -1034,9 +1101,14 @@ class CurtailmentPlugin(PredBatPlugin):
         except (ValueError, TypeError):
             solcast_remaining_kwh = 0.0
         calibration_ratio = self._compute_calibration_ratio(minutes_now, solcast_remaining_kwh)
-        overflow_p10 = self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw, calibration_ratio, detailed)
-        overflow_p50 = self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw, calibration_ratio, detailed)
-        overflow_p90 = self._compute_overflow_band("pv_estimate90", floor_scale, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_forecast_kw, calibration_ratio, detailed)
+        # R60: feed band integrals the realistic export ceiling, not theoretical DNO.
+        # Smaller effective_dno → bigger forecast overflow → curt_floor lower → more
+        # drain. Sized correctly when voltage-throttle is active, falls back to DNO
+        # when not. self._effective_dno was set near the top of calculate().
+        eff_dno = self._effective_dno
+        overflow_p10 = self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_forecast_kw, calibration_ratio, detailed)
+        overflow_p50 = self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_forecast_kw, calibration_ratio, detailed)
+        overflow_p90 = self._compute_overflow_band("pv_estimate90", floor_scale, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_forecast_kw, calibration_ratio, detailed)
 
         # Read confidence and tunable thresholds from helpers
         confidence = self._get_solcast_confidence()
@@ -1207,15 +1279,35 @@ class CurtailmentPlugin(PredBatPlugin):
             if self._overnight_target_kwh is not None:
                 effective_keep = max(effective_keep, self._overnight_target_kwh)
 
-        # R54 (v20): single drain-target rule.
-        # Both overflow_floor and effective_keep are "drain TO this level" —
-        # the lower one wins (more drain). reserve is a hard floor.
+        # R59: P10 recovery floor — minimum SOC needed to recover to overnight
+        # target on a worst-case (P10) PV day. Acts as a lower bound alongside
+        # `reserve` in the outer max — never lowers the floor, only raises it
+        # if existing rules would drain too low for cloudy-afternoon recovery.
+        try:
+            p10_pv_remaining = float(self.base.get_state_wrapper(SOLCAST_REMAINING, attribute="estimate10", default=0))
+        except (ValueError, TypeError):
+            p10_pv_remaining = 0.0
+        # load_remaining was computed earlier (R5 activation check)
+        overnight_for_recovery = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
+        p10_recovery = compute_p10_recovery_floor(
+            overnight_target_kwh=overnight_for_recovery,
+            p10_pv_remaining_kwh=p10_pv_remaining,
+            load_remaining_kwh=load_remaining,
+        )
+        self._p10_recovery_floor = round(p10_recovery, 2)
+
+        # R54 (v20) + R59: single drain-target rule with P10 recovery lower bound.
+        # Inner min: overflow_floor & effective_keep are "drain TO this level" —
+        #   lower wins (more drain).
+        # Outer max: clamp above reserve, p10_recovery, and inner min — highest
+        #   of these "minimum SOC" requirements wins.
         # On big-overflow days: overflow_floor < effective_keep → drain to
         #   overflow_floor (curtailment wins, R48 latch already relaxed
-        #   effective_keep so this is safe).
+        #   effective_keep so this is safe). Late afternoon: p10_recovery rises
+        #   and starts capping how low we go.
         # On no/small-overflow days: overflow_floor → soc_max → drain only
         #   to effective_keep (overnight target, replaces R45 100% chase).
-        floor = max(min(overflow_floor, effective_keep), reserve)
+        floor = max(reserve, p10_recovery, min(overflow_floor, effective_keep))
         floor = min(floor, soc_max)
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase
@@ -1368,7 +1460,22 @@ class CurtailmentPlugin(PredBatPlugin):
         pv_to_release = solcast_tomorrow * fraction
         pv_after_release = solcast_tomorrow * (1 - fraction)
         load_to_release = sum(load_step.get(m, 0) * to_kw * step_hours for m in range(pv_start, release_end, PREDICT_STEP))
-        excess = max(0, pv_to_release - load_to_release)
+
+        # R60 for tomorrow: estimate effective DNO from TODAY'S full-day cap mean
+        # (most recent daytime data available — by the time this forecast runs,
+        # today's PV is done). Falls back to yesterday's mean, then DNO.
+        # Subtract exportable energy from excess so "will_activate" reflects
+        # ACTUAL curtailment risk after realistic export, not raw PV-load.
+        tomorrow_eff_dno = compute_effective_export_cap(
+            today_samples_kw=self._cap_samples_full_day,
+            yesterday_avg_kw=self._yesterday_cap_avg,
+            dno_kw=dno_limit,
+            min_samples=10,
+            hard_floor_kw=2.0,
+        )
+        overflow_window_hours = max(0.0, (release_end - pv_start) / 60.0)
+        exportable_kwh = tomorrow_eff_dno * overflow_window_hours
+        excess = max(0, pv_to_release - load_to_release - exportable_kwh)
 
         morning_gap = compute_morning_gap(
             pv_step,
@@ -1395,6 +1502,8 @@ class CurtailmentPlugin(PredBatPlugin):
             "pv_to_release_kwh": round(pv_to_release, 1),
             "pv_after_release_kwh": round(pv_after_release, 1),
             "load_to_release_kwh": round(load_to_release, 1),
+            "exportable_kwh": round(exportable_kwh, 1),
+            "tomorrow_eff_dno_kw": round(tomorrow_eff_dno, 2),
             "excess_kwh": round(excess, 1),
             "headroom_kwh": round(headroom, 1),
             "morning_gap_kwh": round(morning_gap, 2),
@@ -1468,6 +1577,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 "safe_time": self._safe_time_str,
                 "buffer_reduced": self._buffer_reduced,
                 "effective_max_reserved": round(self._effective_max_reserved, 2),
+                "effective_dno_kw": round(self._effective_dno, 2),
+                "p10_recovery_floor_kwh": self._p10_recovery_floor,
+                "yesterday_cap_avg_kw": round(self._yesterday_cap_avg, 2) if self._yesterday_cap_avg is not None else None,
+                "cap_samples_today": len(self._cap_samples),
                 "last_decision": self._last_decision,
             },
         )

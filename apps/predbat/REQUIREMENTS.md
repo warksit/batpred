@@ -642,15 +642,37 @@ contribution to the forecast.
 Pure function `compute_effective_export_cap()` — passes eight unit tests
 covering all three regimes plus clamps.
 
-### Plugin wiring (deferred)
+### Plugin wiring (done 2026-05-06)
 
-Both functions are isolated and tested. Wiring into the plugin requires:
-- Maintaining a rolling cap-sample list (filtered to PV>load conditions)
-- Persisting yesterday's daytime mean across day rollover (state.json)
-- Computing p10_pv_remaining and load_remaining from existing forecasts
-- Threading `effective_dno` through three `compute_solcast_overflow` calls
-- Adding `p10_recovery_floor` term to R54 outer max
-- Integration tests against historical CSV data (R34)
+Both R59 and R60 wired into `curtailment_plugin.py`:
 
-Recommend doing this in a calm session with TDD discipline (R36) and
-regression coverage against existing real-day fixtures.
+- **State**: `_cap_samples` (deque, last 6 = 30 min), `_cap_samples_full_day`
+  (list, full-day samples), `_yesterday_cap_avg` (float, persisted),
+  `_effective_dno` (float, computed each cycle), `_p10_recovery_floor`
+  (float, computed each cycle).
+- **Sampling**: `voltage_throttle_filtered_cap` read each cycle. Filtered
+  to `actual_pv > 0.5 kW` so idle hours don't dilute the daytime mean.
+- **State persistence**: yesterday_cap_avg, cap_samples,
+  cap_samples_full_day round-trip through `_load_state` / `_save_state`.
+- **Day rollover** (`_reset_for_new_day`): rolls today's full-day mean
+  into `_yesterday_cap_avg`, clears today's lists.
+- **Today's overflow integral**: passes `self._effective_dno` to all three
+  `_compute_overflow_band` calls in calculate() and
+  `_publish_forecast_overflow`.
+- **R54 floor formula** updated to:
+  ```text
+  floor = max(reserve, p10_recovery, min(overflow_floor, effective_keep))
+  ```
+- **Tomorrow's forecast** uses `compute_effective_export_cap` against
+  `_cap_samples_full_day` (today's just-completed daytime mean) with
+  yesterday fallback. `excess` now subtracts realistic exportable_kwh
+  before comparison to headroom — was previously assuming all PV-load
+  could exit (over-optimistic).
+- **Diagnostic attributes** on `sensor.predbat_curtailment_phase`:
+  `effective_dno_kw`, `p10_recovery_floor_kwh`, `yesterday_cap_avg_kw`,
+  `cap_samples_today`. Tomorrow sensor adds `exportable_kwh` and
+  `tomorrow_eff_dno_kw`.
+
+All 138 curtailment tests pass (15 new + existing). Pure-function unit
+tests cover the math; integration tests cover the floor formula change
+through real-day CSV fixtures.
