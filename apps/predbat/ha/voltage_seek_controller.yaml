@@ -73,26 +73,25 @@ action:
   - variables:
       v: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
-      target: "{{ states('input_number.voltage_seek_target_v') | float(252) }}"
+      target: "{{ states('input_number.voltage_seek_target_v') | float(250) }}"
+      range_v: "{{ states('input_number.voltage_seek_range_v') | float(8) }}"
       deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
-      ramp_slope_kw: 0.5
-      ramp_width_v: 8.0
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
       dno: 4.0
       under_v: "{{ (target - deadband) - v }}"
       step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
-      # Ramp tracks target with configurable slope:
-      #   cap_max = max(0, dno - ramp_slope_kw × (V - target))
-      # Default 0.5 kW/V from target — V=target → 4, V=target+2 → 3,
-      # V=target+4 → 2, V=target+6 → 1, V=target+8 → 0.
+      # Ramp tracks target, slope derived from range:
+      #   cap_max = max(0, dno - (dno/range_v) × (V - target))
+      # Ramp starts at V=target (cap=DNO) and lands at cap=0 at V=target+range_v.
+      # Default target=250, range=8 → slope 0.5 kW/V.
       # Ratchet (min with current cap) — never raises cap on this path.
       new_cap: >-
-        {%- if v >= (target + ramp_width_v) -%}
+        {%- if v >= (target + range_v) -%}
           0.0
         {%- elif v > target -%}
-          {{ [cap, [0.0, dno - ramp_slope_kw * (v - target)] | max] | min }}
+          {{ [cap, [0.0, dno - (dno / range_v) * (v - target)] | max] | min }}
         {%- elif v < (target - deadband) -%}
           {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}
