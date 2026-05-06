@@ -21,7 +21,11 @@
 #   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
 #
 # Hard-coded constants (edit YAML to change):
-#   hard_limit_v   = 259V — above this, cap = 0 immediately
+#   hard_limit_v   = 257V — at/above this, cap = 0. Lowered from 259 on
+#                   2026-05-06 after a 254→263V spike in 5s (faster than
+#                   the 5s tick) tripped the SIG on OVP. Combined with the
+#                   numeric_state trigger above 257V, response time is now
+#                   sub-second, not waiting for the next tick.
 #   step_up_base   = 0.05 kW/tick — minimum climb rate (in deadband edge)
 #   step_up_per_v  = 0.05 kW/tick per V below (target-deadband-1) — adaptive
 #   step_up_max    = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
@@ -40,16 +44,25 @@
 
 alias: "Voltage Seek Controller"
 description: >-
-  Integral seek controller for SIG export cap. Tick every 5s. Updates
-  input_number.voltage_throttle_filtered_cap to hold grid voltage at target
-  (default 255V). Slow climb on under-voltage, proportional drop on
-  over-voltage, hard cap=0 on V >= 259V.
-mode: single
+  Integral seek controller for SIG export cap. Tick every 5s + immediate
+  trigger on V > 257V. Updates input_number.voltage_throttle_filtered_cap
+  to hold grid voltage at target (default 255V). Slow climb on
+  under-voltage, proportional drop on over-voltage, hard cap=0 on V >= 257V.
+mode: restart
 max_exceeded: silent
 
 trigger:
   - platform: time_pattern
     seconds: "/5"
+  # Immediate emergency trigger — fast voltage spike, do not wait for tick.
+  # Reason: 2026-05-06 trip — V went 254→263V in 5s (faster than tick),
+  # SIG hit OVP before the next 5s tick fired. With this trigger and
+  # mode: restart, any V > 257V instantly re-runs the action which evaluates
+  # hard_limit_v=257 → cap=0 sub-second.
+  - platform: numeric_state
+    entity_id: sensor.sigen_inverter_phase_a_voltage
+    above: 257
+    id: voltage_spike
 
 action:
   - variables:
@@ -57,7 +70,7 @@ action:
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
       target: "{{ states('input_number.voltage_seek_target_v') | float(255) }}"
       deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
-      hard_limit_v: 259.0
+      hard_limit_v: 257.0
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
