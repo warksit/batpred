@@ -4,12 +4,12 @@
 # its asymmetric output filter. Single writer to
 # input_number.voltage_throttle_filtered_cap.
 #
-# Behaviour every 5s + on numeric_state above target+1 (sub-second):
+# Behaviour every 5s + on numeric_state above 253V (sub-second):
 #   - V >= (target + ramp_width_v)        : cap = 0
-#   - V > target                          : cap = min(cap, max(0, dno - (V-target)))
-#                                            ratchet down only — proportional ramp
-#                                            relative to target (V=target+1→cap=3,
-#                                            V=target+2→2, V=target+3→1, V=target+4→0)
+#   - V > target                          : cap = min(cap, max(0, dno - ramp_slope_kw*(V-target)))
+#                                            ratchet down only — proportional ramp with
+#                                            configurable slope (default 0.5 kW/V):
+#                                            target+2→cap=3, target+4→2, target+6→1, target+8→0
 #   - V < (target - deadband)             : cap += step_up_kw (adaptive climb)
 #   - target-deadband <= V <= target      : hold
 #
@@ -25,8 +25,12 @@
 #   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
 #
 # Hard-coded constants (edit YAML to change):
-#   ramp_width_v  = 4V — width of the down-ramp from cap=DNO down to cap=0.
-#                   Tracks target: cap=4 at V=target, cap=0 at V=target+ramp_width_v.
+#   ramp_slope_kw = 0.5 kW/V — proportional drop per V over target.
+#                   At default slope, V=target+2 → cap=3, target+4 → 2, etc.
+#                   Tuned 2026-05-06 to be gentler than slope=1.0 (which over-
+#                   reacted to small V drift inside the ramp band).
+#   ramp_width_v  = 8V — width of the down-ramp from cap=DNO down to cap=0.
+#                   Must equal dno / ramp_slope_kw for consistency.
 #   step_up_base  = 0.05 kW/tick — minimum climb rate (near deadband edge)
 #   step_up_per_v = 0.05 kW/tick per V below (target-deadband-1) — adaptive
 #   step_up_max   = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
@@ -71,21 +75,24 @@ action:
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
       target: "{{ states('input_number.voltage_seek_target_v') | float(252) }}"
       deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
-      ramp_width_v: 4.0
+      ramp_slope_kw: 0.5
+      ramp_width_v: 8.0
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
       dno: 4.0
       under_v: "{{ (target - deadband) - v }}"
       step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
-      # Ramp tracks target: cap_max = dno - (V - target). Engages immediately
-      # above target. V=target → 4, V=target+1 → 3, V=target+2 → 2, ..., V=target+4 → 0.
+      # Ramp tracks target with configurable slope:
+      #   cap_max = max(0, dno - ramp_slope_kw × (V - target))
+      # Default 0.5 kW/V from target — V=target → 4, V=target+2 → 3,
+      # V=target+4 → 2, V=target+6 → 1, V=target+8 → 0.
       # Ratchet (min with current cap) — never raises cap on this path.
       new_cap: >-
         {%- if v >= (target + ramp_width_v) -%}
           0.0
         {%- elif v > target -%}
-          {{ [cap, [0.0, dno - (v - target)] | max] | min }}
+          {{ [cap, [0.0, dno - ramp_slope_kw * (v - target)] | max] | min }}
         {%- elif v < (target - deadband) -%}
           {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}

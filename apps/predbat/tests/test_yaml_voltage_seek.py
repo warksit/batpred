@@ -111,7 +111,7 @@ def evaluate(variables, set_value_tpl, states):
 # ---------- Fixture builder ----------------------------------------------------
 
 
-def build_states(v, cap, target=252.0, deadband=1.0):
+def build_states(v, cap, target=250.0, deadband=1.0):
     return {
         "sensor.sigen_inverter_phase_a_voltage": str(v),
         "input_number.voltage_throttle_filtered_cap": str(cap),
@@ -129,38 +129,37 @@ class Scenario:
     v: float
     cap: float
     expected: float
-    target: float = 252.0
+    target: float = 250.0
     deadband: float = 1.0
     tol: float = 0.01
 
 
 SCENARIOS = [
-    # Hold band (target=252, deadband=1) — hold band = (251, 252]
-    Scenario("hold band centre — cap unchanged", v=251.5, cap=3.5, expected=3.5),
-    Scenario("hold band upper edge (V=target) — cap unchanged", v=252.0, cap=4.0, expected=4.0),
-    Scenario("hold band lower edge (target-deadband+ε) — cap unchanged", v=251.5, cap=2.0, expected=2.0),
-    # Down ramp tracks target: cap_max = max(0, dno - (V - target))
-    Scenario("V=target+0.5 → cap_max=3.5, ratchet from 4", v=252.5, cap=4.0, expected=3.5),
-    Scenario("V=target+1 → cap_max=3", v=253.0, cap=4.0, expected=3.0),
-    Scenario("V=target+1 → cap stays if already < cap_max", v=253.0, cap=2.0, expected=2.0),
-    Scenario("V=target+2 → cap_max=2", v=254.0, cap=4.0, expected=2.0),
-    Scenario("V=target+3 → cap_max=1", v=255.0, cap=4.0, expected=1.0),
-    Scenario("V=target+4 → cap=0 (ramp full)", v=256.0, cap=4.0, expected=0.0),
-    Scenario("V=target+5 → cap=0 (above ramp width)", v=257.0, cap=4.0, expected=0.0),
+    # target=250, deadband=1, ramp_slope_kw=0.5, ramp_width_v=8 → ramp 250→4, 258→0
+    # Hold band = (249, 250]
+    Scenario("hold band centre — cap unchanged", v=249.5, cap=3.5, expected=3.5),
+    Scenario("hold band upper edge (V=target) — cap unchanged", v=250.0, cap=4.0, expected=4.0),
+    Scenario("hold band lower edge (target-deadband+ε) — cap unchanged", v=249.5, cap=2.0, expected=2.0),
+    # Down ramp tracks target with slope 0.5: cap_max = max(0, dno - 0.5×(V - target))
+    Scenario("V=target+1 → cap_max=3.5", v=251.0, cap=4.0, expected=3.5),
+    Scenario("V=target+2 → cap_max=3", v=252.0, cap=4.0, expected=3.0),
+    Scenario("V=target+2 → cap stays if already < cap_max", v=252.0, cap=2.5, expected=2.5),
+    Scenario("V=target+4 → cap_max=2", v=254.0, cap=4.0, expected=2.0),
+    Scenario("V=target+6 → cap_max=1", v=256.0, cap=4.0, expected=1.0),
+    Scenario("V=target+8 → cap=0 (ramp full)", v=258.0, cap=4.0, expected=0.0),
+    Scenario("V=target+9 → cap=0 (above ramp width)", v=259.0, cap=4.0, expected=0.0),
     Scenario("V=263 (real spike) → cap=0", v=263.0, cap=3.5, expected=0.0),
-    # Climb (V < target-deadband=251)
-    Scenario("V=250 climb base step from 0", v=250.0, cap=0.0, expected=0.05),
-    Scenario("V=247 climb adaptive (under_v=4)", v=247.0, cap=0.0, expected=0.20),
-    Scenario("V=246 climb hits max", v=246.0, cap=0.0, expected=0.25),
-    Scenario("V=240 climb clamped to step_up_max=0.4", v=240.0, cap=0.0, expected=0.4),
-    Scenario("climb saturates at DNO", v=240.0, cap=4.0, expected=4.0),
-    # Adjustable target — ramp NOW tracks target (V=target → cap=4, V=target+4 → 0)
-    Scenario("target=255 V=251 climb (under_v=3 → step=0.15)", v=251.0, cap=3.0, expected=3.15, target=255.0),
-    Scenario("target=255 V=255 (=target) hold → cap unchanged", v=255.0, cap=3.0, expected=3.0, target=255.0),
-    Scenario("target=255 V=256 (=target+1) → cap_max=3", v=256.0, cap=4.0, expected=3.0, target=255.0),
-    Scenario("target=255 V=259 (=target+4) → cap=0", v=259.0, cap=4.0, expected=0.0, target=255.0),
-    Scenario("target=250 V=251 (=target+1) → cap_max=3", v=251.0, cap=4.0, expected=3.0, target=250.0),
-    Scenario("target=250 V=254 (=target+4) → cap=0", v=254.0, cap=4.0, expected=0.0, target=250.0),
+    # Climb (V < target-deadband=249)
+    Scenario("V=248 climb base step from 0", v=248.0, cap=0.0, expected=0.05),
+    Scenario("V=245 climb adaptive (under_v=4)", v=245.0, cap=0.0, expected=0.20),
+    Scenario("V=244 climb hits max", v=244.0, cap=0.0, expected=0.25),
+    Scenario("V=238 climb clamped to step_up_max=0.4", v=238.0, cap=0.0, expected=0.4),
+    Scenario("climb saturates at DNO", v=238.0, cap=4.0, expected=4.0),
+    # Adjustable target — ramp tracks target with same slope 0.5
+    Scenario("target=255 V=257 (=target+2) → cap_max=3", v=257.0, cap=4.0, expected=3.0, target=255.0),
+    Scenario("target=255 V=263 (=target+8) → cap=0", v=263.0, cap=4.0, expected=0.0, target=255.0),
+    Scenario("target=252 V=254 (=target+2) → cap_max=3", v=254.0, cap=4.0, expected=3.0, target=252.0),
+    Scenario("target=252 V=260 (=target+8) → cap=0", v=260.0, cap=4.0, expected=0.0, target=252.0),
 ]
 
 
