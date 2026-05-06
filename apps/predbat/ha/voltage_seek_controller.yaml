@@ -1,0 +1,73 @@
+# Voltage Seek Controller — integral export-cap seeker
+#
+# Replaces the proportional voltage throttle (sensor.sig_voltage_max_export_kw
+# linear ramp) plus its asymmetric output filter. Instead of a memoryless
+# proportional response, this controller HOLDS state in
+# input_number.voltage_throttle_filtered_cap and slowly seeks the maximum
+# export cap that keeps grid voltage at the target.
+#
+# Behaviour every 5s:
+#   - V >= hard_limit_v  : cap = 0     (safety override on a real spike)
+#   - V > target + deadband : cap -= 0.5 × (V - target - deadband)
+#                             (proportional dump — bigger overshoot, bigger drop)
+#   - V < target - deadband : cap += step_up_kw  (slow climb)
+#   - in deadband           : hold
+#
+# Result: cap converges to whatever value makes terminal voltage ≈ target.
+# Stops the proportional ramp's hunting around the engagement edge.
+#
+# Tunables (live via input_number helpers):
+#   input_number.voltage_seek_target_v    — voltage to hold at (default 255)
+#   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
+#
+# Hard-coded constants (edit YAML to change):
+#   hard_limit_v = 259V — above this, cap = 0 immediately
+#   step_up_kw   = 0.05 kW per 5s tick (1.2 kW/min seek rate)
+#   drop_gain    = 0.5  (kW reduction per V over upper deadband)
+#   dno          = 4.0  kW (DNO export limit)
+#
+# IMPORTANT: this is the sole writer to input_number.voltage_throttle_filtered_cap.
+# The old "Voltage Throttle Filter — Asymmetric Rate Limit" automation must be
+# disabled in HA before enabling this one.
+#
+# Update and commit this file before changing the automation in HA.
+
+alias: "Voltage Seek Controller"
+description: >-
+  Integral seek controller for SIG export cap. Tick every 5s. Updates
+  input_number.voltage_throttle_filtered_cap to hold grid voltage at target
+  (default 255V). Slow climb on under-voltage, proportional drop on
+  over-voltage, hard cap=0 on V >= 259V.
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: time_pattern
+    seconds: "/5"
+
+action:
+  - variables:
+      v: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
+      cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
+      target: "{{ states('input_number.voltage_seek_target_v') | float(255) }}"
+      deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
+      hard_limit_v: 259.0
+      step_up_kw: 0.05
+      drop_gain: 0.5
+      dno: 4.0
+      new_cap: >-
+        {%- if v >= hard_limit_v -%}
+          0.0
+        {%- elif v > (target + deadband) -%}
+          {{ [0.0, cap - drop_gain * (v - target - deadband)] | max }}
+        {%- elif v < (target - deadband) -%}
+          {{ [dno, cap + step_up_kw] | min }}
+        {%- else -%}
+          {{ cap }}
+        {%- endif -%}
+
+  - action: input_number.set_value
+    target:
+      entity_id: input_number.voltage_throttle_filtered_cap
+    data:
+      value: "{{ new_cap | float | round(2) }}"
