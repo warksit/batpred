@@ -1,40 +1,41 @@
-# Voltage Seek Controller — integral export-cap seeker
+# Voltage Seek Controller — hybrid down-ramp + adaptive climb
 #
-# Replaces the proportional voltage throttle (sensor.sig_voltage_max_export_kw
-# linear ramp) plus its asymmetric output filter. Instead of a memoryless
-# proportional response, this controller HOLDS state in
-# input_number.voltage_throttle_filtered_cap and slowly seeks the maximum
-# export cap that keeps grid voltage at the target.
+# Hybrid voltage cap controller. Replaces the old proportional throttle and
+# its asymmetric output filter. Single writer to
+# input_number.voltage_throttle_filtered_cap.
 #
-# Behaviour every 5s:
-#   - V >= hard_limit_v  : cap = 0     (safety override on a real spike)
-#   - V > target + deadband : cap -= 0.5 × (V - target - deadband)
-#                             (proportional dump — bigger overshoot, bigger drop)
-#   - V < target - deadband : cap += step_up_kw  (slow climb)
-#   - in deadband           : hold
+# Behaviour every 5s + on numeric_state above 254V (sub-second):
+#   - V >= ramp_zero_v (257)              : cap = 0
+#   - V > ramp_full_v (253)               : cap = min(cap, ramp_zero_v - V)
+#                                            ratchet down only — instant
+#                                            proportional ramp (V=254→3,
+#                                            V=255→2, V=256→1, V=257→0)
+#   - V < (target - deadband)             : cap += step_up_kw (adaptive climb)
+#   - in hold band                        : hold
 #
-# Result: cap converges to whatever value makes terminal voltage ≈ target.
-# Stops the proportional ramp's hunting around the engagement edge.
+# Why hybrid: pure seek (proportional drop with drop_gain) was too slow on
+# 8V-in-5s rises (multiple SIG OVP trips on 2026-05-06). Pure proportional
+# ramp from V was the old behaviour — instant response on every V change.
+# The hybrid uses the old's instant ramp on the way DOWN (cap can only
+# decrease via this path) and the seek's adaptive climb on the way UP
+# (no bang-bang oscillation).
 #
 # Tunables (live via input_number helpers):
-#   input_number.voltage_seek_target_v    — voltage to hold at (default 255)
+#   input_number.voltage_seek_target_v    — current hold target (default 252)
 #   input_number.voltage_seek_deadband_v  — ±band where cap is held (default 1.0)
 #
 # Hard-coded constants (edit YAML to change):
-#   hard_limit_v   = 257V — at/above this, cap = 0. Lowered from 259 on
-#                   2026-05-06 after a 254→263V spike in 5s (faster than
-#                   the 5s tick) tripped the SIG on OVP. Combined with the
-#                   numeric_state trigger above 257V, response time is now
-#                   sub-second, not waiting for the next tick.
-#   step_up_base   = 0.05 kW/tick — minimum climb rate (in deadband edge)
-#   step_up_per_v  = 0.05 kW/tick per V below (target-deadband-1) — adaptive
-#   step_up_max    = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
-#   drop_gain      = 0.5  (kW reduction per V over upper deadband)
-#   dno            = 4.0  kW (DNO export limit)
+#   ramp_zero_v   = 257V — at/above this, cap = 0
+#   ramp_full_v   = 253V — at this V, cap_max = 4 (DNO); above this, ratchet
+#                   linearly down to 0 at ramp_zero_v
+#   step_up_base  = 0.05 kW/tick — minimum climb rate (near deadband edge)
+#   step_up_per_v = 0.05 kW/tick per V below (target-deadband-1) — adaptive
+#   step_up_max   = 0.4  kW/tick — cap on climb rate (~4.8 kW/min)
+#   dno           = 4.0  kW (DNO export limit)
 #
 # Adaptive climb keeps motion gentle near target (avoids overshoot) but
-# recovers fast after a deep cut. e.g. v=254 → 0.05/tick, v=250 → 0.25/tick,
-# v=246+ → 0.4/tick (4.8 kW/min, ~50s for 0→4 recovery).
+# recovers fast after a deep cut: v=251 → 0.05/tick, v=247 → 0.25/tick,
+# v ≤ 246 → 0.4/tick (4.8 kW/min, ~50s for 0→4 recovery).
 #
 # IMPORTANT: this is the sole writer to input_number.voltage_throttle_filtered_cap.
 # The old "Voltage Throttle Filter — Asymmetric Rate Limit" automation must be
@@ -44,10 +45,10 @@
 
 alias: "Voltage Seek Controller"
 description: >-
-  Integral seek controller for SIG export cap. Tick every 5s + immediate
-  trigger on V > 257V. Updates input_number.voltage_throttle_filtered_cap
-  to hold grid voltage at target (default 255V). Slow climb on
-  under-voltage, proportional drop on over-voltage, hard cap=0 on V >= 257V.
+  Hybrid voltage controller: instant proportional ramp DOWN (V=253 cap=4,
+  V=257 cap=0, linear), adaptive climb UP. Tick every 5s + immediate
+  trigger on V > 254V. Sole writer to
+  input_number.voltage_throttle_filtered_cap.
 mode: restart
 max_exceeded: silent
 
@@ -55,34 +56,33 @@ trigger:
   - platform: time_pattern
     seconds: "/5"
   # Immediate emergency trigger — fast voltage spike, do not wait for tick.
-  # Reason: 2026-05-06 trip — V went 254→263V in 5s (faster than tick),
-  # SIG hit OVP before the next 5s tick fired. With this trigger and
-  # mode: restart, any V > 257V instantly re-runs the action which evaluates
-  # hard_limit_v=257 → cap=0 sub-second.
+  # Reason: 2026-05-06 trips — V went 254→263V in 5s (faster than tick).
+  # With this trigger and mode: restart, any V crossing above 254V instantly
+  # re-runs the action which applies the down-ramp.
   - platform: numeric_state
     entity_id: sensor.sigen_inverter_phase_a_voltage
-    above: 257
+    above: 254
     id: voltage_spike
 
 action:
   - variables:
       v: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
-      target: "{{ states('input_number.voltage_seek_target_v') | float(255) }}"
+      target: "{{ states('input_number.voltage_seek_target_v') | float(252) }}"
       deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(1.0) }}"
-      hard_limit_v: 257.0
+      ramp_zero_v: 257.0
+      ramp_full_v: 253.0
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
-      drop_gain: 0.5
       dno: 4.0
       under_v: "{{ (target - deadband) - v }}"
       step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
       new_cap: >-
-        {%- if v >= hard_limit_v -%}
+        {%- if v >= ramp_zero_v -%}
           0.0
-        {%- elif v > (target + deadband) -%}
-          {{ [0.0, cap - drop_gain * (v - target - deadband)] | max }}
+        {%- elif v > ramp_full_v -%}
+          {{ [cap, [0.0, ramp_zero_v - v] | max] | min }}
         {%- elif v < (target - deadband) -%}
           {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}
