@@ -123,7 +123,8 @@ def evaluate_variables(variables, fixture):
 
 def build_fixture(
     soc_pct,
-    target_pct=None,
+    charge_below_pct=None,
+    drain_above_pct=None,
     excess=0.0,
     hours_until_safe=3.5,
     manual="Off",
@@ -133,17 +134,20 @@ def build_fixture(
     plugin_phase="Active",
     now=None,
 ):
-    """Build an HA-mock fixture from scenario-shaped parameters."""
+    """Build an HA-mock fixture from scenario-shaped parameters.
+
+    charge_below_pct / drain_above_pct: SOC %% thresholds for the split-threshold
+    model. If omitted, defaults to soc_pct (= phase land in Hold). For Schmitt
+    tests, set them explicitly to position the SOC relative to each band.
+    """
     now = now or datetime(2026, 4, 30, 13, 0, 0)
 
     # Synthesise pv/load to give the requested excess (load = 0.5 kW base).
     pv = max(excess, 0.0) + 0.5
     load = pv - excess
 
-    if target_pct is None:
-        target_kwh = soc_pct / 100.0 * BATTERY_KWH
-    else:
-        target_kwh = target_pct / 100.0 * BATTERY_KWH
+    cb_kwh = (charge_below_pct if charge_below_pct is not None else 0.0) / 100.0 * BATTERY_KWH
+    da_kwh = (drain_above_pct if drain_above_pct is not None else 100.0) / 100.0 * BATTERY_KWH
 
     if hours_until_safe is None:
         safe_time_str = "none"
@@ -160,6 +164,8 @@ def build_fixture(
             "sensor.sigen_plant_pv_power": f"{pv:.3f}",
             "sensor.sigen_plant_consumed_power": f"{load:.3f}",
             "sensor.predbat_curtailment_export_target": str(export_cap_raw),
+            "sensor.predbat_curtailment_charge_below": f"{cb_kwh:.3f}",
+            "sensor.predbat_curtailment_drain_above": f"{da_kwh:.3f}",
             "input_number.voltage_throttle_filtered_cap": str(voltage_cap),
             "input_select.curtailment_manual_hold": manual,
             "input_text.curtailment_live_phase": current_phase,
@@ -167,7 +173,6 @@ def build_fixture(
             "number.sigen_plant_grid_export_limitation": "4",
         },
         "attrs": {
-            ("sensor.predbat_curtailment_target_soc", "target_kwh"): target_kwh,
             ("sensor.predbat_curtailment_phase", "safe_time"): safe_time_str,
         },
     }
@@ -186,6 +191,8 @@ class Scenario:
 
 
 def _scenarios():
+    # Split-threshold model: charge_below = P10 recovery floor (SOC must be ≥ this);
+    # drain_above = curtailment buffer (SOC must be ≤ this); Hold otherwise.
     return [
         Scenario(
             "1 Idle (plugin Off)",
@@ -194,75 +201,108 @@ def _scenarios():
             expected_new_limit=4.0,
         ),
         Scenario(
-            "2 Hold near target",
-            build_fixture(soc_pct=60, target_pct=60, excess=2.0, current_phase="Hold", export_cap_raw=2.0),
+            "2 Hold — SOC inside [charge_below, drain_above] band",
+            # SOC=50%, charge_below=10%, drain_above=70% → wide hold band
+            build_fixture(soc_pct=50, charge_below_pct=10, drain_above_pct=70, excess=2.0, current_phase="Hold", export_cap_raw=2.0),
             expected_phase="Hold",
             expected_new_limit=2.0,
         ),
         Scenario(
-            "3 Drain SOC > target+OUTER",
-            # plugin sets export_cap_raw=DNO when it wants drain
-            build_fixture(soc_pct=80, target_pct=60, excess=5.0, current_phase="Drain", export_cap_raw=4.0),
+            "3 Drain — SOC > drain_above + OUTER (Schmitt entry)",
+            # SOC=80%=14.46 kWh, drain_above=60%=10.85 kWh, gap > 0.18 → Drain
+            build_fixture(soc_pct=80, charge_below_pct=10, drain_above_pct=60, excess=5.0, current_phase="Hold", export_cap_raw=4.0),
             expected_phase="Drain",
             expected_new_limit=4.0,
         ),
         Scenario(
-            "4 Soft-charge low PV (formula path)",
-            build_fixture(soc_pct=60, target_pct=70, excess=2.0, current_phase="Charge", export_cap_raw=2.0),
-            expected_phase="Charge",
-            # gap=1.808, rate=1.808/3.5=0.52, 2-0.52=1.48 → round(1)=1.5
-            expected_new_limit=1.5,
-        ),
-        Scenario(
-            "5 Soft-charge high PV (DNO clamp)",
-            build_fixture(soc_pct=60, target_pct=70, excess=5.5, current_phase="Charge", export_cap_raw=2.0),
-            expected_phase="Charge",
-            # 5.5-0.52=4.98 → DNO clamp at 4.0
+            "4 Drain stays Drain until SOC ≤ drain_above (Schmitt hold)",
+            # SOC=62%=11.21, drain_above=60%=10.85 — still above ceiling, drain continues
+            build_fixture(soc_pct=62, charge_below_pct=10, drain_above_pct=60, excess=2.0, current_phase="Drain", export_cap_raw=4.0),
+            expected_phase="Drain",
             expected_new_limit=4.0,
         ),
         Scenario(
-            "6 Active overflow (DNO clamp during Charge)",
-            build_fixture(soc_pct=70, target_pct=75, excess=8.0, hours_until_safe=2.0, current_phase="Charge", export_cap_raw=2.0),
+            "5 Drain exits to Hold once SOC reaches drain_above",
+            # SOC=60%, drain_above=60% — SOC ≤ drain_above → exit Drain
+            build_fixture(soc_pct=60, charge_below_pct=10, drain_above_pct=60, excess=2.0, current_phase="Drain", export_cap_raw=2.0),
+            expected_phase="Hold",
+            expected_new_limit=2.0,
+        ),
+        Scenario(
+            "6 Charge — SOC < charge_below - OUTER (Schmitt entry)",
+            # SOC=20%, charge_below=40% (=7.23 kWh), drain_above=80% — soft-charge target = charge_below
+            build_fixture(soc_pct=20, charge_below_pct=40, drain_above_pct=80, excess=2.0, current_phase="Hold", export_cap_raw=2.0),
+            expected_phase="Charge",
+            # gap=20%=3.616 kWh, rate=3.616/3.5=1.033, 2-1.03=0.97 → round(1)=1.0
+            expected_new_limit=1.0,
+        ),
+        Scenario(
+            "7 Charge stays Charge until SOC reaches charge_below",
+            # SOC=35%, charge_below=40% — still below floor, charge continues
+            build_fixture(soc_pct=35, charge_below_pct=40, drain_above_pct=80, excess=2.0, current_phase="Charge", export_cap_raw=2.0),
+            expected_phase="Charge",
+            # gap=5%=0.904 kWh, rate=0.904/3.5=0.26, 2-0.26=1.74 → round(1)=1.7
+            expected_new_limit=1.7,
+        ),
+        Scenario(
+            "8 Charge exits to Hold once SOC passes charge_below",
+            # SOC=42%, charge_below=40% — SOC > charge_below → exit Charge
+            build_fixture(soc_pct=42, charge_below_pct=40, drain_above_pct=80, excess=2.0, current_phase="Charge", export_cap_raw=2.0),
+            expected_phase="Hold",
+            expected_new_limit=2.0,
+        ),
+        Scenario(
+            "9 Active overflow during Charge (DNO clamp)",
+            # excess=8 way above DNO; charge_rate small but DNO clamp dominates
+            build_fixture(soc_pct=20, charge_below_pct=40, drain_above_pct=80, excess=8.0, hours_until_safe=2.0, current_phase="Charge", export_cap_raw=2.0),
             expected_phase="Charge",
             expected_new_limit=4.0,
         ),
         Scenario(
-            "7 Late-day soft-charge (formula path, < DNO)",
-            # excess=3.82 chosen to land below DNO so the formula path is exercised.
-            build_fixture(soc_pct=85, target_pct=87, excess=3.82, hours_until_safe=2.0, current_phase="Charge", export_cap_raw=2.0),
-            expected_phase="Charge",
-            # gap=0.3616, rate=0.18, 3.82-0.18=3.64 → round(1)=3.6
-            expected_new_limit=3.6,
-        ),
-        Scenario(
-            "8 Manual Charge",
+            "10 Manual Charge",
             build_fixture(soc_pct=50, excess=5.0, manual="Charge", export_cap_raw=2.0),
             expected_phase="Manual Charge",
             expected_new_limit=0.0,
         ),
         Scenario(
-            "9 Manual Drain",
+            "11 Manual Drain",
             build_fixture(soc_pct=50, manual="Drain", export_cap_raw=2.0),
             expected_phase="Manual Drain",
             expected_new_limit=4.0,
         ),
         Scenario(
-            "10 Voltage cap engages (Hold)",
-            build_fixture(soc_pct=60, target_pct=60, excess=5.0, voltage_cap=2.0, current_phase="Hold", export_cap_raw=4.0),
+            "12 Voltage cap engages (Hold)",
+            build_fixture(soc_pct=50, charge_below_pct=10, drain_above_pct=70, excess=5.0, voltage_cap=2.0, current_phase="Hold", export_cap_raw=4.0),
             expected_phase="Hold",
             expected_new_limit=2.0,
         ),
         Scenario(
-            "11 hours_remaining ≤ 0 (legacy fallback)",
-            build_fixture(soc_pct=60, target_pct=70, excess=5.0, hours_until_safe=-0.5, current_phase="Charge", export_cap_raw=2.0),
+            "13 hours_remaining ≤ 0 (Charge legacy fallback)",
+            build_fixture(soc_pct=20, charge_below_pct=40, drain_above_pct=80, excess=5.0, hours_until_safe=-0.5, current_phase="Charge", export_cap_raw=2.0),
             expected_phase="Charge",
             expected_new_limit=0.0,
         ),
         Scenario(
-            "12 safe_time='none' (pre-PV bootstrap → Charge)",
-            build_fixture(soc_pct=60, target_pct=70, excess=0.0, hours_until_safe=None, current_phase="Off", export_cap_raw=2.0),
+            "14 safe_time='none' bootstrap (SOC < charge_below → Charge)",
+            build_fixture(soc_pct=20, charge_below_pct=40, drain_above_pct=80, excess=0.0, hours_until_safe=None, current_phase="Off", export_cap_raw=2.0),
             expected_phase="Charge",
             expected_new_limit=0.0,
+        ),
+        Scenario(
+            "15 Sunset: charge_below ≈ drain_above, SOC just below → Charge",
+            # charge_below=50%, drain_above=50%, SOC=49% → SOC < charge_below - 0.18 → Charge
+            build_fixture(soc_pct=49, charge_below_pct=50, drain_above_pct=50, excess=1.0, hours_until_safe=1.0, current_phase="Off", export_cap_raw=2.0),
+            expected_phase="Charge",
+            # gap=1%=0.18, rate=0.18, 1-0.18=0.82 → round(1)=0.8
+            expected_new_limit=0.8,
+        ),
+        Scenario(
+            "16 Today's morning case: SOC=12%, charge_below=0, drain_above=41% → Hold",
+            # The original problem: under old single-target logic this was Charge (export=0).
+            # Under new model with charge_below=0 (no recovery risk, P10 PV >> need) → Hold.
+            build_fixture(soc_pct=12, charge_below_pct=0, drain_above_pct=41.4, excess=2.0, current_phase="Off", export_cap_raw=2.0),
+            expected_phase="Hold",
+            expected_new_limit=2.0,
         ),
     ]
 
