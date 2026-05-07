@@ -133,6 +133,34 @@ def compute_morning_gap(
     return gap_kwh
 
 
+def should_defer_to_charge(gshp_ch_active, soc_kw, soc_keep, was_deferring):
+    """R4 (gated): defer to Predbat charge window only when GSHP heating is active.
+
+    R4's purpose was to let Predbat fill the battery from cheap-rate grid for
+    overnight heating load. In summer (CH off), there's no overnight heating
+    load to cover — plugin should manage its own morning drain to maximize
+    curtailment headroom, not yield to Predbat.
+
+    Hysteresis ±0.2 kWh (was_deferring): once deferring, hold until SOC
+    rises above keep+0.2 (prevents 5-min flicker at the boundary).
+
+    Args:
+        gshp_ch_active: bool — whether central heating is currently active.
+        soc_kw: kWh — current battery SOC.
+        soc_keep: kWh — Predbat's effective keep target.
+        was_deferring: bool — was the plugin already in defer state last cycle?
+
+    Returns:
+        bool — True if plugin should yield to Predbat charge window.
+    """
+    if not gshp_ch_active:
+        return False
+    engage = soc_keep - 0.2
+    release = soc_keep + 0.2
+    threshold = release if was_deferring else engage
+    return soc_kw < threshold
+
+
 def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_keep):
     """R54 with diagnostic source tracking.
 
@@ -161,10 +189,10 @@ def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_k
     """
     if effective_keep <= overflow_floor:
         inner_min = effective_keep
-        inner_source = "effective_keep"
+        inner_source = "Overnight Need"
     else:
         inner_min = overflow_floor
-        inner_source = "overflow_floor"
+        inner_source = "Curtailment Buffer"
 
     # Outer max: pick the largest of [reserve, p10_recovery, inner_min].
     # Tie-breaking preference: inner_source > p10_recovery > reserve.
@@ -172,10 +200,10 @@ def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_k
     source = inner_source
     if p10_recovery > floor:
         floor = p10_recovery
-        source = "p10_recovery"
+        source = "P10 Recovery"
     if reserve > floor:
         floor = reserve
-        source = "reserve"
+        source = "Reserve"
     return floor, source
 
 

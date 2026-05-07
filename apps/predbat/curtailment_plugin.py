@@ -42,6 +42,7 @@ from curtailment_calc import (
     compute_p10_recovery_floor,
     compute_effective_export_cap,
     compute_floor_with_source,
+    should_defer_to_charge,
     compute_pv_start_time,
     p90_scale_from_forecast,
     p_scales_from_forecast,
@@ -231,9 +232,18 @@ class CurtailmentPlugin(PredBatPlugin):
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
         # Diagnostic: which term of R54 (or which off-path) drove the published target.
-        # Values: 'effective_keep', 'overflow_floor', 'p10_recovery', 'reserve',
-        #         'pre_pv_drain', 'overnight_target', 'r4_defer', 'sundown', 'no_solcast'
-        self._floor_source = "none"
+        # User-facing strings (shown directly on dashboard tile):
+        #   'Overnight Need'      — R54 effective_keep binding
+        #   'Curtailment Buffer'  — R54 overflow_floor binding
+        #   'P10 Recovery'        — R59 outer-max binding (cloudy-afternoon recovery)
+        #   'Reserve'             — hardware floor binding
+        #   'Battery Full'        — clamped to soc_max
+        #   'Pre-PV Drain'        — R52 pre-sunrise drain target
+        #   'Overnight Reserve'   — off path, target = overnight_target_kwh
+        #   'No Forecast'         — off (Solcast unavailable)
+        #   'Predbat Charging'    — R4 yielded to Predbat charge window
+        #   'Initialising'        — plugin not yet run
+        self._floor_source = "Initialising"
         # Diagnostic: components of the R54 floor formula at last cycle
         self._effective_keep_kwh = 0.0
         self._overflow_floor_kwh = 0.0
@@ -1017,12 +1027,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._last_floor_scale = 0.0
                 self._export_target = dno_limit_kw
                 self.was_active = True
-                self._floor_source = "pre_pv_drain"
+                self._floor_source = "Pre-PV Drain"
                 self._save_state()
                 return target_kwh, "active"
 
             self._last_decision = "off: no PV yet"
-            self._floor_source = "overnight_target"
+            self._floor_source = "Overnight Reserve"
             return soc_max, "off"
 
         # Track actual peak for scale calibration (R43)
@@ -1041,7 +1051,7 @@ class CurtailmentPlugin(PredBatPlugin):
             # No Solcast data and no yesterday's scale — cannot compute safely
             self._export_target = -2
             self._last_decision = "off: p90_scale<0.5 (no Solcast)"
-            self._floor_source = "no_solcast"
+            self._floor_source = "No Forecast"
             return soc_max, "off"
 
         # Compute actual scale from observed peak (R43)
@@ -1180,7 +1190,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
             self._floor_ratchet = None
             self._export_target = -2
-            self._floor_source = "overnight_target"
+            self._floor_source = "Overnight Reserve"
             # End-of-day reset: clear peak so tomorrow starts fresh
             if minutes_now > 1200:
                 self._peak_pv = 0.0
@@ -1344,7 +1354,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_floor_kwh = round(overflow_floor, 2)
         floor = min(floor, soc_max)
         if floor >= soc_max:
-            self._floor_source = "soc_max_clamp"
+            self._floor_source = "Battery Full"
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase
         # (Charge/Hold/Drain) from SOC vs target with symmetric hysteresis. Plugin just
@@ -1827,9 +1837,18 @@ class CurtailmentPlugin(PredBatPlugin):
             soc_kw = getattr(self.base, "soc_kw", 0)
             effective_keep = getattr(self.base, "best_soc_keep", 0)
             if phase != "off":
+                # R4 (gated by GSHP CH active flag): only defer to Predbat charge
+                # window when heating is active. In summer (CH off), no overnight
+                # heating load to cover → plugin handles its own drain.
+                gshp_ch = self._is_gshp_ch_active()
                 engage_threshold = effective_keep - 0.2
                 release_threshold = effective_keep + 0.2
-                should_defer = (soc_kw < release_threshold) if self._r4_deferring else (soc_kw < engage_threshold)
+                should_defer = should_defer_to_charge(
+                    gshp_ch_active=gshp_ch,
+                    soc_kw=soc_kw,
+                    soc_keep=effective_keep,
+                    was_deferring=self._r4_deferring,
+                )
 
                 if should_defer:
                     minutes_now = getattr(self.base, "minutes_now", 0)
@@ -1845,7 +1864,7 @@ class CurtailmentPlugin(PredBatPlugin):
                                 phase = "off"
                                 floor = soc_max
                                 self._last_decision = "off: R4 defer to charge window"
-                                self._floor_source = "r4_defer"
+                                self._floor_source = "Predbat Charging"
                                 self._r4_deferring = True
                             else:
                                 self._r4_deferring = False

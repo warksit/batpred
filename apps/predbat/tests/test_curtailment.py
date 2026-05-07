@@ -27,6 +27,7 @@ from curtailment_calc import (
     compute_p10_recovery_floor,
     compute_effective_export_cap,
     compute_floor_with_source,
+    should_defer_to_charge,
 )
 
 # Battery constants (Mum's SIG system)
@@ -654,6 +655,52 @@ def test_effective_cap_today_actual_last_hour():
 
 
 # ============================================================================
+# R4 defer-to-Predbat decision: only when GSHP heating is active.
+# In summer (CH off), plugin handles morning drain — don't yield to Predbat.
+# ============================================================================
+
+
+def test_r4_defer_gshp_off_no_defer_even_when_low():
+    """Summer (CH off): SOC below keep should NOT trigger defer — plugin manages drain."""
+    assert should_defer_to_charge(gshp_ch_active=False, soc_kw=2.0, soc_keep=4.9, was_deferring=False) is False
+    print("  test_r4_defer_gshp_off_no_defer_even_when_low: PASSED")
+
+
+def test_r4_defer_gshp_on_low_soc_defers():
+    """Winter (CH on): SOC below engage threshold → defer to Predbat charge."""
+    # engage = 4.9 - 0.2 = 4.7. SOC=4.0 < 4.7 → defer
+    assert should_defer_to_charge(gshp_ch_active=True, soc_kw=4.0, soc_keep=4.9, was_deferring=False) is True
+    print("  test_r4_defer_gshp_on_low_soc_defers: PASSED")
+
+
+def test_r4_defer_gshp_on_above_release_no_defer():
+    """Winter, SOC above release threshold → no defer."""
+    # release = 4.9 + 0.2 = 5.1. SOC=5.5 > 5.1 → no defer
+    assert should_defer_to_charge(gshp_ch_active=True, soc_kw=5.5, soc_keep=4.9, was_deferring=True) is False
+    print("  test_r4_defer_gshp_on_above_release_no_defer: PASSED")
+
+
+def test_r4_defer_gshp_on_in_hysteresis_was_deferring():
+    """Winter, SOC inside hysteresis band, was already deferring → keep deferring."""
+    # SOC=4.8 between engage (4.7) and release (5.1). Already deferring → release threshold.
+    assert should_defer_to_charge(gshp_ch_active=True, soc_kw=4.8, soc_keep=4.9, was_deferring=True) is True
+    print("  test_r4_defer_gshp_on_in_hysteresis_was_deferring: PASSED")
+
+
+def test_r4_defer_gshp_on_in_hysteresis_was_not_deferring():
+    """Winter, SOC inside hysteresis band, was NOT deferring → don't start."""
+    # SOC=4.8 between engage (4.7) and release (5.1). Not deferring → engage threshold.
+    assert should_defer_to_charge(gshp_ch_active=True, soc_kw=4.8, soc_keep=4.9, was_deferring=False) is False
+    print("  test_r4_defer_gshp_on_in_hysteresis_was_not_deferring: PASSED")
+
+
+def test_r4_defer_gshp_off_high_soc_no_defer():
+    """Summer + high SOC: definitely no defer."""
+    assert should_defer_to_charge(gshp_ch_active=False, soc_kw=10.0, soc_keep=4.9, was_deferring=False) is False
+    print("  test_r4_defer_gshp_off_high_soc_no_defer: PASSED")
+
+
+# ============================================================================
 # R54 with diagnostic source — which term of the max won?
 #
 # floor = max(reserve, p10_recovery, min(curt_floor, effective_keep))
@@ -665,7 +712,7 @@ def test_floor_source_effective_keep_wins():
     """Typical mid-overflow day: effective_keep < curt_floor → effective_keep wins."""
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.0, overflow_floor=10.0, effective_keep=4.0)
     assert floor == 4.0
-    assert source == "effective_keep"
+    assert source == "Overnight Need"
     print(f"  test_floor_source_effective_keep_wins: PASSED ({floor}, {source})")
 
 
@@ -673,7 +720,7 @@ def test_floor_source_overflow_floor_wins():
     """Big-overflow day: overflow_floor < effective_keep → overflow_floor wins."""
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.0, overflow_floor=2.0, effective_keep=5.0)
     assert floor == 2.0
-    assert source == "overflow_floor"
+    assert source == "Curtailment Buffer"
     print(f"  test_floor_source_overflow_floor_wins: PASSED ({floor}, {source})")
 
 
@@ -682,7 +729,7 @@ def test_floor_source_p10_recovery_binds():
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=7.0, overflow_floor=10.0, effective_keep=4.0)
     # inner min = 4.0 (effective_keep), but p10_recovery=7 > 4 → p10_recovery wins
     assert floor == 7.0
-    assert source == "p10_recovery"
+    assert source == "P10 Recovery"
     print(f"  test_floor_source_p10_recovery_binds: PASSED ({floor}, {source})")
 
 
@@ -690,7 +737,7 @@ def test_floor_source_reserve_binds():
     """Pathological: everything below reserve → reserve wins."""
     floor, source = compute_floor_with_source(reserve=0.5, p10_recovery=0.0, overflow_floor=0.2, effective_keep=0.3)
     assert floor == 0.5
-    assert source == "reserve"
+    assert source == "Reserve"
     print(f"  test_floor_source_reserve_binds: PASSED ({floor}, {source})")
 
 
@@ -699,18 +746,18 @@ def test_floor_source_tie_picks_inner_min_over_others():
     # When p10_recovery == inner_min, label as inner_min source (more useful info)
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=4.0, overflow_floor=10.0, effective_keep=4.0)
     assert floor == 4.0
-    # tie-breaking: prefer effective_keep / overflow_floor over p10_recovery
-    assert source in ("effective_keep", "p10_recovery"), f"Got {source}"
+    # tie-breaking: prefer Overnight Need / Curtailment Buffer over P10 Recovery
+    assert source in ("Overnight Need", "P10 Recovery"), f"Got {source}"
     print(f"  test_floor_source_tie_picks_inner_min_over_others: PASSED ({floor}, {source})")
 
 
 def test_floor_source_today_yesterday_morning():
     """Reference: yesterday morning's transition. effective_keep ≈ 7.5 kWh (41%),
-    overflow_floor was high, p10_recovery low, reserve 0. effective_keep should win.
+    overflow_floor was high, p10_recovery low, reserve 0. Overnight Need should win.
     """
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.4, overflow_floor=15.16, effective_keep=7.49)
     assert abs(floor - 7.49) < 0.01
-    assert source == "effective_keep"
+    assert source == "Overnight Need"
     print(f"  test_floor_source_today_yesterday_morning: PASSED ({floor}, {source})")
 
 
@@ -4244,6 +4291,13 @@ def run_curtailment_tests(my_predbat=None):
         test_effective_cap_clamped_to_dno_ceiling,
         test_effective_cap_today_30min_typical_day,
         test_effective_cap_today_actual_last_hour,
+        # R4 defer to Predbat — gshp gate
+        test_r4_defer_gshp_off_no_defer_even_when_low,
+        test_r4_defer_gshp_on_low_soc_defers,
+        test_r4_defer_gshp_on_above_release_no_defer,
+        test_r4_defer_gshp_on_in_hysteresis_was_deferring,
+        test_r4_defer_gshp_on_in_hysteresis_was_not_deferring,
+        test_r4_defer_gshp_off_high_soc_no_defer,
         # R54-with-source diagnostic
         test_floor_source_effective_keep_wins,
         test_floor_source_overflow_floor_wins,
