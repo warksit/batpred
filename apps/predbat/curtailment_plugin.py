@@ -232,6 +232,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_dno = 4.0
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
+        # R59 inputs (diagnostic — the two terms feeding p10_recovery)
+        self._p10_pv_remaining_kwh = 0.0
+        self._load_remaining_kwh = 0.0
         # Diagnostic: which term of R54 (or which off-path) drove the published target.
         # User-facing strings (shown directly on dashboard tile):
         #   'Overnight Need'      — R54 effective_keep binding
@@ -1332,6 +1335,8 @@ class CurtailmentPlugin(PredBatPlugin):
             load_remaining_kwh=load_remaining,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
+        self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
+        self._load_remaining_kwh = round(load_remaining, 2)
 
         # R54 (v20) + R59: single drain-target rule with P10 recovery lower bound.
         # Inner min: overflow_floor & effective_keep are "drain TO this level" —
@@ -1681,6 +1686,31 @@ class CurtailmentPlugin(PredBatPlugin):
                 "device_class": "energy",
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-up",
+                "p10_pv_remaining_kwh": self._p10_pv_remaining_kwh,
+                "load_remaining_kwh": self._load_remaining_kwh,
+                "overnight_target_kwh": round(self._overnight_target_kwh, 2) if self._overnight_target_kwh is not None else None,
+            },
+        )
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_p10_pv_remaining".format(prefix),
+            self._p10_pv_remaining_kwh,
+            {
+                "friendly_name": "Curtailment P10 PV Remaining",
+                "unit_of_measurement": "kWh",
+                "device_class": "energy",
+                "state_class": "measurement",
+                "icon": "mdi:weather-cloudy",
+            },
+        )
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_load_remaining".format(prefix),
+            self._load_remaining_kwh,
+            {
+                "friendly_name": "Curtailment Load Remaining (to safe_time)",
+                "unit_of_measurement": "kWh",
+                "device_class": "energy",
+                "state_class": "measurement",
+                "icon": "mdi:home-lightning-bolt",
             },
         )
         self.base.dashboard_item(
