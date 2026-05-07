@@ -762,6 +762,85 @@ def test_floor_source_today_yesterday_morning():
 
 
 # ============================================================================
+# Split-threshold proposed phase (shadow mode for upcoming HA refactor)
+#
+# Charge below charge_below (= p10_recovery), drain above drain_above
+# (= curt_floor), Hold otherwise. Plugin still publishes legacy target_soc
+# unchanged — this sensor is for monitoring before we cut the automation over.
+# ============================================================================
+
+
+def test_proposed_phase_hold_in_band():
+    """SOC between thresholds → Hold (the common case)."""
+    from curtailment_calc import compute_proposed_phase
+
+    phase = compute_proposed_phase(soc_kwh=8.0, charge_below_kwh=2.0, drain_above_kwh=14.0)
+    assert phase == "Hold", f"Expected Hold, got {phase}"
+    print(f"  test_proposed_phase_hold_in_band: PASSED ({phase})")
+
+
+def test_proposed_phase_charge_below_floor():
+    """SOC < charge_below → Charge (P10 recovery at risk)."""
+    from curtailment_calc import compute_proposed_phase
+
+    phase = compute_proposed_phase(soc_kwh=2.0, charge_below_kwh=4.0, drain_above_kwh=14.0)
+    assert phase == "Charge", f"Expected Charge, got {phase}"
+    print(f"  test_proposed_phase_charge_below_floor: PASSED ({phase})")
+
+
+def test_proposed_phase_drain_above_ceiling():
+    """SOC > drain_above → Drain (curtailment headroom exhausted)."""
+    from curtailment_calc import compute_proposed_phase
+
+    phase = compute_proposed_phase(soc_kwh=15.0, charge_below_kwh=2.0, drain_above_kwh=14.0)
+    assert phase == "Drain", f"Expected Drain, got {phase}"
+    print(f"  test_proposed_phase_drain_above_ceiling: PASSED ({phase})")
+
+
+def test_proposed_phase_today_7am_actual():
+    """Today 7 AM actual values: SOC=2.19, charge_below=2.09, drain_above=13.9 → Hold.
+
+    User's observed state at 2026-05-07 07:00. Old single-target logic forced
+    Charge (export=0). New split-threshold logic should report Hold so PV flows
+    naturally to grid + battery.
+    """
+    from curtailment_calc import compute_proposed_phase
+
+    phase = compute_proposed_phase(soc_kwh=2.19, charge_below_kwh=2.09, drain_above_kwh=13.9)
+    assert phase == "Hold", f"Expected Hold for today's 7AM state, got {phase}"
+    print(f"  test_proposed_phase_today_7am_actual: PASSED ({phase})")
+
+
+def test_proposed_phase_off_when_plugin_inactive():
+    """Plugin Off → phase Off regardless of SOC."""
+    from curtailment_calc import compute_proposed_phase
+
+    phase = compute_proposed_phase(soc_kwh=2.0, charge_below_kwh=4.0, drain_above_kwh=14.0, plugin_active=False)
+    assert phase == "Off", f"Expected Off, got {phase}"
+    print(f"  test_proposed_phase_off_when_plugin_inactive: PASSED ({phase})")
+
+
+def test_proposed_phase_thresholds_collapse_at_sunset():
+    """Sunset: charge_below == drain_above (overflow=0, p10_recovery=overnight).
+    SOC at threshold → Hold (boundary, not strictly < or >). Slight excursion
+    triggers Charge or Drain accordingly.
+    """
+    from curtailment_calc import compute_proposed_phase
+
+    # Exact boundary
+    phase_eq = compute_proposed_phase(soc_kwh=10.0, charge_below_kwh=10.0, drain_above_kwh=10.0)
+    assert phase_eq == "Hold", f"Boundary should Hold, got {phase_eq}"
+
+    phase_below = compute_proposed_phase(soc_kwh=9.5, charge_below_kwh=10.0, drain_above_kwh=10.0)
+    assert phase_below == "Charge", f"Below should Charge, got {phase_below}"
+
+    phase_above = compute_proposed_phase(soc_kwh=10.5, charge_below_kwh=10.0, drain_above_kwh=10.0)
+    assert phase_above == "Drain", f"Above should Drain, got {phase_above}"
+
+    print("  test_proposed_phase_thresholds_collapse_at_sunset: PASSED")
+
+
+# ============================================================================
 # v10 floor tests
 # ============================================================================
 
@@ -2863,9 +2942,7 @@ def test_R55_on_before_plan_does_not_clobber_calculate_overnight_target():
     plugin.calculate(dno_limit_kw=4.0)
     target_after_calculate = plugin._overnight_target_kwh
     sensor_after_calculate = base.published["sensor.predbat_curtailment_overnight_target"]
-    assert sensor_after_calculate["attrs"]["source"] == "calculate", (
-        f"calculate() must publish source='calculate', " f"got {sensor_after_calculate['attrs']['source']}"
-    )
+    assert sensor_after_calculate["attrs"]["source"] == "calculate", f"calculate() must publish source='calculate', " f"got {sensor_after_calculate['attrs']['source']}"
     assert target_after_calculate > 0.5, f"calculate() should set overnight_target > soc_keep_fallback (got {target_after_calculate})"
 
     # Step 2: simulate Predbat wiping pv_step at end of update_pred.
@@ -2875,15 +2952,11 @@ def test_R55_on_before_plan_does_not_clobber_calculate_overnight_target():
     plugin.on_before_plan({"best_soc_keep": 4.0})
 
     # In-memory state from calculate() must be preserved.
-    assert plugin._overnight_target_kwh == target_after_calculate, (
-        f"on_before_plan must not overwrite _overnight_target_kwh " f"(was {target_after_calculate}, now {plugin._overnight_target_kwh})"
-    )
+    assert plugin._overnight_target_kwh == target_after_calculate, f"on_before_plan must not overwrite _overnight_target_kwh " f"(was {target_after_calculate}, now {plugin._overnight_target_kwh})"
 
     # Published sensor must still reflect calculate()'s value.
     pub = base.published["sensor.predbat_curtailment_overnight_target"]
-    assert pub["attrs"]["source"] == "calculate", (
-        f"on_before_plan's no_pv_forecast fallback must not republish over " f"calculate()'s value (source now '{pub['attrs']['source']}')"
-    )
+    assert pub["attrs"]["source"] == "calculate", f"on_before_plan's no_pv_forecast fallback must not republish over " f"calculate()'s value (source now '{pub['attrs']['source']}')"
     print(f"  test_R55_on_before_plan_does_not_clobber_calculate_overnight_target: PASSED " f"(overnight_target preserved at {plugin._overnight_target_kwh:.2f} kWh)")
 
 
@@ -4305,6 +4378,13 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_source_reserve_binds,
         test_floor_source_tie_picks_inner_min_over_others,
         test_floor_source_today_yesterday_morning,
+        # Split-threshold proposed phase (shadow mode)
+        test_proposed_phase_hold_in_band,
+        test_proposed_phase_charge_below_floor,
+        test_proposed_phase_drain_above_ceiling,
+        test_proposed_phase_today_7am_actual,
+        test_proposed_phase_off_when_plugin_inactive,
+        test_proposed_phase_thresholds_collapse_at_sunset,
         test_floor_computation,
         test_floor_above_soc_keep,
         # v19 tapered-cap tests

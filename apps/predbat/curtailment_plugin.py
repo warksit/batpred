@@ -42,6 +42,7 @@ from curtailment_calc import (
     compute_p10_recovery_floor,
     compute_effective_export_cap,
     compute_floor_with_source,
+    compute_proposed_phase,
     should_defer_to_charge,
     compute_pv_start_time,
     p90_scale_from_forecast,
@@ -314,7 +315,7 @@ class CurtailmentPlugin(PredBatPlugin):
             except (ValueError, TypeError):
                 continue
         self._cap_samples_full_day = []
-        for s in (data.get("cap_samples_full_day") or []):
+        for s in data.get("cap_samples_full_day") or []:
             try:
                 self._cap_samples_full_day.append(float(s))
             except (ValueError, TypeError):
@@ -1658,6 +1659,50 @@ class CurtailmentPlugin(PredBatPlugin):
                 "effective_keep_kwh": self._effective_keep_kwh,
                 "overflow_floor_kwh": self._overflow_floor_kwh,
                 "p10_recovery_floor_kwh": self._p10_recovery_floor,
+            },
+        )
+
+        # Split-threshold preview sensors (shadow mode for upcoming HA refactor).
+        # Active automation still uses target_soc with single-threshold ±0.5 kWh
+        # logic; these publish what the new "Charge only if necessary, Drain only
+        # if necessary" model would say so we can monitor before cutting over.
+        plugin_active = phase == "active"
+        charge_below = self._p10_recovery_floor if plugin_active else 0.0
+        drain_above = round(target_kwh, 2) if plugin_active else round(soc_max, 2)
+        soc_now = float(getattr(self.base, "soc_kw", 0))
+        proposed = compute_proposed_phase(soc_now, charge_below, drain_above, plugin_active=plugin_active)
+
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_charge_below".format(prefix),
+            charge_below,
+            {
+                "friendly_name": "Curtailment Charge Below (P10 Recovery)",
+                "unit_of_measurement": "kWh",
+                "device_class": "energy",
+                "state_class": "measurement",
+                "icon": "mdi:battery-arrow-up",
+            },
+        )
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_drain_above".format(prefix),
+            drain_above,
+            {
+                "friendly_name": "Curtailment Drain Above (Curt Floor)",
+                "unit_of_measurement": "kWh",
+                "device_class": "energy",
+                "state_class": "measurement",
+                "icon": "mdi:battery-arrow-down",
+            },
+        )
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_proposed_phase".format(prefix),
+            proposed,
+            {
+                "friendly_name": "Curtailment Proposed Phase (Shadow)",
+                "icon": "mdi:traffic-light",
+                "soc_kwh": round(soc_now, 2),
+                "charge_below_kwh": charge_below,
+                "drain_above_kwh": drain_above,
             },
         )
 

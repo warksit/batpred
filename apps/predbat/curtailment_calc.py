@@ -276,6 +276,35 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - p10_charging_potential)
 
 
+def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
+    """Split-threshold phase decision (shadow-mode preview of new HA logic).
+
+    Default = Hold. Force Charge only if SOC < charge_below (genuine recovery
+    risk on a P10 day). Force Drain only if SOC > drain_above (curtailment
+    headroom about to be exhausted). Otherwise let PV flow naturally.
+
+    No hysteresis here — that belongs in the HA automation. This is a pure
+    point-in-time preview of what the split-threshold model would say given
+    current numbers.
+
+    Args:
+        soc_kwh: current battery SOC in kWh
+        charge_below_kwh: lower threshold (= p10_recovery_floor)
+        drain_above_kwh: upper threshold (= curt_floor / target_soc)
+        plugin_active: when False, plugin is Off — automation idles regardless.
+
+    Returns:
+        "Off", "Charge", "Drain", or "Hold".
+    """
+    if not plugin_active:
+        return "Off"
+    if soc_kwh < charge_below_kwh:
+        return "Charge"
+    if soc_kwh > drain_above_kwh:
+        return "Drain"
+    return "Hold"
+
+
 def compute_release_offset(pv_forecast, load_forecast, dno_limit=4.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """Find the release point: one slot after the last slot where PV-load > DNO.
 
