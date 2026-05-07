@@ -26,6 +26,7 @@ from curtailment_calc import (
     compute_pv_start_time,
     compute_p10_recovery_floor,
     compute_effective_export_cap,
+    compute_floor_with_source,
 )
 
 # Battery constants (Mum's SIG system)
@@ -650,6 +651,67 @@ def test_effective_cap_today_actual_last_hour():
     cap = compute_effective_export_cap(today_samples_kw=today, yesterday_avg_kw=None, dno_kw=4.0)
     assert abs(cap - 2.92) < 0.01, f"Expected today's mean=2.92, got {cap}"
     print(f"  test_effective_cap_today_actual_last_hour: PASSED ({cap})")
+
+
+# ============================================================================
+# R54 with diagnostic source — which term of the max won?
+#
+# floor = max(reserve, p10_recovery, min(curt_floor, effective_keep))
+# Returns (floor_kwh, source) so the publisher can label what's binding.
+# ============================================================================
+
+
+def test_floor_source_effective_keep_wins():
+    """Typical mid-overflow day: effective_keep < curt_floor → effective_keep wins."""
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.0, overflow_floor=10.0, effective_keep=4.0)
+    assert floor == 4.0
+    assert source == "effective_keep"
+    print(f"  test_floor_source_effective_keep_wins: PASSED ({floor}, {source})")
+
+
+def test_floor_source_overflow_floor_wins():
+    """Big-overflow day: overflow_floor < effective_keep → overflow_floor wins."""
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.0, overflow_floor=2.0, effective_keep=5.0)
+    assert floor == 2.0
+    assert source == "overflow_floor"
+    print(f"  test_floor_source_overflow_floor_wins: PASSED ({floor}, {source})")
+
+
+def test_floor_source_p10_recovery_binds():
+    """Late in day: p10_recovery exceeds inner min → outer max binds on p10_recovery."""
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=7.0, overflow_floor=10.0, effective_keep=4.0)
+    # inner min = 4.0 (effective_keep), but p10_recovery=7 > 4 → p10_recovery wins
+    assert floor == 7.0
+    assert source == "p10_recovery"
+    print(f"  test_floor_source_p10_recovery_binds: PASSED ({floor}, {source})")
+
+
+def test_floor_source_reserve_binds():
+    """Pathological: everything below reserve → reserve wins."""
+    floor, source = compute_floor_with_source(reserve=0.5, p10_recovery=0.0, overflow_floor=0.2, effective_keep=0.3)
+    assert floor == 0.5
+    assert source == "reserve"
+    print(f"  test_floor_source_reserve_binds: PASSED ({floor}, {source})")
+
+
+def test_floor_source_tie_picks_inner_min_over_others():
+    """Tie between inner_min and another term: prefer the more-specific source."""
+    # When p10_recovery == inner_min, label as inner_min source (more useful info)
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=4.0, overflow_floor=10.0, effective_keep=4.0)
+    assert floor == 4.0
+    # tie-breaking: prefer effective_keep / overflow_floor over p10_recovery
+    assert source in ("effective_keep", "p10_recovery"), f"Got {source}"
+    print(f"  test_floor_source_tie_picks_inner_min_over_others: PASSED ({floor}, {source})")
+
+
+def test_floor_source_today_yesterday_morning():
+    """Reference: yesterday morning's transition. effective_keep ≈ 7.5 kWh (41%),
+    overflow_floor was high, p10_recovery low, reserve 0. effective_keep should win.
+    """
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.4, overflow_floor=15.16, effective_keep=7.49)
+    assert abs(floor - 7.49) < 0.01
+    assert source == "effective_keep"
+    print(f"  test_floor_source_today_yesterday_morning: PASSED ({floor}, {source})")
 
 
 # ============================================================================
@@ -4182,6 +4244,13 @@ def run_curtailment_tests(my_predbat=None):
         test_effective_cap_clamped_to_dno_ceiling,
         test_effective_cap_today_30min_typical_day,
         test_effective_cap_today_actual_last_hour,
+        # R54-with-source diagnostic
+        test_floor_source_effective_keep_wins,
+        test_floor_source_overflow_floor_wins,
+        test_floor_source_p10_recovery_binds,
+        test_floor_source_reserve_binds,
+        test_floor_source_tie_picks_inner_min_over_others,
+        test_floor_source_today_yesterday_morning,
         test_floor_computation,
         test_floor_above_soc_keep,
         # v19 tapered-cap tests

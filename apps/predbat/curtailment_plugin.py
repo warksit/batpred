@@ -41,6 +41,7 @@ from curtailment_calc import (
     compute_expected_overflow,
     compute_p10_recovery_floor,
     compute_effective_export_cap,
+    compute_floor_with_source,
     compute_pv_start_time,
     p90_scale_from_forecast,
     p_scales_from_forecast,
@@ -229,6 +230,13 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_dno = 4.0
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
+        # Diagnostic: which term of R54 (or which off-path) drove the published target.
+        # Values: 'effective_keep', 'overflow_floor', 'p10_recovery', 'reserve',
+        #         'pre_pv_drain', 'overnight_target', 'r4_defer', 'sundown', 'no_solcast'
+        self._floor_source = "none"
+        # Diagnostic: components of the R54 floor formula at last cycle
+        self._effective_keep_kwh = 0.0
+        self._overflow_floor_kwh = 0.0
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
@@ -1009,10 +1017,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._last_floor_scale = 0.0
                 self._export_target = dno_limit_kw
                 self.was_active = True
+                self._floor_source = "pre_pv_drain"
                 self._save_state()
                 return target_kwh, "active"
 
             self._last_decision = "off: no PV yet"
+            self._floor_source = "overnight_target"
             return soc_max, "off"
 
         # Track actual peak for scale calibration (R43)
@@ -1031,6 +1041,7 @@ class CurtailmentPlugin(PredBatPlugin):
             # No Solcast data and no yesterday's scale — cannot compute safely
             self._export_target = -2
             self._last_decision = "off: p90_scale<0.5 (no Solcast)"
+            self._floor_source = "no_solcast"
             return soc_max, "off"
 
         # Compute actual scale from observed peak (R43)
@@ -1169,6 +1180,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
             self._floor_ratchet = None
             self._export_target = -2
+            self._floor_source = "overnight_target"
             # End-of-day reset: clear peak so tomorrow starts fresh
             if minutes_now > 1200:
                 self._peak_pv = 0.0
@@ -1321,8 +1333,18 @@ class CurtailmentPlugin(PredBatPlugin):
         #   and starts capping how low we go.
         # On no/small-overflow days: overflow_floor → soc_max → drain only
         #   to effective_keep (overnight target, replaces R45 100% chase).
-        floor = max(reserve, p10_recovery, min(overflow_floor, effective_keep))
+        floor, self._floor_source = compute_floor_with_source(
+            reserve=reserve,
+            p10_recovery=p10_recovery,
+            overflow_floor=overflow_floor,
+            effective_keep=effective_keep,
+        )
+        # Stash diagnostics for sensor publishing
+        self._effective_keep_kwh = round(effective_keep, 2)
+        self._overflow_floor_kwh = round(overflow_floor, 2)
         floor = min(floor, soc_max)
+        if floor >= soc_max:
+            self._floor_source = "soc_max_clamp"
 
         # Plugin publishes DNO as export cap when active; HA automation decides phase
         # (Charge/Hold/Drain) from SOC vs target with symmetric hysteresis. Plugin just
@@ -1593,6 +1615,9 @@ class CurtailmentPlugin(PredBatPlugin):
                 "effective_max_reserved": round(self._effective_max_reserved, 2),
                 "effective_dno_kw": round(self._effective_dno, 2),
                 "p10_recovery_floor_kwh": self._p10_recovery_floor,
+                "effective_keep_kwh": self._effective_keep_kwh,
+                "overflow_floor_kwh": self._overflow_floor_kwh,
+                "floor_source": self._floor_source,
                 "yesterday_cap_avg_kw": round(self._yesterday_cap_avg, 2) if self._yesterday_cap_avg is not None else None,
                 "cap_samples_today": len(self._cap_samples),
                 "last_decision": self._last_decision,
@@ -1607,6 +1632,22 @@ class CurtailmentPlugin(PredBatPlugin):
                 "unit_of_measurement": "%",
                 "icon": "mdi:battery-charging-medium",
                 "target_kwh": round(target_kwh, 2),
+                "source": self._floor_source,
+            },
+        )
+
+        # Dedicated sensor for HA history graph: which term drives target_soc.
+        # Categorical state lets you see in the recorder when it transitioned
+        # between e.g. 'pre_pv_drain' → 'effective_keep' → 'overnight_target'.
+        self.base.dashboard_item(
+            "sensor.{}_curtailment_floor_source".format(prefix),
+            self._floor_source,
+            {
+                "friendly_name": "Curtailment Floor Source",
+                "icon": "mdi:source-branch",
+                "effective_keep_kwh": self._effective_keep_kwh,
+                "overflow_floor_kwh": self._overflow_floor_kwh,
+                "p10_recovery_floor_kwh": self._p10_recovery_floor,
             },
         )
 
@@ -1804,6 +1845,7 @@ class CurtailmentPlugin(PredBatPlugin):
                                 phase = "off"
                                 floor = soc_max
                                 self._last_decision = "off: R4 defer to charge window"
+                                self._floor_source = "r4_defer"
                                 self._r4_deferring = True
                             else:
                                 self._r4_deferring = False

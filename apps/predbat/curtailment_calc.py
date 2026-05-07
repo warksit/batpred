@@ -133,6 +133,52 @@ def compute_morning_gap(
     return gap_kwh
 
 
+def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_keep):
+    """R54 with diagnostic source tracking.
+
+    Same formula as R54:
+        floor = max(reserve, p10_recovery, min(overflow_floor, effective_keep))
+
+    But also returns which term won, so the dashboard can display the binding
+    constraint. Without this, the published target_soc is opaque — the user
+    can't tell if they're seeing the overnight target, R59 P10 recovery,
+    overflow headroom, or the absolute reserve.
+
+    Args:
+        reserve: kWh — absolute physical floor (battery/inverter limit)
+        p10_recovery: kWh — R59 P10 recovery floor
+        overflow_floor: kWh — R9 overflow-headroom floor (soc_max - overflow*1.2)
+        effective_keep: kWh — R55 morning_gap-derived effective_keep
+
+    Returns:
+        (floor_kwh, source) where source ∈ {'effective_keep', 'overflow_floor',
+        'p10_recovery', 'reserve'}.
+
+    Tie-breaking: when multiple terms produce the same floor, the source
+    label prefers the one with the most diagnostic value (the *inner-min*
+    term that was already determining the active control). This matters
+    most for the typical case where effective_keep == p10_recovery numerically.
+    """
+    if effective_keep <= overflow_floor:
+        inner_min = effective_keep
+        inner_source = "effective_keep"
+    else:
+        inner_min = overflow_floor
+        inner_source = "overflow_floor"
+
+    # Outer max: pick the largest of [reserve, p10_recovery, inner_min].
+    # Tie-breaking preference: inner_source > p10_recovery > reserve.
+    floor = inner_min
+    source = inner_source
+    if p10_recovery > floor:
+        floor = p10_recovery
+        source = "p10_recovery"
+    if reserve > floor:
+        floor = reserve
+        source = "reserve"
+    return floor, source
+
+
 def compute_effective_export_cap(today_samples_kw, yesterday_avg_kw, dno_kw=4.0, min_samples=10, hard_floor_kw=2.0):
     """R60: realistic export ceiling for the overflow integral.
 
