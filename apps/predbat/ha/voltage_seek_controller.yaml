@@ -5,31 +5,30 @@
 # input_number.voltage_throttle_filtered_cap.
 #
 # Behaviour every 5s + on numeric_state above 253V (sub-second):
-#   - V >= (target + range_v)             : cap = 0
-#   - V > target                          : cap = min(cap, max(0, dno - (dno/range_v)*(V-target)))
-#                                            ratchet down only — proportional ramp tracks target.
+#   - V >= (target + deadband + range_v)  : cap = 0
+#   - V >  (target + deadband)            : cap = min(cap, max(0, dno - (dno/range_v)*(V-target-deadband)))
+#                                            ratchet down only — ramp anchored to (target + deadband).
 #                                            slope = dno/range_v (range=4 → 1 kW/V steep,
 #                                            range=8 → 0.5 kW/V gentle).
-#   - V < target                          : cap += step_up_kw (adaptive climb)
-#                                            no lower deadband — climb fires any time V is
-#                                            below target. Sensor reports 0.01V granularity
-#                                            so small V drift is meaningful signal.
-#   - V == target (rare)                  : hold
+#   - target-deadband ≤ V ≤ target+deadband : HOLD (no change)
+#                                            symmetric hysteresis band kills micro-thrash when V
+#                                            wobbles around target. With deadband=0.5 and target=253
+#                                            the band is [252.5, 253.5].
+#   - V < (target - deadband)             : cap += step_up_kw (adaptive climb)
 #
 # Why this shape: pure seek (proportional drop with drop_gain) was too slow on
 # 8V-in-5s rises (multiple SIG OVP trips on 2026-05-06). Pure proportional
 # ramp from V was the old behaviour — instant response on every V change.
 # This uses the old's instant ramp on the way DOWN (cap can only decrease
-# via this path) and the seek's adaptive climb on the way UP. Lower deadband
-# was removed 2026-05-06 — it left cap stuck at low values when V drifted
-# back into target range without going below the deadband edge.
+# via this path) and the seek's adaptive climb on the way UP. Symmetric
+# deadband re-introduced 2026-05-07 to kill saw-tooth at the operating point;
+# the earlier-removed lower-only deadband stranded cap at low values, the
+# symmetric version doesn't (V routinely crosses below target-deadband).
 #
 # Tunables (live via input_number helpers):
-#   input_number.voltage_seek_target_v    — V where ramp starts (cap=DNO)
-#   input_number.voltage_seek_range_v     — V span until cap=0 (slope = dno/range_v)
-#
-# Note: input_number.voltage_seek_deadband_v helper exists but is no longer
-# referenced by the controller. Kept for potential reuse / dashboard cosmetics.
+#   input_number.voltage_seek_target_v    — V at centre of hold band
+#   input_number.voltage_seek_range_v     — V span from band edge to cap=0
+#   input_number.voltage_seek_deadband_v  — half-width of hold band (each side)
 #
 # Hard-coded constants (edit YAML to change):
 #   step_up_base  = 0.05 kW/tick — minimum climb rate (near target)
@@ -76,25 +75,28 @@ action:
       cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
       target: "{{ states('input_number.voltage_seek_target_v') | float(250) }}"
       range_v: "{{ states('input_number.voltage_seek_range_v') | float(8) }}"
+      deadband: "{{ states('input_number.voltage_seek_deadband_v') | float(0.5) }}"
       step_up_base: 0.05
       step_up_per_v: 0.05
       step_up_max: 0.4
       dno: 4.0
       under_v: "{{ target - v }}"
       step_up_kw: "{{ [step_up_max, [step_up_base, step_up_base + step_up_per_v * (under_v | float - 1)] | max] | min }}"
-      # Asymmetric: ramp DOWN tracks target, slope derived from range:
-      #   cap_max = max(0, dno - (dno/range_v) × (V - target))
-      # Ramp engages at V > target. cap=0 at V=target+range_v.
-      # Climb branch fires whenever V < target (no lower deadband, since
-      # sensor reads 0.01V granularity and we want cap to recover any time
-      # V is below target).
-      # Hold only when V == target exactly (rare).
+      ramp_start_v: "{{ target + deadband }}"
+      ramp_zero_v: "{{ target + deadband + range_v }}"
+      hold_low_v: "{{ target - deadband }}"
+      # Symmetric hysteresis around target:
+      #   ramp DOWN engages at V > (target + deadband). Slope derived from range:
+      #     cap_max = max(0, dno - (dno/range_v) × (V - target - deadband))
+      #   cap=0 at V=(target + deadband + range_v).
+      #   Climb engages at V < (target - deadband).
+      #   Hold band [target-deadband, target+deadband] = no change to cap.
       new_cap: >-
-        {%- if v >= (target + range_v) -%}
+        {%- if v >= ramp_zero_v -%}
           0.0
-        {%- elif v > target -%}
-          {{ [cap, [0.0, dno - (dno / range_v) * (v - target)] | max] | min }}
-        {%- elif v < target -%}
+        {%- elif v > ramp_start_v -%}
+          {{ [cap, [0.0, dno - (dno / range_v) * (v - target - deadband)] | max] | min }}
+        {%- elif v < hold_low_v -%}
           {{ [dno, cap + (step_up_kw | float)] | min }}
         {%- else -%}
           {{ cap }}

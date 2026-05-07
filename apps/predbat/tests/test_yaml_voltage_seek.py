@@ -111,12 +111,13 @@ def evaluate(variables, set_value_tpl, states):
 # ---------- Fixture builder ----------------------------------------------------
 
 
-def build_states(v, cap, target=250.0, range_v=8.0):
+def build_states(v, cap, target=250.0, range_v=8.0, deadband=0.5):
     return {
         "sensor.sigen_inverter_phase_a_voltage": str(v),
         "input_number.voltage_throttle_filtered_cap": str(cap),
         "input_number.voltage_seek_target_v": str(target),
         "input_number.voltage_seek_range_v": str(range_v),
+        "input_number.voltage_seek_deadband_v": str(deadband),
     }
 
 
@@ -131,43 +132,53 @@ class Scenario:
     expected: float
     target: float = 250.0
     range_v: float = 8.0
+    deadband: float = 0.5
     tol: float = 0.01
 
 
 SCENARIOS = [
-    # target=250, range_v=8 → ramp 250→4, 258→0; no lower deadband.
-    # V at target → hold (rare exact match). V > target → ramp. V < target → climb.
-    Scenario("V=target → hold (cap unchanged)", v=250.0, cap=3.0, expected=3.0),
-    # Down ramp tracks target: cap_max = max(0, dno - (dno/range_v)*(V - target))
-    Scenario("V=target+0.5 → cap_max=3.75, ratchet from 4", v=250.5, cap=4.0, expected=3.75),
-    Scenario("V=target+1 → cap_max=3.5", v=251.0, cap=4.0, expected=3.5),
-    Scenario("V=target+2 → cap_max=3", v=252.0, cap=4.0, expected=3.0),
+    # target=250, range_v=8, deadband=0.5 (default) → hold band [249.5, 250.5];
+    # ramp engages at V>250.5, cap=0 at V=258.5. Climb fires at V<249.5.
+    # ----- Hold band (symmetric hysteresis around target) -----
+    Scenario("V=target → hold (centre of band)", v=250.0, cap=3.0, expected=3.0),
+    Scenario("V=target+0.3 → hold (inside band)", v=250.3, cap=3.0, expected=3.0),
+    Scenario("V=target+0.5 → hold (boundary, > strict)", v=250.5, cap=4.0, expected=4.0),
+    Scenario("V=target-0.3 → hold (inside band)", v=249.7, cap=2.0, expected=2.0),
+    Scenario("V=target-0.5 → hold (boundary, < strict)", v=249.5, cap=2.0, expected=2.0),
+    # ----- Ramp DOWN: anchored at (target + deadband), slope = dno/range_v -----
+    Scenario("V=target+0.7 → cap_max=4-0.5*0.2=3.9", v=250.7, cap=4.0, expected=3.9),
+    Scenario("V=target+1 → cap_max=4-0.5*0.5=3.75", v=251.0, cap=4.0, expected=3.75),
+    Scenario("V=target+2 → cap_max=4-0.5*1.5=3.25", v=252.0, cap=4.0, expected=3.25),
     Scenario("V=target+2 → cap stays if already < cap_max", v=252.0, cap=2.5, expected=2.5),
-    Scenario("V=target+4 → cap_max=2", v=254.0, cap=4.0, expected=2.0),
-    Scenario("V=target+6 → cap_max=1", v=256.0, cap=4.0, expected=1.0),
-    Scenario("V=target+8 → cap=0 (ramp full)", v=258.0, cap=4.0, expected=0.0),
-    Scenario("V=target+9 → cap=0 (above ramp width)", v=259.0, cap=4.0, expected=0.0),
+    Scenario("V=target+4 → cap_max=4-0.5*3.5=2.25", v=254.0, cap=4.0, expected=2.25),
+    Scenario("V=target+6 → cap_max=4-0.5*5.5=1.25", v=256.0, cap=4.0, expected=1.25),
+    Scenario("V=target+8 → cap_max=4-0.5*7.5=0.25", v=258.0, cap=4.0, expected=0.25),
+    Scenario("V=target+8.5 → cap=0 (ramp_zero)", v=258.5, cap=4.0, expected=0.0),
+    Scenario("V=target+9 → cap=0 (beyond ramp_zero)", v=259.0, cap=4.0, expected=0.0),
     Scenario("V=263 (real spike) → cap=0", v=263.0, cap=3.5, expected=0.0),
-    # Climb fires whenever V < target (no lower deadband)
-    Scenario("V=target-0.1 → climb fires", v=249.9, cap=2.0, expected=2.05),
-    Scenario("V=target-0.5 → climb base step", v=249.5, cap=2.0, expected=2.05),
-    Scenario("V=target-1 → climb base step (under_v=1, step=base)", v=249.0, cap=0.0, expected=0.05),
+    # ----- Climb (V below hold band) -----
+    Scenario("V=target-0.7 → climb base", v=249.3, cap=2.0, expected=2.05),
+    Scenario("V=target-1 → climb base (under_v=1, step=base)", v=249.0, cap=0.0, expected=0.05),
     Scenario("V=246 climb adaptive (under_v=4 → step=0.20)", v=246.0, cap=0.0, expected=0.20),
     Scenario("V=245 climb (under_v=5 → step=0.25)", v=245.0, cap=0.0, expected=0.25),
     Scenario("V=240 climb clamped to step_up_max=0.4", v=240.0, cap=0.0, expected=0.4),
     Scenario("climb saturates at DNO", v=240.0, cap=4.0, expected=4.0),
-    # Adjustable target — ramp tracks target with same slope (range=8 → 0.5 kW/V)
-    Scenario("target=255 V=257 (=target+2) → cap_max=3", v=257.0, cap=4.0, expected=3.0, target=255.0),
-    Scenario("target=255 V=263 (=target+8) → cap=0", v=263.0, cap=4.0, expected=0.0, target=255.0),
-    Scenario("target=255 V=254 (just below) → climb", v=254.0, cap=2.0, expected=2.05, target=255.0),
-    Scenario("target=252 V=254 (=target+2) → cap_max=3", v=254.0, cap=4.0, expected=3.0, target=252.0),
-    Scenario("target=252 V=260 (=target+8) → cap=0", v=260.0, cap=4.0, expected=0.0, target=252.0),
-    Scenario("target=252 V=251 → climb (under_v=1, step=base)", v=251.0, cap=2.0, expected=2.05, target=252.0),
-    # Range adjustable — slope = dno/range_v
-    Scenario("range=4: V=target+2 → cap_max=2 (slope 1.0)", v=252.0, cap=4.0, expected=2.0, target=250.0, range_v=4.0),
-    Scenario("range=4: V=target+4 → cap=0", v=254.0, cap=4.0, expected=0.0, target=250.0, range_v=4.0),
-    Scenario("range=12: V=target+6 → cap_max=2 (slope 0.33)", v=256.0, cap=4.0, expected=2.0, target=250.0, range_v=12.0),
-    Scenario("range=12: V=target+12 → cap=0", v=262.0, cap=4.0, expected=0.0, target=250.0, range_v=12.0),
+    # ----- Deadband=0 (no hysteresis) — equivalent to old behaviour -----
+    Scenario("deadband=0: V=target+1 → cap_max=3.5", v=251.0, cap=4.0, expected=3.5, deadband=0.0),
+    Scenario("deadband=0: V=target+8 → cap=0", v=258.0, cap=4.0, expected=0.0, deadband=0.0),
+    Scenario("deadband=0: V=target → hold", v=250.0, cap=3.0, expected=3.0, deadband=0.0),
+    Scenario("deadband=0: V=target-0.1 → climb", v=249.9, cap=2.0, expected=2.05, deadband=0.0),
+    # ----- Wider deadband -----
+    Scenario("deadband=1.0: V=target+0.8 → hold", v=250.8, cap=3.0, expected=3.0, deadband=1.0),
+    Scenario("deadband=1.0: V=target+1.5 → cap_max=4-0.5*0.5=3.75", v=251.5, cap=4.0, expected=3.75, deadband=1.0),
+    Scenario("deadband=1.0: V=target-0.8 → hold", v=249.2, cap=2.0, expected=2.0, deadband=1.0),
+    # ----- Adjustable target (deadband=0.5 default) -----
+    Scenario("target=253 V=253.4 → hold (inside band)", v=253.4, cap=4.0, expected=4.0, target=253.0),
+    Scenario("target=253 V=255 → cap_max=4-0.5*1.5=3.25", v=255.0, cap=4.0, expected=3.25, target=253.0),
+    Scenario("target=253 V=261.5 → cap=0 (target+8.5)", v=261.5, cap=4.0, expected=0.0, target=253.0),
+    # ----- Adjustable range (deadband=0.5 default) -----
+    Scenario("range=4: V=target+1.5 → cap_max=4-1.0*1.0=3", v=251.5, cap=4.0, expected=3.0, range_v=4.0),
+    Scenario("range=4: V=target+4.5 → cap=0", v=254.5, cap=4.0, expected=0.0, range_v=4.0),
 ]
 
 
@@ -186,11 +197,14 @@ def test_bug_pattern_caught():
     set_value_tpl = load_set_value_template(YAML_PATH)
     states = build_states(v=256.0, cap=3.16)
 
-    # Reorder: move range_v to AFTER new_cap (it's referenced inside new_cap).
+    # Reorder: move ramp_start_v to AFTER new_cap (it's referenced inside new_cap).
+    # This is the exact mechanism that broke us on 2026-05-06 — out-of-order
+    # variables that new_cap depends on, evaluated as Undefined under HA's
+    # loose semantics, falling through every branch to else { cap }.
     broken = {}
     moved = {}
     for k, v in variables.items():
-        if k == "range_v":
+        if k == "ramp_start_v":
             moved[k] = v
         else:
             broken[k] = v
@@ -220,7 +234,7 @@ def main():
 
     failed = 0
     for s in SCENARIOS:
-        states = build_states(s.v, s.cap, s.target, s.range_v)
+        states = build_states(s.v, s.cap, s.target, s.range_v, s.deadband)
         try:
             actual = evaluate(variables, set_value_tpl, states)
         except jinja2.UndefinedError as e:
