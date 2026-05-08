@@ -237,7 +237,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._p10_pv_remaining_kwh = 0.0
         self._p50_pv_remaining_kwh = 0.0
         self._load_remaining_kwh = 0.0
-        self._calibration_ratio = 1.0
         # Diagnostic: which term of R54 (or which off-path) drove the published target.
         # User-facing strings (shown directly on dashboard tile):
         #   'Overnight Need'      — R54 effective_keep binding
@@ -1334,19 +1333,16 @@ class CurtailmentPlugin(PredBatPlugin):
             p50_pv_remaining = float(self.base.get_state_wrapper(SOLCAST_REMAINING, attribute="estimate", default=0))
         except (ValueError, TypeError):
             p50_pv_remaining = p10_pv_remaining
-        # load_remaining was computed earlier (R5 activation check)
+        # load_remaining was computed earlier (R5 activation check).
+        # Use Solcast's P50 directly — Solcast revises through the day, so
+        # an over-optimistic morning P50 catches up to reality without us
+        # second-guessing with a 30-min tracking ratio.
         overnight_for_recovery = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
-        # R58 calibration ratio: actual_pv_30min / solcast_30min — scales the
-        # P50 forecast by how today is actually tracking. Defaults to 1.0 when
-        # not enough history yet (early morning).
-        calibration_ratio = self._compute_calibration_ratio(minutes_now, solcast_remaining)
-        self._calibration_ratio = round(calibration_ratio, 3)
         p10_recovery = compute_p10_recovery_floor(
             overnight_target_kwh=overnight_for_recovery,
             p10_pv_remaining_kwh=p10_pv_remaining,
             p50_pv_remaining_kwh=p50_pv_remaining,
             load_remaining_kwh=load_remaining,
-            calibration_ratio=calibration_ratio,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
         self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
@@ -1711,7 +1707,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 "p50_pv_remaining_kwh": self._p50_pv_remaining_kwh,
                 "load_remaining_kwh": self._load_remaining_kwh,
                 "overnight_target_kwh": round(self._overnight_target_kwh, 2) if self._overnight_target_kwh is not None else None,
-                "calibration_ratio": self._calibration_ratio,
                 "confidence": self._confidence,
             },
         )
