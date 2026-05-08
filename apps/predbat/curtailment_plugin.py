@@ -233,8 +233,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_dno = 4.0
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
-        # R59 inputs (diagnostic — the two terms feeding p10_recovery)
+        # R59 inputs (diagnostic — the terms feeding p10_recovery)
         self._p10_pv_remaining_kwh = 0.0
+        self._p50_pv_remaining_kwh = 0.0
         self._load_remaining_kwh = 0.0
         # Diagnostic: which term of R54 (or which off-path) drove the published target.
         # User-facing strings (shown directly on dashboard tile):
@@ -1328,15 +1329,22 @@ class CurtailmentPlugin(PredBatPlugin):
             p10_pv_remaining = float(self.base.get_state_wrapper(SOLCAST_REMAINING, attribute="estimate10", default=0))
         except (ValueError, TypeError):
             p10_pv_remaining = 0.0
+        try:
+            p50_pv_remaining = float(self.base.get_state_wrapper(SOLCAST_REMAINING, attribute="estimate", default=0))
+        except (ValueError, TypeError):
+            p50_pv_remaining = p10_pv_remaining
         # load_remaining was computed earlier (R5 activation check)
         overnight_for_recovery = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
         p10_recovery = compute_p10_recovery_floor(
             overnight_target_kwh=overnight_for_recovery,
             p10_pv_remaining_kwh=p10_pv_remaining,
+            p50_pv_remaining_kwh=p50_pv_remaining,
             load_remaining_kwh=load_remaining,
+            confidence=self._confidence,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
         self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
+        self._p50_pv_remaining_kwh = round(p50_pv_remaining, 2)
         self._load_remaining_kwh = round(load_remaining, 2)
 
         # R54 (v20) + R59: single drain-target rule with P10 recovery lower bound.
@@ -1694,8 +1702,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-up",
                 "p10_pv_remaining_kwh": self._p10_pv_remaining_kwh,
+                "p50_pv_remaining_kwh": self._p50_pv_remaining_kwh,
                 "load_remaining_kwh": self._load_remaining_kwh,
                 "overnight_target_kwh": round(self._overnight_target_kwh, 2) if self._overnight_target_kwh is not None else None,
+                "confidence": self._confidence,
             },
         )
         self.base.dashboard_item(

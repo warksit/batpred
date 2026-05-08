@@ -571,13 +571,70 @@ def test_drain_above_reserve_floor():
 
 
 def test_p10_recovery_floor_today_2026_05_08_cloudy():
-    """Real input from 2026-05-08 cloudy morning that exposed the bug.
-    P10 PV remaining=7.97, load remaining=10.46, overnight_target=7.42.
-    Floor must reflect the 2.49 kWh deficit: 7.42 - (-2.49) = 9.91.
+    """Real input from 2026-05-08 cloudy morning that exposed the deficit bug.
+    P10=7.97, load=10.46, target=7.42. Old (P10-only): floor = 9.91.
     """
     floor = compute_p10_recovery_floor(overnight_target_kwh=7.42, p10_pv_remaining_kwh=7.97, load_remaining_kwh=10.46)
     assert abs(floor - 9.91) < 0.001, f"Expected 9.91, got {floor}"
     print(f"  test_p10_recovery_floor_today_2026_05_08_cloudy: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_high_confidence_uses_p10():
+    """Confidence=1.0 → effective PV = P10 (full safety margin, old behaviour)."""
+    floor = compute_p10_recovery_floor(
+        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
+        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, confidence=1.0,
+    )
+    # effective = P10 = 2, net = -3, floor = 9.4 - (-3) = 12.4
+    assert abs(floor - 12.4) < 0.001, f"Expected 12.4, got {floor}"
+    print(f"  test_p10_recovery_floor_high_confidence_uses_p10: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_low_confidence_uses_p50():
+    """Confidence=0.0 → effective PV = P50 (no over-reaction to worst case)."""
+    floor = compute_p10_recovery_floor(
+        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
+        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, confidence=0.0,
+    )
+    # effective = P50 = 10, net = 5, floor = max(0, 9.4 - 5) = 4.4
+    assert abs(floor - 4.4) < 0.001, f"Expected 4.4, got {floor}"
+    print(f"  test_p10_recovery_floor_low_confidence_uses_p50: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_today_blended_avoids_eager_charge():
+    """Today's actual case: P10=7.97, P50=39.5, load=10.46, conf=0.13.
+    Confidence-blend should land at floor=0 (no cross-over, no eager-charge).
+    Old P10-only formula gave floor=9.91, forcing the unwanted eager-charge.
+    """
+    floor = compute_p10_recovery_floor(
+        overnight_target_kwh=7.42,
+        p10_pv_remaining_kwh=7.97,
+        p50_pv_remaining_kwh=39.5,
+        load_remaining_kwh=10.46,
+        confidence=0.13,
+    )
+    # effective = 0.13*7.97 + 0.87*39.5 = 35.40
+    # net = 24.94
+    # floor = max(0, 7.42 - 24.94) = 0
+    assert abs(floor - 0.0) < 0.001, f"Expected 0.0 (no eager-charge), got {floor}"
+    print(f"  test_p10_recovery_floor_today_blended_avoids_eager_charge: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_high_conf_genuinely_cloudy():
+    """High-confidence cloudy day (small spread, both P10 and P50 low) → floor stays high.
+    Protects against the actual P10 day scenario.
+    """
+    floor = compute_p10_recovery_floor(
+        overnight_target_kwh=7.42,
+        p10_pv_remaining_kwh=4.0,
+        p50_pv_remaining_kwh=5.0,
+        load_remaining_kwh=10.0,
+        confidence=0.9,
+    )
+    # effective = 0.9*4 + 0.1*5 = 4.1
+    # net = -5.9, floor = 7.42 - (-5.9) = 13.32
+    assert abs(floor - 13.32) < 0.001, f"Expected 13.32, got {floor}"
+    print(f"  test_p10_recovery_floor_high_conf_genuinely_cloudy: PASSED (floor={floor})")
 
 
 def test_p10_recovery_floor_zero_target():
@@ -4433,6 +4490,10 @@ def run_curtailment_tests(my_predbat=None):
         test_drain_above_overflow_floor_wins_on_big_overflow,
         test_drain_above_reserve_floor,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
+        test_p10_recovery_floor_high_confidence_uses_p10,
+        test_p10_recovery_floor_low_confidence_uses_p50,
+        test_p10_recovery_floor_today_blended_avoids_eager_charge,
+        test_p10_recovery_floor_high_conf_genuinely_cloudy,
         test_p10_recovery_floor_zero_target,
         test_p10_recovery_floor_today_at_11_03,
         test_p10_recovery_floor_combines_with_r54_min,

@@ -246,40 +246,46 @@ def compute_effective_export_cap(today_samples_kw, yesterday_avg_kw, dno_kw=4.0,
     return max(hard_floor_kw, min(dno_kw, estimate))
 
 
-def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh):
-    """R59: minimum SOC such that even on a P10 (worst-case PV) day the battery
-    still recovers to overnight_target by sundown.
+def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh, p50_pv_remaining_kwh=None, confidence=1.0):
+    """Confidence-blended recovery floor — minimum SOC such that we can recover
+    to overnight_target by sundown.
 
-    Solcast convention: pv_estimate10 is the pessimistic forecast (90% chance
-    actual exceeds it). Sizing the floor against P10 means we're safe across
-    almost all PV outcomes without over-reserving on the typical day.
+    Mirrors the curtailment side: when forecast confidence is low, the
+    P10/P90 spread is huge and trusting the worst-case point estimate
+    over-reacts. Curtailment defends against P90 (worst-case high PV) when
+    low confidence; recovery defends against P10 (worst-case low PV) only
+    when high confidence — falls back toward P50 (expected) when uncertain.
 
-    Pure function of three numbers — no time / forecast / state dependency.
-    The plugin computes p10_pv_remaining and load_remaining from its forecasts
-    and passes them in.
+    Blend formula (mirror of curtailment's confidence-weighted overflow):
+        effective_pv = confidence * p10_pv + (1 - confidence) * p50_pv
+
+    - confidence=1.0 (forecast trusted): effective = P10, full safety margin
+    - confidence=0.0 (no trust):         effective = P50, plan for typical
+    - between:                           linear blend
+
+    The signed net (effective_pv - load): negative deficit RAISES the floor
+    to compensate for through-day battery drain.
 
     Args:
         overnight_target_kwh: required SOC by end of day (typically
                               effective_keep, possibly with extra margin).
-        p10_pv_remaining_kwh: Solcast P10 PV remaining today (kWh).
+        p10_pv_remaining_kwh: Solcast P10 PV remaining today (kWh, pessimistic).
+        p50_pv_remaining_kwh: Solcast P50 PV remaining today (kWh, expected).
         load_remaining_kwh: forecast load remaining today (kWh).
+        confidence: forecast confidence in [0, 1] from solcast spread analysis.
 
     Returns:
         kWh — minimum SOC the floor must hold to guarantee overnight recovery
-        on a P10 day. Lower bound is 0 when P10 charging potential exceeds
-        remaining need.
+        given the confidence-weighted PV outlook.
 
     Used in R54's outer max as a lower-bound term (alongside `reserve`):
         target = max(reserve, p10_recovery, min(curt_floor, effective_keep))
-
-    The net (pv - load) is signed: a negative value (deficit, common on
-    cloudy days where load exceeds remaining P10 PV) RAISES the floor above
-    overnight_target to compensate for through-day battery drain. Earlier
-    revisions clamped this to zero, which under-stated the floor on cloudy
-    days and let SOC drift below the level needed to ride out load through
-    sundown.
     """
-    net_charging = p10_pv_remaining_kwh - load_remaining_kwh  # signed
+    if p50_pv_remaining_kwh is None:
+        p50_pv_remaining_kwh = p10_pv_remaining_kwh
+    confidence = max(0.0, min(1.0, confidence))
+    effective_pv = confidence * p10_pv_remaining_kwh + (1.0 - confidence) * p50_pv_remaining_kwh
+    net_charging = effective_pv - load_remaining_kwh  # signed
     return max(0.0, overnight_target_kwh - net_charging)
 
 
