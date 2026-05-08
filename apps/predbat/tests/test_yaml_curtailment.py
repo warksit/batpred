@@ -309,10 +309,13 @@ def _scenarios():
             expected_new_limit=0.0,
         ),
         Scenario(
-            "18 Cross-over with SOC above drain_above but below charge_below → Charge",
+            "18 Cross-over: SOC above drain_above (lower threshold) → exit Charge to Hold",
+            # 2026-05-08 refinement: charge target = min(cb, da) on cross-over.
+            # SOC=45% > drain_above=41% (the lower) → stop charging, preserve overflow headroom.
+            # Old behaviour was Charge to charge_below=56%. Now Hold at drain_above.
             build_fixture(soc_pct=45, charge_below_pct=56, drain_above_pct=41, excess=2.0, current_phase="Off", export_cap_raw=2.0),
-            expected_phase="Charge",
-            expected_new_limit=0.0,
+            expected_phase="Hold",
+            expected_new_limit=2.0,
         ),
         Scenario(
             "19 Cross-over: SOC ABOVE charge_below — must NOT drain to drain_above (re-drain trap)",
@@ -320,6 +323,14 @@ def _scenarios():
             # have flipped to Drain (SOC > drain_above=41% + OUTER) and dumped recovery
             # energy. New logic: drain_ceiling never below charge_below → Hold.
             build_fixture(soc_pct=58, charge_below_pct=56, drain_above_pct=41, excess=1.0, current_phase="Charge", export_cap_raw=2.0),
+            expected_phase="Hold",
+            expected_new_limit=1.0,
+        ),
+        Scenario(
+            "20a Cross-over: SOC reaches drain_above mid-charge → exit Charge to Hold",
+            # SOC=42% (= 7.59 kWh), charge_below=56%, drain_above=41% (= 7.41 kWh).
+            # current=Charge, charge_floor (Schmitt) = min(cb,da) = 7.41. 7.59 > 7.41 → exit.
+            build_fixture(soc_pct=42, charge_below_pct=56, drain_above_pct=41, excess=1.0, current_phase="Charge", export_cap_raw=2.0),
             expected_phase="Hold",
             expected_new_limit=1.0,
         ),

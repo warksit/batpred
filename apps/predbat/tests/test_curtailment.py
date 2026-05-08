@@ -867,6 +867,34 @@ def test_proposed_phase_off_when_plugin_inactive():
     print(f"  test_proposed_phase_off_when_plugin_inactive: PASSED ({phase})")
 
 
+def test_proposed_phase_cross_over_charges_to_lower_threshold():
+    """Cross-over day (cb > da): charge target is drain_above (the lower of the two).
+    Preserves curtailment headroom for surprise PV vs the deficit-insurance scenario.
+    """
+    from curtailment_calc import compute_proposed_phase
+
+    # SOC below both thresholds → Charge
+    assert compute_proposed_phase(soc_kwh=5.0, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Charge"
+    # SOC at drain_above (lower threshold) → exit to Hold (don't chase charge_below)
+    assert compute_proposed_phase(soc_kwh=7.5, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Hold"
+    # SOC well above both → Hold (Drain suppressed on cross-over)
+    assert compute_proposed_phase(soc_kwh=15.0, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Hold"
+    print("  test_proposed_phase_cross_over_charges_to_lower_threshold: PASSED")
+
+
+def test_proposed_phase_normal_day_unchanged():
+    """Normal day (da > cb): charge target is charge_below (unchanged behaviour)."""
+    from curtailment_calc import compute_proposed_phase
+
+    # SOC below charge_below → Charge
+    assert compute_proposed_phase(soc_kwh=1.0, charge_below_kwh=2.0, drain_above_kwh=14.0) == "Charge"
+    # In between → Hold (wide band)
+    assert compute_proposed_phase(soc_kwh=8.0, charge_below_kwh=2.0, drain_above_kwh=14.0) == "Hold"
+    # Above drain_above → Drain (not suppressed on normal day)
+    assert compute_proposed_phase(soc_kwh=15.0, charge_below_kwh=2.0, drain_above_kwh=14.0) == "Drain"
+    print("  test_proposed_phase_normal_day_unchanged: PASSED")
+
+
 def test_proposed_phase_thresholds_collapse_at_sunset():
     """Sunset: charge_below == drain_above (overflow=0, p10_recovery=overnight).
     SOC at threshold → Hold (boundary, not strictly < or >). Slight excursion
@@ -4435,6 +4463,8 @@ def run_curtailment_tests(my_predbat=None):
         test_proposed_phase_drain_above_ceiling,
         test_proposed_phase_today_7am_actual,
         test_proposed_phase_off_when_plugin_inactive,
+        test_proposed_phase_cross_over_charges_to_lower_threshold,
+        test_proposed_phase_normal_day_unchanged,
         test_proposed_phase_thresholds_collapse_at_sunset,
         test_floor_computation,
         test_floor_above_soc_keep,

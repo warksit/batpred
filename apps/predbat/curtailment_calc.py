@@ -303,20 +303,24 @@ def compute_drain_above(reserve, overflow_floor, effective_keep):
 
 
 def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
-    """Split-threshold phase decision (shadow-mode preview of new HA logic).
+    """Split-threshold phase decision (shadow + automation logic).
 
-    Default = Hold. Force Charge only if SOC < charge_below (genuine recovery
-    risk on a P10 day). Force Drain only if SOC > drain_above (curtailment
-    headroom about to be exhausted). Otherwise let PV flow naturally.
+    Charge target = min(charge_below, drain_above). On a normal day this is
+    charge_below (the lower threshold); on a cross-over day (cb > da, deficit
+    forecast) this is drain_above. Charging to the lower of the two preserves
+    curtailment headroom — if the deficit forecast proves wrong and surplus PV
+    arrives, we have room to absorb without curtailing.
 
-    No hysteresis here — that belongs in the HA automation. This is a pure
-    point-in-time preview of what the split-threshold model would say given
-    current numbers.
+    Drain is suppressed on cross-over days: every kWh stays in battery to
+    insure the deficit (or, if forecast was wrong, fills toward charge_below
+    naturally as conditions improve and cb drops below da).
+
+    No hysteresis here — that belongs in the HA automation Schmitt-trigger.
 
     Args:
         soc_kwh: current battery SOC in kWh
-        charge_below_kwh: lower threshold (= p10_recovery_floor)
-        drain_above_kwh: upper threshold (= curt_floor / target_soc)
+        charge_below_kwh: P10 recovery floor (must charge to this if no deficit forecast)
+        drain_above_kwh: curtailment-buffer floor (drain to this on overflow days)
         plugin_active: when False, plugin is Off — automation idles regardless.
 
     Returns:
@@ -324,8 +328,12 @@ def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_ac
     """
     if not plugin_active:
         return "Off"
-    if soc_kwh < charge_below_kwh:
+    cross_over = charge_below_kwh > drain_above_kwh
+    charge_target = min(charge_below_kwh, drain_above_kwh)
+    if soc_kwh < charge_target:
         return "Charge"
+    if cross_over:
+        return "Hold"  # Drain suppressed on deficit days
     if soc_kwh > drain_above_kwh:
         return "Drain"
     return "Hold"
