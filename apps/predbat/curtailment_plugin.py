@@ -1686,10 +1686,19 @@ class CurtailmentPlugin(PredBatPlugin):
         # floor (R54 inner-min) regardless of recovery requirements.
         plugin_active = phase == "active"
         reserve = getattr(self.base, "reserve", 0)
-        charge_below = self._p10_recovery_floor if plugin_active else 0.0
+        soc_keep_kwh = float(getattr(self.base, "best_soc_keep", 0) or 0)
+        # Published charge_below is clamped to soc_keep — never tell the HA
+        # automation that less than soc_keep is fine. Below soc_keep the
+        # battery is in Predbat's grid-charge zone anyway; charge_below
+        # represents "minimum SOC the curtailment manager will allow", not
+        # just "minimum to recover overnight target on a sunny day".
+        # The R54 floor input (self._p10_recovery_floor) is NOT clamped so
+        # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
+            charge_below = round(max(self._p10_recovery_floor, soc_keep_kwh), 2)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh), 2)
         else:
+            charge_below = 0.0
             drain_above = round(soc_max, 2)
         soc_now = float(getattr(self.base, "soc_kw", 0))
         proposed = compute_proposed_phase(soc_now, charge_below, drain_above, plugin_active=plugin_active)

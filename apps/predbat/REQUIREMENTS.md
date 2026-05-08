@@ -786,6 +786,24 @@ For each day shape, document:
 - Real-day CSV fixtures: capture 2026-05-08 (under-forecast cloudy)
   for regression. **TODO**.
 
+### soc_keep floor (added 2026-05-08)
+
+The published `charge_below` sensor is clamped to be ≥ `soc_keep`. Even
+when forecast says we'll comfortably exceed overnight target without
+intervention, charge_below should never tell the HA automation that
+SOC below soc_keep is acceptable — soc_keep represents the minimum
+acceptable SOC for comfort/safety, regardless of forecast.
+
+This clamp is applied at publish time only — the R54 floor input
+(`_p10_recovery_floor`) is not clamped, so R48's effective_keep
+relaxation still works on big-overflow days (where intentionally
+allowing SOC < soc_keep absorbs more PV). Two separate concepts:
+
+- `_p10_recovery_floor`: pure forecast-derived recovery requirement
+  (input to R54 outer max for drain target)
+- Published `charge_below`: clamped to soc_keep (defines what the HA
+  automation will force-charge to recover)
+
 ### Why we accept this design's failure modes
 
 The trade is:
