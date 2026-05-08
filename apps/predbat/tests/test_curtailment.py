@@ -511,10 +511,11 @@ def test_p10_recovery_floor_huge_pv_runway():
 
 
 def test_p10_recovery_floor_no_pv_remaining():
-    """Sunset: no PV ahead → floor = overnight_target (must hold all of it now)."""
+    """Sunset: no PV ahead, load still drains battery → floor must cover both
+    overnight_target AND remaining load."""
     floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=0.0, load_remaining_kwh=2.0)
-    # potential = max(0, -2) = 0, floor = 9.4
-    assert abs(floor - 9.4) < 0.001, f"Expected 9.4 (no runway), got {floor}"
+    # net = 0 - 2 = -2 (deficit). floor = 9.4 - (-2) = 11.4
+    assert abs(floor - 11.4) < 0.001, f"Expected 11.4 (target+load deficit), got {floor}"
     print(f"  test_p10_recovery_floor_no_pv_remaining: PASSED (floor={floor})")
 
 
@@ -527,11 +528,27 @@ def test_p10_recovery_floor_partial_charging():
 
 
 def test_p10_recovery_floor_load_exceeds_pv():
-    """Defensive: load > P10 PV (low-light + DHW). Potential clamps to 0."""
+    """Cloudy day: load > P10 PV. Battery DRAINS through the day, so the floor
+    must be RAISED above overnight_target by the deficit to compensate.
+
+    Bug fix 2026-05-08: previously clamped potential to 0 and returned target,
+    ignoring the through-day deficit. Real example today: P10=7.97, load=10.46,
+    target=7.42 → old formula said 7.42, real answer is 9.91.
+    """
     floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0, load_remaining_kwh=5.0)
-    # potential = max(0, -3) = 0, floor = 9.4
-    assert abs(floor - 9.4) < 0.001, f"Expected 9.4, got {floor}"
-    print(f"  test_p10_recovery_floor_load_exceeds_pv: PASSED (floor={floor})")
+    # net = 2 - 5 = -3 (deficit). floor = max(0, 9.4 - (-3)) = 12.4
+    assert abs(floor - 12.4) < 0.001, f"Expected 12.4 (target raised to cover deficit), got {floor}"
+    print(f"  test_p10_recovery_floor_load_exceeds_pv: PASSED (floor={floor}, deficit raises floor)")
+
+
+def test_p10_recovery_floor_today_2026_05_08_cloudy():
+    """Real input from 2026-05-08 cloudy morning that exposed the bug.
+    P10 PV remaining=7.97, load remaining=10.46, overnight_target=7.42.
+    Floor must reflect the 2.49 kWh deficit: 7.42 - (-2.49) = 9.91.
+    """
+    floor = compute_p10_recovery_floor(overnight_target_kwh=7.42, p10_pv_remaining_kwh=7.97, load_remaining_kwh=10.46)
+    assert abs(floor - 9.91) < 0.001, f"Expected 9.91, got {floor}"
+    print(f"  test_p10_recovery_floor_today_2026_05_08_cloudy: PASSED (floor={floor})")
 
 
 def test_p10_recovery_floor_zero_target():
@@ -573,10 +590,11 @@ def test_p10_recovery_floor_combines_with_r54_min():
     target_early = max(reserve, p10_early, min(curt_floor, effective_keep))
     assert target_early == 4.0, f"Early: expected min(5,4)=4, got {target_early}"
 
-    # Late in day — no P10 PV remaining
+    # Late in day — no P10 PV remaining, load still depletes battery → floor raised by deficit
     p10_late = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=0.0, load_remaining_kwh=2.0)
     target_late = max(reserve, p10_late, min(curt_floor, effective_keep))
-    assert abs(target_late - 9.4) < 0.001, f"Late: expected 9.4 (overnight_target binds), got {target_late}"
+    # p10_late = 9.4 - (-2) = 11.4 → outer max binds at 11.4
+    assert abs(target_late - 11.4) < 0.001, f"Late: expected 11.4 (overnight_target + load deficit), got {target_late}"
     print(f"  test_p10_recovery_floor_combines_with_r54_min: PASSED (early={target_early}, late={target_late})")
 
 
@@ -4352,6 +4370,7 @@ def run_curtailment_tests(my_predbat=None):
         test_p10_recovery_floor_no_pv_remaining,
         test_p10_recovery_floor_partial_charging,
         test_p10_recovery_floor_load_exceeds_pv,
+        test_p10_recovery_floor_today_2026_05_08_cloudy,
         test_p10_recovery_floor_zero_target,
         test_p10_recovery_floor_today_at_11_03,
         test_p10_recovery_floor_combines_with_r54_min,

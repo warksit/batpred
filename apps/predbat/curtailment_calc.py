@@ -271,9 +271,16 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
 
     Used in R54's outer max as a lower-bound term (alongside `reserve`):
         target = max(reserve, p10_recovery, min(curt_floor, effective_keep))
+
+    The net (pv - load) is signed: a negative value (deficit, common on
+    cloudy days where load exceeds remaining P10 PV) RAISES the floor above
+    overnight_target to compensate for through-day battery drain. Earlier
+    revisions clamped this to zero, which under-stated the floor on cloudy
+    days and let SOC drift below the level needed to ride out load through
+    sundown.
     """
-    p10_charging_potential = max(0.0, p10_pv_remaining_kwh - load_remaining_kwh)
-    return max(0.0, overnight_target_kwh - p10_charging_potential)
+    net_charging = p10_pv_remaining_kwh - load_remaining_kwh  # signed
+    return max(0.0, overnight_target_kwh - net_charging)
 
 
 def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
