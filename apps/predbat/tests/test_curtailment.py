@@ -579,62 +579,69 @@ def test_p10_recovery_floor_today_2026_05_08_cloudy():
     print(f"  test_p10_recovery_floor_today_2026_05_08_cloudy: PASSED (floor={floor})")
 
 
-def test_p10_recovery_floor_high_confidence_uses_p10():
-    """Confidence=1.0 → effective PV = P10 (full safety margin, old behaviour)."""
+def test_p10_recovery_floor_ratio_1_uses_p50():
+    """No tracking data yet (ratio=1.0): expected PV = P50."""
     floor = compute_p10_recovery_floor(
         overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
-        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, confidence=1.0,
+        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, calibration_ratio=1.0,
     )
-    # effective = P10 = 2, net = -3, floor = 9.4 - (-3) = 12.4
-    assert abs(floor - 12.4) < 0.001, f"Expected 12.4, got {floor}"
-    print(f"  test_p10_recovery_floor_high_confidence_uses_p10: PASSED (floor={floor})")
-
-
-def test_p10_recovery_floor_low_confidence_uses_p50():
-    """Confidence=0.0 → effective PV = P50 (no over-reaction to worst case)."""
-    floor = compute_p10_recovery_floor(
-        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
-        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, confidence=0.0,
-    )
-    # effective = P50 = 10, net = 5, floor = max(0, 9.4 - 5) = 4.4
+    # expected = clamp(1.0*10, 2, 10) = 10. net = 5, floor = max(0, 9.4-5) = 4.4
     assert abs(floor - 4.4) < 0.001, f"Expected 4.4, got {floor}"
-    print(f"  test_p10_recovery_floor_low_confidence_uses_p50: PASSED (floor={floor})")
+    print(f"  test_p10_recovery_floor_ratio_1_uses_p50: PASSED (floor={floor})")
 
 
-def test_p10_recovery_floor_today_blended_avoids_eager_charge():
-    """Today's actual case: P10=7.97, P50=39.5, load=10.46, conf=0.13.
-    Confidence-blend should land at floor=0 (no cross-over, no eager-charge).
-    Old P10-only formula gave floor=9.91, forcing the unwanted eager-charge.
+def test_p10_recovery_floor_low_ratio_clamped_to_p10():
+    """Very poor tracking (ratio=0.1, ratio×P50 < P10): floor at P10 worst case."""
+    floor = compute_p10_recovery_floor(
+        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
+        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, calibration_ratio=0.1,
+    )
+    # ratio*P50 = 1.0, clamped up to P10=2. expected=2, net=-3, floor=12.4
+    assert abs(floor - 12.4) < 0.001, f"Expected 12.4, got {floor}"
+    print(f"  test_p10_recovery_floor_low_ratio_clamped_to_p10: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_today_uses_calibration_ratio():
+    """Today's actual case (2026-05-08 ~13:00 BST):
+    P10=7.97, P50=39.5, load=10.46, R58 ratio≈0.4 (15 kWh actual remaining vs 39.5 forecast).
+    Floor should reflect ~15 kWh expected PV: 7.42 - (15 - 10.46) = 2.88, NOT 0 (raw P50)
+    or 9.91 (P10-only).
     """
     floor = compute_p10_recovery_floor(
         overnight_target_kwh=7.42,
         p10_pv_remaining_kwh=7.97,
         p50_pv_remaining_kwh=39.5,
         load_remaining_kwh=10.46,
-        confidence=0.13,
+        calibration_ratio=0.4,
     )
-    # effective = 0.13*7.97 + 0.87*39.5 = 35.40
-    # net = 24.94
-    # floor = max(0, 7.42 - 24.94) = 0
-    assert abs(floor - 0.0) < 0.001, f"Expected 0.0 (no eager-charge), got {floor}"
-    print(f"  test_p10_recovery_floor_today_blended_avoids_eager_charge: PASSED (floor={floor})")
+    # ratio*P50 = 15.8, clamp to [7.97, 39.5] = 15.8. net = 5.34, floor = 7.42 - 5.34 = 2.08
+    assert abs(floor - 2.08) < 0.05, f"Expected ~2.08, got {floor}"
+    print(f"  test_p10_recovery_floor_today_uses_calibration_ratio: PASSED (floor={floor})")
 
 
-def test_p10_recovery_floor_high_conf_genuinely_cloudy():
-    """High-confidence cloudy day (small spread, both P10 and P50 low) → floor stays high.
-    Protects against the actual P10 day scenario.
-    """
+def test_p10_recovery_floor_genuine_cloudy_high_ratio():
+    """High-confidence cloudy day (small spread, P10≈P50). Ratio=1.0 → P50 used."""
     floor = compute_p10_recovery_floor(
         overnight_target_kwh=7.42,
         p10_pv_remaining_kwh=4.0,
         p50_pv_remaining_kwh=5.0,
         load_remaining_kwh=10.0,
-        confidence=0.9,
+        calibration_ratio=1.0,
     )
-    # effective = 0.9*4 + 0.1*5 = 4.1
-    # net = -5.9, floor = 7.42 - (-5.9) = 13.32
-    assert abs(floor - 13.32) < 0.001, f"Expected 13.32, got {floor}"
-    print(f"  test_p10_recovery_floor_high_conf_genuinely_cloudy: PASSED (floor={floor})")
+    # expected = P50 = 5, net = -5, floor = 7.42 + 5 = 12.42
+    assert abs(floor - 12.42) < 0.001, f"Expected 12.42, got {floor}"
+    print(f"  test_p10_recovery_floor_genuine_cloudy_high_ratio: PASSED (floor={floor})")
+
+
+def test_p10_recovery_floor_high_ratio_capped_at_p50():
+    """Better-than-forecast day (ratio=1.5): capped at P50 (don't over-optimise)."""
+    floor = compute_p10_recovery_floor(
+        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
+        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, calibration_ratio=1.5,
+    )
+    # ratio*P50 = 15, clamped to P50 = 10. net = 5, floor = 4.4
+    assert abs(floor - 4.4) < 0.001, f"Expected 4.4 (cap at P50), got {floor}"
+    print(f"  test_p10_recovery_floor_high_ratio_capped_at_p50: PASSED (floor={floor})")
 
 
 def test_p10_recovery_floor_zero_target():
@@ -4490,10 +4497,11 @@ def run_curtailment_tests(my_predbat=None):
         test_drain_above_overflow_floor_wins_on_big_overflow,
         test_drain_above_reserve_floor,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
-        test_p10_recovery_floor_high_confidence_uses_p10,
-        test_p10_recovery_floor_low_confidence_uses_p50,
-        test_p10_recovery_floor_today_blended_avoids_eager_charge,
-        test_p10_recovery_floor_high_conf_genuinely_cloudy,
+        test_p10_recovery_floor_ratio_1_uses_p50,
+        test_p10_recovery_floor_low_ratio_clamped_to_p10,
+        test_p10_recovery_floor_today_uses_calibration_ratio,
+        test_p10_recovery_floor_genuine_cloudy_high_ratio,
+        test_p10_recovery_floor_high_ratio_capped_at_p50,
         test_p10_recovery_floor_zero_target,
         test_p10_recovery_floor_today_at_11_03,
         test_p10_recovery_floor_combines_with_r54_min,

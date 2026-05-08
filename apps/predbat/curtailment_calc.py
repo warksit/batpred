@@ -246,46 +246,48 @@ def compute_effective_export_cap(today_samples_kw, yesterday_avg_kw, dno_kw=4.0,
     return max(hard_floor_kw, min(dno_kw, estimate))
 
 
-def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh, p50_pv_remaining_kwh=None, confidence=1.0):
-    """Confidence-blended recovery floor — minimum SOC such that we can recover
-    to overnight_target by sundown.
+def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh, p50_pv_remaining_kwh=None, calibration_ratio=1.0):
+    """Recovery floor scaled by today's actual PV tracking — minimum SOC to
+    recover to overnight_target by sundown given how the day is unfolding.
 
-    Mirrors the curtailment side: when forecast confidence is low, the
-    P10/P90 spread is huge and trusting the worst-case point estimate
-    over-reacts. Curtailment defends against P90 (worst-case high PV) when
-    low confidence; recovery defends against P10 (worst-case low PV) only
-    when high confidence — falls back toward P50 (expected) when uncertain.
+    The pure confidence blend over-credits P50 when actual PV is tracking
+    poorly. Solution: scale P50 by R58 calibration_ratio (actual PV last 30
+    min / Solcast forecast last 30 min). When today is tracking at 40% of
+    forecast, expected remaining PV is 0.4 × P50 — which matches reality
+    much better than raw P50 or a P10-vs-P50 spread blend.
 
-    Blend formula (mirror of curtailment's confidence-weighted overflow):
-        effective_pv = confidence * p10_pv + (1 - confidence) * p50_pv
+    Formula:
+        expected_pv = clamp(calibration_ratio * p50, P10, P50)
+        floor = max(0, overnight_target - (expected_pv - load))
 
-    - confidence=1.0 (forecast trusted): effective = P10, full safety margin
-    - confidence=0.0 (no trust):         effective = P50, plan for typical
-    - between:                           linear blend
+    - ratio = 1.0 (matching forecast or no data yet): use P50 (typical day)
+    - ratio = 0.4 (poor tracking):                    use 0.4 × P50, floored at P10
+    - ratio = 1.5 (better than forecast):             cap at P50
 
-    The signed net (effective_pv - load): negative deficit RAISES the floor
-    to compensate for through-day battery drain.
+    The lower clamp at P10 ensures we never plan for less than the worst-case
+    forecast — if today is tracking abysmally, defer to P10 floor protection.
+    The upper clamp at P50 prevents over-optimism on freak high-tracking days.
 
     Args:
-        overnight_target_kwh: required SOC by end of day (typically
-                              effective_keep, possibly with extra margin).
+        overnight_target_kwh: required SOC by end of day.
         p10_pv_remaining_kwh: Solcast P10 PV remaining today (kWh, pessimistic).
         p50_pv_remaining_kwh: Solcast P50 PV remaining today (kWh, expected).
         load_remaining_kwh: forecast load remaining today (kWh).
-        confidence: forecast confidence in [0, 1] from solcast spread analysis.
+        calibration_ratio: actual_pv_last_30min / solcast_last_30min (R58).
+                           1.0 when no live tracking data yet.
 
     Returns:
-        kWh — minimum SOC the floor must hold to guarantee overnight recovery
-        given the confidence-weighted PV outlook.
+        kWh — minimum SOC needed now to guarantee overnight recovery given
+        today's tracking.
 
     Used in R54's outer max as a lower-bound term (alongside `reserve`):
         target = max(reserve, p10_recovery, min(curt_floor, effective_keep))
     """
     if p50_pv_remaining_kwh is None:
         p50_pv_remaining_kwh = p10_pv_remaining_kwh
-    confidence = max(0.0, min(1.0, confidence))
-    effective_pv = confidence * p10_pv_remaining_kwh + (1.0 - confidence) * p50_pv_remaining_kwh
-    net_charging = effective_pv - load_remaining_kwh  # signed
+    scaled_pv = calibration_ratio * p50_pv_remaining_kwh
+    expected_pv = max(p10_pv_remaining_kwh, min(p50_pv_remaining_kwh, scaled_pv))
+    net_charging = expected_pv - load_remaining_kwh  # signed
     return max(0.0, overnight_target_kwh - net_charging)
 
 
