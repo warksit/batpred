@@ -311,9 +311,11 @@ def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_ac
     curtailment headroom — if the deficit forecast proves wrong and surplus PV
     arrives, we have room to absorb without curtailing.
 
-    Drain is suppressed on cross-over days: every kWh stays in battery to
-    insure the deficit (or, if forecast was wrong, fills toward charge_below
-    naturally as conditions improve and cb drops below da).
+    Drain fires when SOC > drain_above (curtailment buffer breached).
+    Curtailment defence wins over deficit insurance: if SOC drifts above
+    drain_above (e.g., during Hold while battery passively absorbs PV),
+    Drain pulls it back. Predbat handles overnight grid-charge if the
+    deficit forecast holds and we end the day below overnight target.
 
     No hysteresis here — that belongs in the HA automation Schmitt-trigger.
 
@@ -328,12 +330,9 @@ def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_ac
     """
     if not plugin_active:
         return "Off"
-    cross_over = charge_below_kwh > drain_above_kwh
     charge_target = min(charge_below_kwh, drain_above_kwh)
     if soc_kwh < charge_target:
         return "Charge"
-    if cross_over:
-        return "Hold"  # Drain suppressed on deficit days
     if soc_kwh > drain_above_kwh:
         return "Drain"
     return "Hold"

@@ -869,16 +869,18 @@ def test_proposed_phase_off_when_plugin_inactive():
 
 def test_proposed_phase_cross_over_charges_to_lower_threshold():
     """Cross-over day (cb > da): charge target is drain_above (the lower of the two).
-    Preserves curtailment headroom for surprise PV vs the deficit-insurance scenario.
+    Drain still fires when SOC exceeds drain_above — curtailment defence wins.
     """
     from curtailment_calc import compute_proposed_phase
 
     # SOC below both thresholds → Charge
     assert compute_proposed_phase(soc_kwh=5.0, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Charge"
-    # SOC at drain_above (lower threshold) → exit to Hold (don't chase charge_below)
-    assert compute_proposed_phase(soc_kwh=7.5, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Hold"
-    # SOC well above both → Hold (Drain suppressed on cross-over)
-    assert compute_proposed_phase(soc_kwh=15.0, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Hold"
+    # SOC just above drain_above → Drain (back to threshold)
+    assert compute_proposed_phase(soc_kwh=7.5, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Drain"
+    # SOC well above → Drain
+    assert compute_proposed_phase(soc_kwh=15.0, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Drain"
+    # SOC exactly at drain_above (boundary) → Hold
+    assert compute_proposed_phase(soc_kwh=7.0, charge_below_kwh=10.0, drain_above_kwh=7.0) == "Hold"
     print("  test_proposed_phase_cross_over_charges_to_lower_threshold: PASSED")
 
 

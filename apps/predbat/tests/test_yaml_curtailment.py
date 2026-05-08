@@ -309,39 +309,39 @@ def _scenarios():
             expected_new_limit=0.0,
         ),
         Scenario(
-            "18 Cross-over: SOC above drain_above (lower threshold) → exit Charge to Hold",
-            # 2026-05-08 refinement: charge target = min(cb, da) on cross-over.
-            # SOC=45% > drain_above=41% (the lower) → stop charging, preserve overflow headroom.
-            # Old behaviour was Charge to charge_below=56%. Now Hold at drain_above.
-            build_fixture(soc_pct=45, charge_below_pct=56, drain_above_pct=41, excess=2.0, current_phase="Off", export_cap_raw=2.0),
-            expected_phase="Hold",
-            expected_new_limit=2.0,
+            "18 Cross-over: SOC above drain_above + OUTER → Drain (curtailment defence)",
+            # 2026-05-08: charge target = min(cb, da) = drain_above. Once SOC clears
+            # drain_above + OUTER (= 7.59 kWh on 41%), Drain back to drain_above.
+            build_fixture(soc_pct=45, charge_below_pct=56, drain_above_pct=41, excess=2.0, current_phase="Off", export_cap_raw=4.0),
+            expected_phase="Drain",
+            expected_new_limit=4.0,
         ),
         Scenario(
-            "19 Cross-over: SOC ABOVE charge_below — must NOT drain to drain_above (re-drain trap)",
-            # 2026-05-08 trap: after eager-charging to charge_below=56%, SOC=58% would
-            # have flipped to Drain (SOC > drain_above=41% + OUTER) and dumped recovery
-            # energy. New logic: drain_ceiling never below charge_below → Hold.
-            build_fixture(soc_pct=58, charge_below_pct=56, drain_above_pct=41, excess=1.0, current_phase="Charge", export_cap_raw=2.0),
-            expected_phase="Hold",
-            expected_new_limit=1.0,
+            "19 Cross-over: SOC drifted above drain_above in Hold → Drain back to threshold",
+            # 2026-05-08 real case: cb=8.24, da=7.43, SOC=8.28 (45.8%). After
+            # eager Charge to drain_above=7.43, Hold passively absorbed surplus
+            # PV pushing SOC to 8.28 > 7.43 + OUTER. Drain fires to pull SOC
+            # back. Curtailment defence wins over deficit insurance — Predbat
+            # handles overnight grid-charge if forecast holds.
+            build_fixture(soc_pct=46, charge_below_pct=46, drain_above_pct=41, excess=2.0, current_phase="Hold", export_cap_raw=4.0),
+            expected_phase="Drain",
+            expected_new_limit=4.0,
         ),
         Scenario(
-            "20a Cross-over: SOC reaches drain_above mid-charge → exit Charge to Hold",
-            # SOC=42% (= 7.59 kWh), charge_below=56%, drain_above=41% (= 7.41 kWh).
-            # current=Charge, charge_floor (Schmitt) = min(cb,da) = 7.41. 7.59 > 7.41 → exit.
-            build_fixture(soc_pct=42, charge_below_pct=56, drain_above_pct=41, excess=1.0, current_phase="Charge", export_cap_raw=2.0),
-            expected_phase="Hold",
-            expected_new_limit=1.0,
+            "20a Cross-over: SOC reaches drain_above + OUTER → Drain back",
+            # SOC=42% = 7.59 kWh, charge_below=56%, drain_above=41% = 7.41.
+            # 7.59 > drain_above + OUTER (7.59) — at the boundary, Drain fires.
+            build_fixture(soc_pct=42, charge_below_pct=56, drain_above_pct=41, excess=1.0, current_phase="Charge", export_cap_raw=4.0),
+            expected_phase="Drain",
+            expected_new_limit=4.0,
         ),
         Scenario(
-            "20 Cross-over: SOC well above charge_below — Drain SUPPRESSED on deficit day",
-            # SOC=70%, charge_below=56%, drain_above=41% — cross-over (cb > da).
-            # On a deficit day we keep every kWh: no Drain even at high SOC.
-            # If battery genuinely fills, SIG clips PV at the panels.
+            "20 Cross-over: SOC well above drain_above → Drain (curtailment defence)",
+            # SOC=70%, drain_above=41% — cross-over but SOC way above drain ceiling.
+            # Drain fires regardless of cross-over. Recovery from grid overnight if needed.
             build_fixture(soc_pct=70, charge_below_pct=56, drain_above_pct=41, excess=2.0, current_phase="Hold", export_cap_raw=4.0),
-            expected_phase="Hold",
-            expected_new_limit=2.0,
+            expected_phase="Drain",
+            expected_new_limit=4.0,
         ),
     ]
 

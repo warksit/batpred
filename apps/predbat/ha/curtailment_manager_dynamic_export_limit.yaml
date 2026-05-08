@@ -129,22 +129,23 @@ action:
       manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
       current_phase: "{{ states('input_text.curtailment_live_phase') }}"
       # Charge target = min(charge_below, drain_above). On normal days this is
-      # charge_below (the lower); on cross-over days (cb > da, deficit forecast)
-      # this is drain_above. Charging only to the lower threshold preserves
-      # curtailment headroom — if the deficit forecast is wrong and surplus PV
-      # arrives, we have room to absorb without curtailing.
+      # charge_below; on cross-over days (cb > da, deficit forecast) this is
+      # drain_above. Charging only to the lower threshold preserves curtailment
+      # headroom for surprise PV.
+      #
+      # Drain still fires above drain_above + OUTER even on cross-over days —
+      # if SOC drifts above drain_above (battery passively absorbing surplus
+      # in Hold), pull it back. Curtailment defence wins over deficit insurance;
+      # Predbat handles overnight grid-charge if needed.
       charge_target_kwh: "{{ [charge_below_kwh, drain_above_kwh] | min }}"
       # Schmitt-trigger phase selection on split thresholds.
       #   charge_floor  = charge_target if current=Charge, else charge_target - OUTER
-      #   drain_ceiling = drain_above if current=Drain, else drain_above + OUTER
-      # Cross-over (charge_below > drain_above): drain_ceiling = 999 — Drain
-      # disabled so we never dump recovery energy. SIG clips PV at panels if
-      # battery genuinely fills.
+      #   drain_ceiling = drain_above   if current=Drain,  else drain_above   + OUTER
       # Phase: Charge if SOC < charge_floor, Drain if SOC > drain_ceiling, else Hold.
       charge_floor: >-
         {% if current_phase == 'Charge' %}{{ charge_target_kwh }}{% else %}{{ charge_target_kwh - outer_threshold }}{% endif %}
       drain_ceiling: >-
-        {% if charge_below_kwh | float > drain_above_kwh | float %}999{% elif current_phase == 'Drain' %}{{ drain_above_kwh }}{% else %}{{ drain_above_kwh + outer_threshold }}{% endif %}
+        {% if current_phase == 'Drain' %}{{ drain_above_kwh }}{% else %}{{ drain_above_kwh + outer_threshold }}{% endif %}
       phase: >-
         {% if manual_mode == 'Charge' %}Manual Charge
         {% elif manual_mode == 'Hold' %}Manual Hold
