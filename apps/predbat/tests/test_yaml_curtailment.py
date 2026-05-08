@@ -304,6 +304,24 @@ def _scenarios():
             expected_phase="Hold",
             expected_new_limit=2.0,
         ),
+        Scenario(
+            "17 Cloudy/deficit day: charge_below > drain_above (cross-over) → Charge wins",
+            # 2026-05-08 case: P10 deficit raised charge_below to 56%, drain_above stayed at 41%.
+            # SOC=22% < charge_below_floor → Charge. Drain must NOT fire.
+            build_fixture(soc_pct=22, charge_below_pct=56, drain_above_pct=41, excess=2.0, current_phase="Off", export_cap_raw=2.0),
+            expected_phase="Charge",
+            # gap=(56-22)%=6.15 kWh, rate=6.15/3.5=1.76, 2-1.76=0.24 → round(1)=0.2
+            expected_new_limit=0.2,
+        ),
+        Scenario(
+            "18 Cross-over with SOC ABOVE drain_above but BELOW charge_below → Charge",
+            # SOC=45% (above drain_above=41), charge_below=56% (deficit) → must keep charging.
+            # Without Charge-first ordering this would have flipped to Drain.
+            build_fixture(soc_pct=45, charge_below_pct=56, drain_above_pct=41, excess=2.0, current_phase="Off", export_cap_raw=2.0),
+            expected_phase="Charge",
+            # gap=(56-45)%=1.99 kWh, rate=1.99/3.5=0.57, 2-0.57=1.43 → round(1)=1.4
+            expected_new_limit=1.4,
+        ),
     ]
 
 

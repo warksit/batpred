@@ -283,6 +283,25 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - net_charging)
 
 
+def compute_drain_above(reserve, overflow_floor, effective_keep):
+    """Drain target: lowest SOC we'd drain to in pursuit of curtailment-buffer
+    headroom. Independent of p10_recovery — if recovery requirements raise the
+    overall floor higher, that affects charge_below not drain_above.
+
+    Returns: max(reserve, min(overflow_floor, effective_keep))
+
+    Inner min picks the lower of the two "drain to" targets:
+      - overflow_floor: drain to here to make room for forecast overflow
+      - effective_keep: don't drain below overnight need (R55)
+    Outer max ensures we never drain through the hardware reserve.
+
+    Pairs with compute_p10_recovery_floor(): on cloudy/deficit days
+    p10_recovery > drain_above (Charge wins, no Drain). On sunny days
+    drain_above >> charge_below (wide Hold band, drain to make room).
+    """
+    return max(reserve, min(overflow_floor, effective_keep))
+
+
 def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
     """Split-threshold phase decision (shadow-mode preview of new HA logic).
 

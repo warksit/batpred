@@ -41,6 +41,7 @@ from curtailment_calc import (
     compute_expected_overflow,
     compute_p10_recovery_floor,
     compute_effective_export_cap,
+    compute_drain_above,
     compute_floor_with_source,
     compute_proposed_phase,
     should_defer_to_charge,
@@ -1667,13 +1668,19 @@ class CurtailmentPlugin(PredBatPlugin):
             },
         )
 
-        # Split-threshold preview sensors (shadow mode for upcoming HA refactor).
-        # Active automation still uses target_soc with single-threshold ±0.5 kWh
-        # logic; these publish what the new "Charge only if necessary, Drain only
-        # if necessary" model would say so we can monitor before cutting over.
+        # Split-threshold control: Charge only if SOC < charge_below, Drain only
+        # if SOC > drain_above, Hold otherwise. The two thresholds are independent
+        # by design — on cloudy/deficit days charge_below can climb above
+        # drain_above (Charge wins, no Drain). drain_above is computed WITHOUT
+        # the p10_recovery clamp so it stays anchored to the curtailment-buffer
+        # floor (R54 inner-min) regardless of recovery requirements.
         plugin_active = phase == "active"
+        reserve = getattr(self.base, "reserve", 0)
         charge_below = self._p10_recovery_floor if plugin_active else 0.0
-        drain_above = round(target_kwh, 2) if plugin_active else round(soc_max, 2)
+        if plugin_active:
+            drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh), 2)
+        else:
+            drain_above = round(soc_max, 2)
         soc_now = float(getattr(self.base, "soc_kw", 0))
         proposed = compute_proposed_phase(soc_now, charge_below, drain_above, plugin_active=plugin_active)
 

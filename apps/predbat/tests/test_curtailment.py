@@ -24,6 +24,7 @@ from curtailment_calc import (
     p_scales_from_forecast,
     compute_expected_overflow,
     compute_pv_start_time,
+    compute_drain_above,
     compute_p10_recovery_floor,
     compute_effective_export_cap,
     compute_floor_with_source,
@@ -539,6 +540,34 @@ def test_p10_recovery_floor_load_exceeds_pv():
     # net = 2 - 5 = -3 (deficit). floor = max(0, 9.4 - (-3)) = 12.4
     assert abs(floor - 12.4) < 0.001, f"Expected 12.4 (target raised to cover deficit), got {floor}"
     print(f"  test_p10_recovery_floor_load_exceeds_pv: PASSED (floor={floor}, deficit raises floor)")
+
+
+def test_drain_above_curtailment_buffer_only():
+    """drain_above is the curtailment-buffer floor; NOT clamped up by p10_recovery.
+
+    On a cloudy day the deficit raises the overall combined floor (charge_below)
+    above the curtailment buffer — drain_above must remain at the buffer level
+    so the two thresholds can cross over.
+    """
+    # Cloudy day: overflow_floor=17.87 (essentially soc_max-buffer), effective_keep=7.42
+    drain = compute_drain_above(reserve=0.0, overflow_floor=17.87, effective_keep=7.42)
+    # min(17.87, 7.42) = 7.42; max(0, 7.42) = 7.42
+    assert abs(drain - 7.42) < 0.001, f"Expected 7.42 (effective_keep wins), got {drain}"
+    print(f"  test_drain_above_curtailment_buffer_only: PASSED ({drain})")
+
+
+def test_drain_above_overflow_floor_wins_on_big_overflow():
+    """Big overflow day: overflow_floor < effective_keep → drain to overflow_floor."""
+    drain = compute_drain_above(reserve=0.0, overflow_floor=10.0, effective_keep=15.0)
+    assert abs(drain - 10.0) < 0.001, f"Expected 10.0 (overflow_floor wins), got {drain}"
+    print(f"  test_drain_above_overflow_floor_wins_on_big_overflow: PASSED ({drain})")
+
+
+def test_drain_above_reserve_floor():
+    """Reserve never breached."""
+    drain = compute_drain_above(reserve=2.0, overflow_floor=1.0, effective_keep=1.5)
+    assert abs(drain - 2.0) < 0.001, f"Expected 2.0 (reserve), got {drain}"
+    print(f"  test_drain_above_reserve_floor: PASSED ({drain})")
 
 
 def test_p10_recovery_floor_today_2026_05_08_cloudy():
@@ -4370,6 +4399,9 @@ def run_curtailment_tests(my_predbat=None):
         test_p10_recovery_floor_no_pv_remaining,
         test_p10_recovery_floor_partial_charging,
         test_p10_recovery_floor_load_exceeds_pv,
+        test_drain_above_curtailment_buffer_only,
+        test_drain_above_overflow_floor_wins_on_big_overflow,
+        test_drain_above_reserve_floor,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
         test_p10_recovery_floor_zero_target,
         test_p10_recovery_floor_today_at_11_03,
