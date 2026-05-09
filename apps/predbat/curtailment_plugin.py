@@ -43,7 +43,6 @@ from curtailment_calc import (
     compute_effective_export_cap,
     compute_drain_above,
     compute_floor_with_source,
-    compute_proposed_phase,
     should_defer_to_charge,
     compute_pv_start_time,
     p90_scale_from_forecast,
@@ -1700,8 +1699,6 @@ class CurtailmentPlugin(PredBatPlugin):
         else:
             charge_below = 0.0
             drain_above = round(soc_max, 2)
-        soc_now = float(getattr(self.base, "soc_kw", 0))
-        proposed = compute_proposed_phase(soc_now, charge_below, drain_above, plugin_active=plugin_active)
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_charge_below".format(prefix),
@@ -1752,18 +1749,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 "icon": "mdi:battery-arrow-down",
             },
         )
-        self.base.dashboard_item(
-            "sensor.{}_curtailment_proposed_phase".format(prefix),
-            proposed,
-            {
-                "friendly_name": "Curtailment Proposed Phase (Shadow)",
-                "icon": "mdi:traffic-light",
-                "soc_kwh": round(soc_now, 2),
-                "charge_below_kwh": charge_below,
-                "drain_above_kwh": drain_above,
-            },
-        )
-
         et = export_target if export_target is not None else -2
         self.base.dashboard_item(
             "sensor.{}_curtailment_export_target".format(prefix),
