@@ -576,9 +576,11 @@ unit-test coverage; plugin integration is a follow-up change.
 ### R59 — P10 recovery floor (lower bound on R54 floor)
 
 The current R54 formula:
-```
+
+```text
 target = max(min(curt_floor, effective_keep), reserve)
 ```
+
 ensures we drain to *at least* `reserve`, but doesn't ensure we'll
 actually recover to `overnight_target` by sundown on a worst-case (P10)
 PV day. R55 sources `effective_keep` from *tomorrow's* morning gap,
@@ -588,6 +590,7 @@ where R48 relaxes effective_keep to 0.5 kWh, we drain to 0.5 and
 end below overnight target.
 
 **R59**: add a P10 recovery lower bound:
+
 ```text
 p10_charging_potential = max(0, p10_pv_remaining_kwh - load_remaining_kwh)
 p10_recovery_floor = max(0, overnight_target_kwh - p10_charging_potential)
@@ -600,6 +603,7 @@ tests covering huge-runway / no-runway / partial / load>PV / zero-target /
 today's actual data / combined-with-R54.
 
 Behaviour:
+
 - Sunrise (lots of P10 PV ahead): p10_recovery ≈ 0 → outer max yields
   inner min (no change vs current)
 - Mid-afternoon (less ahead): rises, starts capping how low keep can go
@@ -628,6 +632,7 @@ effective_dno = compute_effective_export_cap(
 ```
 
 Three-regime fallback:
+
 1. ≥ min_samples today → today's mean (clamped [hard_floor, DNO])
 2. else yesterday's daytime mean
 3. else DNO (cold start, no persisted data)
@@ -660,9 +665,11 @@ Both R59 and R60 wired into `curtailment_plugin.py`:
   `_compute_overflow_band` calls in calculate() and
   `_publish_forecast_overflow`.
 - **R54 floor formula** updated to:
+
   ```text
   floor = max(reserve, p10_recovery, min(overflow_floor, effective_keep))
   ```
+
 - **Tomorrow's forecast** uses `compute_effective_export_cap` against
   `_cap_samples_full_day` (today's just-completed daytime mean) with
   yesterday fallback. `excess` now subtracts realistic exportable_kwh
@@ -677,7 +684,6 @@ All 138 curtailment tests pass (15 new + existing). Pure-function unit
 tests cover the math; integration tests cover the floor formula change
 through real-day CSV fixtures.
 
-
 ## Day-Shape Scenario Test Matrix (2026-05-08)
 
 Every proposed change to charge_below / drain_above / phase logic must
@@ -685,102 +691,110 @@ be reasoned through these five canonical day shapes before merging.
 Asymmetric days (sunny→cloudy, cloudy→sunny) are the critical guard
 cases — naive blending and naive past-tracking ratios both fail there.
 
-**Design choice 2026-05-08:** charge_below uses Solcast's *current* P50
-remaining estimate directly. We do NOT apply a calibration ratio (last
-30 min actual / solcast). Two reasons:
+**Design choice 2026-05-11:** charge_below uses Solcast P10 (pessimistic)
+remaining estimate directly. Reverts the 2026-05-08 P50 choice.
+
+Rationale: once SOC crosses overnight_target the Hold/Drain logic exports
+the surplus, so over-charging by a kWh or two costs at most one battery
+round-trip (~10%). Under-charging costs the full overnight import bill
+plus comfort risk. Asymmetric cost → choose the defensive quantile.
+
+We do NOT apply a calibration ratio (last 30 min actual / solcast):
+
 - The past doesn't predict the future on shape-changing days
   (sunny→cloudy invalidates a high morning ratio for the afternoon)
-- Solcast already revises P50 through the day as actual conditions
+- Solcast already revises P10 through the day as actual conditions
   clarify; layering a ratio on top second-guesses Solcast's own
   time-aware model
 
 For each day shape, document:
+
 1. Expected SOC trajectory
 2. Expected charge_below trajectory
 3. Expected drain_above trajectory
 4. Pitfalls (what the wrong logic would do)
 
-### Scenario 1 — On-forecast day (Solcast P50 ≈ actual)
+### Scenario 1 — On-forecast day (Solcast P50 ≈ actual, P10 below)
 
 - Profile: PV tracks Solcast P50 ±10% all day.
-- charge_below: low all day (P50 PV >> load remaining → no recovery
-  worry). Floor stays near 0.
+- charge_below: moderate early (P10 is conservative; floor reflects
+  pessimistic outlook). Eases as P10 PV remaining shrinks toward
+  sunset and actual PV is banked.
 - drain_above: tracks `min(overflow_floor, effective_keep)`. On a
   bright day overflow_floor wins (low value); on a normal day
   effective_keep wins (= overnight target).
-- Phase: morning Charge to drain_above (= effective_keep), Hold
-  through midday, Drain when overflow develops, Hold to sunset.
-- Pitfall: none — this is the easy case.
+- Phase: morning Charge to charge_below as a safety buffer, then
+  Hold/Drain as actual PV exceeds the P10 line.
+- Pitfall: small extra round-trip on days that turn out P50+. Cost
+  is ~10% of the over-charged slice — accepted as insurance.
 
 ### Scenario 2 — Under-forecast day (actual < Solcast)
 
-- Profile: clouds materialise that Solcast didn't predict. Solcast P50
+- Profile: clouds materialise that Solcast didn't predict. Solcast P10
   remaining revises down through the morning to catch up.
-- charge_below: tracks revised P50 directly. As Solcast lowers P50
-  (catching up to clouds), the deficit becomes visible and floor
-  rises. Some lag is unavoidable — Solcast typically takes 1-3 hours
-  to re-converge after weather diverges.
+- charge_below: P10 already pessimistic, so morning floor is already
+  high enough to force-charge well before deficit becomes critical.
+  As P10 revises down further the floor rises more, but most of the
+  defensive charging happened earlier.
 - drain_above: stays at curtailment-buffer floor — overflow probably
   won't materialise.
-- Phase: morning Hold (P50 still optimistic, no force-charge); as P50
-  revises down and floor rises, Charge fires if SOC drops below it.
-- Pitfall: pure P10-only forecast gave 9.91 kWh floor on 2026-05-08
-  morning — eager-charge on a day actual was much better than P10.
-  P50-direct gave 0 morning, then climbed as Solcast revised. We
-  accept some morning over-trust as the cost of avoiding round-trip
-  when the day proves better than P10.
+- Phase: morning Charge ensures SOC reaches target even on worst-case
+  forecast.
+- Pitfall: minimal — P10 is designed for this case.
 
 ### Scenario 3 — Over-forecast day (actual > Solcast)
 
-- Profile: clearer than Solcast predicted. P50 remaining stays low
-  until Solcast revises up.
-- charge_below: based on revised P50 — lags actual but converges.
+- Profile: clearer than Solcast predicted. P10 remaining stays low
+  (conservative) until Solcast revises up.
+- charge_below: P10-based, so it stays elevated even as actual PV
+  pours in. Some "wasted" defensive charging happens, but once SOC
+  crosses target the Drain phase exports the surplus.
 - drain_above: as actual overflow develops, overflow_floor lowers
   (R50 confidence weighting on the curtailment side handles this).
   drain_above tracks the overflow buffer requirement.
-- Phase: morning Hold, increasingly active Drain through midday as
-  overflow develops, Hold late afternoon.
-- Pitfall: same lag as Scenario 2 in opposite direction. Acceptable.
+- Phase: morning Charge to P10 floor; Drain as overflow develops and
+  SOC exceeds target.
+- Pitfall: defensive charging cost ~10% on the over-charged slice.
+  Accepted.
 
 ### Scenario 4 — Sunny morning, cloudy afternoon (front-loaded)
 
 - Profile: clear sunrise → high PV early → clouds 11:00-13:00 → little
-  afternoon. Solcast P50 should reflect this from sunrise (the model
-  knows time-of-day weather variation).
-- charge_below: stays low early (lots of forecast PV ahead per P50).
-  Rises in afternoon as P50 falls (clouds shorten remaining PV).
+  afternoon. Solcast P10 should reflect this from sunrise.
+- charge_below: starts elevated (P10 already accounts for afternoon
+  clouds). Falls as morning PV banks.
 - drain_above: drain target tracks overflow_floor. Drain may fire
   morning when battery fills from sunny-morning surplus.
-- Phase: morning Charge or Hold to drain_above; Hold/Drain midday;
-  Charge afternoon if SOC drops below charge_below.
+- Phase: morning Charge to P10 floor; Hold/Drain midday; SOC already
+  comfortable for afternoon clouds.
 - Pitfall: a calibration ratio approach would say "ratio=1.3 morning,
   trust = scale up afternoon forecast" — wrong, the afternoon clouds
-  are already in the forecast. Direct P50 avoids this trap.
+  are already in the forecast. Direct P10 avoids this trap.
 
 ### Scenario 5 — Cloudy morning, sunny afternoon (back-loaded)
 
 - Profile: clouds sunrise → low PV early → clears 11:00 → high PV
-  afternoon. Solcast P50 should reflect this from sunrise.
-- charge_below: starts moderate (P50 says afternoon PV will recover);
-  as morning unfolds and P50 maybe revises further (down if cloudier
-  than forecast, up if better), floor adjusts.
+  afternoon. Solcast P10 should reflect this from sunrise.
+- charge_below: starts elevated (P10 won't promise the afternoon
+  recovery — it assumes worst case). Triggers morning Charge from
+  grid to guarantee target.
 - drain_above: rises as Solcast says afternoon overflow likely;
   morning Hold ensures battery has room.
-- Phase: morning Charge if SOC critically low; otherwise Hold and
-  let afternoon PV fill. Drain mid/late afternoon if overflow develops.
+- Phase: morning Charge to P10 floor; Drain mid/late afternoon if
+  overflow develops.
 - Pitfall: a calibration ratio would say "ratio=0.3 morning, scale
   down afternoon forecast" — wrong, the afternoon sun is already in
-  the forecast. Direct P50 avoids this trap.
-- 2026-05-08 was this shape. P10-only gave eager-charge morning →
-  round-trip drain afternoon. P50-direct gives 0 floor morning (P50
-  already optimistic about afternoon), no eager-charge. If the day
-  proves worse than P50 expected, Predbat handles overnight grid-
-  charge at cheap rate.
+  the forecast. Direct P10 avoids this trap.
+- 2026-05-08 was this shape. With P10 we'd eager-charge morning →
+  round-trip drain afternoon (cost ~£0.10-0.20 + battery wear). The
+  alternative — P50-direct — gave 0 morning floor but accepted ending
+  below overnight target if actual undershot P50. P10 chooses the
+  defensive bet.
 
 ### Test Coverage Required
 
-- `test_curtailment.py` pure-function tests: P50 with deficit / surplus /
-  zero target / load > P50. ✓
+- `test_curtailment.py` pure-function tests: P10 with deficit / surplus /
+  zero target / load > P10, plus regression guard that P50 is ignored. ✓
 - Integration scenario tests: each of the 5 day shapes simulated end-
   to-end against expected SOC trajectory. **TODO**.
 - Real-day CSV fixtures: capture 2026-05-08 (under-forecast cloudy)
@@ -806,14 +820,19 @@ allowing SOC < soc_keep absorbs more PV). Two separate concepts:
 
 ### Why we accept this design's failure modes
 
-The trade is:
-- **Best case (typical days):** no round-trip loss, no battery cycle
-  wear from defensive charging.
-- **Worst case (worse-than-P50 day):** end below overnight target,
-  Predbat grid-charges at cheap rate (~12p/kWh).
-- **Round-trip cost of being wrong defensively:** ~10% efficiency
-  loss + cycle wear.
+The trade (P10 choice, 2026-05-11):
 
-Empirically on 2026-05-08: P10-only triggered ~6 kWh round-trip
-(£0.10-0.20 + battery wear) on a day where Predbat would have
-covered the gap for less.
+- **Best case (P10-or-worse day):** overnight target guaranteed,
+  no expensive evening grid-fill.
+- **Worst case (clearer than P10 day):** defensive charging that
+  later round-trips out as Drain-phase export — ~10% efficiency
+  loss on the over-charged slice + minor cycle wear.
+- **Asymmetric cost calculus:** under-charging costs the full
+  overnight import bill plus comfort risk; over-charging costs
+  one round-trip on a small slice. Defensive bet wins.
+
+Empirically on 2026-05-08 (cloudy morning, sunny afternoon shape):
+P10 triggered ~6 kWh round-trip drain afternoon (£0.10-0.20 + cycle).
+P50 would have skipped the morning charge but accepted ending below
+overnight target on worse-than-P50 days. We prefer the round-trip
+cost over the import-bill exposure.

@@ -1333,14 +1333,13 @@ class CurtailmentPlugin(PredBatPlugin):
         except (ValueError, TypeError):
             p50_pv_remaining = p10_pv_remaining
         # load_remaining was computed earlier (R5 activation check).
-        # Use Solcast's P50 directly — Solcast revises through the day, so
-        # an over-optimistic morning P50 catches up to reality without us
-        # second-guessing with a 30-min tracking ratio.
+        # Use Solcast P10 (pessimistic) — guarantee we hit overnight target
+        # even on a worse-than-median PV day. Over-charging cost is one
+        # round-trip; under-charging cost is the overnight grid-fill bill.
         overnight_for_recovery = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
         p10_recovery = compute_p10_recovery_floor(
             overnight_target_kwh=overnight_for_recovery,
             p10_pv_remaining_kwh=p10_pv_remaining,
-            p50_pv_remaining_kwh=p50_pv_remaining,
             load_remaining_kwh=load_remaining,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)

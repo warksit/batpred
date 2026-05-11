@@ -77,6 +77,7 @@ daysymbol
 dedup
 dend
 denorm
+deque
 dess
 devcontainer
 devcontainers
@@ -382,6 +383,7 @@ unstaged
 useid
 userinterface
 varh
+vcap
 venv
 Victron
 visibilitychange

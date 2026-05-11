@@ -247,39 +247,28 @@ def compute_effective_export_cap(today_samples_kw, yesterday_avg_kw, dno_kw=4.0,
 
 
 def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh, p50_pv_remaining_kwh=None, calibration_ratio=1.0):
-    """Recovery floor based on Solcast's current P50 remaining estimate —
-    minimum SOC needed now to land on overnight_target by sundown.
-
-    Solcast revises its forecast through the day as actual conditions
-    clarify. Trust those revisions: an over-optimistic morning P50 catches
-    up to cloudy reality within a few hours. We don't apply a calibration
-    ratio on top — the past 30 minutes don't predict the next 6 hours
-    (sunny mornings can become cloudy afternoons), and any ratio multiplier
-    second-guesses Solcast's own model which already accounts for time-of-
-    day weather variation.
+    """Recovery floor based on Solcast's P10 (pessimistic) remaining estimate —
+    minimum SOC needed now to land on overnight_target by sundown even on a
+    worse-than-median PV day.
 
     Formula:
-        floor = max(0, overnight_target - (effective_pv - load_remaining))
+        floor = max(0, overnight_target - (p10_pv_remaining - load_remaining))
 
-    where effective_pv is P50 (Solcast's current best estimate of remaining
-    PV) when available, else falls back to P10 (legacy worst-case behaviour
-    for callers that don't pass P50).
-
-    Tradeoff: trusting P50 means accepting that on a worse-than-P50 day we
-    may end the day below overnight_target. Predbat's overnight grid charge
-    fills the gap at cheap import rate — typically cheaper than the round-
-    trip loss of pre-emptively charging the battery on a forecast that turns
-    out to be too pessimistic.
+    Design choice (2026-05-11): use P10, not P50. The cost of being defensive
+    is a small extra round-trip when the day beats P10 (~10% efficiency loss
+    on the slice we over-charged). The cost of being optimistic is missing
+    overnight_target → forced grid-fill at evening rates (which can be more
+    expensive than mid-day import, especially on flat 19p legacy tariffs).
+    Once we cross overnight_target the Hold/Drain logic exports the excess,
+    so over-charging by a kWh or two costs at most the round-trip; under-
+    charging costs the import bill plus comfort risk.
 
     Args:
         overnight_target_kwh: required SOC by end of day.
-        p10_pv_remaining_kwh: Solcast P10 PV remaining (kWh, fallback).
+        p10_pv_remaining_kwh: Solcast P10 PV remaining (kWh) — used.
         load_remaining_kwh: forecast load remaining today (kWh).
-        p50_pv_remaining_kwh: Solcast P50 (current best estimate). If None,
-                              falls back to P10.
-        calibration_ratio: ignored — kept for backwards compat; the function
-                           previously scaled P50 by this. Solcast's own
-                           revisions provide the time-varying correction.
+        p50_pv_remaining_kwh: accepted for backward compat; ignored.
+        calibration_ratio: accepted for backward compat; ignored.
 
     Returns:
         kWh — minimum SOC needed now to land on overnight target.
@@ -287,9 +276,8 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     Used in R54's outer max as a lower-bound term (alongside `reserve`):
         target = max(reserve, p10_recovery, min(curt_floor, effective_keep))
     """
-    del calibration_ratio  # accepted but not used
-    effective_pv = p50_pv_remaining_kwh if p50_pv_remaining_kwh is not None else p10_pv_remaining_kwh
-    net_charging = effective_pv - load_remaining_kwh  # signed
+    del calibration_ratio, p50_pv_remaining_kwh  # accepted but not used
+    net_charging = p10_pv_remaining_kwh - load_remaining_kwh  # signed
     return max(0.0, overnight_target_kwh - net_charging)
 
 

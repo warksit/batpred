@@ -579,17 +579,20 @@ def test_p10_recovery_floor_today_2026_05_08_cloudy():
     print(f"  test_p10_recovery_floor_today_2026_05_08_cloudy: PASSED (floor={floor})")
 
 
-def test_p10_recovery_floor_uses_p50_when_available():
-    """P50 provided → floor based on Solcast's current best estimate.
-    No ratio scaling — Solcast's revisions are the time-varying correction.
+def test_p10_recovery_floor_ignores_p50():
+    """Design choice 2026-05-11: charge_below uses P10 only. P50 passed for
+    backward compat is ignored — guarantees we hit overnight target even on
+    a worse-than-median PV day.
     """
     floor = compute_p10_recovery_floor(
-        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
-        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0,
+        overnight_target_kwh=9.4,
+        p10_pv_remaining_kwh=2.0,
+        p50_pv_remaining_kwh=10.0,
+        load_remaining_kwh=5.0,
     )
-    # effective = P50 = 10. net = 5. floor = max(0, 9.4 - 5) = 4.4
-    assert abs(floor - 4.4) < 0.001, f"Expected 4.4, got {floor}"
-    print(f"  test_p10_recovery_floor_uses_p50_when_available: PASSED (floor={floor})")
+    # Uses P10=2, ignores P50=10. net = 2-5 = -3, floor = max(0, 9.4+3) = 12.4
+    assert abs(floor - 12.4) < 0.001, f"Expected 12.4 (P10-based, P50 ignored), got {floor}"
+    print(f"  test_p10_recovery_floor_ignores_p50: PASSED (floor={floor})")
 
 
 def test_p10_recovery_floor_calibration_ratio_ignored():
@@ -597,45 +600,46 @@ def test_p10_recovery_floor_calibration_ratio_ignored():
     doesn't predict next 6 hours. Result identical to ratio=1.0.
     """
     f_ignored = compute_p10_recovery_floor(
-        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
-        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0, calibration_ratio=0.3,
+        overnight_target_kwh=9.4,
+        p10_pv_remaining_kwh=2.0,
+        load_remaining_kwh=5.0,
+        calibration_ratio=0.3,
     )
     f_default = compute_p10_recovery_floor(
-        overnight_target_kwh=9.4, p10_pv_remaining_kwh=2.0,
-        p50_pv_remaining_kwh=10.0, load_remaining_kwh=5.0,
+        overnight_target_kwh=9.4,
+        p10_pv_remaining_kwh=2.0,
+        load_remaining_kwh=5.0,
     )
     assert abs(f_ignored - f_default) < 0.001, f"ratio should be ignored, got {f_ignored} vs {f_default}"
     print(f"  test_p10_recovery_floor_calibration_ratio_ignored: PASSED (floor={f_ignored})")
 
 
-def test_p10_recovery_floor_today_p50_direct():
-    """Today's actual case (2026-05-08 mid-afternoon):
-    Solcast revised P50=14.3, load=4.26, target=7.45.
-    Floor = max(0, 7.45 - (14.3 - 4.26)) = max(0, -2.59) = 0.
-    Solcast's own revision from morning's 39.5 → 14.3 has caught up to reality.
-    Trust it.
+def test_p10_recovery_floor_late_afternoon_pessimistic():
+    """Late afternoon real-world case: P10 PV remaining is small, load drains
+    battery. Floor must be raised above overnight_target to cover the deficit.
     """
     floor = compute_p10_recovery_floor(
         overnight_target_kwh=7.45,
         p10_pv_remaining_kwh=2.72,
-        p50_pv_remaining_kwh=14.3,
         load_remaining_kwh=4.26,
     )
-    assert abs(floor - 0.0) < 0.001, f"Expected 0.0, got {floor}"
-    print(f"  test_p10_recovery_floor_today_p50_direct: PASSED (floor={floor})")
+    # net = 2.72 - 4.26 = -1.54, floor = max(0, 7.45 + 1.54) = 8.99
+    assert abs(floor - 8.99) < 0.001, f"Expected 8.99, got {floor}"
+    print(f"  test_p10_recovery_floor_late_afternoon_pessimistic: PASSED (floor={floor})")
 
 
-def test_p10_recovery_floor_genuine_cloudy_p50():
-    """Real cloudy day: Solcast P50 already reflects low PV (no spread illusion)."""
+def test_p10_recovery_floor_genuine_cloudy_day():
+    """Real cloudy day: P10 PV low and load high → floor well above target
+    to ensure overnight need is met.
+    """
     floor = compute_p10_recovery_floor(
         overnight_target_kwh=7.42,
         p10_pv_remaining_kwh=4.0,
-        p50_pv_remaining_kwh=5.0,
         load_remaining_kwh=10.0,
     )
-    # effective = P50 = 5, net = -5 (deficit), floor = 7.42 + 5 = 12.42
-    assert abs(floor - 12.42) < 0.001, f"Expected 12.42, got {floor}"
-    print(f"  test_p10_recovery_floor_genuine_cloudy_p50: PASSED (floor={floor})")
+    # net = 4-10 = -6, floor = max(0, 7.42 + 6) = 13.42
+    assert abs(floor - 13.42) < 0.001, f"Expected 13.42, got {floor}"
+    print(f"  test_p10_recovery_floor_genuine_cloudy_day: PASSED (floor={floor})")
 
 
 def test_p10_recovery_floor_zero_target():
@@ -4491,10 +4495,10 @@ def run_curtailment_tests(my_predbat=None):
         test_drain_above_overflow_floor_wins_on_big_overflow,
         test_drain_above_reserve_floor,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
-        test_p10_recovery_floor_uses_p50_when_available,
+        test_p10_recovery_floor_ignores_p50,
         test_p10_recovery_floor_calibration_ratio_ignored,
-        test_p10_recovery_floor_today_p50_direct,
-        test_p10_recovery_floor_genuine_cloudy_p50,
+        test_p10_recovery_floor_late_afternoon_pessimistic,
+        test_p10_recovery_floor_genuine_cloudy_day,
         test_p10_recovery_floor_zero_target,
         test_p10_recovery_floor_today_at_11_03,
         test_p10_recovery_floor_combines_with_r54_min,
