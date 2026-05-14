@@ -8,9 +8,12 @@
 # while away from phone. This automation repeats a critical mobile push every 15 min
 # until the inverter returns to Running.
 #
-# Detection rule: state="Shutdown" for >5 minutes. The 5-min threshold filters out
-# transient G99 protective disconnects (which auto-recover well before then) and
-# catches CLS faults which sustain.
+# Detection rule: state="Shutdown" for >2 minutes. Transient OVPs cycle
+# EA→Standby→Running without entering Shutdown at all, so the trigger
+# is already filter enough. The 2-min for: clause catches the rare brief
+# Shutdown that recovers cleanly (e.g. 5/8 08:25 morning startup, 4 min)
+# without delaying real CLS detection — false positive cost is one
+# ignorable push, vs. 3 min of unnoticed CLS time.
 #
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 # See `apps/predbat/.claude/CLAUDE.md` HA Automation Edits workflow.
@@ -19,7 +22,7 @@ id: "1778793888979"
 alias: "SIG CLS Fault Repeating Alert"
 description: >-
   Sustained SIG inverter failure CLS alert 4004_1. Fires when Shutdown lasts
-  over 5 min and repeats critical mobile push every 15 min until SIG returns
+  over 2 min and repeats critical mobile push every 15 min until SIG returns
   to Running.
 mode: single
 max_exceeded: silent
@@ -29,7 +32,7 @@ trigger:
     entity_id: sensor.sigen_plant_plant_running_state
     to: "Shutdown"
     for:
-      minutes: 5
+      minutes: 2
 
 action:
   - repeat:
