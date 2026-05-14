@@ -1,0 +1,66 @@
+# SIG CLS Fault Repeating Alert
+#
+# Sustained SIG inverter failure (Alert Code 4004_1, "CLS malfunction") needs
+# MANUAL reset via the Sigen app — unlike transient OVP trips which cycle through
+# Environmental Abnormality → Standby → Running in ~90 seconds, a CLS fault
+# leaves the inverter stuck in Shutdown for hours. The default sig_inverter_fault_alert
+# fires once and assumes auto-recovery; the user missed a 3h47m outage on 2026-05-14
+# while away from phone. This automation repeats a critical mobile push every 15 min
+# until the inverter returns to Running.
+#
+# Detection rule: state="Shutdown" for >5 minutes. The 5-min threshold filters out
+# transient G99 protective disconnects (which auto-recover well before then) and
+# catches CLS faults which sustain.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+# See `apps/predbat/.claude/CLAUDE.md` HA Automation Edits workflow.
+
+id: "1778793888979"
+alias: "SIG CLS Fault Repeating Alert"
+description: >-
+  Sustained SIG inverter failure CLS alert 4004_1. Fires when Shutdown lasts
+  over 5 min and repeats critical mobile push every 15 min until SIG returns
+  to Running.
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: sensor.sigen_plant_plant_running_state
+    to: "Shutdown"
+    for:
+      minutes: 5
+
+action:
+  - repeat:
+      until:
+        - condition: state
+          entity_id: sensor.sigen_plant_plant_running_state
+          state: "Running"
+      sequence:
+        - service: notify.mobile_app_andrew_iphone
+          data:
+            title: "SIG CLS Fault - Manual Reset Needed"
+            message: >-
+              SIG stuck ({{ states('sensor.sigen_plant_plant_running_state') }}).
+              Clear via Sigen app, alert 4004_1.
+              SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%,
+              V {{ states('sensor.sigen_inverter_phase_a_voltage') }}V
+            data:
+              push:
+                sound:
+                  name: "default"
+                  critical: 1
+                  volume: 1
+                interruption_level: "critical"
+        - delay:
+            minutes: 15
+
+  # All-clear when SIG returns to Running
+  - service: notify.mobile_app_andrew_iphone
+    data:
+      title: "SIG CLS Fault RESOLVED"
+      message: >-
+        SIG returned to Running.
+        SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%,
+        PV {{ states('sensor.sigen_plant_pv_power') }} kW
