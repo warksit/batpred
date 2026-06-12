@@ -32,7 +32,12 @@
 #
 # EMS mode management:
 #   Manual != Off OR plugin active → Command Discharging (ESS First)
-#   Both off → Maximum Self Consumption (normal operation)
+#   Both off AND EMS == Command Discharging (ESS First) → restore MSC.
+#   Restoration ONLY reverts curtailment's own mode (D-ESS). It must never
+#   clobber a mode set by Predbat's requested-mode mapper — 2026-06-11 the
+#   old "EMS != MSC" form reverted Predbat's overnight cheap-rate charge
+#   (Command Charging) to MSC within 5 seconds; battery sat at 0% all night
+#   and the house imported at full rate.
 #
 # Voltage-based cap (input_number.voltage_throttle_filtered_cap):
 #   Continuous proportional throttle from the voltage seek controller. Min'd
@@ -98,7 +103,11 @@ condition:
           - condition: state
             entity_id: select.sigen_plant_remote_ems_control_mode
             state: "Command Discharging (ESS First)"
-      # Both off and EMS not MSC — trigger MSC restoration
+      # Both off and EMS still in curtailment's own mode — trigger MSC
+      # restoration. Matches Command Discharging (ESS First) specifically,
+      # NOT "anything != MSC": Predbat's requested-mode mapper may have set a
+      # charge/discharge mode while the plugin is Off (e.g. overnight cheap-
+      # rate grid charge) and this automation must not run over the top of it.
       - condition: and
         conditions:
           - condition: state
@@ -107,11 +116,9 @@ condition:
           - condition: state
             entity_id: sensor.predbat_curtailment_phase
             state: "Off"
-          - condition: not
-            conditions:
-              - condition: state
-                entity_id: select.sigen_plant_remote_ems_control_mode
-                state: "Maximum Self Consumption"
+          - condition: state
+            entity_id: select.sigen_plant_remote_ems_control_mode
+            state: "Command Discharging (ESS First)"
 
 action:
   - variables:
@@ -224,10 +231,13 @@ action:
         data:
           value: 9200
 
-  # Restore MSC when both manual and plugin off
+  # Restore MSC when both manual and plugin off AND the EMS is still in
+  # curtailment's own mode (D-ESS). Never reverts modes set by Predbat's
+  # requested-mode mapper (Command Charging / Command Discharging (PV First))
+  # — see 2026-06-11 incident in header.
   - if:
       - condition: template
-        value_template: "{{ manual_mode == 'Off' and states('sensor.predbat_curtailment_phase') == 'Off' and states('select.sigen_plant_remote_ems_control_mode') != 'Maximum Self Consumption' }}"
+        value_template: "{{ manual_mode == 'Off' and states('sensor.predbat_curtailment_phase') == 'Off' and states('select.sigen_plant_remote_ems_control_mode') == 'Command Discharging (ESS First)' }}"
     then:
       - action: select.select_option
         target:

@@ -74,6 +74,22 @@ def load_variables_from_yaml(path):
     raise RuntimeError(f"No 'variables' block found in {path}")
 
 
+def load_msc_restore_condition(path):
+    """Return the condition template of the restore-MSC action step.
+
+    Identified as the `if` step whose `then` selects Maximum Self Consumption.
+    """
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    for step in doc.get("action", []):
+        if not (isinstance(step, dict) and "if" in step):
+            continue
+        for act in step.get("then", []):
+            if isinstance(act, dict) and act.get("data", {}).get("option") == "Maximum Self Consumption":
+                return step["if"][0]["value_template"]
+    raise RuntimeError(f"No restore-MSC step found in {path}")
+
+
 # ---------- Variable evaluator -------------------------------------------------
 
 
@@ -132,6 +148,7 @@ def build_fixture(
     voltage_cap=4.0,
     export_cap_raw=None,
     plugin_phase="Active",
+    ems_mode="Maximum Self Consumption",
     now=None,
 ):
     """Build an HA-mock fixture from scenario-shaped parameters.
@@ -171,6 +188,7 @@ def build_fixture(
             "input_text.curtailment_live_phase": current_phase,
             "sensor.predbat_curtailment_phase": plugin_phase,
             "number.sigen_plant_grid_export_limitation": "4",
+            "select.sigen_plant_remote_ems_control_mode": ems_mode,
         },
         "attrs": {
             ("sensor.predbat_curtailment_phase", "safe_time"): safe_time_str,
@@ -346,6 +364,94 @@ def _scenarios():
     ]
 
 
+# ---------- MSC restoration scenarios ------------------------------------------
+#
+# 2026-06-11 incident: Predbat requested an overnight cheap-rate charge at
+# 22:03 BST (mapper set EMS = Command Charging). Five seconds later this
+# automation's restore-MSC step saw "manual Off + plugin Off + EMS != MSC"
+# and flipped EMS back to Maximum Self Consumption — which never grid-charges.
+# Battery sat at 0% all night; house imported at full rate.
+#
+# The restore step exists to clean up after the CURTAILMENT system itself
+# (which leaves EMS in Command Discharging (ESS First)). It must restore ONLY
+# from that mode — never clobber a mode Predbat's requested-mode mapper set.
+
+
+@dataclass
+class MscScenario:
+    name: str
+    fixture: dict
+    expected_restore: bool
+
+
+def _msc_scenarios():
+    return [
+        MscScenario(
+            "M1 Restore fires on curtailment leftover (D-ESS, both off)",
+            build_fixture(soc_pct=50, plugin_phase="Off", export_cap_raw=-1.0, ems_mode="Command Discharging (ESS First)"),
+            expected_restore=True,
+        ),
+        MscScenario(
+            "M2 Defers to Predbat overnight charge (PV First, both off)",
+            build_fixture(soc_pct=2, plugin_phase="Off", export_cap_raw=-1.0, ems_mode="Command Charging (PV First)"),
+            expected_restore=False,
+        ),
+        MscScenario(
+            "M3 Defers to Predbat overnight charge (Grid First, both off)",
+            build_fixture(soc_pct=2, plugin_phase="Off", export_cap_raw=-1.0, ems_mode="Command Charging (Grid First)"),
+            expected_restore=False,
+        ),
+        MscScenario(
+            "M4 No restore while plugin Active (D-ESS is curtailment's mode)",
+            build_fixture(soc_pct=50, plugin_phase="Active", export_cap_raw=2.0, ems_mode="Command Discharging (ESS First)"),
+            expected_restore=False,
+        ),
+        MscScenario(
+            "M5 No restore when already MSC",
+            build_fixture(soc_pct=50, plugin_phase="Off", export_cap_raw=-1.0, ems_mode="Maximum Self Consumption"),
+            expected_restore=False,
+        ),
+        MscScenario(
+            "M6 No restore during manual override (D-ESS intended)",
+            build_fixture(soc_pct=50, plugin_phase="Off", export_cap_raw=-1.0, manual="Drain", ems_mode="Command Discharging (ESS First)"),
+            expected_restore=False,
+        ),
+    ]
+
+
+def run_msc_restore_tests():
+    print("**** Running MSC restoration tests ****")
+    try:
+        variables = load_variables_from_yaml(YAML_PATH)
+        condition = load_msc_restore_condition(YAML_PATH)
+    except Exception as e:
+        print(f"  FAILED to load YAML: {e}")
+        return True
+
+    failed = False
+    for s in _msc_scenarios():
+        try:
+            ctx = evaluate_variables(variables, s.fixture)
+            ha = HAState(s.fixture)
+            env = _new_env(ha)
+            rendered = env.from_string(condition).render(**ctx).strip()
+        except Exception as e:
+            print(f"  {s.name}: FAILED — render error: {e}")
+            failed = True
+            continue
+
+        actual = rendered == "True"
+        if actual != s.expected_restore:
+            print(f"  {s.name}: FAILED — restore={actual}, expected {s.expected_restore}")
+            failed = True
+        else:
+            print(f"  {s.name}: ok (restore={actual})")
+
+    if not failed:
+        print("**** All MSC restoration tests PASSED ****")
+    return failed
+
+
 # ---------- Runner -------------------------------------------------------------
 
 
@@ -400,4 +506,6 @@ def run_yaml_curtailment_tests():
 
 
 if __name__ == "__main__":
-    sys.exit(1 if run_yaml_curtailment_tests() else 0)
+    failed = run_yaml_curtailment_tests()
+    failed = run_msc_restore_tests() or failed
+    sys.exit(1 if failed else 0)
