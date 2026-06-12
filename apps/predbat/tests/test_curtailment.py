@@ -24,6 +24,7 @@ from curtailment_calc import (
     p_scales_from_forecast,
     compute_expected_overflow,
     compute_pv_start_time,
+    compute_charge_below,
     compute_drain_above,
     compute_p10_recovery_floor,
     compute_effective_export_cap,
@@ -568,6 +569,50 @@ def test_drain_above_reserve_floor():
     drain = compute_drain_above(reserve=2.0, overflow_floor=1.0, effective_keep=1.5)
     assert abs(drain - 2.0) < 0.001, f"Expected 2.0 (reserve), got {drain}"
     print(f"  test_drain_above_reserve_floor: PASSED ({drain})")
+
+
+def test_drain_above_deep_discharge_floor():
+    """Extreme-overflow day: overflow_floor=0 and R48 relaxed effective_keep to 0.5.
+
+    The inner min(overflow_floor=0, effective_keep=0.5) is 0, which would drain
+    the battery to absolute empty. drain_above must not drop below the 0.5 kWh
+    deep-discharge buffer — 0.5 kWh of headroom is negligible against a multi-kWh
+    overflow but protects the cell from a full bottom-out. R48 itself relaxes
+    keep to 0.5 (not 0) for exactly this reason; the inner min must not undo it.
+    """
+    drain = compute_drain_above(reserve=0.0, overflow_floor=0.0, effective_keep=0.5)
+    assert abs(drain - 0.5) < 0.001, f"Expected 0.5 (deep-discharge floor), got {drain}"
+    print(f"  test_drain_above_deep_discharge_floor: PASSED ({drain})")
+
+
+def test_charge_below_deep_discharge_floor():
+    """Sunny-tomorrow day: R26 has relaxed best_soc_keep to 0; p10 recovery 0.
+
+    The soc_keep clamp (REQUIREMENTS "soc_keep floor", 2026-05-08) protects
+    against reporting charge_below < overnight need — but evaporates when
+    overnight need itself is 0. The deep-discharge floor must apply
+    symmetrically to charge_below so charge_target = min(charge_below,
+    drain_above) never drops below 0.5 kWh. Without this, the YAML stays
+    in Hold (exporting) while SOC = 0 — observed 2026-06-04 with battery
+    at 0% during PV-load surplus + kettle transient → grid import.
+    """
+    cb = compute_charge_below(p10_recovery_floor=0.0, soc_keep=0.0)
+    assert abs(cb - 0.5) < 0.001, f"Expected 0.5 (deep-discharge floor), got {cb}"
+    print(f"  test_charge_below_deep_discharge_floor: PASSED ({cb})")
+
+
+def test_charge_below_soc_keep_wins():
+    """When soc_keep > deep-discharge floor, soc_keep wins (existing clamp)."""
+    cb = compute_charge_below(p10_recovery_floor=0.2, soc_keep=2.0)
+    assert abs(cb - 2.0) < 0.001, f"Expected 2.0 (soc_keep), got {cb}"
+    print(f"  test_charge_below_soc_keep_wins: PASSED ({cb})")
+
+
+def test_charge_below_p10_recovery_wins():
+    """When p10_recovery > soc_keep, p10_recovery wins (cloudy-tomorrow day)."""
+    cb = compute_charge_below(p10_recovery_floor=4.0, soc_keep=1.5)
+    assert abs(cb - 4.0) < 0.001, f"Expected 4.0 (p10_recovery), got {cb}"
+    print(f"  test_charge_below_p10_recovery_wins: PASSED ({cb})")
 
 
 def test_p10_recovery_floor_today_2026_05_08_cloudy():
@@ -4494,6 +4539,10 @@ def run_curtailment_tests(my_predbat=None):
         test_drain_above_curtailment_buffer_only,
         test_drain_above_overflow_floor_wins_on_big_overflow,
         test_drain_above_reserve_floor,
+        test_drain_above_deep_discharge_floor,
+        test_charge_below_deep_discharge_floor,
+        test_charge_below_soc_keep_wins,
+        test_charge_below_p10_recovery_wins,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
         test_p10_recovery_floor_ignores_p50,
         test_p10_recovery_floor_calibration_ratio_ignored,

@@ -475,20 +475,38 @@ R26, R27, R28, R29, R30, R34, R35, R36, R37, R38, R44, R47, R48, R49.
 - **R54** (single drain-target rule). At every plugin cycle:
 
   ```text
-  target_soc = max(min(curtailment_floor, effective_keep), reserve)
+  target_soc = max(min(curtailment_floor, effective_keep),
+                   reserve, DEEP_DISCHARGE_FLOOR_KWH)
   ```
 
     - `curtailment_floor` from R9 (Solcast-shaped via R53).
     - `effective_keep` is `soc_keep` after R26 (plan-time reduction)
     and R48 (live big-overflow relaxation latch).
     - `reserve` is the absolute physical floor (battery/inverter limit).
+    - `DEEP_DISCHARGE_FLOOR_KWH = 0.5` — the drain target never
+    falls below this regardless of `reserve` or overflow size.
     - `min` because both numbers are "drain TO this level"; lower wins.
-    - `max` clamp guarantees we never request below `reserve`.
+    - `max` clamp guarantees we never request below `reserve` nor below
+    the deep-discharge floor.
 
   Trade-off: when `effective_keep < curtailment_floor` (modest overflow
     - low overnight need), the rule drains slightly lower than curtailment
   strictly requires. Accepted in exchange for a single uniform rule
   across the day with no phase switch.
+
+  **Deep-discharge floor (2026-05-19).** On an extreme-overflow day
+  `curtailment_floor` (= `overflow_floor`) goes to 0 and R48 has relaxed
+  `effective_keep` to 0.5 kWh. The inner `min(0, 0.5)` is 0, and with
+  Predbat's `reserve` also 0 the drain target reaches absolute empty —
+  observed live 2026-05-19 with the battery at 0.0% SOC. R48 deliberately
+  relaxes keep to 0.5 (not 0); the inner `min` must not undo that. The
+  `DEEP_DISCHARGE_FLOOR_KWH` (0.5 kWh ≈ 2.8% of soc_max) term in the
+  outer `max` keeps a deep-discharge buffer. 0.5 kWh of headroom is
+  negligible against a multi-kWh overflow (the battery is slammed full
+  mid-day regardless) but protects the cell from a full bottom-out. This
+  applies only to the drain target (`compute_drain_above` /
+  `sensor.predbat_curtailment_drain_above`); the published `charge_below`
+  is separately clamped to `soc_keep`.
 
 - **R55** (overnight target sourced from morning gap).
   `effective_keep` is set in `on_before_plan` (R26) to
@@ -817,6 +835,34 @@ allowing SOC < soc_keep absorbs more PV). Two separate concepts:
   (input to R54 outer max for drain target)
 - Published `charge_below`: clamped to soc_keep (defines what the HA
   automation will force-charge to recover)
+
+### Deep-discharge floor on charge_below (added 2026-06-04)
+
+The soc_keep clamp above evaporates when `on_before_plan` (R26)
+relaxes `best_soc_keep` toward 0 on sunny-tomorrow days. On those
+days `charge_below = max(p10_recovery=0, soc_keep=0) = 0`, so
+`charge_target = min(charge_below, drain_above) = 0`. With SOC = 0
+the YAML stays in Hold and exports surplus PV to grid — leaving no
+buffer for a load transient. Observed 2026-06-04: battery at 0%,
+PV-load surplus 5 kW exporting, kettle (~3 kW) caused a sub-second
+grid touch.
+
+Symmetric fix: `compute_charge_below` floors at the same
+`DEEP_DISCHARGE_FLOOR_KWH = 0.5` constant used by R54's drain target.
+
+```text
+charge_below = max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
+```
+
+With SOC = 0 and `charge_below = 0.5`, `charge_target = 0.5` and the
+phase flips to Charge: `export = 0`, all PV is directed to battery
+until SOC reaches 0.5 kWh. A load transient at low SOC is now
+absorbed by redirecting PV (already on-site) rather than from the
+grid (round-trip via the export commitment).
+
+Invariant: the system never reports a target SOC below
+`DEEP_DISCHARGE_FLOOR_KWH` on either threshold, regardless of how
+optimistic the forecast or how low `soc_keep` is.
 
 ### Why we accept this design's failure modes
 

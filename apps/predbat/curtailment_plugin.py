@@ -41,6 +41,7 @@ from curtailment_calc import (
     compute_expected_overflow,
     compute_p10_recovery_floor,
     compute_effective_export_cap,
+    compute_charge_below,
     compute_drain_above,
     compute_floor_with_source,
     should_defer_to_charge,
@@ -1685,15 +1686,16 @@ class CurtailmentPlugin(PredBatPlugin):
         plugin_active = phase == "active"
         reserve = getattr(self.base, "reserve", 0)
         soc_keep_kwh = float(getattr(self.base, "best_soc_keep", 0) or 0)
-        # Published charge_below is clamped to soc_keep — never tell the HA
-        # automation that less than soc_keep is fine. Below soc_keep the
-        # battery is in Predbat's grid-charge zone anyway; charge_below
-        # represents "minimum SOC the curtailment manager will allow", not
-        # just "minimum to recover overnight target on a sunny day".
+        # Published charge_below is clamped via compute_charge_below — never
+        # tell the HA automation that less than soc_keep, p10 recovery floor,
+        # or the deep-discharge floor is fine. The deep-discharge floor (0.5
+        # kWh) bites when on_before_plan relaxes soc_keep toward 0 on sunny-
+        # tomorrow days: without it charge_target = min(0, drain_above) = 0
+        # and the YAML exports while battery is at empty (observed 2026-06-04).
         # The R54 floor input (self._p10_recovery_floor) is NOT clamped so
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
-            charge_below = round(max(self._p10_recovery_floor, soc_keep_kwh), 2)
+            charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh), 2)
         else:
             charge_below = 0.0

@@ -13,6 +13,15 @@ SAFE_PV_THRESHOLD_KW = 2.0
 
 MIN_BASE_LOAD_KW = 0.5
 
+# Deep-discharge floor (~2.8% of an 18 kWh battery). Applies symmetrically to
+# both charge_below and drain_above — the system must never report a target
+# below this, so charge_target = min(charge_below, drain_above) and the YAML
+# phase logic both stay anchored above the deep-discharge SOC. Prevents the
+# inner min collapsing to 0 on extreme-overflow days (drain_above) AND prevents
+# Hold/export while SOC is empty on sunny-tomorrow days where soc_keep relaxes
+# toward 0 (charge_below).
+DEEP_DISCHARGE_FLOOR_KWH = 0.5
+
 
 def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """
@@ -286,18 +295,45 @@ def compute_drain_above(reserve, overflow_floor, effective_keep):
     headroom. Independent of p10_recovery — if recovery requirements raise the
     overall floor higher, that affects charge_below not drain_above.
 
-    Returns: max(reserve, min(overflow_floor, effective_keep))
+    Returns: max(reserve, DEEP_DISCHARGE_FLOOR_KWH,
+                 min(overflow_floor, effective_keep))
 
     Inner min picks the lower of the two "drain to" targets:
       - overflow_floor: drain to here to make room for forecast overflow
       - effective_keep: don't drain below overnight need (R55)
-    Outer max ensures we never drain through the hardware reserve.
+    Outer max ensures we never drain through the hardware reserve, nor below
+    the DEEP_DISCHARGE_FLOOR_KWH buffer. On an extreme-overflow day
+    overflow_floor is 0 and R48 has relaxed effective_keep to 0.5; the inner
+    min(0, 0.5)=0 would drain the cell to absolute empty. The 0.5 kWh floor
+    keeps a small deep-discharge buffer — negligible curtailment headroom lost,
+    real battery protection gained (R54).
 
     Pairs with compute_p10_recovery_floor(): on cloudy/deficit days
     p10_recovery > drain_above (Charge wins, no Drain). On sunny days
     drain_above >> charge_below (wide Hold band, drain to make room).
     """
-    return max(reserve, min(overflow_floor, effective_keep))
+    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, min(overflow_floor, effective_keep))
+
+
+def compute_charge_below(p10_recovery_floor, soc_keep):
+    """Charge target: SOC level below which the system must not be exporting.
+
+    Returns: max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
+
+    Three terms in descending order of priority:
+      - p10_recovery_floor: SOC needed now to land on overnight target even on
+        a worst-case (P10) PV day (R59).
+      - soc_keep: overnight need / safety margin — the "soc_keep floor" clamp
+        documented in REQUIREMENTS (2026-05-08).
+      - DEEP_DISCHARGE_FLOOR_KWH: symmetric with compute_drain_above. The
+        soc_keep clamp evaporates when on_before_plan relaxes soc_keep toward 0
+        on sunny-tomorrow days (charge_below = max(0, 0) = 0). The deep-
+        discharge floor keeps charge_target = min(charge_below, drain_above)
+        above 0.5 kWh, so the YAML never reports Hold/exporting while SOC sits
+        at empty. Observed 2026-06-04 with battery at 0% during PV surplus +
+        kettle transient → grid import.
+    """
+    return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
 
 
 def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
