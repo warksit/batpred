@@ -37,7 +37,7 @@ For each date compute:
 
 ---
 
-## Step 2: Pull Data — Two Calls in Parallel
+## Step 2: Pull Data — Three Calls in Parallel
 
 ### Call A: ha_get_history (sparse state changes)
 
@@ -88,9 +88,7 @@ For **today**, current state contains today's totals. For **past days**, you mus
     "sensor.sigen_plant_daily_third_party_inverter_energy",
     "sensor.sigen_plant_daily_grid_import_energy",
     "sensor.sigen_plant_daily_grid_export_energy",
-    "sensor.curtailment_overflow_energy",
     "counter.voltage_throttle_activations_today",
-    "sensor.sig_voltage_throttle_lost_energy",
     "sensor.sigen_plant_pv_power",
     "sensor.sigen_plant_battery_state_of_charge",
     "sensor.predbat_curtailment_phase"
@@ -105,9 +103,35 @@ any need to pull phase-attribute history. Daily grid import/export are the
 clearest "did the day go well" signal — near-zero import on an overflow day is
 the success marker.
 
+### Call C: ha_get_history statistics (day-deltas for lifetime-cumulative sensors)
+
+`sensor.curtailment_overflow_energy` and `sensor.sig_voltage_throttle_lost_energy`
+are **lifetime-cumulative** (`state_class: total`, hundreds of kWh) — their current
+state is useless for a daily figure. Get the day's delta directly (works for today
+AND past days, tiny response):
+
+```json
+{
+  "source": "statistics",
+  "entity_ids": ["sensor.curtailment_overflow_energy", "sensor.sig_voltage_throttle_lost_energy"],
+  "period": "day",
+  "statistic_types": ["change"],
+  "start_time": "<date>T00:00:00+00:00",
+  "end_time": "<date+1>T00:00:00+00:00"
+}
+```
+
+`change` = the day's overflow kWh and throttle-lost kWh. (Observed 2026-07-04:
+raw states were 767 / 439 kWh cumulative; day changes were 10.87 / 5.07.)
+
 ### Past-day adjustments
 
-If `is_today` is false, replace Call B with a `ha_get_history` for the same entities **at start_time and end_time** (use `limit=2` and rely on first/last values) so you can compute the day's delta for cumulative sensors. Solcast forecast for past days is not retained — note "forecast unavailable for past days" in the PV Accuracy section instead.
+If `is_today` is false, replace Call B's daily-total sensors with a `ha_get_history`
+**at start_time and end_time** (use `limit=2` and rely on first/last values) so you
+can compute the day's delta for the `daily_*` cumulative sensors. Call C already
+handles the two lifetime-cumulative sensors for any date. Solcast forecast for past
+days is not retained — note "forecast unavailable for past days" in the PV Accuracy
+section instead.
 
 ---
 
@@ -119,7 +143,7 @@ If `is_today` is false, replace Call B with a `ha_get_history` for the same enti
 2. **PV forecast today**: state of `sensor.solcast_pv_forecast_forecast_today` (also has p10/p90 in attributes)
 3. **PV ratio**: actual / forecast
 4. **Voltage throttle activations**: state of `counter.voltage_throttle_activations_today`
-5. **Voltage throttle lost energy** (today's session if active, else cumulative): see attributes — `sensor.sig_voltage_throttle_lost_energy` is cumulative; subtract `input_number.voltage_throttle_engage_lost_start` for the current engagement session, or use the daily-reset variant if one exists
+5. **Voltage throttle lost energy + curtailment overflow (day)**: the `change` values from Call C — never the raw cumulative states
 6. **Current SOC** (or sunset SOC if past day): state of `sensor.sigen_plant_battery_state_of_charge`
 
 ### From Call A (history)
@@ -200,7 +224,7 @@ HH:MM  Phase         Target%  Note
 - **No curtailment activity** (phase Off all day): report "Curtailment manager inactive — no overflow detected" and skip floor/phase analysis. Still report PV total, sunset SOC, voltage throttle (if any).
 - **Today, mid-day**: state day is in progress; skip sunset SOC (use "current SOC: X%").
 - **Missing data**: report which call failed and present what you have.
-- **Voltage throttle data**: if more than one voltage throttle session today, the cumulative-minus-start-of-session math doesn't give a clean per-session breakdown — just report total daily lost energy (delta of cumulative sensor between start_time and now/end_time).
+- **Voltage throttle data**: Call C's day `change` is the total daily lost energy — don't attempt per-session breakdowns from the cumulative sensor.
 
 ---
 
