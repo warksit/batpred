@@ -103,7 +103,8 @@ from tests.test_temperature import test_temperature
 from tests.test_oauth_mixin import run_oauth_mixin_tests
 from tests.test_fox_oauth import run_fox_oauth_tests
 from tests.test_band_rate_text import test_band_rate_text
-from tests.test_inverter_integration import run_inverter_integration_tests
+from tests.test_kraken import run_kraken_tests
+from tests.test_kraken_auth_mixin import run_kraken_auth_mixin_tests
 
 
 # Mock the components and plugin system
@@ -158,7 +159,6 @@ def main():
         ("model", run_model_tests, "Model tests", False),
         ("inverter", run_inverter_tests, "Inverter tests", False),
         ("execute", run_execute_tests, "Execute tests", False),
-        ("inverter_integration", run_inverter_integration_tests, "Inverter integration tests", False),
         ("basic_rates", test_basic_rates, "Basic rates tests", False),
         ("window_sort", run_window_sort_tests, "Window sort tests", False),
         ("window2minutes", test_window2minutes, "Window to minutes tests", False),
@@ -266,6 +266,9 @@ def main():
         # OAuth infrastructure tests
         ("oauth_mixin", run_oauth_mixin_tests, "OAuth mixin tests (token refresh, expiry, 401 handling, env var fallback)", False),
         ("fox_oauth", run_fox_oauth_tests, "Fox API OAuth tests (dual auth headers, 401 retry, initialize params)", False),
+        # Kraken Energy (EDF/E.ON) tests
+        ("kraken", run_kraken_tests, "Kraken API tests (init, GraphQL, tariff discovery, rate fetching, run lifecycle)", False),
+        ("kraken_auth", run_kraken_auth_mixin_tests, "Kraken auth mixin tests (API key, email, refresh, 401 handling)", False),
         ("optimise_levels", run_optimise_levels_tests, "Optimise levels tests", False),
         ("optimise_windows", run_optimise_all_windows_tests, "Optimise all windows tests", True),
         ("debug_cases", run_debug_cases, "Debug case file tests", True),
