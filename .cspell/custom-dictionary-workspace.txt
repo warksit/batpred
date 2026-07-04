@@ -74,6 +74,7 @@ dateutil
 dayname
 daynumber
 daysymbol
+deadband
 dedup
 dend
 denorm
@@ -166,6 +167,7 @@ inday
 INTELLI
 intelligentdevice
 interp
+intraday
 invbatpower
 invname
 isoformat
