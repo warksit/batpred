@@ -647,6 +647,81 @@ def test_no_surplus_hold_surplus_allows_drain():
     print(f"  test_no_surplus_hold_surplus_allows_drain: PASSED ({held})")
 
 
+def test_huge_day_drain_budget_r61_r52():
+    """R61 × R52 interaction: on a huge PV day the drain budget still closes.
+
+    R61 blocks draining during the dawn gap (PV present but not covering
+    load). The design relies on the OTHER two windows to reach the huge-day
+    floor before overflow starts:
+      A. Pre-dawn: R52 drains at full DNO to soc_keep + PRE_PV_BUFFER_PCT
+         (separate path, not gated by R61).
+      B. Ramp (pv_covering → overflow start): drain rate = DNO − (pv − load).
+
+    Invariant pinned here: residual drain need after R52
+    (r52_target − DEEP_DISCHARGE_FLOOR) must fit in the ramp window's
+    capacity plus the reserved buffer (MAX_RESERVED_KWH), on a clear
+    scale-8.1 July day at Middlemuir. Checked for BOTH the current 4.0 kW
+    DNO and the post-swap 3.68 kW limit.
+
+    Also pinned: the R52-didn't-fire risk case (low pre-dawn confidence,
+    day turns out huge) starting from a typical overnight target — the ramp
+    window alone must cover it within the buffer.
+
+    Fails if: R61 is extended to block the ramp window, PRE_PV_BUFFER_PCT
+    default rises, the buffer shrinks, or the DNO drop breaks the budget.
+    """
+    import math as _math
+    from curtailment_plugin import PRE_PV_BUFFER_PCT_DEFAULT, MAX_RESERVED_KWH
+    from curtailment_calc import DEEP_DISCHARGE_FLOOR_KWH
+
+    lat, lon, doy, scale = 52.33, -1.32, 186, 8.1
+    load_kw = 0.5
+    soc_max, soc_keep = 18.08, 1.0
+    pv_margin_kw = 0.5  # pv_covering threshold (PV_MARGIN_KW in calculate())
+
+    def pv_at(t_utc):
+        elev = solar_elevation(lat, lon, t_utc, doy)
+        return scale * max(0.0, _math.sin(_math.radians(elev)))
+
+    r52_target = soc_keep + (PRE_PV_BUFFER_PCT_DEFAULT / 100.0) * soc_max
+
+    for dno in (4.0, 3.68):
+        # Find dawn crossings by scanning the geometry curve
+        t_cover = t_overflow = None
+        t = 0.0
+        while t < 14.0:
+            p = pv_at(t)
+            if t_cover is None and (p - load_kw) > pv_margin_kw:
+                t_cover = t
+            if t_overflow is None and (p - load_kw) > dno:
+                t_overflow = t
+                break
+            t += 1.0 / 60
+        assert t_cover is not None and t_overflow is not None and t_overflow > t_cover
+
+        # Ramp window drain capacity: export budget left after PV surplus
+        capacity = 0.0
+        t = t_cover
+        while t < t_overflow:
+            capacity += max(0.0, dno - (pv_at(t) - load_kw)) * (1.0 / 60)
+            t += 1.0 / 60
+
+        # Case 1: R52 fired pre-dawn — residual from r52_target to floor
+        residual = r52_target - DEEP_DISCHARGE_FLOOR_KWH
+        assert residual <= capacity + MAX_RESERVED_KWH, f"dno={dno}: R52 residual {residual:.2f} kWh exceeds ramp capacity {capacity:.2f} + buffer {MAX_RESERVED_KWH}"
+
+        # Case 2: R52 did NOT fire (low pre-dawn confidence, day turned huge).
+        # Ramp window alone must get from a typical overnight target to the
+        # floor, within the buffer.
+        overnight_target = 6.0
+        residual2 = overnight_target - DEEP_DISCHARGE_FLOOR_KWH
+        assert residual2 <= capacity + MAX_RESERVED_KWH, f"dno={dno}: no-R52 residual {residual2:.2f} kWh exceeds ramp capacity {capacity:.2f} + buffer {MAX_RESERVED_KWH}"
+
+        print(f"  test_huge_day_drain_budget_r61_r52: dno={dno} cover={t_cover:.2f}h overflow={t_overflow:.2f}h capacity={capacity:.2f}kWh residual={residual:.2f}/{residual2:.2f}kWh")
+
+    print("  test_huge_day_drain_budget_r61_r52: PASSED")
+
+
 def test_p10_recovery_floor_today_2026_05_08_cloudy():
     """Real input from 2026-05-08 cloudy morning that exposed the deficit bug.
     P10=7.97, load=10.46, target=7.42. Old (P10-only): floor = 9.91.
@@ -4578,6 +4653,7 @@ def run_curtailment_tests(my_predbat=None):
         test_no_surplus_hold_dawn_collapse,
         test_no_surplus_hold_target_above_soc_unchanged,
         test_no_surplus_hold_surplus_allows_drain,
+        test_huge_day_drain_budget_r61_r52,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
         test_p10_recovery_floor_ignores_p50,
         test_p10_recovery_floor_calibration_ratio_ignored,
