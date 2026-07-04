@@ -336,6 +336,41 @@ def compute_charge_below(p10_recovery_floor, soc_keep):
     return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
 
 
+def apply_no_surplus_drain_hold(drain_target, soc_kw, pv_covering):
+    """Option A (2026-06-15): never request draining below current SOC while PV
+    is not yet covering load (no genuine surplus).
+
+    The morning_gap-derived overnight target legitimately shrinks toward sunrise
+    (less battery needed as morning nears) — that part is correct. The flaw is
+    that compute_morning_gap calls "sunrise" the moment PV crosses ~0.3 kW, well
+    before PV actually exceeds load. Draining to that shrinking target empties
+    the battery before PV relieves it. 2026-06-15: plugin activated 05:11 BST
+    with target 0.3 kWh, drained 7.6% → 2.7% to grid, then imported once empty;
+    PV did not actually exceed load until ~08:44.
+
+    Draining exists to make room for *surplus* PV. With no surplus there is
+    nothing to make room for, so hold at (at least) current SOC — no Drain
+    fires, the battery still covers load naturally in Hold (export = 0). Once PV
+    covers load, normal drain-to-target resumes, and by then the target has
+    correctly risen again (post-sunrise rollover).
+
+    R52 pre-PV drain (intentional pre-sunrise drain on confirmed-overflow days)
+    uses a separate, separately-gated path and does not flow through here.
+
+    Args:
+        drain_target: kWh — computed drain floor (effective_keep) before the guard.
+        soc_kw: kWh — current battery SOC.
+        pv_covering: bool — True when actual PV exceeds load by the surplus margin.
+
+    Returns:
+        kWh — drain_target unchanged when there is surplus; otherwise raised to
+        at least soc_kw so no drain below the current level is requested.
+    """
+    if pv_covering:
+        return drain_target
+    return max(drain_target, soc_kw)
+
+
 def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
     """Split-threshold phase decision (shadow + automation logic).
 

@@ -882,3 +882,40 @@ P10 triggered ~6 kWh round-trip drain afternoon (£0.10-0.20 + cycle).
 P50 would have skipped the morning charge but accepted ending below
 overnight target on worse-than-P50 days. We prefer the round-trip
 cost over the import-bill exposure.
+
+### R61 — no-surplus drain hold (Option A, 2026-06-15)
+
+The drain target (`effective_keep`) must never request draining below
+the CURRENT SOC while PV is not covering load (no genuine surplus):
+
+```text
+effective_keep = apply_no_surplus_drain_hold(effective_keep, soc_kw, pv_covering)
+# i.e. if not pv_covering: effective_keep = max(effective_keep, soc_kw)
+```
+
+**Why.** The R55 overnight target legitimately shrinks toward sunrise
+(less battery needed as the morning nears). But `compute_morning_gap`
+declares "sunrise" when PV crosses ~0.3 kW sustained — hours before PV
+actually exceeds load. Draining to that collapsed target empties the
+battery before PV relieves it. Observed 2026-06-15: plugin activated
+05:11 BST with target ≈ 0.3 kWh, drained 7.6% → 2.7% to grid, then
+imported at standard rate once empty; PV did not exceed load until
+~08:44.
+
+**Principle.** Draining exists to make room for *surplus* PV (R25/R52).
+With no surplus there is nothing to make room for — hold at (at least)
+current SOC. No Drain fires; the battery still covers load naturally in
+Hold. Once `pv_covering` becomes true, normal drain-to-target resumes.
+
+**Interaction with R52.** Pre-PV drain is an intentional pre-sunrise
+drain on confirmed-overflow days; it uses a separate, separately-gated
+path (`_pre_pv_drain_decision`) and does NOT flow through this guard.
+
+Tests: `test_no_surplus_hold_dawn_collapse`,
+`test_no_surplus_hold_target_above_soc_unchanged`,
+`test_no_surplus_hold_surplus_allows_drain`.
+
+Known residual (future work): the root cause — morning_gap's sunrise
+boundary (PV ≥ 0.3 kW instead of PV ≥ load) — remains; the collapsed
+pre-dawn overnight_target still feeds the published Off-path target and
+R59's recovery input. Fix tracked in master-plan-jul-2026 Phase 1.5.

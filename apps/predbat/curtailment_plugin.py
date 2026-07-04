@@ -34,6 +34,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from curtailment_calc import (
+    apply_no_surplus_drain_hold,
     compute_morning_gap,
     compute_remaining_overflow,
     compute_solar_overflow,
@@ -1320,6 +1321,14 @@ class CurtailmentPlugin(PredBatPlugin):
             effective_keep = soc_keep
             if self._overnight_target_kwh is not None:
                 effective_keep = max(effective_keep, self._overnight_target_kwh)
+
+        # Option A (2026-06-15): don't drain below current SOC while PV isn't
+        # covering load. The overnight target legitimately shrinks toward
+        # sunrise, but morning_gap's "sunrise" (PV≥0.3kW) precedes PV exceeding
+        # load — draining to it empties the battery before PV relieves it
+        # (05:11 BST activation drained 7.6%→2.7%, then imported). No surplus =
+        # nothing to make room for. R52 pre-PV drain is a separate path.
+        effective_keep = apply_no_surplus_drain_hold(effective_keep, soc_kw, pv_covering)
 
         # R59: P10 recovery floor — minimum SOC needed to recover to overnight
         # target on a worst-case (P10) PV day. Acts as a lower bound alongside

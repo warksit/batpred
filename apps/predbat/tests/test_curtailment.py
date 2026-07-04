@@ -24,6 +24,7 @@ from curtailment_calc import (
     p_scales_from_forecast,
     compute_expected_overflow,
     compute_pv_start_time,
+    apply_no_surplus_drain_hold,
     compute_charge_below,
     compute_drain_above,
     compute_p10_recovery_floor,
@@ -613,6 +614,37 @@ def test_charge_below_p10_recovery_wins():
     cb = compute_charge_below(p10_recovery_floor=4.0, soc_keep=1.5)
     assert abs(cb - 4.0) < 0.001, f"Expected 4.0 (p10_recovery), got {cb}"
     print(f"  test_charge_below_p10_recovery_wins: PASSED ({cb})")
+
+
+def test_no_surplus_hold_dawn_collapse():
+    """2026-06-15 incident: dawn activation, target collapsed to 0.3, SOC 1.4.
+
+    overnight_target legitimately shrinks toward sunrise, but PV wasn't yet
+    covering load (pv_covering=False). Draining to 0.3 emptied the battery
+    before PV relieved it → import. With no surplus, the drain target must be
+    held at (at least) current SOC so no Drain fires.
+    """
+    held = apply_no_surplus_drain_hold(drain_target=0.3, soc_kw=1.4, pv_covering=False)
+    assert abs(held - 1.4) < 0.001, f"Expected 1.4 (hold at SOC, no drain), got {held}"
+    print(f"  test_no_surplus_hold_dawn_collapse: PASSED ({held})")
+
+
+def test_no_surplus_hold_target_above_soc_unchanged():
+    """No surplus but target already above SOC → unchanged (no spurious raise)."""
+    held = apply_no_surplus_drain_hold(drain_target=6.0, soc_kw=1.4, pv_covering=False)
+    assert abs(held - 6.0) < 0.001, f"Expected 6.0 (unchanged), got {held}"
+    print(f"  test_no_surplus_hold_target_above_soc_unchanged: PASSED ({held})")
+
+
+def test_no_surplus_hold_surplus_allows_drain():
+    """PV covering load (genuine surplus) → drain to target allowed, unchanged.
+
+    This is the case the dropping overnight target is FOR: real midday surplus,
+    drain the battery to make curtailment room / export at 12p.
+    """
+    held = apply_no_surplus_drain_hold(drain_target=0.3, soc_kw=1.4, pv_covering=True)
+    assert abs(held - 0.3) < 0.001, f"Expected 0.3 (drain allowed), got {held}"
+    print(f"  test_no_surplus_hold_surplus_allows_drain: PASSED ({held})")
 
 
 def test_p10_recovery_floor_today_2026_05_08_cloudy():
@@ -4543,6 +4575,9 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_deep_discharge_floor,
         test_charge_below_soc_keep_wins,
         test_charge_below_p10_recovery_wins,
+        test_no_surplus_hold_dawn_collapse,
+        test_no_surplus_hold_target_above_soc_unchanged,
+        test_no_surplus_hold_surplus_allows_drain,
         test_p10_recovery_floor_today_2026_05_08_cloudy,
         test_p10_recovery_floor_ignores_p50,
         test_p10_recovery_floor_calibration_ratio_ignored,
