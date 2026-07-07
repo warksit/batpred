@@ -65,6 +65,7 @@ darkgreen
 darkred
 darray
 dasharray
+datacorrect
 datain
 datalog
 datap

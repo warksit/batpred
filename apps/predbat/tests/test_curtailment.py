@@ -1518,6 +1518,56 @@ def _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", buffer_pct=20, hour=2, p90_pea
     return base
 
 
+def test_solcast_stale_date_rejected():
+    """Unknown-unknowns item 4: a stale detailedForecast (slots dated yesterday)
+    must be rejected, not consumed as today's. compute_solcast_overflow parses
+    only HH:MM from period_start so date-blind consumption is silent."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 8.0,
+        "sensor.sigen_plant_consumed_power": 1.0,
+        # Slot dated the day BEFORE MockBase's now_utc (2025-07-12)
+        "sensor.solcast_pv_forecast_forecast_today": {"detailedForecast": [{"period_start": "2025-07-11T12:00:00+00:00", "pv_estimate90": 8.58}]},
+        "sensor.solcast_pv_forecast_forecast_remaining_today": 25.0,
+    }
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.40, minutes_now=720, sensor_overrides=sensor_overrides)
+    plugin = CurtailmentPlugin(base)
+    assert plugin._get_solcast_detailed() == [], "Stale-dated forecast must be rejected"
+    # With no cached scale and no usable forecast, plugin must go safe (off)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"No trustworthy forecast should mean off, got {phase}"
+    assert plugin._floor_source == "No Forecast", f"Expected No Forecast, got {plugin._floor_source}"
+    print("  test_solcast_stale_date_rejected: PASSED")
+
+
+def test_solcast_datacorrect_false_rejected():
+    """Unknown-unknowns item 4: Solcast's own dataCorrect=False flag must gate
+    the forecast (it was previously never read)."""
+    pv, load = _make_overflow_pv(minutes_now=720)
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 8.0,
+        "sensor.sigen_plant_consumed_power": 1.0,
+        "sensor.solcast_pv_forecast_forecast_today": {"dataCorrect": False, "detailedForecast": [{"period_start": "2025-07-12T12:00:00+00:00", "pv_estimate90": 8.58}]},
+        "sensor.solcast_pv_forecast_forecast_remaining_today": 25.0,
+    }
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.40, minutes_now=720, sensor_overrides=sensor_overrides)
+    plugin = CurtailmentPlugin(base)
+    assert plugin._get_solcast_detailed() == [], "dataCorrect=False forecast must be rejected"
+    print("  test_solcast_datacorrect_false_rejected: PASSED")
+
+
+def test_solcast_current_date_accepted():
+    """Gate sanity: a correctly-dated forecast with dataCorrect=True passes."""
+    sensor_overrides = {
+        "sensor.solcast_pv_forecast_forecast_today": {"dataCorrect": True, "detailedForecast": [{"period_start": "2025-07-12T12:00:00+00:00", "pv_estimate90": 8.58}]},
+    }
+    base = MockBase(pv_step={}, load_step={}, soc_kw=5.0, minutes_now=720, sensor_overrides=sensor_overrides)
+    plugin = CurtailmentPlugin(base)
+    detailed = plugin._get_solcast_detailed()
+    assert len(detailed) == 1, f"Valid forecast must pass the gates, got {detailed}"
+    print("  test_solcast_current_date_accepted: PASSED")
+
+
 def test_R52_pre_pv_drain_blocked_by_ch_active():
     """When GSHP CH is on, no pre-PV drain — protect overnight battery."""
     base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="on", hour=2)  # 02:00 local, CH on
@@ -5102,6 +5152,9 @@ def run_curtailment_tests(my_predbat=None):
         test_R52_compute_pv_start_time_winter_low_scale,
         test_R52_compute_pv_start_time_called_post_crossing,
         test_R52_compute_pv_start_time_threshold_at_dno,
+        test_solcast_stale_date_rejected,
+        test_solcast_datacorrect_false_rejected,
+        test_solcast_current_date_accepted,
         test_R52_pre_pv_drain_blocked_by_ch_active,
         test_R52_pre_pv_drain_too_early,
         test_R52_pre_pv_drain_active_at_drain_start,

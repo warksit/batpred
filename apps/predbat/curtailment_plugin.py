@@ -257,6 +257,11 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_floor_kwh = 0.0
         # Date this state belongs to — lets us detect day rollover in calculate()
         self._state_date = None
+        # Silent-fallback audit (unknown-unknowns item 4, 2026-07-07): every
+        # degraded-input path logs ONCE per day via _log_once so schema drift
+        # in dependencies (Solcast attrs, sensors) can't change behaviour
+        # invisibly. Keys re-arm at day rollover.
+        self._logged_once = set()
         # Load persisted state (Bug 2) — recovers peak_pv / ratchet across restart
         self._load_state()
 
@@ -397,7 +402,24 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_recovered = False
         self._keep_drained_today = False
         self._r48_engaged_today = False
+        self._logged_once = set()  # re-arm the once-per-day fallback logs
         self._state_date = datetime.now().strftime("%Y-%m-%d")
+
+    def _log_once(self, key, msg):
+        """Log a degraded-input/fallback message once per day per key.
+
+        Silent `except: pass` fallbacks let dependency schema drift change
+        behaviour with no trace (e.g. Solcast renaming analysis.confidence
+        would silently pin the system to permanent p90 mode). One line per
+        day per condition makes every fallback visible without log spam.
+        """
+        if key in self._logged_once:
+            return
+        self._logged_once.add(key)
+        try:
+            self.log("Curtailment: FALLBACK [{}] {}".format(key, msg))
+        except Exception:
+            pass
 
     def register_hooks(self, plugin_system):
         plugin_system.register_hook("on_update", self.on_update, plugin=self)
@@ -645,8 +667,8 @@ class CurtailmentPlugin(PredBatPlugin):
                     "source": "calculate",
                 },
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_once("overnight_target_error", "_refresh_overnight_target failed: {} — overnight_target frozen at previous value".format(exc))
 
     def _get_p90_scale(self, lat, lon, doy, local_offset):
         """Get clear-sky scale from Solcast p90 forecast (R42).
@@ -655,26 +677,48 @@ class CurtailmentPlugin(PredBatPlugin):
         Falls back to yesterday's scale if unavailable (R44).
         """
         try:
-            detailed = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="detailedForecast", default=[])
+            detailed = self._get_solcast_detailed()
             if detailed:
                 scale, peak_kw, peak_utc = p90_scale_from_forecast(detailed, lat, lon, doy, local_offset)
                 if scale > 0:
                     self._p90_scale = scale
                     self._p90_peak_kw = peak_kw
                     return scale, peak_kw, peak_utc
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_once("p90_scale_error", "p90 scale derivation failed: {}".format(exc))
         # Fallback: yesterday's scale (changes ~1° elevation per day, R44)
+        self._log_once("p90_scale_fallback", "Solcast unavailable — using cached p90 scale {:.2f}".format(self._p90_scale))
         return self._p90_scale, self._p90_peak_kw, 0.0
 
     def _get_solcast_detailed(self):
-        """Return Solcast detailedForecast list, or [] if unavailable."""
+        """Return Solcast detailedForecast list, or [] if unavailable/untrusted.
+
+        Gates (unknown-unknowns item 4, 2026-07-07):
+        - dataCorrect is False → Solcast itself says the data is bad; reject.
+        - Slot dates != today → stale forecast. compute_solcast_overflow parses
+          only HH:MM from period_start, so yesterday's forecast would otherwise
+          be consumed as today's with no error.
+        Rejection falls back to the clear-sky model / cached scale — same
+        degraded modes as "Solcast missing", now visible via _log_once.
+        """
         try:
+            data_correct = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="dataCorrect", default=None)
+            if data_correct is not None and str(data_correct).lower() == "false":
+                self._log_once("solcast_datacorrect", "Solcast dataCorrect=False — ignoring detailedForecast")
+                return []
             detailed = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="detailedForecast", default=[])
-            if isinstance(detailed, list):
-                return detailed
-        except Exception:
-            pass
+            if not isinstance(detailed, list) or not detailed:
+                return []
+            now_local = getattr(self.base, "now_utc", None)  # local-tz-aware (misnamed)
+            if now_local is not None:
+                today_str = now_local.strftime("%Y-%m-%d")
+                slot_date = str(detailed[0].get("period_start", ""))[:10]
+                if slot_date and slot_date != today_str:
+                    self._log_once("solcast_stale_date", "Solcast detailedForecast dated {} but today is {} — ignoring stale forecast".format(slot_date, today_str))
+                    return []
+            return detailed
+        except Exception as exc:
+            self._log_once("solcast_detailed_error", "detailedForecast read failed: {}".format(exc))
         return []
 
     def _compute_calibration_ratio(self, minutes_now, solcast_remaining):
@@ -754,15 +798,16 @@ class CurtailmentPlugin(PredBatPlugin):
         Falls back gracefully: if Solcast unavailable, returns (0, 0, p90_cached).
         """
         try:
-            detailed = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="detailedForecast", default=[])
+            detailed = self._get_solcast_detailed()
             if detailed:
                 p10, p50, p90 = p_scales_from_forecast(detailed, lat, lon, doy, local_offset)
                 # At least p90 should be valid on a normal day; missing p10/p50
                 # is unusual but not fatal (we'll treat their integrals as p90's).
                 return p10, p50, p90
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_once("p_scales_error", "band scale derivation failed: {}".format(exc))
         # Fallback: use cached p90 for all three (degenerates to current pre-R50)
+        self._log_once("p_scales_fallback", "Solcast unavailable — band scales degenerate to cached p90 {:.2f}".format(self._p90_scale))
         return 0.0, 0.0, self._p90_scale
 
     def _get_confidence_thresholds(self):
@@ -781,13 +826,20 @@ class CurtailmentPlugin(PredBatPlugin):
         return low, high
 
     def _get_solcast_confidence(self):
-        """Read Solcast analysis.confidence; fall back to CONFIDENCE_DEFAULT."""
+        """Read Solcast analysis.confidence; fall back to CONFIDENCE_DEFAULT.
+
+        The fallback is dangerous if it becomes permanent: 0.9 ≥ conf_high
+        pins the R50 blend to pure p90 (maximum aggression) every day. A
+        Solcast schema change here MUST be visible — hence _log_once.
+        """
         try:
             analysis = self.base.get_state_wrapper(SOLCAST_TODAY, attribute="analysis", default={}) or {}
             if isinstance(analysis, dict) and "confidence" in analysis:
                 return float(analysis["confidence"])
-        except (ValueError, TypeError, KeyError):
-            pass
+        except (ValueError, TypeError, KeyError) as exc:
+            self._log_once("confidence_error", "analysis.confidence read failed ({}) — default {} = permanent p90 mode".format(exc, CONFIDENCE_DEFAULT))
+            return CONFIDENCE_DEFAULT
+        self._log_once("confidence_missing", "Solcast analysis.confidence missing — default {} pins R50 blend to p90".format(CONFIDENCE_DEFAULT))
         return CONFIDENCE_DEFAULT
 
     def _is_gshp_ch_active(self):
@@ -944,8 +996,8 @@ class CurtailmentPlugin(PredBatPlugin):
             self._overflow_p10 = round(self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
             self._overflow_p50 = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
             self._overflow_p90 = round(self._compute_overflow_band("pv_estimate90", p90_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_once("forecast_overflow_error", "_publish_forecast_overflow failed: {} — overflow bands frozen at previous cycle (pre-PV drain gating affected)".format(exc))
 
     def calculate(self, dno_limit_kw):
         """Compute floor using v17 solar geometry model.

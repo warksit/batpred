@@ -955,7 +955,15 @@ but silently did nothing.
 Tests: `test_R62_pre_pv_target_*` (pure), updated `test_R52_pre_pv_drain_*`,
 `test_R62_pre_pv_publish_thresholds_not_stale` (stale-leak regression).
 
-Known open items (Phase 1.4): R61 dusk asymmetry (no-surplus hold blocks the
-R56 late-afternoon drain once evening PV < load — dawn rationale applied to
-dusk); tomorrow-sensor `exportable = eff_dno × window` linearisation ignores
-the battery-absorb timing constraint (display-only).
+Known open items (Phase 1.4): tomorrow-sensor `exportable = eff_dno ×
+window` linearisation ignores the battery-absorb timing constraint
+(display-only).
+
+**R61 dusk behaviour — DECIDED intentional (2026-07-08).** The no-surplus
+hold also stops the R56 late-afternoon drain once evening PV < load. Under
+the flat 12p export tariff this is economically CORRECT: dusk drain earns
+nothing over exporting tomorrow (flat rate), while tomorrow's overflow room
+is R52/R62's job — decided pre-dawn with a fresher forecast. R56's "evening
+kWh has higher grid value" rationale belonged to the old deemed-£0 tariff.
+Do not "fix" the dusk asymmetry; revisit only if the export tariff becomes
+time-of-use.
