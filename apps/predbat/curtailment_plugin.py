@@ -44,6 +44,7 @@ from curtailment_calc import (
     compute_effective_export_cap,
     compute_charge_below,
     compute_drain_above,
+    compute_pre_pv_target,
     compute_floor_with_source,
     should_defer_to_charge,
     compute_pv_start_time,
@@ -844,9 +845,45 @@ class CurtailmentPlugin(PredBatPlugin):
         soc_kw = float(getattr(self.base, "soc_kw", 0))
         soc_max = float(getattr(self.base, "soc_max", 18.08))
         soc_keep = float(getattr(self.base, "best_soc_keep", 0))
+        reserve = float(getattr(self.base, "reserve", 0) or 0)
+
+        # R62: forecast-driven target. Blend the overflow bands (already
+        # computed this cycle by _publish_forecast_overflow, against the R60
+        # effective cap) by Solcast confidence, then let the R54-shaped
+        # overflow floor set the drain depth. The legacy soc_keep + buffer%
+        # value survives as a ceiling only.
+        conf_low, conf_high = self._get_confidence_thresholds()
+        expected_overflow = compute_expected_overflow(
+            p10=self._overflow_p10,
+            p50=self._overflow_p50,
+            p90=self._overflow_p90,
+            confidence=self._confidence,
+            low=conf_low,
+            high=conf_high,
+        )
+        # Dawn load: house load the battery must carry from PV-start until PV
+        # covers load (the R61 no-drain window). Crossing at base load + the
+        # pv_covering margin; falls back to ~1h of base load if no crossing.
+        _cm, cover_utc = compute_pv_start_time(p90_scale, lat, lon, doy, MIN_BASE_LOAD_KW + 0.5, utc_hours)
+        dawn_load_kwh = MIN_BASE_LOAD_KW * 1.0
+        if cover_utc is not None and pv_start_utc is not None and cover_utc > pv_start_utc:
+            load_step = getattr(self.base, "load_minutes_step", {}) or {}
+            step_h = PREDICT_STEP / 60.0
+            start_off = max(0, int((pv_start_utc - utc_hours) * 60))
+            cover_off = max(start_off, int((cover_utc - utc_hours) * 60))
+            dawn_load_kwh = sum(max(load_step.get(m, 0.0), MIN_BASE_LOAD_KW * step_h) for m in range(start_off, cover_off, PREDICT_STEP))
 
         buffer_pct = self._pre_pv_buffer_pct()
-        target_kwh = soc_keep + (buffer_pct / 100.0) * soc_max
+        target_kwh = compute_pre_pv_target(
+            soc_keep=soc_keep,
+            soc_max=soc_max,
+            buffer_pct=buffer_pct,
+            reserve=reserve,
+            expected_overflow_kwh=expected_overflow,
+            dawn_load_kwh=dawn_load_kwh,
+            max_reserved_kwh=MAX_RESERVED_KWH,
+            safety_factor=OVERFLOW_SAFETY_FACTOR,
+        )
 
         if soc_kw <= target_kwh + 0.1:
             return None  # already at/below pre-PV target
@@ -1035,6 +1072,17 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._export_target = dno_limit_kw
                 self.was_active = True
                 self._floor_source = "Pre-PV Drain"
+                # R62: stamp the published-threshold inputs with the pre-PV
+                # target. Without this, publish() derives drain_above from
+                # YESTERDAY EVENING'S _effective_keep_kwh/_overflow_floor_kwh
+                # (e.g. 14.95 after an R61 dusk hold) and the HA automation
+                # never drains below yesterday's level — pre-PV drain would
+                # silently do nothing. p10_recovery is likewise stale from
+                # dusk; pre-dawn recovery is meaningless (whole PV day ahead),
+                # so clear it — charge_below then rests on soc_keep/deep floor.
+                self._effective_keep_kwh = round(target_kwh, 2)
+                self._overflow_floor_kwh = round(target_kwh, 2)
+                self._p10_recovery_floor = 0.0
                 self._save_state()
                 return target_kwh, "active"
 

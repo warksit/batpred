@@ -919,3 +919,43 @@ Known residual (future work): the root cause — morning_gap's sunrise
 boundary (PV ≥ 0.3 kW instead of PV ≥ load) — remains; the collapsed
 pre-dawn overnight_target still feeds the published Off-path target and
 R59's recovery input. Fix tracked in master-plan-jul-2026 Phase 1.5.
+
+### R62 — forecast-driven pre-PV drain target (autonomous, 2026-07-07)
+
+R52's pre-PV drain target was `soc_keep + PRE_PV_BUFFER_PCT% × soc_max` — a
+static knob. On 2026-07-07 (63 kWh forecast @ 0.92 confidence, ~17-20 kWh
+above the effective cap vs 17.6 kWh total battery headroom) it would have
+stopped draining at 3.6 kWh, stranding ~3 kWh of headroom on exactly the day
+it mattered. The plugin must size the pre-PV drain from the forecast itself —
+no manual helper-tweaking the night before.
+
+```text
+legacy         = soc_keep + buffer_pct% × soc_max        (unchanged knob)
+overflow_floor = max(0, (soc_max − min(1.8, overflow)) − overflow × 1.2)
+target         = min(legacy, max(reserve,
+                                 DEEP_DISCHARGE_FLOOR + dawn_load,
+                                 overflow_floor))
+```
+
+- `overflow` = R50 confidence-blended overflow integral against the R60
+  effective cap (both already computed pre-dawn by _publish_forecast_overflow).
+  Low confidence shrinks overflow → target returns to legacy: the formula can
+  only be MORE aggressive than R52, never less.
+- `dawn_load` = forecast house load from PV-start until PV covers load — the
+  R61 window where the battery still carries the house. Near-zero, never zero.
+- Implemented in `compute_pre_pv_target()` (curtailment_calc.py).
+
+**Companion fix (same date):** the pre-PV activation branch now stamps
+`_effective_keep_kwh` / `_overflow_floor_kwh` with the pre-PV target and
+clears `_p10_recovery_floor`. Previously publish() derived `drain_above` from
+YESTERDAY EVENING'S values (e.g. 14.95 kWh after an R61 dusk hold), so the HA
+automation would refuse to drain below yesterday's level — pre-PV drain fired
+but silently did nothing.
+
+Tests: `test_R62_pre_pv_target_*` (pure), updated `test_R52_pre_pv_drain_*`,
+`test_R62_pre_pv_publish_thresholds_not_stale` (stale-leak regression).
+
+Known open items (Phase 1.4): R61 dusk asymmetry (no-surplus hold blocks the
+R56 late-afternoon drain once evening PV < load — dawn rationale applied to
+dusk); tomorrow-sensor `exportable = eff_dno × window` linearisation ignores
+the battery-absorb timing constraint (display-only).

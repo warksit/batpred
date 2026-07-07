@@ -1541,25 +1541,142 @@ def test_R52_pre_pv_drain_too_early():
 
 
 def test_R52_pre_pv_drain_active_at_drain_start():
-    """At drain_start time with CH off + high SOC + big overflow forecast: Active."""
-    # 03:30 local (after drain_start ≈ 02:35 for 70% SOC). Plugin should be Active.
+    """At drain_start time with CH off + high SOC + big overflow forecast: Active.
+
+    R62 (2026-07-07): on a big-overflow forecast the pre-PV target is
+    forecast-driven (overflow_floor collapses toward the deep floor + dawn
+    load), NOT the static soc_keep + buffer_pct. The legacy value acts only
+    as a ceiling. This fixture's p90 forecast produces a large overflow, so
+    the target must land well BELOW the legacy 5.12 kWh and at/above the
+    deep-discharge floor.
+    """
     base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", hour=4)  # 04:00 local
     plugin = CurtailmentPlugin(base)
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"Pre-PV drain window should be Active, got phase={phase}"
-    # Target = soc_keep + 20% = 1.5 + 3.62 = 5.12 kWh = 28.3%
-    expected_target = 1.5 + 0.20 * BATTERY_KWH
-    assert abs(floor - expected_target) < 0.05, f"Pre-PV target should be ≈{expected_target:.2f}kWh, got {floor:.2f}"
-    print(f"  test_R52_pre_pv_drain_active_at_drain_start: PASSED (target={floor:.2f}kWh)")
+    legacy_target = 1.5 + 0.20 * BATTERY_KWH  # 5.12
+    assert floor < legacy_target - 1.0, f"R62: big-overflow pre-PV target should be well below legacy {legacy_target:.2f}, got {floor:.2f}"
+    assert floor >= 0.5, f"Pre-PV target must respect deep-discharge floor, got {floor:.2f}"
+    print(f"  test_R52_pre_pv_drain_active_at_drain_start: PASSED (target={floor:.2f}kWh < legacy {legacy_target:.2f})")
+
+
+def test_R62_pre_pv_target_huge_confident_day():
+    """R62 pure: huge confident overflow → target collapses to deep floor + dawn load."""
+    from curtailment_calc import compute_pre_pv_target
+
+    # Tomorrow-2026-07-08 shape: soc_keep 0, buffer 20%, overflow 18 kWh
+    target = compute_pre_pv_target(
+        soc_keep=0.0,
+        soc_max=18.08,
+        buffer_pct=20.0,
+        reserve=0.0,
+        expected_overflow_kwh=18.0,
+        dawn_load_kwh=1.0,
+        max_reserved_kwh=1.8,
+        safety_factor=1.2,
+    )
+    # overflow_floor = (18.08-1.8) - 18*1.2 = negative → 0; floor_driven = 0.5+1.0 = 1.5
+    assert abs(target - 1.5) < 0.01, f"Expected 1.5 (deep floor + dawn load), got {target}"
+    print(f"  test_R62_pre_pv_target_huge_confident_day: PASSED ({target})")
+
+
+def test_R62_pre_pv_target_moderate_day_legacy_ceiling():
+    """R62 pure: moderate overflow → overflow_floor high → legacy ceiling binds (no behaviour change)."""
+    from curtailment_calc import compute_pre_pv_target
+
+    target = compute_pre_pv_target(
+        soc_keep=1.5,
+        soc_max=18.08,
+        buffer_pct=20.0,
+        reserve=0.0,
+        expected_overflow_kwh=5.0,
+        dawn_load_kwh=1.0,
+        max_reserved_kwh=1.8,
+        safety_factor=1.2,
+    )
+    # overflow_floor = (18.08-1.8) - 6.0 = 10.28 → floor_driven 10.28 → min(5.12, 10.28) = 5.12
+    legacy = 1.5 + 0.20 * 18.08
+    assert abs(target - legacy) < 0.01, f"Moderate day should keep legacy target {legacy:.2f}, got {target}"
+    print(f"  test_R62_pre_pv_target_moderate_day_legacy_ceiling: PASSED ({target:.2f})")
+
+
+def test_R62_pre_pv_target_low_confidence_stays_legacy():
+    """R62 pure: low confidence blends overflow down → target stays at legacy (no over-drain on uncertain days)."""
+    from curtailment_calc import compute_pre_pv_target, compute_expected_overflow
+
+    # Confidence 0.4 with big p90 but zero p10 → blended overflow small
+    blended = compute_expected_overflow(p10=0.0, p50=4.0, p90=16.0, confidence=0.4, low=0.6, high=0.85)
+    target = compute_pre_pv_target(
+        soc_keep=1.5,
+        soc_max=18.08,
+        buffer_pct=20.0,
+        reserve=0.0,
+        expected_overflow_kwh=blended,
+        dawn_load_kwh=1.0,
+        max_reserved_kwh=1.8,
+        safety_factor=1.2,
+    )
+    legacy = 1.5 + 0.20 * 18.08
+    assert abs(target - legacy) < 0.01, f"Low confidence should keep legacy target, got {target}"
+    print(f"  test_R62_pre_pv_target_low_confidence_stays_legacy: PASSED (blend={blended:.2f}, target={target:.2f})")
+
+
+def test_R62_pre_pv_target_reserve_wins():
+    """R62 pure: hardware reserve is never violated even on extreme overflow."""
+    from curtailment_calc import compute_pre_pv_target
+
+    target = compute_pre_pv_target(
+        soc_keep=0.0,
+        soc_max=18.08,
+        buffer_pct=20.0,
+        reserve=2.5,
+        expected_overflow_kwh=30.0,
+        dawn_load_kwh=0.5,
+        max_reserved_kwh=1.8,
+        safety_factor=1.2,
+    )
+    assert abs(target - 2.5) < 0.01, f"Reserve should bind, got {target}"
+    print(f"  test_R62_pre_pv_target_reserve_wins: PASSED ({target})")
+
+
+def test_R62_pre_pv_publish_thresholds_not_stale():
+    """R62: during pre-PV active, the published drain thresholds must reflect the
+    pre-PV target — NOT yesterday evening's effective_keep/overflow_floor.
+
+    Latent bug found 2026-07-07: the pre-PV branch returned target_kwh but left
+    _effective_keep_kwh/_overflow_floor_kwh at their last main-path values (e.g.
+    14.95 from the previous dusk after the R61 hold). publish() derives
+    drain_above from those attrs, so the HA automation would refuse to drain
+    below yesterday's level and pre-PV drain would do nothing.
+    """
+    from curtailment_calc import compute_drain_above
+
+    base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", hour=4)
+    plugin = CurtailmentPlugin(base)
+    # Simulate stale state from yesterday evening (R61 dusk hold stamped high keep)
+    plugin._effective_keep_kwh = 14.95
+    plugin._overflow_floor_kwh = 18.08
+    plugin._p10_recovery_floor = 6.25
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active"
+    drain_above = compute_drain_above(0.0, plugin._overflow_floor_kwh, plugin._effective_keep_kwh)
+    assert abs(drain_above - max(floor, 0.5)) < 0.05, f"Published drain_above must track pre-PV target {floor:.2f}, got {drain_above:.2f} (stale state leak)"
+    assert plugin._p10_recovery_floor < 1.0, f"Stale p10_recovery must be cleared pre-dawn, got {plugin._p10_recovery_floor}"
+    print(f"  test_R62_pre_pv_publish_thresholds_not_stale: PASSED (drain_above={drain_above:.2f} tracks target={floor:.2f})")
 
 
 def test_R52_pre_pv_drain_already_below_target():
-    """SOC already below pre-PV target → no drain needed → off."""
-    # Target = 1.5 + 20% = 5.12 kWh. SOC at 4 kWh (22%) < target.
-    base = _make_pre_pv_base(soc_pct=0.22, gshp_ch="off", hour=4)
+    """SOC already at/below the pre-PV target → no drain needed → off.
+
+    R62 note: on this big-overflow fixture the forecast-driven target is
+    ~0.7 kWh, so "below target" now means near the deep floor. 22% SOC on a
+    huge day correctly KEEPS draining (covered by
+    test_R52_pre_pv_drain_active_at_drain_start); only ≈empty is exempt.
+    """
+    base = _make_pre_pv_base(soc_pct=0.03, gshp_ch="off", hour=4)  # 0.54 kWh
     plugin = CurtailmentPlugin(base)
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "off", f"SOC below target should be off, got {phase}"
+    assert phase == "off", f"SOC at/below target should be off, got {phase}"
     print("  test_R52_pre_pv_drain_already_below_target: PASSED")
 
 
@@ -4988,6 +5105,11 @@ def run_curtailment_tests(my_predbat=None):
         test_R52_pre_pv_drain_blocked_by_ch_active,
         test_R52_pre_pv_drain_too_early,
         test_R52_pre_pv_drain_active_at_drain_start,
+        test_R62_pre_pv_target_huge_confident_day,
+        test_R62_pre_pv_target_moderate_day_legacy_ceiling,
+        test_R62_pre_pv_target_low_confidence_stays_legacy,
+        test_R62_pre_pv_target_reserve_wins,
+        test_R62_pre_pv_publish_thresholds_not_stale,
         test_R52_pre_pv_drain_already_below_target,
         test_R52_pre_pv_drain_low_overflow_forecast,
     ]
