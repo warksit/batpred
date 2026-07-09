@@ -37,7 +37,7 @@ For each date compute:
 
 ---
 
-## Step 2: Pull Data — Three Calls in Parallel
+## Step 2: Pull Data — Four Calls in Parallel
 
 ### Call A: ha_get_history (sparse state changes)
 
@@ -52,7 +52,6 @@ attributes, so do not pay for them.
     "input_text.curtailment_live_phase",
     "sensor.predbat_curtailment_drain_above",
     "sensor.predbat_curtailment_charge_below",
-    "sensor.sigen_plant_battery_state_of_charge",
     "select.sigen_plant_remote_ems_control_mode",
     "input_select.predbat_requested_mode",
     "sensor.sigen_inverter_running_state"
@@ -64,10 +63,15 @@ attributes, so do not pay for them.
 }
 ```
 
-This typically returns 5–10 KB for one day. SOC has many changes but
-`significant_changes_only` collapses them. The drain_above / charge_below
+This typically returns 5–10 KB for one day. The drain_above / charge_below
 series let you verify the deep-discharge floor (≥ 0.5 kWh while plugin Active);
 the EMS-mode / requested-mode series let you verify no MSC-clobber regression.
+
+**Do NOT include `sensor.sigen_plant_battery_state_of_charge` here** — even with
+`significant_changes_only` it returned 142 KB and hit the 1000-row limit at
+midday, losing the afternoon trace (observed 2026-07-09). SOC comes from Call D
+instead; only pull raw SOC history for a narrow window (< 1 h) if a specific
+floor-crossing needs second-level timing.
 
 **Phase-sensor attributes** (floor_pct, overflow_kwh, safe_time, floor_source,
 effective_keep_kwh, confidence) come from a single current `ha_get_state` of
@@ -124,6 +128,25 @@ AND past days, tiny response):
 `change` = the day's overflow kWh and throttle-lost kWh. (Observed 2026-07-04:
 raw states were 767 / 439 kWh cumulative; day changes were 10.87 / 5.07.)
 
+### Call D: ha_get_history statistics (SOC hourly)
+
+SOC min/peak/sunset come from hourly statistics — 24 tiny rows, works for any date:
+
+```json
+{
+  "source": "statistics",
+  "entity_ids": ["sensor.sigen_plant_battery_state_of_charge"],
+  "period": "hour",
+  "statistic_types": ["mean", "min", "max"],
+  "start_time": "<date>T00:00:00+00:00",
+  "end_time": "<date+1>T00:00:00+00:00"
+}
+```
+
+Sunset SOC = mean of the hour containing sunset (~20:00 UTC midsummer at 52.3°N).
+Day min = min over the day (check its hour against the phase timeline: pre-PV
+near-zero is by design on big-overflow days).
+
 ### Past-day adjustments
 
 If `is_today` is false, replace Call B's daily-total sensors with a `ha_get_history`
@@ -144,7 +167,7 @@ section instead.
 3. **PV ratio**: actual / forecast
 4. **Voltage throttle activations**: state of `counter.voltage_throttle_activations_today`
 5. **Voltage throttle lost energy + curtailment overflow (day)**: the `change` values from Call C — never the raw cumulative states
-6. **Current SOC** (or sunset SOC if past day): state of `sensor.sigen_plant_battery_state_of_charge`
+6. **Current SOC** (today: state of `sensor.sigen_plant_battery_state_of_charge`; sunset/min/peak SOC for any date: Call D hourly stats)
 
 ### From Call A (history)
 
@@ -164,6 +187,7 @@ section instead.
     - High daily import on a day with PV ratio ≥ 0.9: drained too LOW / recovered too late
     - Curtailment overflow > 0 or a SIG fault: drained too little / cap breached
 14. **Export verdict**: voltage throttle activation count is the proxy for "did we hit the cap". A busy 50+ kWh export day will show dozens of activations — that's normal, not a fault. Don't pull 5-min export statistics just to check max — the throttle counter and SIG faults already tell the story.
+    - **`sig_voltage_throttle_lost_energy` is a misnomer — it is DEFERRED export, not lost generation** (established 2026-07-09). The throttle caps `number.sigen_plant_grid_export_limitation` (SIG grid export); the SMA keeps generating and the surplus charges the battery, which exports it later. True cost ≈ round-trip loss only (~10% × 12p ≈ 1.2p/kWh); FIT generation is unaffected. Report it as "X kWh deferred through battery (~Yp round-trip cost)". It is only genuinely lost if the battery was FULL while the throttle was engaged — check Call D's SOC peak before calling it a loss.
 
 ### Step 3b — OPTIONAL deeper pull (only if Step 3 flagged an issue)
 
@@ -194,7 +218,7 @@ Single entity, single stat = ~16 KB instead of 63 KB. Skip this entirely for nor
 - PV today: XX.X kWh actual vs YY.Y kWh forecast (ratio Z.ZZx) [✓/⚠]
 - Sunset SOC (or current SOC if today): XX.X% [✓ ≥95% / ⚠ below]
 - SIG faults: [0 ✓ / ⚠ N — list HH:MM and duration]
-- Voltage throttle: N activations, X.X kWh lost [✓ none / ⚠ engaged N times]
+- Voltage throttle: N activations, X.X kWh deferred via battery (~Yp round-trip) [✓ none-or-deferred / ⚠ battery was full while throttled — genuinely lost]
 - Phase oscillations (Charge↔Hold): N flips [✓ stable / ⚠ unstable in HH:MM-HH:MM]
 
 ### Phase Timeline
