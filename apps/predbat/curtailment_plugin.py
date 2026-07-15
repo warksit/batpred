@@ -73,7 +73,7 @@ PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
 
 # SIG/Solcast sensor entities
-SIG_DAILY_PV = "sensor.sigen_plant_daily_third_party_inverter_energy"
+SIG_DAILY_PV = "sensor.sigen_plant_daily_pv_energy"  # 2026-07-15 swap: PV on SIG MPPTs, third_party (SMA) sensor dead
 PREDBAT_PV_TODAY = "sensor.predbat_pv_today"
 SOLCAST_TODAY = "sensor.solcast_pv_forecast_forecast_today"
 SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"

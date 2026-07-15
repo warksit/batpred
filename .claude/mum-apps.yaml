@@ -40,7 +40,7 @@ pred_bat:
   export_today:
   - sensor.sigen_plant_daily_grid_export_energy
   pv_today:
-  - sensor.sigen_plant_daily_third_party_inverter_energy
+  - sensor.sigen_plant_daily_pv_energy  # 2026-07-15 swap: PV now on SIG MPPTs; third_party (SMA) sensor is dead
 
   charge_rate:
   - input_number.charge_rate
@@ -113,7 +113,7 @@ pred_bat:
   # Export limit is a software limit set on your inverter that prevents exporting above a given level
   # When enabled Predbat will model this limit
   export_limit:
-    - 4000
+    - input_number.dno_export_limit_w  # 2026-07-15: G99 limit 3680 W, single source of truth
 
 
   #  - 3600
