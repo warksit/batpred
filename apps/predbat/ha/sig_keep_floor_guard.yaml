@@ -1,0 +1,81 @@
+# SIG Keep Floor Guard (2026-07-16)
+#
+# Full Feed-in to Grid (the app-set default work mode) defends export at the
+# grid cap bidirectionally — including discharging the battery when PV < cap
+# (verified live 16 Jul). It has NO floor: left alone it sells the battery to
+# the 10% hardware cut-off overnight. This guard is the missing floor:
+#
+#   SOC ≤ input_number.sig_keep_floor_pct (3 min sustained)
+#     → open a Remote-EMS session: PCS Remote Control + dispatch = load +
+#       policy Load Only (sig_dispatch_heartbeat maintains it thereafter)
+#   PV back above 1.5 kW (10 min sustained) while guarding
+#     → close the session (policy Off, Remote EMS off) → FFG resumes
+#
+# Single-writer doctrine: the guard only ENTERS when Remote EMS is off (FFG in
+# charge); if a session is already open, a human/plugin owns the inverter.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config:, NOT python_transform.
+
+id: "sig_keep_floor_guard"
+alias: "SIG Keep Floor Guard"
+description: >-
+  Stops FFG's floor-less battery export at the overnight keep floor by opening
+  a Load-Only dispatch session; releases back to FFG when PV returns. See repo
+  file header.
+mode: single
+
+trigger:
+  - platform: numeric_state
+    entity_id: sensor.sigen_plant_battery_state_of_charge
+    below: input_number.sig_keep_floor_pct
+    for: "00:03:00"
+    id: floor_hit
+  - platform: numeric_state
+    entity_id: sensor.sigen_plant_pv_power
+    above: 1.5
+    for: "00:10:00"
+    id: pv_back
+
+action:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: floor_hit
+          - condition: state
+            entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+            state: "off"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+          - action: select.select_option
+            target:
+              entity_id: select.sigen_plant_remote_ems_control_mode
+            data:
+              option: "PCS Remote Control"
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_active_power_fixed_adjustment
+            data:
+              value: "{{ [[states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max, 6.0] | min | round(2) }}"
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_dispatch_policy
+            data:
+              option: "Load Only"
+      - conditions:
+          - condition: trigger
+            id: pv_back
+          - condition: state
+            entity_id: input_select.sig_dispatch_policy
+            state: "Load Only"
+        sequence:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_dispatch_policy
+            data:
+              option: "Off"
+          - action: switch.turn_off
+            target:
+              entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
