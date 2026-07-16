@@ -1,0 +1,74 @@
+# SIG Dispatch Heartbeat — interim v-next executor (2026-07-16)
+#
+# The DC-coupled EC 6.0 SP is controlled by ONE lever: PCS Remote Control mode +
+# active_power_fixed_adjustment (PCS output setpoint). The inverter's own fast
+# loops do everything real-time: DC-bus physics buffers PV swings into the
+# battery, and the grid_export_limitation register is a hardware closed loop on
+# the SPCT meter that enforces the 3.68 kW G99 cap. This automation is only the
+# slow planner: every minute it re-asserts the (perishable) export limit and
+# recomputes the dispatch setpoint per the selected policy.
+#
+# Policies (input_select.sig_dispatch_policy):
+#   Full Export — dispatch = cap + load: export pinned at 3.68, battery buffers
+#                 (absorbs PV above, tops up below). The whole-day workhorse.
+#   Hold        — dispatch = PV: battery flat, export = PV − load. Tracks PV only;
+#                 load changes shift the export/home split grid-side (no battery effect).
+#   Load Only   — dispatch = load: no export from battery, no absorption block; use
+#                 to stop evening drain at the keep floor.
+#   Off         — heartbeat does nothing (manual control / native modes).
+#
+# Guards: dispatch clamped to [0, 6.0] (AC rating); heartbeat only runs while
+# Remote EMS is on AND mode is PCS Remote Control — any other state means a
+# human or another system owns the inverter (single-writer doctrine).
+#
+# Safe state on failure: if this automation dies, hardware caps export at the
+# last-written limit and the discharge cut-off (10%) floors the battery.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config: (full replacement), NOT python_transform.
+
+id: "sig_dispatch_heartbeat"
+alias: "SIG Dispatch Heartbeat"
+description: >-
+  Interim executor for the DC-coupled SigenStor: re-asserts export limit and
+  sets PCS dispatch per policy every minute. See repo file header.
+mode: single
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+
+condition:
+  - condition: state
+    entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+    state: "on"
+  - condition: state
+    entity_id: select.sigen_plant_remote_ems_control_mode
+    state: "PCS Remote Control"
+  - condition: template
+    value_template: "{{ states('input_select.sig_dispatch_policy') in ['Full Export', 'Hold', 'Load Only'] }}"
+
+action:
+  - variables:
+      export_cap_kw: "{{ (states('input_number.dno_export_limit_w') | float(3680)) / 1000 }}"
+      load_kw: "{{ [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max }}"
+      pv_kw: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
+      policy: "{{ states('input_select.sig_dispatch_policy') }}"
+      dispatch_kw: >-
+        {% if policy == 'Full Export' %}
+          {{ [[export_cap_kw + load_kw, 6.0] | min, 0] | max }}
+        {% elif policy == 'Hold' %}
+          {{ [[pv_kw, 6.0] | min, 0] | max }}
+        {% else %}
+          {{ [[load_kw, 6.0] | min, 0] | max }}
+        {% endif %}
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_grid_export_limitation
+    data:
+      value: "{{ export_cap_kw | round(2) }}"
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_active_power_fixed_adjustment
+    data:
+      value: "{{ dispatch_kw | float | round(2) }}"
