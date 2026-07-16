@@ -45,8 +45,12 @@ condition:
   - condition: state
     entity_id: select.sigen_plant_remote_ems_control_mode
     state: "PCS Remote Control"
-  - condition: template
-    value_template: "{{ states('input_select.sig_dispatch_policy') in ['Full Export', 'Hold', 'Load Only'] }}"
+  - condition: state
+    entity_id: input_select.sig_dispatch_policy
+    state:
+      - "Full Export"
+      - "Hold"
+      - "Load Only"
 
 action:
   - variables:
