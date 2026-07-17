@@ -11,8 +11,9 @@
 # Policies (input_select.sig_dispatch_policy):
 #   Full Export — dispatch = cap + load: export pinned at 3.68, battery buffers
 #                 (absorbs PV above, tops up below). The whole-day workhorse.
-#   Hold        — dispatch = PV: battery flat, export = PV − load. Tracks PV only;
-#                 load changes shift the export/home split grid-side (no battery effect).
+#   Hold        — dispatch = max(PV, load): battery never ABSORBS (room preserved),
+#                 exports PV surplus, covers load shortfall from battery rather than
+#                 importing (Andrew 2026-07-17). SOC drifts down only by house load.
 #   Load Only   — dispatch = load: no export from battery, no absorption block; use
 #                 to stop evening drain at the keep floor.
 #   Off         — heartbeat does nothing (manual control / native modes).
@@ -48,7 +49,7 @@ trigger:
       {% set cap = (states('input_number.dno_export_limit_w') | float(3680)) / 1000 %}
       {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
       {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
-      {% set want = cap + load if p == 'Full Export' else (pv if p == 'Hold' else load) %}
+      {% set want = cap + load if p == 'Full Export' else ([pv, load] | max if p == 'Hold' else load) %}
       {{ p in ['Full Export', 'Hold', 'Load Only'] and
          (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.3 }}
     for: "00:00:10"
@@ -78,7 +79,7 @@ action:
         {% if policy == 'Full Export' %}
           {{ [[export_cap_kw + load_kw, 6.0] | min, 0] | max }}
         {% elif policy == 'Hold' %}
-          {{ [[pv_kw, 6.0] | min, 0] | max }}
+          {{ [[[pv_kw, load_kw] | max, 6.0] | min, 0] | max }}
         {% else %}
           {{ [[load_kw, 6.0] | min, 0] | max }}
         {% endif %}
