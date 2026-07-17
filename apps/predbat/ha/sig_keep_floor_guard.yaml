@@ -36,9 +36,36 @@ trigger:
     above: 1.5
     for: "00:10:00"
     id: pv_back
+  # HARD FLOOR — fires inside ANY session (manual or automated). Discovered
+  # 2026-07-17: PCS dispatch IGNORES ess_discharge_cut_off_state_of_charge
+  # (battery ran 38% → 2.3% through the "10% cut-off" overnight). Below the
+  # hard floor the only safe posture is native MSC: close the session, battery
+  # rests, house imports, PV recharges. CM may lower the helper for deliberate
+  # deep pre-dawn drains.
+  - platform: numeric_state
+    entity_id: sensor.sigen_plant_battery_state_of_charge
+    below: input_number.sig_hard_floor_pct
+    for: "00:03:00"
+    id: hard_floor
 
 action:
   - choose:
+      # Hard floor: close ANY open session, return to native MSC
+      - conditions:
+          - condition: trigger
+            id: hard_floor
+          - condition: state
+            entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+            state: "on"
+        sequence:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_dispatch_policy
+            data:
+              option: "Off"
+          - action: switch.turn_off
+            target:
+              entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
       - conditions:
           - condition: trigger
             id: floor_hit
