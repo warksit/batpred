@@ -1138,6 +1138,58 @@ def test_dispatch_policy_handback_once_on_deactivate():
     print("  test_dispatch_policy_handback_once_on_deactivate: PASSED")
 
 
+def test_read_only_set_when_cm_driving():
+    """R3 mutex: gate on + active + SOC in band (CM driving a non-Predbat policy)
+    → suppress Predbat via base.set_read_only=True."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    assert base.set_read_only is False
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert base.set_read_only is True, "CM driving must suppress Predbat (read_only True)"
+    print("  test_read_only_set_when_cm_driving: PASSED")
+
+
+def test_read_only_released_on_handback():
+    """R3/RD6: once CM hands back (plugin inactive, e.g. safe_time) read_only clears
+    so Predbat resumes owning the machine."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert base.set_read_only is True
+    plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+    assert base.set_read_only is False, "handback must release read_only"
+    print("  test_read_only_released_on_handback: PASSED")
+
+
+def test_read_only_released_on_low_soc_handover():
+    """RD4: active but SOC below the low-SOC handover → CM hands to Predbat (MSC),
+    so read_only clears even though the plugin is still active."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert base.set_read_only is True
+    # 1.5 kWh of 18.08 = 8.3% < 12% handover → hand to Predbat
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.5, soc_max=18.08)
+    assert base.set_read_only is False, "low-SOC handover must release read_only"
+    print("  test_read_only_released_on_low_soc_handover: PASSED")
+
+
+def test_read_only_untouched_observe_only():
+    """Observe-only (gate off): CM never suppresses Predbat, even when active."""
+    base = MockBase()  # gate defaults off
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert base.set_read_only is False, "observe-only must not touch read_only"
+    print("  test_read_only_untouched_observe_only: PASSED")
+
+
 def test_proposed_phase_charge_below_floor():
     """SOC < charge_below → Charge (P10 recovery at risk)."""
     from curtailment_calc import compute_proposed_phase
@@ -2805,11 +2857,11 @@ def test_on_update_stays_off_low_pv():
 
 
 def test_deactivation_at_safe_time():
-    """v20 R56 supersedes R6/R12 safe_time deactivation. Plugin now keeps
-    running past safe_time so it can drain SOC to overnight target via Drain
-    mode in late afternoon. Test renamed-in-spirit to verify R56 sundown
-    deactivation: plugin only goes off when actual PV drops to ~0 (sundown),
-    NOT at safe_time.
+    """RD6/R6 (v30): CM owns the curtailment window ONLY and hands back to
+    Predbat at safe_time. Once PV can no longer exceed the export cap there is
+    no curtailment to manage, so the plugin deactivates at safe_time — it does
+    NOT stay active into the evening to drain the battery (that £-optimisation
+    is Predbat's job, R56 removed).
     """
     from datetime import datetime, timezone
 
@@ -2830,27 +2882,18 @@ def test_deactivation_at_safe_time():
     )
     plugin = CurtailmentPlugin(base)
     plugin.on_update()
-    assert plugin.last_phase == "active", "Should activate at noon"
+    assert plugin.last_phase == "active", "Should activate at noon (mid-overflow)"
 
-    # Jump past safe_time but PV still 0.3 kW — R56 says STAY ACTIVE so we
-    # can drain SOC to overnight target through the late afternoon.
+    # Jump past safe_time — sun geometry is now below the export threshold, so
+    # PV can no longer overflow the cap. RD6: hand the machine back to Predbat.
     base.minutes_now = 18 * 60 + 30
     base.now_utc = datetime(2025, 7, 12, 18, 30, tzinfo=timezone.utc)
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.3
     base.services.clear()
     plugin.base = base
     plugin.on_update()
-    assert plugin.last_phase == "active", "R56: stay active past safe_time while PV>0"
-
-    # Now sundown — actual PV drops to ~0 with peak observed → off
-    base.minutes_now = 21 * 60
-    base.now_utc = datetime(2025, 7, 12, 21, 0, tzinfo=timezone.utc)
-    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.05
-    base.services.clear()
-    plugin.base = base
-    plugin.on_update()
-    assert plugin.last_phase == "off", "R56: deactivate at sundown (PV ~0 after peak observed)"
-    print("  test_deactivation_at_safe_time: PASSED (R56: active past safe_time, off at sundown)")
+    assert plugin.last_phase == "off", "RD6: deactivate at safe_time, hand back to Predbat"
+    print("  test_deactivation_at_safe_time: PASSED (RD6: off at safe_time)")
 
 
 def test_defers_to_charge_window():
@@ -2971,15 +3014,18 @@ def test_R54_target_uses_keep_when_lower_than_overflow_floor():
     """R54: target = min(overflow_floor, effective_keep). When overflow is
     small (overflow_floor high), target falls to effective_keep — replaces
     R45 100% chase.
+
+    Scenario: a genuine but SMALL overflow window (peak just over the export
+    threshold, so safe_time is still ahead → plugin active per RD6), with modest
+    Solcast remaining → overflow_floor stays high → min() picks effective_keep.
     """
-    # Small overflow scenario: cloudy day with low Solcast peak
-    pv = {m: 3.0 for m in range(0, 240, PLUGIN_STEP)}
+    pv = {m: 5.5 for m in range(0, 240, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 240, PLUGIN_STEP)}
     sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 3.0,
+        "sensor.sigen_plant_pv_power": 5.5,
         "sensor.sigen_plant_consumed_power": 0.5,
     }
-    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=4.0, solcast_remaining=15.0))
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=5.5, solcast_remaining=12.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
@@ -3056,10 +3102,10 @@ def test_R57_no_chase_to_soc_max_late_in_day():
     print(f"  test_R57_no_chase_to_soc_max_late_in_day: PASSED (floor={floor:.2f} kWh = {floor / BATTERY_KWH * 100:.0f}%)")
 
 
-def test_R56_active_after_safe_time_when_soc_above_keep():
-    """R56: plugin stays active past safe_time so it can drain SOC down to
-    overnight target via Drain mode in the late afternoon. Pre-R56 it would
-    deactivate at safe_time.
+def test_deactivate_at_safe_time_even_above_keep():
+    """RD6 (v30, supersedes R56): even with SOC well above the overnight target,
+    the plugin deactivates at safe_time. It must NOT stay active to drain the
+    battery for evening grid value — that is Predbat's £-optimisation, not CM's.
     """
     from datetime import datetime, timezone
 
@@ -3073,8 +3119,8 @@ def test_R56_active_after_safe_time_when_soc_above_keep():
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=BATTERY_KWH * 0.85,  # above overnight target — Drain territory
-        minutes_now=1140,  # 19:00 BST
+        soc_kw=BATTERY_KWH * 0.85,  # high SOC — old R56 would drain it in the evening
+        minutes_now=1140,  # 19:00 BST — past safe_time
         best_soc_keep=4.0,
         now_utc=datetime(2025, 7, 12, 18, 0, tzinfo=timezone.utc),
         sensor_overrides=sensor_overrides,
@@ -3082,13 +3128,15 @@ def test_R56_active_after_safe_time_when_soc_above_keep():
     plugin = CurtailmentPlugin(base)
     plugin._peak_pv = 7.5  # earlier today there was real PV, so not pre-PV path
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"R56: plugin must stay active past safe_time, got {phase}"
-    print(f"  test_R56_active_after_safe_time_when_soc_above_keep: PASSED (active, floor={floor:.2f})")
+    assert phase == "off", f"RD6: deactivate at safe_time regardless of SOC, got {phase}"
+    print(f"  test_deactivate_at_safe_time_even_above_keep: PASSED (off, floor={floor:.2f})")
 
 
-def test_R56_off_at_sundown():
-    """R56: when peak PV was observed today AND actual PV is now ~0, plugin
-    deactivates (sundown). Hands back to Predbat MSC for overnight.
+def test_off_at_sundown_backstop():
+    """RD6 backstop: when peak PV was observed today AND actual PV is now ~0,
+    plugin deactivates (sundown). This is the fallback for days where safe_time
+    can't be computed; safe_time (R6/RD6) is the primary trigger. Hands back to
+    Predbat for overnight.
     """
     from datetime import datetime, timezone
 
@@ -3112,7 +3160,7 @@ def test_R56_off_at_sundown():
     plugin._peak_pv = 7.5  # had PV earlier today
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "off", f"R56: sundown (peak observed, actual PV=0) → off, got {phase}"
-    print("  test_R56_off_at_sundown: PASSED (off, hands back to Predbat)")
+    print("  test_off_at_sundown_backstop: PASSED (off, hands back to Predbat)")
 
 
 # ============================================================================
@@ -3463,8 +3511,8 @@ def test_R55_overnight_target_raises_effective_keep_in_calculate():
         else:
             pv[m] = 1.5
         load[m] = 0.5
-    sensor_overrides = {"sensor.sigen_plant_pv_power": 1.5, "sensor.sigen_plant_consumed_power": 0.5}
-    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=2.0, solcast_remaining=4.0))
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 5.5, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=5.5, solcast_remaining=8.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
@@ -4627,6 +4675,10 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_max_export_high_soc,
         test_dispatch_policy_low_soc_hands_to_msc,
         test_dispatch_policy_handback_once_on_deactivate,
+        test_read_only_set_when_cm_driving,
+        test_read_only_released_on_handback,
+        test_read_only_released_on_low_soc_handover,
+        test_read_only_untouched_observe_only,
         test_proposed_phase_charge_below_floor,
         test_proposed_phase_drain_above_ceiling,
         test_proposed_phase_today_7am_actual,
@@ -4852,8 +4904,8 @@ def run_curtailment_tests(my_predbat=None):
         test_R54_target_uses_keep_when_lower_than_overflow_floor,
         test_R54_target_uses_overflow_when_lower_than_keep,
         test_R57_no_chase_to_soc_max_late_in_day,
-        test_R56_active_after_safe_time_when_soc_above_keep,
-        test_R56_off_at_sundown,
+        test_deactivate_at_safe_time_even_above_keep,
+        test_off_at_sundown_backstop,
     ]
     print("  --- R54/R56/R57 plugin behaviour tests ---")
     for test_fn in r54_56_57_tests:

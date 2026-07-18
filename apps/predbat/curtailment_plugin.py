@@ -3,12 +3,17 @@
 # Solar-geometry floor algorithm to eliminate solar curtailment
 #
 # Works WITH the HA automation (curtailment_manager_dynamic_export_limit):
-#   - Plugin (5-min): computes floor from solar geometry integral, publishes sensors
-#   - HA automation (~5s): Charge (SOC < floor-0.5), Drain (SOC > floor+0.5), Hold (at floor)
+#   - Plugin (5-min): computes floor + dispatch policy, publishes sensors
+#   - HA heartbeat (~1min): sole SIG register writer, acts on input_select.sig_dispatch_policy
 #
-# Control model (SIG inverter):
-#   Active:   D-ESS mode, read_only=True (suppresses Predbat inverter control)
-#   Inactive: MSC mode, read_only=False (Predbat resumes, fills battery from PV)
+# Control model (v30, DC-coupled SIG):
+#   CM's ONLY job is minimising curtailment, £-aware. Predbat owns everything else
+#   (price, evening export, saving sessions, overnight reserve). So CM has the wheel
+#   ONLY inside the curtailment window: pre-PV drain (R52/R62 headroom) → real-time
+#   overflow management → release at safe_time (R6/RD6).
+#   Driving:  policy = Max Export / Hold Battery / Solar Charge Battery, read_only=True
+#             (base.set_read_only suppresses Predbat — the CM↔Predbat mutex, R3).
+#   Handback: policy = Predbat, read_only=False (safe_time / low-SOC handover / off).
 #
 # Activation (R5): BOTH must be true:
 #   1. remaining_overflow > 0 — solar geometry curve predicts overflow
@@ -210,6 +215,9 @@ class CurtailmentPlugin(PredBatPlugin):
         # hand back exactly once on the active->off edge (RD10) without clobbering
         # manual/Predbat control on ordinary off cycles.
         self._policy_driving = False
+        # R3 read_only mutex: None = unknown (adopt live state on first run), then
+        # tracks whether WE set base.set_read_only so we only ever clear our own.
+        self._read_only_set = None
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0
@@ -1209,16 +1217,18 @@ class CurtailmentPlugin(PredBatPlugin):
         threshold_kw = dno_limit_kw + MIN_BASE_LOAD_KW
         safe_mins, safe_utc = compute_release_time(safe_scale, lat, lon, doy, threshold_kw, utc_hours)
 
+        reached_safe_time = False
         if safe_mins is None:
             # Can't compute — assume far future (very high scale, unusual)
             safe_utc = utc_hours + 12.0
             safe_mins = 720
             self._safe_time_str = "none"
         elif safe_mins <= 0:
-            # R56 (v20): past safe_time no longer deactivates — plugin keeps
-            # running to drain SOC to effective_keep through the late
-            # afternoon. Set integration window to a small slice so overflow
-            # integral returns ~0; R54 then makes floor = effective_keep.
+            # RD6 (v30): we are past safe_time — PV can no longer exceed the export
+            # cap, so there is no curtailment left to manage. Flag it for the
+            # deactivation check below (hand the machine back to Predbat). Keep a
+            # small integration slice so any residual math returns ~0.
+            reached_safe_time = True
             safe_local = safe_utc + local_offset
             self._safe_time_str = "{:02d}:{:02d}".format(int(safe_local) % 24, int((safe_local % 1) * 60))
             safe_utc = utc_hours + 0.1
@@ -1295,16 +1305,22 @@ class CurtailmentPlugin(PredBatPlugin):
         total_excess = max(0.0, solcast_remaining - load_remaining)
 
         will_fill = total_excess > battery_headroom
-        past_safe_time = utc_hours >= safe_utc
 
-        # R56: deactivate at sundown (PV ≤ 0.1 after peak observed). Pre-PV
-        # path is handled earlier; reaching here means PV is currently active
-        # OR we're seeing a brief PV gap mid-day. The "peak observed" guard
-        # ensures we don't deactivate just because PV momentarily dipped on a
-        # cloudy morning before any real PV happened today.
-        sundown = self._peak_pv > 0.5 and actual_pv < 0.1
-        if sundown:
-            self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
+        # RD6/R6 (v30): CM owns the curtailment window ONLY. Deactivate at safe_time
+        # (primary) — past it PV can't exceed the export cap, so there is no
+        # curtailment to manage and the whole machine hands back to Predbat (evening
+        # export, saving sessions, overnight reserve are Predbat's, not CM's). This
+        # supersedes R56 (CM must NOT stay active to drain the battery in the
+        # evening). The peak-observed guard keeps this to the descending side of the
+        # day (pre-PV drain runs before safe_time, so it is unaffected). Sundown
+        # (PV ≤ 0.1 after peak) remains a BACKSTOP for days where safe_time can't
+        # be computed.
+        peaked = self._peak_pv > 0.5
+        past_safe = reached_safe_time and peaked
+        sundown = peaked and actual_pv < 0.1
+        if past_safe or sundown:
+            trigger = "safe_time" if past_safe else "sundown"
+            self._last_decision = "off: {} (peak={:.1f}, actual_pv={:.2f})".format(trigger, self._peak_pv, actual_pv)
             self._floor_ratchet = None
             self._floor_source = "Overnight Reserve"
             # End-of-day reset: clear peak so tomorrow starts fresh
@@ -1313,9 +1329,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._peak_pv_time = 0
             self._save_state()
             return soc_max, "off"
-        # past_safe_time stays as a diagnostic only (R19). Plugin runs through
-        # late-afternoon to drain SOC down to overnight target via R54.
-        _ = past_safe_time
 
         # Active: compute floor (R9/R10)
         soc_keep = getattr(self.base, "best_soc_keep", 0)
@@ -1923,6 +1936,15 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self._log_once("keepfloor_set_err", "Curtailment: failed to set keep floor {}: {}".format(pct, e))
 
+    def _set_read_only(self, value):
+        """R3 mutex: suppress/resume Predbat via its internal read_only flag (NOT an
+        HA entity). True while CM drives the inverter; False on handback."""
+        self.base.set_read_only = value
+        item = self.base.config_index.get("set_read_only")
+        if item:
+            item["value"] = value
+        self.log("Curtailment: read_only -> {} (Predbat {})".format(value, "suppressed" if value else "resumes"))
+
     def _publish_dispatch_policy(self, plugin_active, floor_kwh, soc_kwh, soc_max):
         """RD9 (v30): decide the dispatch policy + sell floor from the split-threshold
         phase, ALWAYS publish the intended decision (observe-only visibility), and ACT
@@ -1972,6 +1994,21 @@ class CurtailmentPlugin(PredBatPlugin):
             )
         except Exception as e:
             self._log_once("intended_policy_pub_err", "Curtailment: intended policy publish failed: {}".format(e))
+
+        # R3 mutex: suppress Predbat ONLY while CM actively drives a non-Predbat
+        # policy (acting + active + above the low-SOC handover). Release on every
+        # handback — low-SOC (RD4), safe_time/off (RD6) — so Predbat resumes owning
+        # the machine. Adopt the live flag on first run so a restart mid-drive (or a
+        # stale True from a crashed run) reconciles instead of stranding Predbat.
+        if self._read_only_set is None:
+            self._read_only_set = bool(getattr(self.base, "set_read_only", False))
+        cm_driving = acting and plugin_active and soc_pct > low_soc
+        if cm_driving and not self._read_only_set:
+            self._set_read_only(True)
+            self._read_only_set = True
+        elif not cm_driving and self._read_only_set:
+            self._set_read_only(False)
+            self._read_only_set = False
 
         if not acting:
             return

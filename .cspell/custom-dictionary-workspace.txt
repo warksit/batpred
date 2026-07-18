@@ -146,6 +146,7 @@ HACS
 hadashboard
 hahistory
 hainterface
+handback
 hanres
 HAOS
 hass
@@ -178,6 +179,7 @@ ivtime
 jedlix
 jsyaml
 kaiming
+keepfloor
 killall
 kopt
 Kostal
@@ -231,6 +233,7 @@ Mosquitto
 mpan
 mppt
 mprn
+mpxn
 mqtt
 mult
 myenergi

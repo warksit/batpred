@@ -30,8 +30,16 @@ reserved cannot be reclaimed.
 ## Safety
 
 - **R1**: Export never exceeds DNO (4kW). SIG faults at 4.5kW. SMA backstop at 4.25kW.
-- **R2**: On error, deactivate cleanly: restore MSC, clear read_only, reset export to DNO.
-- **R3**: read_only=true during active control. Predbat must not change inverter settings.
+- **R2**: On error, deactivate cleanly: release control (policy → Predbat) and clear
+  read_only so Predbat resumes.
+- **R3**: **read_only is the CM↔Predbat mutex** (v30). CM sets `base.set_read_only = True`
+  only while it is *actively driving* a non-Predbat policy (Max Export / Hold Battery /
+  Solar Charge Battery), i.e. inside the curtailment window. It clears read_only the
+  moment it hands back — at the low-SOC handover (R4/RD4), at safe_time (R6/RD6), or on
+  deactivation — so Predbat resumes owning the machine. In observe-only (policy-control
+  gate off) CM never sets read_only. CM's *only* job is curtailment; Predbat owns
+  price, evening export, saving sessions, and overnight reserve, so CM must not hold
+  read_only outside its window.
 - **R4**: Defer to Predbat charge windows when SOC < soc_keep and charge window active.
 
 ## Activation
@@ -41,8 +49,16 @@ reserved cannot be reclaimed.
   2. `solcast_remaining - load_remaining > (soc_max - soc_kw)` — total PV exceeds
      what is needed to fill the battery. If the battery won't reach 100% even with
      all the PV, the overflow energy is needed for charging — do not activate.
-- **R6**: Deactivate at safe_time (R19): restore MSC, hand back to Predbat.
-  Predbat MSC fills the battery with remaining post-safe_time PV.
+- **R6**: **Deactivate at safe_time (R19), handing the whole machine back to Predbat**
+  (RD6). Once `now >= safe_time`, PV can no longer exceed the export cap, so there is
+  no curtailment to manage — CM releases (read_only False, policy → Predbat) and
+  Predbat owns the evening: excess export, saving sessions, and the drive to overnight
+  reserve. **This supersedes R56** — CM must NOT stay active past safe_time to drain
+  the battery to an overnight target; that is a £-optimisation and belongs to Predbat,
+  not CM. Sundown (PV ≤ 0.1 after peak) remains only as a BACKSTOP for days where
+  safe_time can't be computed. Pre-PV drain (R52/R62) is the one place CM acts outside
+  the live-overflow window and STAYS with CM — it creates curtailment headroom, which
+  Predbat cannot do.
 - **R7**: No activation from per-slot forecast scan. Solar geometry and Solcast p90 only.
 - **R8**: When inactive, Predbat manages normally.
 
@@ -384,6 +400,9 @@ Goals of v20:
    Both are "drain to" levels; lower wins.
 4. Plugin runs while PV > 0, not until safe_time. Evening drain to
    `soc_keep` happens through the late afternoon.
+   > **SUPERSEDED by RD6/R6 (v30, 2026-07-18):** this evening-drain-by-CM is
+   > exactly the overreach removed in v30. CM now releases at safe_time; the
+   > evening drain to overnight reserve is Predbat's job. See R6 and RD6.
 
 ### Changed Goal
 
@@ -1107,14 +1126,32 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   manual until Predbat wired.
 
 - **RD6 handover trigger** → **safe_time** (Andrew, 2026-07-18). The CM manages the
-  overflow window and releases (policy Off → Predbat) once `now > safe_time` (R19,
-  the solar-geometry end of overflow). Predbat then exports the evening excess and
-  manages any saving session. This is exactly old R6. **Dusk (guard) is the
-  BACKSTOP** release only — catches a still-active session/manual policy that
-  safe_time didn't clear (e.g. CM never activated). Interim (Predbat mapper not yet
-  wired): safe_time/dusk release → EMS-MSC, which holds/absorbs but does NOT export
-  the evening — evening export + saving sessions are MANUAL until RD7 lands.
+  overflow window and releases (read_only False, policy → Predbat) once
+  `now >= safe_time` (R19, the solar-geometry end of overflow). Predbat then exports
+  the evening excess and manages any saving session. This is exactly old R6. **Dusk
+  (guard) is the BACKSTOP** release only — catches a still-active session/manual
+  policy that safe_time didn't clear (e.g. CM never activated). Interim (Predbat
+  mapper not yet wired): safe_time/dusk release → EMS-MSC, which holds/absorbs but
+  does NOT export the evening — evening export + saving sessions are MANUAL until
+  RD7 lands.
+
+- **Governing principle (Andrew, 2026-07-18)** → **CM does one thing: minimise
+  curtailment, £-aware. Predbat owns everything else.** Predbat has no mechanism to
+  pre-position the battery against a DNO-cap clip, which is the entire reason CM
+  exists. So CM's scope is the curtailment window ONLY: pre-PV drain (R52/R62, to
+  create headroom) → real-time overflow management → release at safe_time (R6/RD6).
+  Outside that window Predbat is in sole control (price, evening export, saving
+  sessions, overnight reserve). `read_only` (R3) is the mutex that enforces this:
+  set only while CM drives, cleared on every handback.
+
+- **RD6 + read_only mutex IMPLEMENTED (2026-07-18):** plugin `calculate()` deactivates
+  at safe_time (sundown = backstop); `_publish_dispatch_policy` sets/clears
+  `base.set_read_only` on the driving/handback edges. Tests:
+  `test_deactivate_at_safe_time*`, `test_read_only_*`.
 
 ### Still open
 
-- (none — spec agreed 2026-07-18; ready to build plugin RD9 + mapper RD7)
+- **RD7 — Predbat mapper onto the policy select** (drive `sig_dispatch_policy` from
+  `predbat_requested_mode`, gated by read_only / CM phase so mapper and CM never both
+  write the select). Until this lands, `read_only=False` lets Predbat *plan* but not
+  *act* (mapper off), so evening export + saving sessions stay MANUAL.
