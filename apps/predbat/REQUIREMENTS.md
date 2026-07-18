@@ -1023,11 +1023,17 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   where policy Off turns Remote EMS off → app mode; must become "set mode MSC, keep
   EMS on".
 - **RD3 — Policy vocabulary.** `Off` (=EMS-MSC rest) / `Full Export` (dispatch =
-  cap+load) / `Hold` (dispatch = max(PV,load): never absorb, cover load from
-  battery not grid) / `Load Only` (dispatch = load) / `Charge` (negative dispatch).
-  **The CM never grid-charges** (Andrew, 2026-07-18) — grid charging is a price
-  decision, always Predbat's. The CM's vocabulary is only Off / Hold / Full Export.
-  `Charge` exists solely for the Predbat mapper (RD7, Charging→Charge).
+  cap+load) / `Hold` (dispatch = max(PV,load): never absorb, sell surplus, cover
+  load from battery) / `Load Only` (dispatch = load: absorb PV surplus, zero export,
+  cover house — grid-neutral) / `Charge` (negative dispatch, grid charge).
+  **CM vocabulary = Off / Hold / Full Export / Load Only** — these are the OLD THREE
+  PHASES (Andrew, 2026-07-18): **Drain (R14)→Full Export, Hold (R15)→Hold, Charge
+  (R16)→Load Only.** Old R16 "Charge" was export=0 + battery charging from sub-DNO PV
+  toward target — exactly Load Only (dispatch=load absorbs the PV surplus). NOT a
+  grid charge. The R14–R16 Schmitt-trigger phase selection survives verbatim; the
+  plugin outputs a policy name instead of an export limit. **The CM never
+  grid-charges** — grid charging is a price decision, always Predbat's; `Charge`
+  (negative dispatch) exists solely for the Predbat mapper (RD7, Charging→Charge).
 - **RD4 — Hard floor, live clamp.** SOC ≤ `sig_hard_floor_pct` → heartbeat clamps
   dispatch ≤ PV (battery never discharges below the floor, any policy). Continuous
   guarantee in the heartbeat, not a transition trigger.
@@ -1079,10 +1085,15 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
 - **RD7 saving sessions** → Predbat owns; bespoke planner DISABLED now (pre-dusk bug),
   manual until Predbat wired.
 
+- **RD6 handover trigger** → **safe_time** (Andrew, 2026-07-18). The CM manages the
+  overflow window and releases (policy Off → Predbat) once `now > safe_time` (R19,
+  the solar-geometry end of overflow). Predbat then exports the evening excess and
+  manages any saving session. This is exactly old R6. **Dusk (guard) is the
+  BACKSTOP** release only — catches a still-active session/manual policy that
+  safe_time didn't clear (e.g. CM never activated). Interim (Predbat mapper not yet
+  wired): safe_time/dusk release → EMS-MSC, which holds/absorbs but does NOT export
+  the evening — evening export + saving sessions are MANUAL until RD7 lands.
+
 ### Still open
 
-- **RD6 dusk vs safe_time** for the CM→Predbat handover trigger on overflow days.
-  (safe_time is the solar-geometry end of the overflow window and can be well before
-  dusk; dusk is simpler but hands over later. On overflow days the CM should probably
-  release at safe_time so Predbat gets the late-afternoon export window; dusk is the
-  fallback release if the CM never activated.)
+- (none — spec agreed 2026-07-18; ready to build plugin RD9 + mapper RD7)
