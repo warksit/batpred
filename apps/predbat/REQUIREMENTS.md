@@ -1024,9 +1024,10 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   EMS on".
 - **RD3 — Policy vocabulary.** `Off` (=EMS-MSC rest) / `Full Export` (dispatch =
   cap+load) / `Hold` (dispatch = max(PV,load): never absorb, cover load from
-  battery not grid) / `Load Only` (dispatch = load) / **`Charge`** (TBD: negative
-  dispatch or Command Charging Grid First, for cheap-window grid charge — the old
-  `charge_below`/P10-recovery role).
+  battery not grid) / `Load Only` (dispatch = load) / `Charge` (negative dispatch).
+  **The CM never grid-charges** (Andrew, 2026-07-18) — grid charging is a price
+  decision, always Predbat's. The CM's vocabulary is only Off / Hold / Full Export.
+  `Charge` exists solely for the Predbat mapper (RD7, Charging→Charge).
 - **RD4 — Hard floor, live clamp.** SOC ≤ `sig_hard_floor_pct` → heartbeat clamps
   dispatch ≤ PV (battery never discharges below the floor, any policy). Continuous
   guarantee in the heartbeat, not a transition trigger.
@@ -1041,9 +1042,13 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   modes (which don't honour dispatch on this firmware). Predbat owns evenings,
   nights, non-overflow days, and **all price events including Octopus saving
   sessions** — Predbat natively models the session reward and plans the SOC
-  trajectory (pre-session reserve + overnight) via its optimizer. **RETIRE the
-  bespoke `sig_saving_session_planner`** and the dynamic saving-session floor idea
-  once Predbat control is re-enabled; they are interim stopgaps only.
+  trajectory (pre-session reserve + overnight) via its optimizer. The bespoke
+  `sig_saving_session_planner` is **DISABLED 2026-07-18** (never worked for a
+  session that ends before dusk — it set policy Off mid-daylight, handing to MSC
+  while PV and export value remained, and the day's posture did not resume).
+  Interim: **saving sessions handled MANUALLY** (set policy Full Export for the
+  window) until Predbat owns them. The approach is replaced, not adapted, at
+  handback.
 - **RD8 — CM owns overflow daylight only.** On a forecast-overflow day, the plugin
   takes ownership for the daylight window (sets policy Hold/Full Export + floors,
   Predbat suppressed), and releases at day-end (RD6 dusk / safe_time) back to
@@ -1067,11 +1072,17 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
 5. Harness tests for heartbeat / guard / (retired session) + plugin. Remove dead
    automations (5-sec export limit, voltage stack).
 
-### Open decisions for Andrew
+### Resolved 2026-07-18 (Andrew)
 
-- **RD3 Charge lever**: negative PCS dispatch (proven, rate-controlled) vs Command
-  Charging Grid First (untested preset)? Recommend negative dispatch.
-- **RD7 saving sessions**: confirm Predbat owns (retire bespoke planner) — vs keep a
-  thin CM stopgap until Predbat re-enabled? Recommend retire once Predbat live; keep
-  disabled-but-present until then.
+- **RD3 Charge lever** → negative PCS dispatch, and it is **Predbat-only**; the CM
+  never grid-charges.
+- **RD7 saving sessions** → Predbat owns; bespoke planner DISABLED now (pre-dusk bug),
+  manual until Predbat wired.
+
+### Still open
+
 - **RD6 dusk vs safe_time** for the CM→Predbat handover trigger on overflow days.
+  (safe_time is the solar-geometry end of the overflow window and can be well before
+  dusk; dusk is simpler but hands over later. On overflow days the CM should probably
+  release at safe_time so Predbat gets the late-afternoon export window; dusk is the
+  fallback release if the CM never activated.)
