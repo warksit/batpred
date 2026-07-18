@@ -1125,17 +1125,84 @@ def test_dispatch_policy_handback_once_on_deactivate():
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
-    plugin._policy_driving = True
+    plugin._cm_controlling = True  # we were controlling the window
+    plugin._read_only_set = True
     base.services.clear()
     plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
     assert _policy_calls(base) == ["Predbat"], base.services
     kf = _keep_floor_calls(base)
     assert kf and abs(kf[-1] - 38) < 0.5, f"keep floor reset to 38, got {kf}"
     assert plugin._policy_driving is False
+    assert plugin._cm_controlling is False
     base.services.clear()
     plugin._publish_dispatch_policy(False, 18.08, 10.0, 18.08)
     assert not _policy_calls(base), f"no repeat handback, got {base.services}"
     print("  test_dispatch_policy_handback_once_on_deactivate: PASSED")
+
+
+def _automation_calls(base):
+    return [(s[0], s[1].get("entity_id")) for s in base.services if s[0] in ("automation/turn_on", "automation/turn_off")]
+
+
+def _ems_mode_calls(base):
+    return [s[1].get("option") for s in base.services if s[0] == "select/select_option" and s[1].get("entity_id") == "select.sigen_plant_remote_ems_control_mode"]
+
+
+def test_heartbeat_enabled_on_control():
+    """Window start: entering CM control enables the heartbeat register-writer."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert ("automation/turn_on", "automation.sig_dispatch_heartbeat") in _automation_calls(base), base.services
+    assert plugin._cm_controlling is True
+    print("  test_heartbeat_enabled_on_control: PASSED")
+
+
+def test_heartbeat_disabled_and_msc_on_handback():
+    """Window end: handback disables the heartbeat AND parks EMS-MSC (never app mode)."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._cm_controlling = True
+    plugin._read_only_set = True
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") in _automation_calls(base), base.services
+    assert _ems_mode_calls(base) == ["Maximum Self Consumption"], base.services
+    print("  test_heartbeat_disabled_and_msc_on_handback: PASSED")
+
+
+def test_heartbeat_untouched_observe_only():
+    """Observe-only (gate off): plugin never toggles the heartbeat or EMS mode."""
+    base = MockBase()  # gate defaults off
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert not _automation_calls(base), base.services
+    assert not _ems_mode_calls(base), base.services
+    print("  test_heartbeat_untouched_observe_only: PASSED")
+
+
+def test_heartbeat_stays_on_through_low_soc():
+    """The window spans low-SOC dips: heartbeat stays enabled (only turned on once,
+    never off) when SOC drops below the handover mid-window."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    # Enter control (SOC in band)
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    base.services.clear()
+    # SOC drops below the 12% handover — still in the window
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.5, soc_max=18.08)
+    assert not any(s == "automation/turn_off" for s, _ in _automation_calls(base)), f"must NOT disable heartbeat on low-SOC, got {base.services}"
+    assert plugin._cm_controlling is True
+    assert _policy_calls(base) == ["Predbat"], base.services
+    print("  test_heartbeat_stays_on_through_low_soc: PASSED")
 
 
 def test_read_only_set_when_cm_driving():
@@ -4679,6 +4746,10 @@ def run_curtailment_tests(my_predbat=None):
         test_read_only_released_on_handback,
         test_read_only_released_on_low_soc_handover,
         test_read_only_untouched_observe_only,
+        test_heartbeat_enabled_on_control,
+        test_heartbeat_disabled_and_msc_on_handback,
+        test_heartbeat_untouched_observe_only,
+        test_heartbeat_stays_on_through_low_soc,
         test_proposed_phase_charge_below_floor,
         test_proposed_phase_drain_above_ceiling,
         test_proposed_phase_today_7am_actual,

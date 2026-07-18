@@ -82,6 +82,12 @@ SIG_POLICY_CONTROL_ENABLE = "input_boolean.sig_plugin_policy_control"
 SIG_POLICY_SELECT = "input_select.sig_dispatch_policy"
 SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
 SIG_LOW_SOC_HANDOVER_HELPER = "input_number.sig_low_soc_handover_pct"
+# Plugin owns the single-writer handoff: it enables the heartbeat (the register
+# writer) only while CM drives, and parks the unit in EMS-MSC on handback so
+# Predbat controls from the EMS plane. Never app modes (RD2).
+SIG_HEARTBEAT_AUTOMATION = "automation.sig_dispatch_heartbeat"
+SIG_EMS_MODE_SELECT = "select.sigen_plant_remote_ems_control_mode"
+SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
 DEFAULT_LOW_SOC_HANDOVER_PCT = 12.0  # below this, hand to MSC (RD4 "A")
 POLICY_PREDBAT = "Predbat"
@@ -218,6 +224,10 @@ class CurtailmentPlugin(PredBatPlugin):
         # R3 read_only mutex: None = unknown (adopt live state on first run), then
         # tracks whether WE set base.set_read_only so we only ever clear our own.
         self._read_only_set = None
+        # Single-writer handoff: True while CM controls (heartbeat enabled). None =
+        # unknown on first run (adopt from read_only). Edge-triggered so we don't
+        # spam turn_on/off or overwrite a manual EMS mode every cycle.
+        self._cm_controlling = None
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0
@@ -1945,6 +1955,36 @@ class CurtailmentPlugin(PredBatPlugin):
             item["value"] = value
         self.log("Curtailment: read_only -> {} (Predbat {})".format(value, "suppressed" if value else "resumes"))
 
+    def _set_automation(self, entity, turn_on):
+        """Enable/disable an HA automation (the heartbeat register-writer)."""
+        service = "automation/turn_on" if turn_on else "automation/turn_off"
+        try:
+            self.base.call_service_wrapper(service, entity_id=entity)
+            self.log("Curtailment: {} -> {}".format(entity, "enabled" if turn_on else "disabled"))
+        except Exception as e:
+            self._log_once("auto_set_err", "Curtailment: failed to {} {}: {}".format("enable" if turn_on else "disable", entity, e))
+
+    def _park_ems_msc(self):
+        """Park the SIG in EMS-MSC — Remote EMS stays ON, control mode Maximum Self
+        Consumption. NEVER app modes (RD2): keeps the EMS plane hot so Predbat controls."""
+        try:
+            self.base.call_service_wrapper("select/select_option", entity_id=SIG_EMS_MODE_SELECT, option=SIG_EMS_MODE_MSC)
+            self.log("Curtailment: EMS mode -> {}".format(SIG_EMS_MODE_MSC))
+        except Exception as e:
+            self._log_once("ems_msc_err", "Curtailment: failed to set EMS-MSC: {}".format(e))
+
+    def _release_to_predbat(self):
+        """Window end (safe_time / off): hand the whole machine back to Predbat.
+        Order (RD2/RD6/RD10): disable the heartbeat writer, park EMS-MSC, set policy
+        Predbat, reset the sell floor, then clear read_only so Predbat resumes."""
+        self._set_automation(SIG_HEARTBEAT_AUTOMATION, False)
+        self._park_ems_msc()
+        self._set_policy(POLICY_PREDBAT)
+        self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
+        if self._read_only_set:
+            self._set_read_only(False)
+            self._read_only_set = False
+
     def _publish_dispatch_policy(self, plugin_active, floor_kwh, soc_kwh, soc_max):
         """RD9 (v30): decide the dispatch policy + sell floor from the split-threshold
         phase, ALWAYS publish the intended decision (observe-only visibility), and ACT
@@ -1995,37 +2035,51 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self._log_once("intended_policy_pub_err", "Curtailment: intended policy publish failed: {}".format(e))
 
-        # R3 mutex: suppress Predbat ONLY while CM actively drives a non-Predbat
-        # policy (acting + active + above the low-SOC handover). Release on every
-        # handback — low-SOC (RD4), safe_time/off (RD6) — so Predbat resumes owning
-        # the machine. Adopt the live flag on first run so a restart mid-drive (or a
-        # stale True from a crashed run) reconciles instead of stranding Predbat.
-        if self._read_only_set is None:
+        # Single-writer handoff (the plugin owns it). The CM WINDOW = plugin_active
+        # while the gate is on; it spans low-SOC dips. The heartbeat register-writer
+        # runs ONLY during the window; read_only follows the DRIVE (dropped on the
+        # low-SOC handover). On the window edge we take/release control atomically.
+        # First run: adopt live state so a restart mid-window reconciles rather than
+        # stranding Predbat or double-writing.
+        if self._cm_controlling is None:
             self._read_only_set = bool(getattr(self.base, "set_read_only", False))
-        cm_driving = acting and plugin_active and soc_pct > low_soc
-        if cm_driving and not self._read_only_set:
-            self._set_read_only(True)
-            self._read_only_set = True
-        elif not cm_driving and self._read_only_set:
-            self._set_read_only(False)
-            self._read_only_set = False
+            self._cm_controlling = self._read_only_set
 
         if not acting:
+            # Observe-only: never hold control. Release cleanly if we somehow were
+            # (gate flipped off mid-window, or stale read_only from a crash).
+            if self._cm_controlling:
+                self._release_to_predbat()
+                self._cm_controlling = False
+            self._policy_driving = False
             return
 
-        # Act
-        if plugin_active and soc_pct > low_soc:
-            self._set_policy(intended_policy)
-            self._set_keep_floor(intended_keep)
-            self._policy_driving = True
-        elif plugin_active:
-            self._set_policy(POLICY_PREDBAT)
+        if plugin_active:
+            # CM window. Ensure the heartbeat writer is running (window start edge).
+            if not self._cm_controlling:
+                self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
+                self._cm_controlling = True
+            if soc_pct > low_soc:
+                # CM drives: suppress Predbat, set the policy.
+                if not self._read_only_set:
+                    self._set_read_only(True)
+                    self._read_only_set = True
+                self._set_policy(intended_policy)
+                self._set_keep_floor(intended_keep)
+            else:
+                # RD4 low-SOC handover: let EMS-MSC cover load; drop drive suppression
+                # but STAY in the window (heartbeat on) so we re-drive when SOC recovers.
+                if self._read_only_set:
+                    self._set_read_only(False)
+                    self._read_only_set = False
+                self._set_policy(POLICY_PREDBAT)
             self._policy_driving = True
         else:
-            if self._policy_driving:
-                self._set_policy(POLICY_PREDBAT)
-                self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
-                self._policy_driving = False
+            # Window end (safe_time / off): hand the whole machine back to Predbat.
+            if self._cm_controlling:
+                self._release_to_predbat()
+                self._cm_controlling = False
+            self._policy_driving = False
 
     def on_update(self):
         """Main entry point, called every Predbat cycle. v30: compute the floor,
