@@ -1055,6 +1055,85 @@ def test_phase_to_policy_mapping():
     print("  test_phase_to_policy_mapping: PASSED")
 
 
+def _policy_calls(base):
+    return [s[1]["option"] for s in base.services if s[0] == "input_select/select_option" and s[1].get("entity_id") == "input_select.sig_dispatch_policy"]
+
+
+def _keep_floor_calls(base):
+    return [s[1]["value"] for s in base.services if s[0] == "input_number/set_value" and s[1].get("entity_id") == "input_number.sig_keep_floor_pct"]
+
+
+def test_dispatch_policy_gated_off_by_default():
+    """RD9: no policy writes when sig_plugin_policy_control gate is off (dormant deploy)."""
+    base = MockBase()
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(plugin_active=True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert not _policy_calls(base), f"gate off must write nothing, got {base.services}"
+    print("  test_dispatch_policy_gated_off_by_default: PASSED")
+
+
+def test_dispatch_policy_drives_hold_when_enabled():
+    """Gate on + active + SOC in band → Hold Battery + keep floor set."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Hold Battery"], base.services
+    kf = _keep_floor_calls(base)
+    assert kf and abs(kf[-1] - 44) <= 1, f"keep floor ~44%, got {kf}"
+    assert plugin._policy_driving is True
+    print("  test_dispatch_policy_drives_hold_when_enabled: PASSED")
+
+
+def test_dispatch_policy_max_export_high_soc():
+    """SOC > drain_above → Max Export."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=14.0, soc_kwh=16.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Max Export"], base.services
+    print("  test_dispatch_policy_max_export_high_soc: PASSED")
+
+
+def test_dispatch_policy_low_soc_hands_to_msc():
+    """RD4 'A': active but SOC below the low-SOC handover → Predbat (MSC), no PCS."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    # 1.5 kWh of 18.08 = 8.3% < 12% handover
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.5, soc_max=18.08)
+    assert _policy_calls(base) == ["Predbat"], base.services
+    assert plugin._policy_driving is True  # still our day; resumes when SOC recovers
+    print("  test_dispatch_policy_low_soc_hands_to_msc: PASSED")
+
+
+def test_dispatch_policy_handback_once_on_deactivate():
+    """RD10: active->off edge hands to Predbat once + resets keep floor to 38; no repeat."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._policy_driving = True
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Predbat"], base.services
+    kf = _keep_floor_calls(base)
+    assert kf and abs(kf[-1] - 38) < 0.5, f"keep floor reset to 38, got {kf}"
+    assert plugin._policy_driving is False
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, 18.08, 10.0, 18.08)
+    assert not _policy_calls(base), f"no repeat handback, got {base.services}"
+    print("  test_dispatch_policy_handback_once_on_deactivate: PASSED")
+
+
 def test_proposed_phase_charge_below_floor():
     """SOC < charge_below → Charge (P10 recovery at risk)."""
     from curtailment_calc import compute_proposed_phase
@@ -4870,6 +4949,11 @@ def run_curtailment_tests(my_predbat=None):
         # Split-threshold proposed phase (shadow mode)
         test_proposed_phase_hold_in_band,
         test_phase_to_policy_mapping,
+        test_dispatch_policy_gated_off_by_default,
+        test_dispatch_policy_drives_hold_when_enabled,
+        test_dispatch_policy_max_export_high_soc,
+        test_dispatch_policy_low_soc_hands_to_msc,
+        test_dispatch_policy_handback_once_on_deactivate,
         test_proposed_phase_charge_below_floor,
         test_proposed_phase_drain_above_ceiling,
         test_proposed_phase_today_7am_actual,

@@ -44,6 +44,8 @@ from curtailment_calc import (
     compute_effective_export_cap,
     compute_charge_below,
     compute_drain_above,
+    compute_proposed_phase,
+    phase_to_policy,
     compute_pre_pv_target,
     compute_floor_with_source,
     should_defer_to_charge,
@@ -68,6 +70,17 @@ SIG_GRID_EXPORT_POWER = "sensor.sigen_plant_grid_export_power"
 
 # HA input helper entity IDs
 HA_ENABLE = "input_boolean.curtailment_manager_enable"
+
+# v30 (DC-coupled) policy control — RD9. Gated behind its own flag (default off)
+# so the plugin can be DEPLOYED dormant and staged-enabled separately from the
+# legacy curtailment_manager_enable.
+SIG_POLICY_CONTROL_ENABLE = "input_boolean.sig_plugin_policy_control"
+SIG_POLICY_SELECT = "input_select.sig_dispatch_policy"
+SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
+SIG_LOW_SOC_HANDOVER_HELPER = "input_number.sig_low_soc_handover_pct"
+DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
+DEFAULT_LOW_SOC_HANDOVER_PCT = 12.0  # below this, hand to MSC (RD4 "A")
+POLICY_PREDBAT = "Predbat"
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
@@ -197,6 +210,13 @@ class CurtailmentPlugin(PredBatPlugin):
         # Export target published to HA automation (-2 = inactive)
         self._export_target = -2
         self._actual_pv_kw = 0.0
+        # v30 policy control (RD9): split thresholds stored by publish() this cycle
+        self._charge_below = 0.0
+        self._drain_above = 0.0
+        # True while the plugin is actively driving the dispatch policy; used to
+        # hand back exactly once on the active->off edge (RD10) without clobbering
+        # manual/Predbat control on ordinary off cycles.
+        self._policy_driving = False
         # Caching for on_before_plan
         self._cached_keep = None
         self._cached_at = 0
@@ -1810,6 +1830,11 @@ class CurtailmentPlugin(PredBatPlugin):
             charge_below = 0.0
             drain_above = round(soc_max, 2)
 
+        # Store for _publish_dispatch_policy (RD9): the v30 policy selection reuses
+        # the same split thresholds this cycle rather than recomputing them.
+        self._charge_below = charge_below
+        self._drain_above = drain_above
+
         self.base.dashboard_item(
             "sensor.{}_curtailment_charge_below".format(prefix),
             charge_below,
@@ -1907,6 +1932,67 @@ class CurtailmentPlugin(PredBatPlugin):
                 self.base.call_service_wrapper("input_text/set_value", entity_id="input_text.curtailment_live_phase", value="Off")
             except Exception:
                 pass
+
+    def _set_policy(self, policy):
+        """Set input_select.sig_dispatch_policy, only when it changes."""
+        current = self.base.get_state_wrapper(SIG_POLICY_SELECT, default=None)
+        if current == policy:
+            return
+        try:
+            self.base.call_service_wrapper("input_select/select_option", entity_id=SIG_POLICY_SELECT, option=policy)
+            self.log("Curtailment: policy -> {}".format(policy))
+        except Exception as e:
+            self._log_once("policy_set_err", "Curtailment: failed to set policy {}: {}".format(policy, e))
+
+    def _set_keep_floor(self, pct):
+        """Set input_number.sig_keep_floor_pct, only when it changes materially."""
+        pct = round(float(pct), 0)
+        try:
+            current = float(self.base.get_state_wrapper(SIG_KEEP_FLOOR_HELPER, default=-1))
+        except (TypeError, ValueError):
+            current = -1
+        if abs(current - pct) < 0.5:
+            return
+        try:
+            self.base.call_service_wrapper("input_number/set_value", entity_id=SIG_KEEP_FLOOR_HELPER, value=pct)
+        except Exception as e:
+            self._log_once("keepfloor_set_err", "Curtailment: failed to set keep floor {}: {}".format(pct, e))
+
+    def _publish_dispatch_policy(self, plugin_active, floor_kwh, soc_kwh, soc_max):
+        """RD9 (v30): drive input_select.sig_dispatch_policy + sig_keep_floor_pct
+        from the split-threshold phase. Gated behind SIG_POLICY_CONTROL_ENABLE so
+        the plugin deploys dormant. Only DRIVES while active and above the low-SOC
+        handover; below it, hands to MSC (RD4 "A"); on the active->off edge, hands
+        back to Predbat once and resets the sell floor (RD10)."""
+        gate = str(self.base.get_state_wrapper(SIG_POLICY_CONTROL_ENABLE, default="off")).lower()
+        if gate not in ("on", "true"):
+            return
+
+        try:
+            low_soc = float(self.base.get_state_wrapper(SIG_LOW_SOC_HANDOVER_HELPER, default=DEFAULT_LOW_SOC_HANDOVER_PCT))
+        except (TypeError, ValueError):
+            low_soc = DEFAULT_LOW_SOC_HANDOVER_PCT
+        soc_pct = soc_kwh / max(soc_max, 0.1) * 100
+
+        if plugin_active and soc_pct > low_soc:
+            schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
+            policy = phase_to_policy(schmitt)
+            keep_floor_pct = min(max(floor_kwh / max(soc_max, 0.1) * 100, 5.0), 95.0)
+            self._set_policy(policy)
+            self._set_keep_floor(keep_floor_pct)
+            self._policy_driving = True
+        elif plugin_active:
+            # Active but at/below the low-SOC handover: hand to MSC (native cut-off
+            # protects; MSC covers load + recharges). Stay "driving" so we resume
+            # when PV lifts SOC back above the handover.
+            self._set_policy(POLICY_PREDBAT)
+            self._policy_driving = True
+        else:
+            # Not active: hand back exactly once on the active->off edge (RD10).
+            if self._policy_driving:
+                self._set_policy(POLICY_PREDBAT)
+                self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
+                self._policy_driving = False
 
     def write_sig(self, ems_mode, charge_limit, export_limit=None):
         """Write SIG entities, only when values change.
@@ -2023,6 +2109,8 @@ class CurtailmentPlugin(PredBatPlugin):
                     self.apply("off")
                 soc_max = getattr(self.base, "soc_max", 10)
                 self.publish("off", soc_max, dno_limit)
+                # Hand the policy back once if we were driving (RD10).
+                self._publish_dispatch_policy(False, soc_max, getattr(self.base, "soc_kw", 0), soc_max)
                 return
 
             floor, phase = self.calculate(dno_limit)
@@ -2116,6 +2204,10 @@ class CurtailmentPlugin(PredBatPlugin):
             # changes, so branch 3's condition no longer matches.
             self.publish(phase, floor, dno_limit, export_target=self._export_target)
             self.apply(phase)
+
+            # v30 (RD9): drive the dispatch policy + sell floor. Gated internally
+            # by SIG_POLICY_CONTROL_ENABLE (dormant until staged on).
+            self._publish_dispatch_policy(phase != "off", floor, soc_kw, soc_max)
 
             # Tomorrow forecast (separate try/except — don't break today's control)
             try:
