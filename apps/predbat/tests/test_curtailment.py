@@ -1063,15 +1063,19 @@ def _keep_floor_calls(base):
     return [s[1]["value"] for s in base.services if s[0] == "input_number/set_value" and s[1].get("entity_id") == "input_number.sig_keep_floor_pct"]
 
 
-def test_dispatch_policy_gated_off_by_default():
-    """RD9: no policy writes when sig_plugin_policy_control gate is off (dormant deploy)."""
+def test_dispatch_policy_gated_off_publishes_intended_only():
+    """RD9 observe-only: gate off → NO input_select write, but the intended policy
+    IS published to sensor.predbat_curtailment_intended_policy with acting=False."""
     base = MockBase()
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     base.services.clear()
     plugin._publish_dispatch_policy(plugin_active=True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
-    assert not _policy_calls(base), f"gate off must write nothing, got {base.services}"
-    print("  test_dispatch_policy_gated_off_by_default: PASSED")
+    assert not _policy_calls(base), f"gate off must not write policy, got {base.services}"
+    pub = base.published.get("sensor.predbat_curtailment_intended_policy")
+    assert pub is not None and pub["value"] == "Hold Battery", f"intended policy should publish Hold Battery, got {pub}"
+    assert pub["attrs"]["acting"] is False, f"acting should be False when gate off, got {pub}"
+    print("  test_dispatch_policy_gated_off_publishes_intended_only: PASSED")
 
 
 def test_dispatch_policy_drives_hold_when_enabled():
@@ -4949,7 +4953,7 @@ def run_curtailment_tests(my_predbat=None):
         # Split-threshold proposed phase (shadow mode)
         test_proposed_phase_hold_in_band,
         test_phase_to_policy_mapping,
-        test_dispatch_policy_gated_off_by_default,
+        test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
         test_dispatch_policy_low_soc_hands_to_msc,

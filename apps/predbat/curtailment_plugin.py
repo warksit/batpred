@@ -1959,36 +1959,67 @@ class CurtailmentPlugin(PredBatPlugin):
             self._log_once("keepfloor_set_err", "Curtailment: failed to set keep floor {}: {}".format(pct, e))
 
     def _publish_dispatch_policy(self, plugin_active, floor_kwh, soc_kwh, soc_max):
-        """RD9 (v30): drive input_select.sig_dispatch_policy + sig_keep_floor_pct
-        from the split-threshold phase. Gated behind SIG_POLICY_CONTROL_ENABLE so
-        the plugin deploys dormant. Only DRIVES while active and above the low-SOC
-        handover; below it, hands to MSC (RD4 "A"); on the active->off edge, hands
-        back to Predbat once and resets the sell floor (RD10)."""
-        gate = str(self.base.get_state_wrapper(SIG_POLICY_CONTROL_ENABLE, default="off")).lower()
-        if gate not in ("on", "true"):
-            return
-
+        """RD9 (v30): decide the dispatch policy + sell floor from the split-threshold
+        phase, ALWAYS publish the intended decision (observe-only visibility), and ACT
+        (write input_select.sig_dispatch_policy + sig_keep_floor_pct) only when
+        SIG_POLICY_CONTROL_ENABLE is on. Drives while active + above the low-SOC
+        handover; below it hands to MSC (RD4 "A"); on the active->off edge hands back
+        to Predbat once and resets the sell floor to 38% (RD10)."""
         try:
             low_soc = float(self.base.get_state_wrapper(SIG_LOW_SOC_HANDOVER_HELPER, default=DEFAULT_LOW_SOC_HANDOVER_PCT))
         except (TypeError, ValueError):
             low_soc = DEFAULT_LOW_SOC_HANDOVER_PCT
         soc_pct = soc_kwh / max(soc_max, 0.1) * 100
 
+        # Decide the intended policy + keep floor (pure decision, no side effects yet)
         if plugin_active and soc_pct > low_soc:
             schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
-            policy = phase_to_policy(schmitt)
-            keep_floor_pct = min(max(floor_kwh / max(soc_max, 0.1) * 100, 5.0), 95.0)
-            self._set_policy(policy)
-            self._set_keep_floor(keep_floor_pct)
+            intended_policy = phase_to_policy(schmitt)
+            intended_keep = min(max(floor_kwh / max(soc_max, 0.1) * 100, 5.0), 95.0)
+            reason = "active {} | soc {:.0f}% band [{:.1f}, {:.1f}] kWh".format(schmitt, soc_pct, self._charge_below, self._drain_above)
+        elif plugin_active:
+            intended_policy = POLICY_PREDBAT
+            intended_keep = None
+            reason = "low-SOC handover ({:.0f}% <= {:.0f}%) -> MSC".format(soc_pct, low_soc)
+        else:
+            intended_policy = POLICY_PREDBAT
+            intended_keep = DEFAULT_KEEP_FLOOR_PCT
+            reason = "inactive -> hand back to Predbat"
+
+        gate = str(self.base.get_state_wrapper(SIG_POLICY_CONTROL_ENABLE, default="off")).lower()
+        acting = gate in ("on", "true")
+
+        # Always publish the intended decision — this is what you watch in observe-only.
+        try:
+            prefix = self.base.prefix
+            self.base.dashboard_item(
+                "sensor.{}_curtailment_intended_policy".format(prefix),
+                intended_policy,
+                {
+                    "friendly_name": "Curtailment Intended Policy",
+                    "icon": "mdi:robot",
+                    "keep_floor_pct": round(intended_keep, 0) if intended_keep is not None else None,
+                    "low_soc_handover_pct": low_soc,
+                    "soc_pct": round(soc_pct, 1),
+                    "reason": reason,
+                    "acting": acting,
+                },
+            )
+        except Exception as e:
+            self._log_once("intended_policy_pub_err", "Curtailment: intended policy publish failed: {}".format(e))
+
+        if not acting:
+            return
+
+        # Act
+        if plugin_active and soc_pct > low_soc:
+            self._set_policy(intended_policy)
+            self._set_keep_floor(intended_keep)
             self._policy_driving = True
         elif plugin_active:
-            # Active but at/below the low-SOC handover: hand to MSC (native cut-off
-            # protects; MSC covers load + recharges). Stay "driving" so we resume
-            # when PV lifts SOC back above the handover.
             self._set_policy(POLICY_PREDBAT)
             self._policy_driving = True
         else:
-            # Not active: hand back exactly once on the active->off edge (RD10).
             if self._policy_driving:
                 self._set_policy(POLICY_PREDBAT)
                 self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
