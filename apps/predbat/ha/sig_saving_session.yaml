@@ -1,0 +1,59 @@
+# SIG Saving Session Planner (2026-07-18)
+#
+# During a joined Octopus saving session, sell hard for the bonus: set policy
+# Full Export so the battery discharges to the export cap through the window.
+# The keep-floor guard (Full Export → Load Only at sig_keep_floor_pct)
+# guarantees the overnight reserve is left behind — so a dull-day low battery
+# simply exports less rather than sacrificing the night. On a sunny day the
+# battery is near full going in and full-exports the whole hour.
+#
+# Sets the POLICY select only (single-writer: heartbeat writes registers).
+# On session end, releases to Off (app work mode / next owner covers the
+# evening). "Keep enough SOC to full-export through the session AND leave
+# enough for overnight" (Andrew 2026-07-18): the export earns the bonus down
+# to the keep floor; the keep floor is the overnight reserve.
+#
+# NOTE: pre-session SOC reservation (ensuring enough charge is HELD back during
+# the afternoon to both full-export the session and keep overnight) is the
+# plugin's future job — this automation guarantees the safe side only.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config:, NOT python_transform.
+
+id: "1784355397820"
+alias: "SIG Saving Session Planner"
+description: >-
+  Full Export during a joined Octopus saving session; release to Off after.
+  Sets policy only. Repo: apps/predbat/ha/sig_saving_session.yaml.
+mode: single
+
+trigger:
+  - platform: state
+    entity_id: binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions
+    to: "on"
+    id: session_start
+  - platform: state
+    entity_id: binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions
+    to: "off"
+    id: session_end
+
+action:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: session_start
+        sequence:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_dispatch_policy
+            data:
+              option: "Full Export"
+      - conditions:
+          - condition: trigger
+            id: session_end
+        sequence:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_dispatch_policy
+            data:
+              option: "Off"
