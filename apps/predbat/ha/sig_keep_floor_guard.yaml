@@ -1,18 +1,21 @@
-# SIG Keep Floor Guard (2026-07-18 rev)
+# SIG Keep Floor Guard + Dusk Release (2026-07-18 rev2)
 #
-# Preserves the overnight reserve by stopping a deliberate SELL (Full Export /
-# saving session) at the keep floor. Sets the POLICY select only — the
-# heartbeat is the sole register writer (single-writer doctrine). The absolute
-# hard floor is now a live clamp inside the heartbeat, so this guard no longer
-# needs a hard-floor branch.
+# Two jobs, both by setting policy → Off (heartbeat then releases to the app
+# work mode = native MSC). Sets POLICY only; heartbeat is the sole register
+# writer.
 #
-#   SOC ≤ input_number.sig_keep_floor_pct (3 min) while policy is Full Export
-#     → switch policy to Load Only: stop selling, cover the house from the
-#       reserve; the heartbeat's hard-floor clamp stops battery discharge at
-#       sig_hard_floor_pct.
-#   PV back above 1.5 kW (10 min) while policy is Load Only
-#     → switch policy to Off: release to the app work mode / next owner for
-#       the new day.
+#   1. KEEP FLOOR — SOC ≤ input_number.sig_keep_floor_pct (3 min) while policy
+#      is Full Export → Off. Stops a deliberate sell so the overnight reserve
+#      survives; MSC then covers the house (and won't export from battery).
+#
+#   2. DUSK RELEASE — sun below horizon AND no active saving session → Off.
+#      Hands the inverter to native MSC (and thence Predbat) for the night.
+#      MSC is the correct overnight state: it is HARDWARE self-protecting
+#      (inverter's own discharge cut-off), so overnight safety does not depend
+#      on the heartbeat staying alive — unlike a held PCS session whose
+#      hard-floor clamp lives inside the (possibly dead) heartbeat.
+#
+# Morning: the day's policy is set by a human / the future plugin from Off.
 #
 # IMPORTANT: update and commit this file before changing the automation in HA.
 # Deploy via ha_config_set_automation config:, NOT python_transform.
@@ -20,9 +23,9 @@
 id: "1784208297065"
 alias: "SIG Keep Floor Guard"
 description: >-
-  Stops a deliberate sell at the overnight keep floor (Full Export → Load Only)
-  and releases Load Only back to Off when PV returns. Sets policy only; the
-  heartbeat writes registers. Repo: apps/predbat/ha/sig_keep_floor_guard.yaml.
+  Keep floor (Full Export → Off at the reserve) and dusk release (→ Off /
+  native MSC for the night). Sets policy only; heartbeat writes registers.
+  Repo: apps/predbat/ha/sig_keep_floor_guard.yaml.
 mode: single
 
 trigger:
@@ -31,11 +34,10 @@ trigger:
     below: input_number.sig_keep_floor_pct
     for: "00:03:00"
     id: floor_hit
-  - platform: numeric_state
-    entity_id: sensor.sigen_plant_pv_power
-    above: 1.5
-    for: "00:10:00"
-    id: pv_back
+  - platform: state
+    entity_id: sun.sun
+    to: "below_horizon"
+    id: dusk
 
 action:
   - choose:
@@ -50,13 +52,18 @@ action:
             target:
               entity_id: input_select.sig_dispatch_policy
             data:
-              option: "Load Only"
+              option: "Off"
       - conditions:
           - condition: trigger
-            id: pv_back
+            id: dusk
           - condition: state
-            entity_id: input_select.sig_dispatch_policy
-            state: "Load Only"
+            entity_id: binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions
+            state: "off"
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: input_select.sig_dispatch_policy
+                state: "Off"
         sequence:
           - action: input_select.select_option
             target:
