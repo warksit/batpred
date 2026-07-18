@@ -6,10 +6,10 @@
 # sets the POLICY; only this automation touches Remote EMS enable, control
 # mode, export limit and PCS dispatch.
 #
-#   Predbat            → release: hand the inverter back (interim: turn Remote
-#                        EMS off → app work mode MSC; RD2 target: keep EMS on,
-#                        mode MSC). Once the mapper is wired this = Predbat in
-#                        control. Only releases if WE own it (EMS on + PCS).
+#   Predbat            → release (RD2): STAY in EMS control — Remote EMS ON, EMS
+#                        control mode = Maximum Self Consumption. NEVER app modes.
+#                        Predbat controls from EMS-MSC by switching EMS modes.
+#                        Idempotent so it doesn't fight Predbat once it takes over.
 #   Max Export         → dispatch = cap + load: export pinned at 3.68, battery
 #                        discharges to hold it below PV, absorbs above. (old Drain)
 #   Hold Battery       → dispatch = max(PV, load): battery flat (never absorbs),
@@ -68,19 +68,35 @@ action:
       raw_kw: "{{ (cap_kw + load_kw) if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
       dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), 6.0] | min, 0] | max }}"
   - choose:
-      # Release (Predbat): WE own the inverter → hand back to app mode (interim MSC)
+      # Release (Predbat): STAY in EMS control (RD2). Remote EMS ON, EMS control
+      # mode = Maximum Self Consumption. NEVER turn Remote EMS off / drop to app
+      # modes — that leaves the EMS plane and Predbat can't get back in. Predbat
+      # controls from EMS-MSC by switching EMS modes. Idempotent: only writes when
+      # not already in that state, so it doesn't fight Predbat once it takes over.
       - conditions:
           - "{{ policy == 'Predbat' }}"
-          - condition: state
-            entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
-            state: "on"
-          - condition: state
-            entity_id: select.sigen_plant_remote_ems_control_mode
-            state: "PCS Remote Control"
         sequence:
-          - action: switch.turn_off
-            target:
-              entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+          - if:
+              - condition: state
+                entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+                state: "off"
+            then:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+              - delay: "00:00:02"
+          - if:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: select.sigen_plant_remote_ems_control_mode
+                    state: "Maximum Self Consumption"
+            then:
+              - action: select.select_option
+                target:
+                  entity_id: select.sigen_plant_remote_ems_control_mode
+                data:
+                  option: "Maximum Self Consumption"
       # Active policy: ensure session open, then re-assert export limit + dispatch
       - conditions:
           - "{{ policy in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] }}"
