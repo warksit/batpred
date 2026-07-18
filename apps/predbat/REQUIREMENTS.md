@@ -1036,26 +1036,30 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   plugin outputs a policy name instead of an export limit. **The CM never
   grid-charges** — grid charging is a price decision, always Predbat's; `Charge`
   (negative dispatch) exists solely for the Predbat mapper (RD7, Charging→Charge).
-- **RD4 — Hard floor = "stop ALL discharge", live clamp.** SOC ≤ `sig_hard_floor_pct`
-  → heartbeat clamps dispatch ≤ PV (battery never discharges below this floor for ANY
-  reason — export OR load, any policy). Continuous guarantee in the heartbeat, not a
-  transition trigger. While the CM owns the day the plugin sets `hard_floor =
-  effective_keep` (protect the overnight reserve); below it, house imports.
-- **RD5 — Keep floor = "stop SELLING", not "hold here".** `Max Export` → `Predbat` at
-  `sig_keep_floor_pct`. This stops the deliberate *sell only* — below it the battery
-  STILL covers house LOAD (Hold Battery / MSC) down to the hard floor. So the keep
-  floor is the drain/sell target, not a "freeze SOC here" level (that is the hard
-  floor). Plugin sets `keep_floor = its drain target (floor)`; the guard enforces the
-  same number as a backstop.
-- **RD10 — Floors MUST reset on handback (Andrew, 2026-07-18).** When the CM hands
-  back (policy → Predbat, at safe_time/dusk/deactivation), BOTH floors reset to safe
-  overnight defaults: `keep_floor` → overnight reserve (default 38%), `hard_floor` →
-  overnight safe minimum (default 12%). Rationale: the CM legitimately *relaxes* the
-  hard floor low for deep pre-dawn drains (R48/R52 → ~0.5 kWh); if that relaxed floor
-  persisted into Predbat/overnight ownership the battery would over-discharge for load
-  toward ~3% (a stale-config repeat of the 2026-07-16 deep drain). The plugin resets
-  on its Off cycle; the guard/dusk backstop path resets too (whichever hands back).
-  (RD7 later: while Predbat owns, keep_floor can track Predbat's soc_keep.)
+- **RD4 — NO software hard floor / no import-clamp (Andrew, 2026-07-18, "A").** The
+  battery must always be able to cover house LOAD down to its own HARDWARE discharge
+  cut-off — never forced to import while it holds charge. The heartbeat does NOT clamp
+  dispatch. Low-SOC protection is delegated entirely to MSC: **PCS mode ignores the
+  native cut-off (proven 2026-07-16 → 2.3%), so whenever SOC reaches the low-SOC
+  handover point (`sig_low_soc_handover_pct`, default ~12%) the CM/guard HANDS TO MSC
+  (policy → Predbat)** — the native cut-off then protects the pack while MSC keeps
+  covering load. Handover, not clamp: battery covers load, no artificial import. This
+  is the ONLY low-SOC threshold, and it behaves as a handover.
+  (Also protected by plugin deactivation when the overflow forecast collapses, and by
+  the safe_time/dusk handover — a PCS session must never persist into no-PV.)
+- **RD5 — Sell floor = "stop SELLING", the only CM floor.** `Max Export` → `Predbat`
+  at `sig_keep_floor_pct` (the drain/sell target). Below it the battery still covers
+  house LOAD via MSC down to the hardware cut-off (RD4). The sell floor is a drain
+  target, not a "freeze SOC" level. Plugin sets `keep_floor = its drain target`; the
+  guard enforces it as a backstop.
+- **RD10 — Sell floor resets on handback.** When the CM hands back (policy → Predbat
+  at safe_time/dusk/deactivation), `keep_floor` resets to the overnight-reserve
+  default (38%) so a later Predbat `Max Export` sells to the right overnight level,
+  not the CM's stale overflow-drain target. There is no hard floor to reset (RD4).
+- **NOTE — live-code delta:** the currently-deployed heartbeat still has the hard-floor
+  CLAMP + `sig_hard_floor_pct`. Under RD4 that clamp is removed and replaced by the
+  low-SOC→MSC handover in the coordinated RD4 implementation. Live clamp is safe-if-
+  suboptimal (imports below 12%) until then; not urgent.
 - **RD6 — Dusk handover.** Sun below horizon (and no active saving session) → policy
   `Off` → EMS-MSC for the night. Overnight safety MUST be hardware (native discharge
   cut-off), never dependent on the heartbeat being alive.
