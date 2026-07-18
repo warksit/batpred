@@ -4,6 +4,12 @@ All changes to the curtailment manager (curtailment_plugin.py, curtailment_calc.
 HA automation, tests) MUST be checked against these requirements. Do not remove
 features without verifying they are not required here.
 
+> **⚠️ 2026-07-18: the control layer is being replaced — see
+> `## v30 — DC-Coupled Architecture` at the end of this file. It supersedes the
+> 5-second three-phase export-limit control (R14–R18, R38) and the DNO software
+> cap (R1). The forecasting brain (R5, R9, R42–R52) survives but now OUTPUTS a
+> policy + floor instead of an export limit. When in conflict, v30 wins.**
+
 ## Goal
 
 Prevent grid export exceeding 4kW DNO limit while minimizing curtailment
@@ -967,3 +973,105 @@ is R52/R62's job — decided pre-dawn with a fresher forecast. R56's "evening
 kWh has higher grid value" rationale belonged to the old deemed-£0 tariff.
 Do not "fix" the dusk asymmetry; revisit only if the export tariff becomes
 time-of-use.
+
+---
+
+## v30 — DC-Coupled Architecture (2026-07-18)
+
+**Status: DIFF FOR REVIEW.** Interim executor (HA automations) is live and
+validated; the plugin/mapper items below are NOT yet built. This section is the
+spec to agree before that work.
+
+### Context
+
+Inverter swapped 2026-07-15: SigenStor EC 6.0 SP, DC-coupled, SIG owns PV at the
+MPPTs (SMA retired). The whole 5-second software export-limit control is obsolete —
+the inverter's own grid-limit register enforces the 3.68 kW G99 cap in hardware,
+and DC-bus physics buffers PV into the battery natively. Control is now ONE lever:
+Remote-EMS `PCS Remote Control` mode + `active_power_fixed_adjustment` (a signed AC
+power setpoint). **R25's principle is UNCHANGED** (Andrew, corrected): once
+PV − load > export cap there are no levers — the battery can only fill; all
+room-making happens BEFORE overflow, judged at overflow start. Only the loss
+changed (MPPT clip at ~31p/kWh, not fault risk) and the cap (4.0 → 3.68).
+
+### Retired
+
+- **R1** software DNO cap → hardware grid-limit register (`grid_export_limitation`).
+- **R14–R16, R16a, R17, R18, R38** — the 5-second three-phase (Charge/Hold/Drain)
+  export-limit automation → retired entirely. `curtailment_manager_dynamic_export_limit`
+  and the voltage seek/throttle stack are OFF and to be removed.
+- **R2** error→MSC restore → reframed as "release to EMS-MSC" (RD2).
+- DNO constant 4.0 → 3.68 everywhere.
+
+### Surviving (the brain — unchanged in purpose, new output)
+
+R5 activation, R9/R9a/R10/R11 floor, R42–R50 scale/confidence/buffer, R52 pre-PV
+drain, R19–R21 safe_time, R26–R30 planning/tomorrow, R47 state persistence,
+R34–R37 testing. These still compute *how much room by when*. Their OUTPUT changes
+from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
+
+### New requirements
+
+- **RD1 — Single writer.** Only `sig_dispatch_heartbeat` writes SIG control
+  registers (Remote-EMS enable, control mode, export limit, dispatch). Everything
+  else (guard, plugin, Predbat mapper, human) sets `input_select.sig_dispatch_policy`.
+- **RD2 — Never app control; EMS-MSC is the rest state.** Remote EMS enable stays
+  ON at all times. The resting/handover/overnight state is Remote-EMS control mode
+  = `Maximum Self Consumption` (NOT Remote-EMS-off / app work mode). App work mode
+  is set to MSC as a pure fallback. (Predbat also drives via Remote-EMS mode, so we
+  must stay in Remote EMS to hand over cleanly.) **CHANGE from current live code**,
+  where policy Off turns Remote EMS off → app mode; must become "set mode MSC, keep
+  EMS on".
+- **RD3 — Policy vocabulary.** `Off` (=EMS-MSC rest) / `Full Export` (dispatch =
+  cap+load) / `Hold` (dispatch = max(PV,load): never absorb, cover load from
+  battery not grid) / `Load Only` (dispatch = load) / **`Charge`** (TBD: negative
+  dispatch or Command Charging Grid First, for cheap-window grid charge — the old
+  `charge_below`/P10-recovery role).
+- **RD4 — Hard floor, live clamp.** SOC ≤ `sig_hard_floor_pct` → heartbeat clamps
+  dispatch ≤ PV (battery never discharges below the floor, any policy). Continuous
+  guarantee in the heartbeat, not a transition trigger.
+- **RD5 — Keep floor.** `Full Export` → `Off` at `sig_keep_floor_pct` (the overnight
+  reserve). MSC then covers the house.
+- **RD6 — Dusk handover.** Sun below horizon (and no active saving session) → policy
+  `Off` → EMS-MSC for the night. Overnight safety MUST be hardware (native discharge
+  cut-off), never dependent on the heartbeat being alive.
+- **RD7 — Predbat owns price/evening/winter (handover).** Rewrite
+  `predbat_requested_mode_action` to drive `input_select.sig_dispatch_policy`
+  (Demand→Off, Charging→Charge, Discharging→Full Export) instead of the Command
+  modes (which don't honour dispatch on this firmware). Predbat owns evenings,
+  nights, non-overflow days, and **all price events including Octopus saving
+  sessions** — Predbat natively models the session reward and plans the SOC
+  trajectory (pre-session reserve + overnight) via its optimizer. **RETIRE the
+  bespoke `sig_saving_session_planner`** and the dynamic saving-session floor idea
+  once Predbat control is re-enabled; they are interim stopgaps only.
+- **RD8 — CM owns overflow daylight only.** On a forecast-overflow day, the plugin
+  takes ownership for the daylight window (sets policy Hold/Full Export + floors,
+  Predbat suppressed), and releases at day-end (RD6 dusk / safe_time) back to
+  Predbat. Non-overflow days and winter: plugin leaves policy `Off`; Predbat owns
+  throughout. This IS the old CM-day / Predbat-evening handover, preserved.
+- **RD9 — Plugin automates the policy + floors (removes the human).** The plugin
+  computes and SETS `input_select.sig_dispatch_policy` and the floor helpers
+  (`sig_keep_floor_pct`, `sig_hard_floor_pct`) each cycle from the forecast:
+  activation (R5) → posture (Hold vs Full Export vs Off); floor (R9/R50) →
+  keep_floor. No daily human mode-switching. Load input MUST use
+  `sensor.sigen_plant_total_load_power` (consumed_power now includes DC battery
+  charging post-swap).
+
+### Implementation order (gated on review of THIS section)
+
+1. **Review + agree this diff** (Andrew). ← we are here
+2. Deploy corrections: RD2 (EMS-MSC rest state), and confirm RD6/RD5 wording.
+3. Plugin rework RD9 (set policy + floors; `total_load_power`). TDD, harness tests.
+4. Predbat mapper RD7 (drive policy); retire bespoke saving-session planner; re-enable
+   Predbat control staged.
+5. Harness tests for heartbeat / guard / (retired session) + plugin. Remove dead
+   automations (5-sec export limit, voltage stack).
+
+### Open decisions for Andrew
+
+- **RD3 Charge lever**: negative PCS dispatch (proven, rate-controlled) vs Command
+  Charging Grid First (untested preset)? Recommend negative dispatch.
+- **RD7 saving sessions**: confirm Predbat owns (retire bespoke planner) — vs keep a
+  thin CM stopgap until Predbat re-enabled? Recommend retire once Predbat live; keep
+  disabled-but-present until then.
+- **RD6 dusk vs safe_time** for the CM→Predbat handover trigger on overflow days.
