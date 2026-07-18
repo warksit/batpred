@@ -1036,11 +1036,26 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   plugin outputs a policy name instead of an export limit. **The CM never
   grid-charges** — grid charging is a price decision, always Predbat's; `Charge`
   (negative dispatch) exists solely for the Predbat mapper (RD7, Charging→Charge).
-- **RD4 — Hard floor, live clamp.** SOC ≤ `sig_hard_floor_pct` → heartbeat clamps
-  dispatch ≤ PV (battery never discharges below the floor, any policy). Continuous
-  guarantee in the heartbeat, not a transition trigger.
-- **RD5 — Keep floor.** `Full Export` → `Off` at `sig_keep_floor_pct` (the overnight
-  reserve). MSC then covers the house.
+- **RD4 — Hard floor = "stop ALL discharge", live clamp.** SOC ≤ `sig_hard_floor_pct`
+  → heartbeat clamps dispatch ≤ PV (battery never discharges below this floor for ANY
+  reason — export OR load, any policy). Continuous guarantee in the heartbeat, not a
+  transition trigger. While the CM owns the day the plugin sets `hard_floor =
+  effective_keep` (protect the overnight reserve); below it, house imports.
+- **RD5 — Keep floor = "stop SELLING", not "hold here".** `Max Export` → `Predbat` at
+  `sig_keep_floor_pct`. This stops the deliberate *sell only* — below it the battery
+  STILL covers house LOAD (Hold Battery / MSC) down to the hard floor. So the keep
+  floor is the drain/sell target, not a "freeze SOC here" level (that is the hard
+  floor). Plugin sets `keep_floor = its drain target (floor)`; the guard enforces the
+  same number as a backstop.
+- **RD10 — Floors MUST reset on handback (Andrew, 2026-07-18).** When the CM hands
+  back (policy → Predbat, at safe_time/dusk/deactivation), BOTH floors reset to safe
+  overnight defaults: `keep_floor` → overnight reserve (default 38%), `hard_floor` →
+  overnight safe minimum (default 12%). Rationale: the CM legitimately *relaxes* the
+  hard floor low for deep pre-dawn drains (R48/R52 → ~0.5 kWh); if that relaxed floor
+  persisted into Predbat/overnight ownership the battery would over-discharge for load
+  toward ~3% (a stale-config repeat of the 2026-07-16 deep drain). The plugin resets
+  on its Off cycle; the guard/dusk backstop path resets too (whichever hands back).
+  (RD7 later: while Predbat owns, keep_floor can track Predbat's soc_keep.)
 - **RD6 — Dusk handover.** Sun below horizon (and no active saving session) → policy
   `Off` → EMS-MSC for the night. Overnight safety MUST be hardware (native discharge
   cut-off), never dependent on the heartbeat being alive.
