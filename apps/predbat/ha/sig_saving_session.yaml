@@ -1,4 +1,6 @@
-# SIG Saving Session Planner (2026-07-18)
+# SIG Saving Session Planner (2026-07-18) — DISABLED. Retired: broke for
+# sessions ending before dusk (set Predbat mid-daylight). Saving sessions are
+# manual until Predbat owns them (RD7). Kept for reference only.
 #
 # During a joined Octopus saving session, sell hard for the bonus: set policy
 # Full Export so the battery discharges to the export cap through the window.
@@ -47,7 +49,7 @@ action:
             target:
               entity_id: input_select.sig_dispatch_policy
             data:
-              option: "Full Export"
+              option: "Max Export"
       - conditions:
           - condition: trigger
             id: session_end
@@ -56,4 +58,4 @@ action:
             target:
               entity_id: input_select.sig_dispatch_policy
             data:
-              option: "Off"
+              option: "Predbat"

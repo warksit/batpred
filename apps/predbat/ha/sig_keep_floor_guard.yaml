@@ -1,21 +1,20 @@
-# SIG Keep Floor Guard + Dusk Release (2026-07-18 rev2)
+# SIG Keep Floor Guard + Dusk Release (2026-07-18 rev, renamed policies)
 #
-# Two jobs, both by setting policy → Off (heartbeat then releases to the app
-# work mode = native MSC). Sets POLICY only; heartbeat is the sole register
-# writer.
+# Two jobs, both by setting policy → Predbat (heartbeat then releases to the
+# app work mode = native MSC; interim, until the Predbat mapper is wired).
+# Sets POLICY only; heartbeat is the sole register writer.
 #
 #   1. KEEP FLOOR — SOC ≤ input_number.sig_keep_floor_pct (3 min) while policy
-#      is Full Export → Off. Stops a deliberate sell so the overnight reserve
-#      survives; MSC then covers the house (and won't export from battery).
+#      is Max Export → Predbat. Stops a deliberate sell so the overnight reserve
+#      survives; MSC then covers the house.
 #
-#   2. DUSK RELEASE — sun below horizon AND no active saving session → Off.
-#      Hands the inverter to native MSC (and thence Predbat) for the night.
-#      MSC is the correct overnight state: it is HARDWARE self-protecting
-#      (inverter's own discharge cut-off), so overnight safety does not depend
-#      on the heartbeat staying alive — unlike a held PCS session whose
-#      hard-floor clamp lives inside the (possibly dead) heartbeat.
+#   2. DUSK RELEASE — sun below horizon AND no active saving session → Predbat.
+#      Hands to native MSC for the night. MSC is HARDWARE self-protecting
+#      (inverter discharge cut-off), so overnight safety does not depend on the
+#      heartbeat staying alive — unlike a held PCS session.
 #
-# Morning: the day's policy is set by a human / the future plugin from Off.
+# NOTE: the CM's primary handover is at safe_time (RD6); this dusk trigger is
+# the BACKSTOP for a still-active manual policy the plugin didn't clear.
 #
 # IMPORTANT: update and commit this file before changing the automation in HA.
 # Deploy via ha_config_set_automation config:, NOT python_transform.
@@ -23,9 +22,9 @@
 id: "1784208297065"
 alias: "SIG Keep Floor Guard"
 description: >-
-  Keep floor (Full Export → Off at the reserve) and dusk release (→ Off /
-  native MSC for the night). Sets policy only; heartbeat writes registers.
-  Repo: apps/predbat/ha/sig_keep_floor_guard.yaml.
+  Keep floor (Max Export → Predbat at the reserve) and dusk backstop release
+  (→ Predbat / native MSC for the night). Sets policy only; heartbeat writes
+  registers. Repo: apps/predbat/ha/sig_keep_floor_guard.yaml.
 mode: single
 
 trigger:
@@ -46,13 +45,13 @@ action:
             id: floor_hit
           - condition: state
             entity_id: input_select.sig_dispatch_policy
-            state: "Full Export"
+            state: "Max Export"
         sequence:
           - action: input_select.select_option
             target:
               entity_id: input_select.sig_dispatch_policy
             data:
-              option: "Off"
+              option: "Predbat"
       - conditions:
           - condition: trigger
             id: dusk
@@ -63,10 +62,10 @@ action:
             conditions:
               - condition: state
                 entity_id: input_select.sig_dispatch_policy
-                state: "Off"
+                state: "Predbat"
         sequence:
           - action: input_select.select_option
             target:
               entity_id: input_select.sig_dispatch_policy
             data:
-              option: "Off"
+              option: "Predbat"

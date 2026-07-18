@@ -1022,10 +1022,12 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   must stay in Remote EMS to hand over cleanly.) **CHANGE from current live code**,
   where policy Off turns Remote EMS off → app mode; must become "set mode MSC, keep
   EMS on".
-- **RD3 — Policy vocabulary.** `Off` (=EMS-MSC rest) / `Full Export` (dispatch =
-  cap+load) / `Hold` (dispatch = max(PV,load): never absorb, sell surplus, cover
-  load from battery) / `Load Only` (dispatch = load: absorb PV surplus, zero export,
-  cover house — grid-neutral) / `Charge` (negative dispatch, grid charge).
+- **RD3 — Policy vocabulary** (display names locked 2026-07-18, `input_select.sig_dispatch_policy`):
+  `Predbat` (=EMS-MSC rest / hand back — binary end state: not-CM-managed = Predbat
+  in control) / `Max Export` (dispatch = cap+load) / `Hold Battery` (dispatch =
+  max(PV,load): never absorb, sell surplus, cover load from battery) / `Solar Charge
+  Battery` (dispatch = load: absorb PV surplus, zero export, cover house —
+  grid-neutral). Future `Grid Charge` (negative dispatch) for the Predbat mapper.
   **CM vocabulary = Off / Hold / Full Export / Load Only** — these are the OLD THREE
   PHASES (Andrew, 2026-07-18): **Drain (R14)→Full Export, Hold (R15)→Hold, Charge
   (R16)→Load Only.** Old R16 "Charge" was export=0 + battery charging from sub-DNO PV
