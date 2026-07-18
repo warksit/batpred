@@ -60,10 +60,9 @@ from curtailment_calc import (
 )
 from plugin_system import PredBatPlugin
 
-# SIG entity names (Mum's system)
-SIG_EMS_MODE = "select.sigen_plant_remote_ems_control_mode"
-SIG_EXPORT_LIMIT = "number.sigen_plant_grid_export_limitation"
-SIG_CHARGE_LIMIT = "number.sigen_plant_ess_charge_cut_off_state_of_charge"
+# SIG entity names (Mum's system) — read-only monitoring inputs.
+# (Control-register writes were removed with the legacy apply() path; the HA
+# heartbeat/guard own inverter control now.)
 SIG_PV_POWER = "sensor.sigen_plant_pv_power"
 SIG_LOAD_POWER = "sensor.sigen_plant_consumed_power"
 SIG_GRID_EXPORT_POWER = "sensor.sigen_plant_grid_export_power"
@@ -173,10 +172,6 @@ class CurtailmentPlugin(PredBatPlugin):
 
     def __init__(self, base):
         super().__init__(base)
-        self.last_ems_mode = None
-        self.last_charge_limit = None
-        self.last_export_limit = None
-        self.was_active = False
         self._dno_limit = 4.0
         self.last_phase = None
         # Day's peak PV (actual observed) for scale calibration (R43)
@@ -207,8 +202,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
-        # Export target published to HA automation (-2 = inactive)
-        self._export_target = -2
         self._actual_pv_kw = 0.0
         # v30 policy control (RD9): split thresholds stored by publish() this cycle
         self._charge_below = 0.0
@@ -1141,8 +1134,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._last_decision = "active (pre-PV): " + decision_str
                 self._floor_ratchet = target_kwh
                 self._last_floor_scale = 0.0
-                self._export_target = dno_limit_kw
-                self.was_active = True
                 self._floor_source = "Pre-PV Drain"
                 # R62: stamp the published-threshold inputs with the pre-PV
                 # target. Without this, publish() derives drain_above from
@@ -1176,7 +1167,6 @@ class CurtailmentPlugin(PredBatPlugin):
 
         if p90_scale < 0.5:
             # No Solcast data and no yesterday's scale — cannot compute safely
-            self._export_target = -2
             self._last_decision = "off: p90_scale<0.5 (no Solcast)"
             self._floor_source = "No Forecast"
             return soc_max, "off"
@@ -1316,7 +1306,6 @@ class CurtailmentPlugin(PredBatPlugin):
         if sundown:
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
             self._floor_ratchet = None
-            self._export_target = -2
             self._floor_source = "Overnight Reserve"
             # End-of-day reset: clear peak so tomorrow starts fresh
             if minutes_now > 1200:
@@ -1500,12 +1489,6 @@ class CurtailmentPlugin(PredBatPlugin):
         floor = min(floor, soc_max)
         if floor >= soc_max:
             self._floor_source = "Battery Full"
-
-        # Plugin publishes DNO as export cap when active; HA automation decides phase
-        # (Charge/Hold/Drain) from SOC vs target with symmetric hysteresis. Plugin just
-        # signals "active with this floor" — the automation handles fast-reaction phase
-        # transitions on 5-sec cadence.
-        self._export_target = dno_limit_kw
 
         self._last_decision = "active: overflow={:.2f} floor={:.2f}kWh".format(remaining_overflow, floor)
 
@@ -1726,12 +1709,13 @@ class CurtailmentPlugin(PredBatPlugin):
         attrs["icon"] = "mdi:solar-power-variant-outline"
         self.base.dashboard_item("sensor.{}_curtailment_tomorrow".format(prefix), state, attrs)
 
-    def publish(self, phase, floor_kwh, dno_limit_kw, export_target=None):
-        """Publish curtailment sensors via dashboard_item.
+    def publish(self, phase, floor_kwh, dno_limit_kw):
+        """Publish curtailment monitoring sensors via dashboard_item.
 
-        Phase sensor shows Active/Off (plugin's strategic decision).
-        Real-time phase (Drain/Hold) is published by the HA automation.
-        export_target: kW export cap for HA automation. -2 = inactive.
+        Phase sensor shows Active/Off (plugin's strategic decision) plus the
+        floor, thresholds and forecast diagnostics. v30: the plugin no longer
+        controls the inverter — the dispatch policy (see _publish_dispatch_policy)
+        and the HA heartbeat do that. These sensors are for monitoring only.
         """
         prefix = self.base.prefix
         soc_max = getattr(self.base, "soc_max", 10)
@@ -1884,18 +1868,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 "icon": "mdi:battery-arrow-down",
             },
         )
-        et = export_target if export_target is not None else -2
-        self.base.dashboard_item(
-            "sensor.{}_curtailment_export_target".format(prefix),
-            et,
-            {
-                "friendly_name": "Curtailment Export Target",
-                "unit_of_measurement": "kW",
-                "icon": "mdi:transmission-tower-export",
-                "dno_limit": dno_limit_kw,
-            },
-        )
-
         # R50 diagnostics promoted to dedicated sensors so HA recorder retains
         # statistics (state_class=measurement) for trend graphs and forecast-vs-actual
         # analysis. Same values as the corresponding overflow_p* attributes on
@@ -1925,13 +1897,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 "icon": "mdi:gauge",
             },
         )
-
-        # Set live phase to Off when plugin is off
-        if state == "Off":
-            try:
-                self.base.call_service_wrapper("input_text/set_value", entity_id="input_text.curtailment_live_phase", value="Off")
-            except Exception:
-                pass
 
     def _set_policy(self, policy):
         """Set input_select.sig_dispatch_policy, only when it changes."""
@@ -2025,127 +1990,23 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
                 self._policy_driving = False
 
-    def write_sig(self, ems_mode, charge_limit, export_limit=None):
-        """Write SIG entities, only when values change.
-
-        Export limit is written FIRST (before EMS mode) to ensure there is
-        never a window where D-ESS is active with a stale export limit.
-        """
-        if export_limit is not None and export_limit != self.last_export_limit:
-            self.base.call_service_wrapper(
-                "number/set_value",
-                entity_id=SIG_EXPORT_LIMIT,
-                value=export_limit,
-            )
-            self.last_export_limit = export_limit
-            self.log("Curtailment: Set export limit -> {}kW".format(export_limit))
-
-        if ems_mode != self.last_ems_mode:
-            self.base.call_service_wrapper(
-                "select/select_option",
-                entity_id=SIG_EMS_MODE,
-                option=ems_mode,
-            )
-            self.last_ems_mode = ems_mode
-            self.log("Curtailment: Set EMS mode -> {}".format(ems_mode))
-
-        if charge_limit != self.last_charge_limit:
-            self.base.call_service_wrapper(
-                "number/set_value",
-                entity_id=SIG_CHARGE_LIMIT,
-                value=charge_limit,
-            )
-            self.last_charge_limit = charge_limit
-            self.log("Curtailment: Set charge limit -> {}%".format(charge_limit))
-
-    def _set_read_only(self, value):
-        """Set read_only via internal flag only — NOT via HA entity."""
-        self.base.set_read_only = value
-        item = self.base.config_index.get("set_read_only")
-        if item:
-            item["value"] = value
-
-    def apply(self, phase):
-        """Apply inverter control based on phase.
-
-        Active:  D-ESS, export=0 (safe default), read_only=true.
-                 HA automation overrides export limit within 5 seconds.
-        Off:     MSC, export=DNO (cleanup), read_only=false.
-        """
-        active = phase != "off"
-
-        if active:
-            if not self.was_active:
-                self.log("Curtailment activating")
-                self.write_sig(
-                    ems_mode="Command Discharging (ESS First)",
-                    charge_limit=100,
-                    export_limit=0,
-                )
-            else:
-                self.write_sig(
-                    ems_mode="Command Discharging (ESS First)",
-                    charge_limit=100,
-                )
-
-            self._set_read_only(True)
-            self.was_active = True
-
-        elif self.was_active:
-            self.log("Curtailment deactivating, restoring MSC")
-            self.write_sig(
-                ems_mode="Maximum Self Consumption",
-                charge_limit=100,
-            )
-            self.base.call_service_wrapper(
-                "number/set_value",
-                entity_id=SIG_EXPORT_LIMIT,
-                value=self._dno_limit,
-            )
-
-            self._set_read_only(False)
-
-            self.last_ems_mode = None
-            self.last_charge_limit = None
-            self.last_export_limit = None
-            self.was_active = False
-
-    HA_AUTOMATION = "automation.curtailment_manager_dynamic_export_limit"
-
-    def _cleanup_read_only(self):
-        """Clear stale state left by a previous plugin run (e.g. after restart)."""
-        if not self.was_active and self.base.set_read_only:
-            self.log("Curtailment: clearing stale read_only from previous run")
-            self._set_read_only(False)
-        if not getattr(self, "_automation_checked", False):
-            self._automation_checked = True
-            try:
-                state = str(self.base.get_state_wrapper(self.HA_AUTOMATION, default="on")).lower()
-                if state == "off":
-                    self.log("Curtailment: re-enabling HA automation after restart")
-                    self.base.call_service_wrapper("automation/turn_on", entity_id=self.HA_AUTOMATION)
-            except Exception:
-                pass
-
     def on_update(self):
-        """Main entry point, called every Predbat cycle."""
+        """Main entry point, called every Predbat cycle. v30: compute the floor,
+        publish monitoring sensors, and drive the dispatch policy. The plugin no
+        longer writes SIG registers or manages any legacy automation — all
+        inverter control is the HA heartbeat/guard acting on the policy select."""
         try:
-            self._cleanup_read_only()
-
             enabled, dno_limit = self.get_config()
             self._dno_limit = dno_limit
+            soc_max = getattr(self.base, "soc_max", 10)
 
             if not enabled:
-                if self.was_active:
-                    self.apply("off")
-                soc_max = getattr(self.base, "soc_max", 10)
                 self.publish("off", soc_max, dno_limit)
                 # Hand the policy back once if we were driving (RD10).
                 self._publish_dispatch_policy(False, soc_max, getattr(self.base, "soc_kw", 0), soc_max)
                 return
 
             floor, phase = self.calculate(dno_limit)
-            soc_max = getattr(self.base, "soc_max", 10)
 
             # Defer to Predbat charge windows when SOC below effective keep (R4).
             # ±0.2 kWh hysteresis via _r4_deferring flag (Bug 6): engage when SOC
@@ -2217,27 +2078,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 )
                 self.last_phase = phase
 
-            # Manual hold: keep D-ESS even when plugin goes off
-            if phase == "off" and self.was_active:
-                manual_hold = self.base.get_state_wrapper("input_select.curtailment_manual_hold", default="Off") != "Off"
-                if manual_hold:
-                    self.log("Curtailment: manual_hold active — staying in D-ESS despite plugin off")
-                    self.apply("active")
-                    self.publish("off", floor, dno_limit, export_target=self._export_target)
-                    return
-
-            # Publish HA-side sensors BEFORE writing SIG entities. The order
-            # matters because the HA automation has a Restore-MSC branch that
-            # fires when (manual=Off, phase sensor=Off, EMS!=MSC). If apply()
-            # ran first on the active edge, EMS becomes D-ESS while phase is
-            # still Off — the automation reverses our EMS write within seconds.
-            # Publishing first means phase=Active is visible by the time EMS
-            # changes, so branch 3's condition no longer matches.
-            self.publish(phase, floor, dno_limit, export_target=self._export_target)
-            self.apply(phase)
-
-            # v30 (RD9): drive the dispatch policy + sell floor. Gated internally
-            # by SIG_POLICY_CONTROL_ENABLE (dormant until staged on).
+            # Publish monitoring sensors, then drive the dispatch policy (RD9).
+            # Gated internally by SIG_POLICY_CONTROL_ENABLE (acts only when on;
+            # always publishes the intended policy for observation).
+            self.publish(phase, floor, dno_limit)
             self._publish_dispatch_policy(phase != "off", floor, soc_kw, soc_max)
 
             # Tomorrow forecast (separate try/except — don't break today's control)
@@ -2250,10 +2094,8 @@ class CurtailmentPlugin(PredBatPlugin):
 
         except Exception as e:
             self.log("Curtailment plugin error: {}".format(e))
-            soc_max = getattr(self.base, "soc_max", 10)
-            self.publish("off", soc_max, self._dno_limit)
-            if self.was_active:
-                try:
-                    self.apply("off")
-                except Exception:
-                    pass
+            try:
+                soc_max = getattr(self.base, "soc_max", 10)
+                self.publish("off", soc_max, self._dno_limit)
+            except Exception:
+                pass

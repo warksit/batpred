@@ -2746,51 +2746,6 @@ def test_floor_clamped_above_reserve():
 # ============================================================================
 
 
-def test_apply_active_sets_export_zero_and_dess():
-    """First activation sets D-ESS with export=0 (safe default for HA automation)."""
-    base = MockBase()
-    plugin = CurtailmentPlugin(base)
-
-    plugin.apply("active")
-    assert base.set_read_only is True, "read_only should be True"
-    # First activation: export=0 as safe default
-    export_calls = [s for s in base.services if s[0] == "number/set_value" and "export" in str(s[1].get("entity_id", ""))]
-    assert any(s[1]["value"] == 0 for s in export_calls), f"Should set export=0 on first activate, got {export_calls}"
-    # D-ESS mode set
-    dess_called = any(s[1].get("option") == "Command Discharging (ESS First)" for s in base.services if s[0] == "select/select_option")
-    assert dess_called, "Should set D-ESS"
-    print("  test_apply_active_sets_export_zero_and_dess: PASSED")
-
-
-def test_apply_already_active_no_export_write():
-    """Subsequent active cycles don't touch export limit (HA automation owns it)."""
-    base = MockBase()
-    plugin = CurtailmentPlugin(base)
-    plugin.was_active = True  # already active
-    plugin.last_ems_mode = "Command Discharging (ESS First)"
-    plugin.last_charge_limit = 100
-
-    plugin.apply("active")
-    # Should NOT write export limit (HA automation controls it)
-    export_calls = [s for s in base.services if s[0] == "number/set_value" and "export" in str(s[1].get("entity_id", ""))]
-    assert len(export_calls) == 0, f"Should not write export when already active, got {export_calls}"
-    print("  test_apply_already_active_no_export_write: PASSED")
-
-
-def test_apply_off_restores_msc():
-    """Off phase restores MSC and clears read_only."""
-    base = MockBase()
-    plugin = CurtailmentPlugin(base)
-    plugin.was_active = True
-    plugin.last_ems_mode = "Command Discharging (ESS First)"
-
-    plugin.apply("off")
-    assert base.set_read_only is False, "read_only should be False"
-    msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
-    assert msc_called, "Should restore MSC"
-    print("  test_apply_off_restores_msc: PASSED")
-
-
 def test_on_update_full_flow():
     """Full on_update: calculates, applies D-ESS, publishes sensors."""
     pv, load = _make_overflow_pv(minutes_now=720)
@@ -2812,7 +2767,7 @@ def test_on_update_full_flow():
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
     phase = phase_sensor.get("value", "Off")
     assert phase == "Active", f"Expected 'Active', got '{phase}'"
-    assert base.set_read_only is True, "read_only should be True"
+    assert plugin.last_phase == "active", "plugin should be active"
 
     target_sensor = base.published.get("sensor.predbat_curtailment_target_soc", {})
     assert target_sensor.get("value") is not None, "Target SOC should be published"
@@ -2820,60 +2775,6 @@ def test_on_update_full_flow():
     assert 0 <= target_pct <= 100, f"Target SOC should be 0-100%, got {target_pct}"
 
     print(f"  test_on_update_full_flow: PASSED (phase={phase}, target={target_pct:.0f}%)")
-
-
-def test_on_update_publishes_phase_before_writing_ems():
-    """Active-edge ordering: phase sensor publish must precede EMS service write.
-
-    The HA automation has a Restore-MSC branch that fires when
-    (manual=Off, phase sensor=Off, EMS!=MSC). If the plugin writes EMS=D-ESS
-    BEFORE publishing phase=Active, the automation can reverse our EMS write
-    in the race window — observed live on 2026-04-30, drain stalled 1h57m.
-
-    Lock in publish-before-apply ordering by capturing call order through
-    instrumented dashboard_item and call_service_wrapper.
-    """
-    pv, load = _make_overflow_pv(minutes_now=720)
-    sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 8.0,
-        "sensor.sigen_plant_consumed_power": 1.0,
-    }
-    sensor_overrides.update(_make_p90_sensors())
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=BATTERY_KWH * 0.40,
-        minutes_now=720,
-        sensor_overrides=sensor_overrides,
-    )
-
-    call_order = []
-    orig_dashboard = base.dashboard_item
-    orig_service = base.call_service_wrapper
-
-    def tracked_dashboard(entity, value, attrs=None):
-        call_order.append(("publish", entity))
-        return orig_dashboard(entity, value, attrs)
-
-    def tracked_service(service, **kwargs):
-        call_order.append(("service", service, kwargs.get("entity_id"), kwargs.get("option")))
-        return orig_service(service, **kwargs)
-
-    base.dashboard_item = tracked_dashboard
-    base.call_service_wrapper = tracked_service
-
-    plugin = CurtailmentPlugin(base)
-    plugin.on_update()
-
-    # Find first phase sensor publish and first EMS service write.
-    phase_idx = next((i for i, c in enumerate(call_order) if c[0] == "publish" and c[1] == "sensor.predbat_curtailment_phase"), None)
-    ems_idx = next((i for i, c in enumerate(call_order) if c[0] == "service" and c[1] == "select/select_option" and c[2] == "select.sigen_plant_remote_ems_control_mode"), None)
-
-    assert phase_idx is not None, "phase sensor was never published"
-    assert ems_idx is not None, "EMS mode was never written"
-    assert phase_idx < ems_idx, "phase sensor publish (idx {}) must precede EMS write (idx {}); preserves ordering required to avoid the HA automation Restore-MSC race".format(phase_idx, ems_idx)
-
-    print("  test_on_update_publishes_phase_before_writing_ems: PASSED (phase@{} before EMS@{})".format(phase_idx, ems_idx))
 
 
 def test_on_update_stays_off_low_pv():
@@ -2899,7 +2800,7 @@ def test_on_update_stays_off_low_pv():
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
     phase = phase_sensor.get("value", "Off")
     assert phase == "Off", f"Expected Off for low PV, got '{phase}'"
-    assert base.set_read_only is False, "read_only should be False when off"
+    assert plugin.last_phase == "off", "plugin should be off"
     print("  test_on_update_stays_off_low_pv: PASSED")
 
 
@@ -2929,7 +2830,7 @@ def test_deactivation_at_safe_time():
     )
     plugin = CurtailmentPlugin(base)
     plugin.on_update()
-    assert base.set_read_only is True, "Should activate at noon"
+    assert plugin.last_phase == "active", "Should activate at noon"
 
     # Jump past safe_time but PV still 0.3 kW — R56 says STAY ACTIVE so we
     # can drain SOC to overnight target through the late afternoon.
@@ -2939,7 +2840,7 @@ def test_deactivation_at_safe_time():
     base.services.clear()
     plugin.base = base
     plugin.on_update()
-    assert base.set_read_only is True, "R56: stay active past safe_time while PV>0"
+    assert plugin.last_phase == "active", "R56: stay active past safe_time while PV>0"
 
     # Now sundown — actual PV drops to ~0 with peak observed → off
     base.minutes_now = 21 * 60
@@ -2948,58 +2849,8 @@ def test_deactivation_at_safe_time():
     base.services.clear()
     plugin.base = base
     plugin.on_update()
-    assert base.set_read_only is False, "R56: deactivate at sundown (PV ~0 after peak observed)"
-    msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
-    assert msc_called, "Should restore MSC at sundown"
+    assert plugin.last_phase == "off", "R56: deactivate at sundown (PV ~0 after peak observed)"
     print("  test_deactivation_at_safe_time: PASSED (R56: active past safe_time, off at sundown)")
-
-
-def test_manual_hold_maintains_dess_after_deactivation():
-    """When manual_hold is on, plugin stays in D-ESS even after overflow clears.
-
-    Without fix: plugin deactivates → restores MSC → Predbat fights automation.
-    With fix: plugin detects manual_hold, keeps D-ESS + read_only=True.
-    """
-    from datetime import datetime, timezone
-
-    pv, load = _make_overflow_pv(minutes_now=720)
-    sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 8.0,
-        "sensor.sigen_plant_consumed_power": 1.0,
-        "input_select.curtailment_manual_hold": "Hold",
-    }
-    sensor_overrides.update(_make_p90_sensors())
-
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=BATTERY_KWH * 0.40,
-        minutes_now=720,
-        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
-        sensor_overrides=sensor_overrides,
-    )
-    plugin = CurtailmentPlugin(base)
-    plugin.on_update()
-    assert base.set_read_only is True, "Should activate"
-
-    # Jump past safe_time so plugin would normally deactivate
-    base.minutes_now = 18 * 60 + 30
-    base.now_utc = datetime(2025, 7, 12, 18, 30, tzinfo=timezone.utc)
-    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.3
-    base.services.clear()
-    plugin.base = base
-    plugin.on_update()
-
-    # manual_hold is on → must stay in D-ESS, must NOT restore MSC
-    assert base.set_read_only is True, "read_only must stay True when manual_hold is on"
-    msc_called = any(s[1].get("option") == "Maximum Self Consumption" for s in base.services if s[0] == "select/select_option")
-    assert not msc_called, "Must NOT restore MSC when manual_hold is on"
-    print("  test_manual_hold_maintains_dess_after_deactivation: PASSED")
-
-
-# ============================================================================
-# Charge window deferral tests
-# ============================================================================
 
 
 def test_defers_to_charge_window():
@@ -3020,7 +2871,7 @@ def test_defers_to_charge_window():
 
     phase_sensor = base.published.get("sensor.predbat_curtailment_phase", {})
     assert phase_sensor.get("value") == "Off", f"Expected Off during charge window, got '{phase_sensor.get('value')}'"
-    assert base.set_read_only is False, "read_only should be False when deferring"
+    assert plugin.last_phase == "off", "plugin should be off when deferring"
     print("  test_defers_to_charge_window: PASSED")
 
 
@@ -3232,7 +3083,6 @@ def test_R56_active_after_safe_time_when_soc_above_keep():
     plugin._peak_pv = 7.5  # earlier today there was real PV, so not pre-PV path
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"R56: plugin must stay active past safe_time, got {phase}"
-    assert plugin._export_target == 4.0, f"R56: export_target should be DNO so HA can Drain, got {plugin._export_target}"
     print(f"  test_R56_active_after_safe_time_when_soc_above_keep: PASSED (active, floor={floor:.2f})")
 
 
@@ -3262,8 +3112,7 @@ def test_R56_off_at_sundown():
     plugin._peak_pv = 7.5  # had PV earlier today
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "off", f"R56: sundown (peak observed, actual PV=0) → off, got {phase}"
-    assert plugin._export_target == -2, f"R56: export_target=-2 to signal MSC handoff, got {plugin._export_target}"
-    print("  test_R56_off_at_sundown: PASSED (off, MSC handoff signaled)")
+    print("  test_R56_off_at_sundown: PASSED (off, hands back to Predbat)")
 
 
 # ============================================================================
@@ -3532,7 +3381,7 @@ def test_R55_target_soc_uses_overnight_when_off():
     )
     plugin = CurtailmentPlugin(base)
     plugin._overnight_target_kwh = 7.0  # simulate cached overnight need
-    plugin.publish("off", BATTERY_KWH, dno_limit_kw=4.0, export_target=-2)
+    plugin.publish("off", BATTERY_KWH, dno_limit_kw=4.0)
 
     pub = base.published["sensor.predbat_curtailment_target_soc"]
     expected_pct = 7.0 / BATTERY_KWH * 100
@@ -3558,7 +3407,7 @@ def test_R55_target_soc_uses_floor_when_active():
     plugin = CurtailmentPlugin(base)
     plugin._overnight_target_kwh = 7.0
     floor_kwh = 2.5  # active drain target (lower than overnight)
-    plugin.publish("active", floor_kwh, dno_limit_kw=4.0, export_target=4.0)
+    plugin.publish("active", floor_kwh, dno_limit_kw=4.0)
 
     pub = base.published["sensor.predbat_curtailment_target_soc"]
     expected_pct = floor_kwh / BATTERY_KWH * 100
@@ -3959,71 +3808,6 @@ def test_floor_lower_with_more_overflow():
     print(f"  test_floor_lower_with_more_overflow: PASSED (p90=6kW→{floor1/BATTERY_KWH*100:.0f}%, p90=10kW→{floor2/BATTERY_KWH*100:.0f}%)")
 
 
-def test_export_target_at_dno_when_soc_above_floor():
-    """Export target = DNO when SOC is above floor (Drain/Hold territory, R38).
-
-    SOC=90% at midday: floor ≈ 30% (large overflow predicted). SOC >> floor+0.5 → Drain → DNO.
-    """
-    pv = {m: 8.0 for m in range(0, 360, PLUGIN_STEP)}
-    load = {m: 1.0 for m in range(0, 360, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.90  # 90% — well above any floor
-    sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 8.0,
-        "sensor.sigen_plant_consumed_power": 1.0,
-    }
-    sensor_overrides.update(_make_p90_sensors(solcast_remaining=25.0))
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=soc_kw,
-        minutes_now=600,
-        sensor_overrides=sensor_overrides,
-    )
-    plugin = CurtailmentPlugin(base)
-    floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"Should be active, got {phase}"
-    assert soc_kw > floor + 0.5, f"Test requires SOC above floor+0.5 ({soc_kw:.1f} vs {floor + 0.5:.1f})"
-    assert plugin._export_target == 4.0, f"Export target should be DNO when SOC above floor, got {plugin._export_target}"
-    print(f"  test_export_target_at_dno_when_soc_above_floor: PASSED (floor={floor/BATTERY_KWH*100:.0f}%, SOC=90%, export_target={plugin._export_target}kW)")
-
-
-def test_export_target_dno_when_active_regardless_of_soc():
-    """Plugin publishes export_target = DNO whenever active; HA automation decides Charge/Hold/Drain.
-
-    SOC below floor: plugin still publishes DNO. Automation reads target_kwh from phase sensor
-    and uses SOC vs target_kwh with symmetric hysteresis to choose Charge (export=0),
-    Hold (export=min(excess,DNO)) or Drain (export=DNO).
-    """
-    from datetime import datetime, timezone
-
-    pv = {m: 5.5 for m in range(0, 60, PLUGIN_STEP)}
-    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.80  # 80% — below the high late-afternoon floor
-    sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 5.5,
-        "sensor.sigen_plant_consumed_power": 0.5,
-    }
-    sensor_overrides.update(_make_p90_sensors(solcast_remaining=5.5))
-    # v20: high best_soc_keep so floor = min(overflow_floor, effective_keep)
-    # ends up high (below SOC=80%) — recreates pre-v20 "SOC below floor" case.
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=soc_kw,
-        minutes_now=1020,
-        best_soc_keep=16.0,
-        # Match minutes_now=1020 (17:00 local) with UTC tz so local_offset=0
-        now_utc=datetime(2025, 7, 12, 17, 0, tzinfo=timezone.utc),
-        sensor_overrides=sensor_overrides,
-    )
-    plugin = CurtailmentPlugin(base)
-    floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"Should be active, got {phase}"
-    assert soc_kw < floor, f"Test requires SOC below floor ({soc_kw:.1f} vs {floor:.1f})"
-    assert plugin._export_target == 4.0, f"Plugin should publish DNO when active, got {plugin._export_target}"
-    print(f"  test_export_target_dno_when_active_regardless_of_soc: PASSED (floor={floor/BATTERY_KWH*100:.0f}%, SOC=80%, export_target={plugin._export_target}kW)")
-
-
 def test_plugin_handles_local_tz_aware_now_utc():
     """Predbat's base.now_utc is named 'now_utc' but is actually local-tz-aware.
     Plugin must convert to real UTC via .astimezone(timezone.utc) — regression
@@ -4213,7 +3997,7 @@ def _integration_test_day(label, filename, watts, start_soc_pct=None, forecast_s
             else:
                 # Hold: export=min(excess, DNO), battery neither drains nor charges from sub-DNO PV
                 # Post-release uses plugin's ramped-down export_target as additional cap.
-                hold_cap = plugin._export_target if (plugin._export_target >= 0) else DNO_LIMIT
+                hold_cap = DNO_LIMIT  # v30: export always capped at DNO (hardware); plugin no longer sets export_target
                 if actual_excess > 0:
                     export = min(actual_excess, hold_cap, DNO_LIMIT)
                     leftover = actual_excess - export
@@ -4431,7 +4215,7 @@ def _integration_test_real_forecast(label, actual_file, forecast_file, start_soc
                     discharge = min(-actual_excess, max_discharge)
             else:
                 # Hold: export=min(excess, DNO). Post-release uses plugin's ramped export_target.
-                hold_cap = plugin._export_target if (plugin._export_target >= 0) else DNO_LIMIT
+                hold_cap = DNO_LIMIT  # v30: export always capped at DNO (hardware); plugin no longer sets export_target
                 if actual_excess > 0:
                     export = min(actual_excess, hold_cap, DNO_LIMIT)
                     leftover = actual_excess - export
@@ -4512,65 +4296,6 @@ def _random_cloud_scale_fn(seed=42):
 # ============================================================================
 
 
-def test_export_target_ramps_down():
-    """Post-release export_target formula decreases as hours_to_pv_end shrinks (R38/R41).
-
-    With 30 kWh remaining PV, 5 kWh load, battery at 30% needing 12.6 kWh,
-    exportable_budget = 30 - 5 - 12.6 = 12.4 kWh.
-    Over 6 hours: export_target = 12.4/6 = 2.07 kW.
-    Over 2 hours: export_target = 12.4/2 = 6.2 → clamped to DNO (4.0).
-    Over 0.5 hours: remaining_pv shrunk, budget likely near 0 → export_target ≈ 0.
-    This tests the post-release formula directly (active phase always returns DNO).
-    """
-    # Simulate shrinking time to release with constant remaining values
-    soc_max = BATTERY_KWH
-    dno = DNO_LIMIT
-    soc_kw = soc_max * 0.30  # 30% = 5.42 kWh
-    energy_needed = soc_max - soc_kw  # 12.66 kWh
-
-    # 6 hours to release: plenty of budget
-    remaining_pv = 30.0
-    remaining_load = 5.0
-    hours = 6.0
-    budget = remaining_pv - remaining_load - energy_needed
-    et_6h = max(0, min(dno, budget / hours))
-
-    # 2 hours: budget same but spread over less time → higher rate but clamped
-    hours = 2.0
-    et_2h = max(0, min(dno, budget / hours))
-
-    # 0.5 hours: remaining_pv much smaller (most PV already generated)
-    remaining_pv_late = 3.0
-    remaining_load_late = 0.3
-    hours = 0.5
-    budget_late = remaining_pv_late - remaining_load_late - energy_needed
-    et_late = max(0, min(dno, budget_late / hours))
-
-    assert et_6h < dno, f"6h out: export_target should be below DNO, got {et_6h:.2f}"
-    assert et_6h > 1.5, f"6h out: export_target should be reasonable, got {et_6h:.2f}"
-    assert et_2h == dno, f"2h out: export_target should be clamped to DNO, got {et_2h:.2f}"
-    assert et_late == 0, f"0.5h out with low PV: export_target should be 0, got {et_late:.2f}"
-    print(f"  test_export_target_ramps_down: PASSED (6h={et_6h:.1f}, 2h={et_2h:.1f}, 0.5h={et_late:.1f})")
-
-
-def test_export_target_never_exceeds_dno():
-    """Export target is always clamped to [0, DNO] (R38 safety)."""
-    soc_max = BATTERY_KWH
-    dno = DNO_LIMIT
-
-    # Huge budget: should clamp to DNO
-    budget = 100.0
-    hours = 1.0
-    et = max(0, min(dno, budget / hours))
-    assert et == dno, f"Should clamp to DNO, got {et:.2f}"
-
-    # Negative budget: should clamp to 0
-    budget = -5.0
-    et = max(0, min(dno, budget / hours))
-    assert et == 0, f"Negative budget should give 0, got {et:.2f}"
-    print("  test_export_target_never_exceeds_dno: PASSED")
-
-
 def test_floor_soft_ratchet():
     """Floor should not jump more than 2% of soc_max per cycle (R39).
 
@@ -4612,62 +4337,6 @@ def test_floor_ratchet_allows_decrease():
     floor_ratcheted = min(floor_raw_new, floor_prev + max_rise_kwh)
     assert floor_ratcheted == floor_raw_new, f"Floor decrease should not be blocked: expected {floor_raw_new:.1f}, got {floor_ratcheted:.1f}"
     print("  test_floor_ratchet_allows_decrease: PASSED")
-
-
-def test_plugin_export_target_published():
-    """Plugin should publish export_target sensor when active."""
-    pv, load = _make_overflow_pv()
-    sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 8.0,
-        "sensor.sigen_plant_consumed_power": 1.0,
-    }
-    sensor_overrides.update(_make_p90_sensors(solcast_remaining=30.0))
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=5.0,
-        minutes_now=720,
-        sensor_overrides=sensor_overrides,
-    )
-    plugin = CurtailmentPlugin(base)
-    plugin.on_update()
-
-    et_sensor = base.published.get("sensor.predbat_curtailment_export_target", {})
-    assert et_sensor, "Export target sensor should be published"
-    value = et_sensor.get("value", -2)
-    assert value >= 0, f"Export target should be >= 0 when active, got {value}"
-    assert value <= DNO_LIMIT, f"Export target should be <= DNO, got {value}"
-    print(f"  test_plugin_export_target_published: PASSED (export_target={value:.2f} kW)")
-
-
-def test_plugin_export_target_inactive():
-    """Plugin should publish export_target = -2 when inactive."""
-    pv = {m: 1.0 for m in range(0, 720, PLUGIN_STEP)}
-    load = {m: 0.5 for m in range(0, 720, PLUGIN_STEP)}
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=5.0,
-        minutes_now=720,
-        sensor_overrides={
-            "sensor.sigen_plant_pv_power": 1.0,
-            "sensor.sigen_plant_consumed_power": 0.5,
-            "sensor.solcast_pv_forecast_forecast_remaining_today": 3.0,
-        },
-    )
-    plugin = CurtailmentPlugin(base)
-    plugin.on_update()
-
-    et_sensor = base.published.get("sensor.predbat_curtailment_export_target", {})
-    assert et_sensor, "Export target sensor should be published even when inactive"
-    value = et_sensor.get("value", 0)
-    assert value == -2, f"Export target should be -2 when inactive, got {value}"
-    print("  test_plugin_export_target_inactive: PASSED")
-
-
-# ============================================================================
-# Deactivation tests
-# ============================================================================
 
 
 def test_same_p90_same_floor():
@@ -5012,8 +4681,6 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_clamped_above_soc_keep,
         test_floor_clamped_above_reserve,
         test_floor_lower_with_more_overflow,
-        test_export_target_at_dno_when_soc_above_floor,
-        test_export_target_dno_when_active_regardless_of_soc,
         test_plugin_handles_local_tz_aware_now_utc,
     ]
     print("  --- plugin integration tests ---")
@@ -5026,14 +4693,9 @@ def run_curtailment_tests(my_predbat=None):
 
     # Apply tests
     apply_tests = [
-        test_apply_active_sets_export_zero_and_dess,
-        test_apply_already_active_no_export_write,
-        test_apply_off_restores_msc,
         test_on_update_full_flow,
-        test_on_update_publishes_phase_before_writing_ems,
         test_on_update_stays_off_low_pv,
         test_deactivation_at_safe_time,
-        test_manual_hold_maintains_dess_after_deactivation,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
@@ -5101,12 +4763,8 @@ def run_curtailment_tests(my_predbat=None):
 
     # Export target ramp & floor stability tests (R38/R39)
     ramp_tests = [
-        test_export_target_ramps_down,
-        test_export_target_never_exceeds_dno,
         test_floor_soft_ratchet,
         test_floor_ratchet_allows_decrease,
-        test_plugin_export_target_published,
-        test_plugin_export_target_inactive,
     ]
     print("  --- export target ramp & floor stability tests ---")
     for test_fn in ramp_tests:
