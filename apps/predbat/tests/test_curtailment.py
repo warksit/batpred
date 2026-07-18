@@ -1040,6 +1040,21 @@ def test_proposed_phase_hold_in_band():
     print(f"  test_proposed_phase_hold_in_band: PASSED ({phase})")
 
 
+def test_phase_to_policy_mapping():
+    """RD9/RD3 (v30): curtailment phase → dispatch policy name for
+    input_select.sig_dispatch_policy. Drain→Max Export, Hold→Hold Battery,
+    Charge→Solar Charge Battery, Off→Predbat; unknown → Predbat (fail safe:
+    hand back rather than mis-drive)."""
+    from curtailment_calc import phase_to_policy
+
+    assert phase_to_policy("Drain") == "Max Export"
+    assert phase_to_policy("Hold") == "Hold Battery"
+    assert phase_to_policy("Charge") == "Solar Charge Battery"
+    assert phase_to_policy("Off") == "Predbat"
+    assert phase_to_policy("wat") == "Predbat"
+    print("  test_phase_to_policy_mapping: PASSED")
+
+
 def test_proposed_phase_charge_below_floor():
     """SOC < charge_below → Charge (P10 recovery at risk)."""
     from curtailment_calc import compute_proposed_phase
@@ -4854,6 +4869,7 @@ def run_curtailment_tests(my_predbat=None):
         test_floor_source_today_yesterday_morning,
         # Split-threshold proposed phase (shadow mode)
         test_proposed_phase_hold_in_band,
+        test_phase_to_policy_mapping,
         test_proposed_phase_charge_below_floor,
         test_proposed_phase_drain_above_ceiling,
         test_proposed_phase_today_7am_actual,

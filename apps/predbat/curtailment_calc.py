@@ -457,6 +457,28 @@ def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_ac
     return "Hold"
 
 
+# v30 (DC-coupled) dispatch policy names — input_select.sig_dispatch_policy (RD3).
+POLICY_PREDBAT = "Predbat"
+POLICY_MAX_EXPORT = "Max Export"
+POLICY_HOLD_BATTERY = "Hold Battery"
+POLICY_SOLAR_CHARGE = "Solar Charge Battery"
+
+_PHASE_TO_POLICY = {
+    "Drain": POLICY_MAX_EXPORT,
+    "Hold": POLICY_HOLD_BATTERY,
+    "Charge": POLICY_SOLAR_CHARGE,
+    "Off": POLICY_PREDBAT,
+}
+
+
+def phase_to_policy(phase):
+    """Map a curtailment phase (compute_proposed_phase output) to a v30 dispatch
+    policy name for input_select.sig_dispatch_policy (RD9/RD3):
+    Drain→Max Export, Hold→Hold Battery, Charge→Solar Charge Battery, Off→Predbat.
+    Unknown input → Predbat (fail safe: hand back rather than mis-drive)."""
+    return _PHASE_TO_POLICY.get(phase, POLICY_PREDBAT)
+
+
 def compute_release_offset(pv_forecast, load_forecast, dno_limit=4.0, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """Find the release point: one slot after the last slot where PV-load > DNO.
 
