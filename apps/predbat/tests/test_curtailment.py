@@ -3230,6 +3230,38 @@ def test_off_at_sundown_backstop():
     print("  test_off_at_sundown_backstop: PASSED (off, hands back to Predbat)")
 
 
+def test_no_dusk_reactivation_after_peak_reset():
+    """REGRESSION: after the end-of-day peak reset (minutes_now>1200 zeroes
+    _peak_pv), a small dusk PV blip (>0.1, so it skips the 'no PV yet' guard, but
+    <0.5 so 'peaked' is False) must NOT re-activate the plugin. Past safe_time is
+    a hard stop regardless of the observed peak — otherwise calculate() falls
+    through to its 'active' default and the plugin spuriously re-activates at night.
+    """
+    from datetime import datetime, timezone
+
+    pv = {m: 0.3 for m in range(0, 60, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
+    sensor_overrides = {
+        "sensor.sigen_plant_pv_power": 0.28,  # dusk blip: >0.1 (skips 'no PV yet'), <0.5
+        "sensor.sigen_plant_consumed_power": 0.5,
+    }
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=0.5))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        minutes_now=1210,  # 20:10 BST — past the 1200 peak-reset threshold
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 0.28  # already reset to ~0 earlier this evening, then the blip
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"must stay OFF at dusk past safe_time despite peak reset, got {phase}"
+    print("  test_no_dusk_reactivation_after_peak_reset: PASSED (off at dusk)")
+
+
 # ============================================================================
 # R55: overnight_target sensor tests (v20)
 # ============================================================================
@@ -4977,6 +5009,7 @@ def run_curtailment_tests(my_predbat=None):
         test_R57_no_chase_to_soc_max_late_in_day,
         test_deactivate_at_safe_time_even_above_keep,
         test_off_at_sundown_backstop,
+        test_no_dusk_reactivation_after_peak_reset,
     ]
     print("  --- R54/R56/R57 plugin behaviour tests ---")
     for test_fn in r54_56_57_tests:

@@ -1320,13 +1320,18 @@ class CurtailmentPlugin(PredBatPlugin):
         # (primary) — past it PV can't exceed the export cap, so there is no
         # curtailment to manage and the whole machine hands back to Predbat (evening
         # export, saving sessions, overnight reserve are Predbat's, not CM's). This
-        # supersedes R56 (CM must NOT stay active to drain the battery in the
-        # evening). The peak-observed guard keeps this to the descending side of the
-        # day (pre-PV drain runs before safe_time, so it is unaffected). Sundown
-        # (PV ≤ 0.1 after peak) remains a BACKSTOP for days where safe_time can't
-        # be computed.
+        # supersedes R56 (CM must NOT stay active to drain the battery in the evening).
+        #
+        # past_safe is a HARD stop on solar geometry alone — it must NOT depend on
+        # the observed peak, because the end-of-day peak reset (below) zeroes
+        # _peak_pv in the evening; a dusk PV blip (>0.1, so it skips the "no PV yet"
+        # early return) would then leave peaked False, the guard would stop firing,
+        # and calculate() would fall through to its "active" default → spurious dusk
+        # re-activation. Pre-dawn is already handled by the "no PV yet" early return
+        # BEFORE this block, so geometry alone is safe. Sundown (peak observed, PV
+        # ≤ 0.1) stays as a BACKSTOP for days where safe_time can't be computed.
         peaked = self._peak_pv > 0.5
-        past_safe = reached_safe_time and peaked
+        past_safe = reached_safe_time
         sundown = peaked and actual_pv < 0.1
         if past_safe or sundown:
             trigger = "safe_time" if past_safe else "sundown"
