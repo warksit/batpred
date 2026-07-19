@@ -20,8 +20,11 @@
 # HARD FLOOR (live clamp): SOC ≤ input_number.sig_hard_floor_pct → dispatch ≤ PV
 # so the battery can never DISCHARGE below the floor for any policy.
 #
-# Triggers: 1-min backstop beat; policy change (immediate recompute);
-# stale-setpoint (>0.3 kW deviation, 10 s).
+# Triggers: 1-min backstop beat; policy change; LIVE stale-setpoint — the
+# template references PV + load, so it re-evaluates on every change and fires
+# when the wanted dispatch drifts >0.1 kW from the register for 2 s. Self-
+# limiting: the load+cap ceiling keeps `want` flat while PV > load+cap, so it
+# stays quiet through the overflow peak and only writes on real output changes.
 #
 # IMPORTANT: update and commit this file before changing the automation in HA.
 # Deploy via ha_config_set_automation config: (full replacement), NOT python_transform.
@@ -50,11 +53,12 @@ trigger:
       {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
       {% set hard = states('input_number.sig_hard_floor_pct') | float(12) %}
       {% set raw = (cap + load) if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
-      {% set want = ([raw, pv] | min if soc <= hard else raw) %}
+      {% set pre = ([raw, pv] | min if soc <= hard else raw) %}
+      {% set want = [[pre, [load + cap, 6.6] | min] | min, 0] | max %}
       {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and
          is_state('switch.sigen_plant_remote_ems_controlled_by_home_assistant', 'on') and
-         (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.3 }}
-    for: "00:00:10"
+         (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1 }}
+    for: "00:00:02"
     id: stale_setpoint
 
 action:
@@ -66,7 +70,12 @@ action:
       hard_pct: "{{ states('input_number.sig_hard_floor_pct') | float(12) }}"
       policy: "{{ states('input_select.sig_dispatch_policy') }}"
       raw_kw: "{{ (cap_kw + load_kw) if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
-      dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), 6.0] | min, 0] | max }}"
+      # Ceiling = the most the inverter can actually push out: export-limited
+      # (load + DNO cap) and never above the 6.6 kW inverter AC rating. Capping
+      # here (rather than a raw 6.0) makes the dispatch figure honest and keeps the
+      # live trigger quiet while PV sits above load+cap (the cap holds output flat).
+      ceiling_kw: "{{ [load_kw + cap_kw, 6.6] | min }}"
+      dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), ceiling_kw] | min, 0] | max }}"
   - choose:
       # Release (Predbat): STAY in EMS control (RD2). Remote EMS ON, EMS control
       # mode = Maximum Self Consumption. NEVER turn Remote EMS off / drop to app

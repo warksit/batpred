@@ -379,6 +379,7 @@ timeobj
 timestep
 timestr
 timezone
+tmpl
 tojson
 Trefor
 treforsiphone
