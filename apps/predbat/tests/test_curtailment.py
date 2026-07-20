@@ -545,16 +545,14 @@ def test_p10_recovery_floor_load_exceeds_pv():
 
 
 def test_drain_above_curtailment_buffer_only():
-    """drain_above is the curtailment-buffer floor; NOT clamped up by p10_recovery.
-
-    On a cloudy day the deficit raises the overall combined floor (charge_below)
-    above the curtailment buffer — drain_above must remain at the buffer level
-    so the two thresholds can cross over.
+    """v31: drain_above is PURE curtailment (overflow_floor) — effective_keep is
+    no longer a drain target (Predbat owns the overnight/evening reserve; the
+    recovery floor in charge_below is the handback backstop).
     """
-    # Cloudy day: overflow_floor=17.87 (essentially soc_max-buffer), effective_keep=7.42
+    # effective_keep (7.42) must NOT pull the drain target down — drain to the
+    # curtailment buffer (overflow_floor) only.
     drain = compute_drain_above(reserve=0.0, overflow_floor=17.87, effective_keep=7.42)
-    # min(17.87, 7.42) = 7.42; max(0, 7.42) = 7.42
-    assert abs(drain - 7.42) < 0.001, f"Expected 7.42 (effective_keep wins), got {drain}"
+    assert abs(drain - 17.87) < 0.001, f"Expected 17.87 (overflow_floor, effective_keep ignored), got {drain}"
     print(f"  test_drain_above_curtailment_buffer_only: PASSED ({drain})")
 
 
@@ -971,10 +969,11 @@ def test_r4_defer_gshp_off_high_soc_no_defer():
 
 def test_floor_source_effective_keep_wins():
     """Typical mid-overflow day: effective_keep < curt_floor → effective_keep wins."""
+    # v31: effective_keep is IGNORED — overflow_floor wins, not the old 4.0/Overnight Need.
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.0, overflow_floor=10.0, effective_keep=4.0)
-    assert floor == 4.0
-    assert source == "Overnight Need"
-    print(f"  test_floor_source_effective_keep_wins: PASSED ({floor}, {source})")
+    assert floor == 10.0
+    assert source == "Curtailment Buffer"
+    print(f"  test_floor_source_effective_keep_wins: PASSED (effective_keep ignored → {floor}, {source})")
 
 
 def test_floor_source_overflow_floor_wins():
@@ -987,8 +986,8 @@ def test_floor_source_overflow_floor_wins():
 
 def test_floor_source_p10_recovery_binds():
     """Late in day: p10_recovery exceeds inner min → outer max binds on p10_recovery."""
-    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=7.0, overflow_floor=10.0, effective_keep=4.0)
-    # inner min = 4.0 (effective_keep), but p10_recovery=7 > 4 → p10_recovery wins
+    # v31: p10_recovery (evening reserve) binds when it exceeds overflow_floor.
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=7.0, overflow_floor=5.0, effective_keep=4.0)
     assert floor == 7.0
     assert source == "P10 Recovery"
     print(f"  test_floor_source_p10_recovery_binds: PASSED ({floor}, {source})")
@@ -1003,22 +1002,23 @@ def test_floor_source_reserve_binds():
 
 
 def test_floor_source_tie_picks_inner_min_over_others():
-    """Tie between inner_min and another term: prefer the more-specific source."""
-    # When p10_recovery == inner_min, label as inner_min source (more useful info)
-    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=4.0, overflow_floor=10.0, effective_keep=4.0)
-    assert floor == 4.0
-    # tie-breaking: prefer Overnight Need / Curtailment Buffer over P10 Recovery
-    assert source in ("Overnight Need", "P10 Recovery"), f"Got {source}"
+    """v31: floor = max(reserve, p10_recovery, overflow_floor). On a tie between
+    overflow_floor and p10_recovery, overflow_floor (the first-checked term) keeps
+    the 'Curtailment Buffer' label."""
+    floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=10.0, overflow_floor=10.0, effective_keep=4.0)
+    assert floor == 10.0
+    assert source == "Curtailment Buffer", f"Got {source}"
     print(f"  test_floor_source_tie_picks_inner_min_over_others: PASSED ({floor}, {source})")
 
 
 def test_floor_source_today_yesterday_morning():
-    """Reference: yesterday morning's transition. effective_keep ≈ 7.5 kWh (41%),
-    overflow_floor was high, p10_recovery low, reserve 0. Overnight Need should win.
+    """v31: same inputs, but effective_keep no longer wins — the overnight reserve
+    is Predbat's, so the floor follows overflow_floor (curtailment), leaving CM
+    free to drain toward it instead of holding 41% for the evening.
     """
     floor, source = compute_floor_with_source(reserve=0.0, p10_recovery=0.4, overflow_floor=15.16, effective_keep=7.49)
-    assert abs(floor - 7.49) < 0.01
-    assert source == "Overnight Need"
+    assert abs(floor - 15.16) < 0.01
+    assert source == "Curtailment Buffer"
     print(f"  test_floor_source_today_yesterday_morning: PASSED ({floor}, {source})")
 
 
@@ -1410,11 +1410,10 @@ def test_cap_at_safe_time_hits_100():
 
 
 def test_plugin_cap_taper_near_safe_time():
-    """v20 R57 supersedes R45 cap taper toward 100%. Plugin no longer chases
-    soc_max — once overflow integral falls, the floor is capped at
-    effective_keep (the overnight target) instead of tapering up to 100%.
-    Test now verifies the new behaviour: late in day with tiny remaining
-    overflow, floor equals effective_keep (or below if overflow_floor lower).
+    """v31: R57's effective_keep cap is REMOVED (evening drain-to-reserve is
+    Predbat's job now). So near safe_time with a nearly-full battery and tiny
+    remaining overflow, the floor tapers UP toward soc_max (R45) — it is no
+    longer pulled down to effective_keep. Battery fills to ~100%.
     """
     from datetime import datetime, timezone
 
@@ -1439,10 +1438,9 @@ def test_plugin_cap_taper_near_safe_time():
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     remaining = plugin._remaining_overflow
     assert remaining < MAX_RESERVED_KWH, f"Tiny remaining expected, got {remaining:.2f}"
-    # R57: floor must be ≤ best_soc_keep (no chase to soc_max). With a small
-    # remaining overflow, overflow_floor is high → min() takes effective_keep.
-    assert floor <= 4.0 + 0.01, f"R57: floor must not exceed effective_keep (4.0 kWh), got {floor:.2f}"
-    print(f"  test_plugin_cap_taper_near_safe_time: PASSED (R57 — floor={floor:.2f}, capped at effective_keep)")
+    # v31: floor tapers UP toward soc_max (R45), no longer capped at effective_keep.
+    assert floor > 4.0, f"v31: floor must taper up (not capped at effective_keep 4.0), got {floor:.2f}"
+    print(f"  test_plugin_cap_taper_near_safe_time: PASSED (R45 taper — floor={floor:.2f})")
 
 
 def test_cap_taper_ratchet_noise_immune():
@@ -2755,18 +2753,21 @@ def test_r48_latches_once_engaged():
     print(f"  test_r48_latches_once_engaged: PASSED (floor1={floor1:.2f}, floor2={floor2:.2f}, latch held)")
 
 
-def test_plugin_floor_clamped_by_soc_keep():
-    """With big overflow that needs room, Bug 8 relaxes keep to 0.5 kWh; otherwise clamps to soc_keep."""
+def test_plugin_floor_not_clamped_by_soc_keep():
+    """v31: on a big-overflow day the floor is PURE CURTAILMENT — it is NOT held
+    up to soc_keep (R48/Bug-8 relax removed, R55 dropped). So even with a high
+    best_soc_keep, the drain target follows overflow_floor low, giving maximum
+    headroom. (Big overflow keeps the plugin active — no early handback.)"""
     pv, load = _make_overflow_pv(minutes_now=720)
     sensor_overrides = {
         "sensor.sigen_plant_pv_power": 8.0,
         "sensor.sigen_plant_consumed_power": 1.0,
     }
-    sensor_overrides.update(_make_p90_sensors())
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=2.0,  # below soc_keep=6 → keep_recovered stays False
+        soc_kw=2.0,
         minutes_now=720,
         best_soc_keep=6.0,
         sensor_overrides=sensor_overrides,
@@ -2774,13 +2775,9 @@ def test_plugin_floor_clamped_by_soc_keep():
     plugin = CurtailmentPlugin(base)
 
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    # Bug 8: PV (8) >> load (1) + 0.5 margin → pv_covering. Big overflow >
-    # room with base keep (16.27 - 6 = 10.27). Both conditions met → keep
-    # relaxes to 0.5. Floor clamped to that.
-    assert floor >= 0.5, f"Floor should be clamped to at least RELAXED_KEEP (0.5), got {floor:.1f}"
-    assert floor < 6.0, f"Bug 8 should have relaxed keep below 6.0, got {floor:.1f}"
-    assert phase == "active", f"Expected active, got {phase}"
-    print(f"  test_plugin_floor_clamped_by_soc_keep: PASSED (Bug 8 relaxed; floor={floor:.1f})")
+    assert phase == "active", f"Expected active on a big overflow day, got {phase}"
+    assert floor < 6.0, f"v31: floor must NOT be clamped up to soc_keep (6.0), got {floor:.1f}"
+    print(f"  test_plugin_floor_not_clamped_by_soc_keep: PASSED (pure curtailment; floor={floor:.1f})")
 
 
 def test_plugin_active_high_soc():
@@ -3103,11 +3100,10 @@ def test_R54_target_uses_keep_when_lower_than_overflow_floor():
     )
     plugin = CurtailmentPlugin(base)
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"Should be active, got {phase}"
-    # overflow_floor would be ~14-18 kWh on this cloudy day; effective_keep=4
-    # min() takes 4. Target should be 4.0 ± small drift from R48 latching.
-    assert floor <= 4.0 + 0.01, f"R54: target should equal effective_keep (4 kWh), got {floor:.2f}"
-    print(f"  test_R54_target_uses_keep_when_lower_than_overflow_floor: PASSED (floor={floor:.2f} = keep)")
+    # v31: this small overflow already fits the battery (16 kWh headroom vs a
+    # small p90 overflow) → early handback to Predbat instead of holding a floor.
+    assert phase == "off", f"small overflow fits → early handback to Predbat, got {phase}"
+    print("  test_R54_target_uses_keep_when_lower_than_overflow_floor: PASSED (early handback, off)")
 
 
 def test_R54_target_uses_overflow_when_lower_than_keep():
@@ -3164,9 +3160,11 @@ def test_R57_no_chase_to_soc_max_late_in_day():
     )
     plugin = CurtailmentPlugin(base)
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"R56: plugin still active after safe_time, got {phase}"
-    assert floor < BATTERY_KWH * 0.5, f"R57: floor must NOT chase soc_max, got {floor:.2f} (>50% of soc_max)"
-    print(f"  test_R57_no_chase_to_soc_max_late_in_day: PASSED (floor={floor:.2f} kWh = {floor / BATTERY_KWH * 100:.0f}%)")
+    assert phase == "active", f"plugin still active before safe_time, got {phase}"
+    # v31: R57's cap is REMOVED — evening drain-to-reserve is Predbat's job, so the
+    # R45 taper fills the battery near safe_time and the floor DOES approach soc_max.
+    assert floor > BATTERY_KWH * 0.5, f"v31: floor tapers toward soc_max near safe_time, got {floor:.2f}"
+    print(f"  test_R57_no_chase_to_soc_max_late_in_day: PASSED (R45 taper — floor={floor:.2f} kWh = {floor / BATTERY_KWH * 100:.0f}%)")
 
 
 def test_deactivate_at_safe_time_even_above_keep():
@@ -3628,12 +3626,13 @@ def test_R55_overnight_target_raises_effective_keep_in_calculate():
     # _overnight_target_kwh is set by _refresh_overnight_target inside calculate()
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     cached_target = plugin._overnight_target_kwh
-    assert cached_target is not None, "calculate should cache overnight_target"
-    assert cached_target > 2.0, f"Test setup: overnight_target ({cached_target:.2f}) should exceed best_soc_keep (2.0)."
-    assert phase == "active", f"Should be active, got {phase}"
-    # R55 should raise effective_keep above 2.0; floor reflects min(overflow_floor, raised_keep)
-    assert floor >= cached_target - 0.1, f"R55: floor must be raised by overnight_target ({cached_target:.2f}), got {floor:.2f}"
-    print(f"  test_R55_overnight_target_raises_effective_keep_in_calculate: PASSED (target={cached_target:.2f}, floor={floor:.2f})")
+    # v31: overnight_target is STILL computed, but it now feeds the recovery floor
+    # (compute_p10_recovery_floor, unit-tested separately) — NOT effective_keep,
+    # and it is no longer a drain target. This small overflow fits the battery, so
+    # the plugin hands back early to Predbat.
+    assert cached_target is not None, "calculate should still cache overnight_target (feeds recovery floor)"
+    assert phase == "off", f"v31: small overflow fits → early handback, got {phase}"
+    print(f"  test_R55_overnight_target_raises_effective_keep_in_calculate: PASSED (overnight_target cached={cached_target:.2f}, early handback)")
 
 
 # ============================================================================
@@ -4520,20 +4519,18 @@ def test_same_p90_same_floor():
 
 
 def test_activation_requires_will_fill():
-    """v20 R56 supersedes the will_fill activation gate. Plugin runs whenever
-    PV is producing AND there is work to do (target < soc_max). Stays off
-    only at sundown (peak observed AND PV ~0). Test now verifies new
-    behaviour: with PV active mid-day, plugin is active regardless of how
-    much energy will fill the battery.
+    """Plugin is active mid-day when there is REAL overflow to manage (p90
+    overflow does not yet fit the battery). v31: the early-handback would fire on
+    a tiny-overflow day, so this asserts the genuine-overflow case stays active.
     """
-    pv = {m: 5.0 for m in range(0, 120, PLUGIN_STEP)}
-    load = {m: 1.0 for m in range(0, 120, PLUGIN_STEP)}
-    soc_kw = BATTERY_KWH * 0.10
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    soc_kw = BATTERY_KWH * 0.55  # less headroom, so the big p90 overflow does NOT fit
     sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 5.0,
+        "sensor.sigen_plant_pv_power": 8.0,
         "sensor.sigen_plant_consumed_power": 1.0,
     }
-    sensor_overrides.update(_make_p90_sensors(solcast_remaining=4.0))
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
@@ -4829,7 +4826,7 @@ def run_curtailment_tests(my_predbat=None):
         test_plugin_activates_on_overflow,
         test_plugin_stays_off_no_overflow,
         test_plugin_publishes_active_not_phase,
-        test_plugin_floor_clamped_by_soc_keep,
+        test_plugin_floor_not_clamped_by_soc_keep,
         test_r48_triggers_after_overnight_100pct,
         test_r48_latches_once_engaged,
         test_plugin_active_high_soc,

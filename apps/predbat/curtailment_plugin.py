@@ -53,6 +53,7 @@ from curtailment_calc import (
     phase_to_policy,
     compute_pre_pv_target,
     compute_floor_with_source,
+    compute_session_reserve,
     should_defer_to_charge,
     compute_pv_start_time,
     p90_scale_from_forecast,
@@ -91,6 +92,11 @@ SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
 DEFAULT_LOW_SOC_HANDOVER_PCT = 12.0  # below this, hand to MSC (RD4 "A")
 POLICY_PREDBAT = "Predbat"
+# v31 floor/handback (2026-07-19): saving-session reserve (Octopus sensor CM can
+# read directly) + early-handback buffer (fit p90 overflow with this to spare).
+SIG_SAVING_SESSION = "binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
+HA_EARLY_HANDBACK_BUFFER = "input_number.curtailment_early_handback_buffer_kwh"
+EARLY_HANDBACK_BUFFER_DEFAULT = 1.5
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
@@ -224,6 +230,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # R3 read_only mutex: None = unknown (adopt live state on first run), then
         # tracks whether WE set base.set_read_only so we only ever clear our own.
         self._read_only_set = None
+        self._session_reserve_kwh = 0.0
         # Single-writer handoff: True while CM controls (heartbeat enabled). None =
         # unknown on first run (adopt from read_only). Edge-triggered so we don't
         # spam turn_on/off or overwrite a manual EMS mode every cycle.
@@ -1333,9 +1340,21 @@ class CurtailmentPlugin(PredBatPlugin):
         peaked = self._peak_pv > 0.5
         past_safe = reached_safe_time
         sundown = peaked and actual_pv < 0.1
-        if past_safe or sundown:
-            trigger = "safe_time" if past_safe else "sundown"
-            self._last_decision = "off: {} (peak={:.1f}, actual_pv={:.2f})".format(trigger, self._peak_pv, actual_pv)
+        # v31 early handback: once the battery can absorb ALL remaining p90
+        # (pessimistic/"what if the clouds clear") overflow with a buffer to
+        # spare, there is no clipping risk left even if CM does nothing — so hand
+        # the afternoon back to Predbat instead of squatting on control to
+        # safe_time. Good days: p90 stays big → exit at safe_time. Fizzled days:
+        # exits early, Predbat gets the afternoon. peaked-guarded so it can't fire
+        # before real PV.
+        try:
+            early_buffer = float(self.base.get_state_wrapper(HA_EARLY_HANDBACK_BUFFER, default=EARLY_HANDBACK_BUFFER_DEFAULT))
+        except (TypeError, ValueError):
+            early_buffer = EARLY_HANDBACK_BUFFER_DEFAULT
+        overflow_fits = peaked and (battery_headroom - overflow_p90) >= early_buffer
+        if past_safe or sundown or overflow_fits:
+            trigger = "safe_time" if past_safe else ("overflow-fits" if overflow_fits else "sundown")
+            self._last_decision = "off: {} (peak={:.1f}, actual_pv={:.2f}, p90={:.1f}, room={:.1f})".format(trigger, self._peak_pv, actual_pv, overflow_p90, battery_headroom)
             self._floor_ratchet = None
             self._floor_source = "Overnight Reserve"
             # End-of-day reset: clear peak so tomorrow starts fresh
@@ -1483,7 +1502,13 @@ class CurtailmentPlugin(PredBatPlugin):
         # Use Solcast P10 (pessimistic) — guarantee we hit overnight target
         # even on a worse-than-median PV day. Over-charging cost is one
         # round-trip; under-charging cost is the overnight grid-fill bill.
-        overnight_for_recovery = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
+        # v31: recovery target = overnight LOAD need + saving-session export
+        # reserve (Octopus sensor). They don't overlap — load is consumption,
+        # the session is discretionary export — so they add. This is the ONE
+        # thing CM needs to be aware of that Predbat "sees"; the drain target
+        # (drain_above) stays pure curtailment.
+        self._session_reserve_kwh = round(self._get_session_reserve_kwh(dno_limit_kw), 2)
+        overnight_for_recovery = (self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep) + self._session_reserve_kwh
         p10_recovery = compute_p10_recovery_floor(
             overnight_target_kwh=overnight_for_recovery,
             p10_pv_remaining_kwh=p10_pv_remaining,
@@ -1959,6 +1984,19 @@ class CurtailmentPlugin(PredBatPlugin):
         if item:
             item["value"] = value
         self.log("Curtailment: read_only -> {} (Predbat {})".format(value, "suppressed" if value else "resumes"))
+
+    def _get_session_reserve_kwh(self, cap_kw):
+        """Saving-session export reserve (kWh) from the Octopus sensor: the
+        largest of any active/upcoming joined session's duration × cap. 0 if
+        none scheduled. This is the 'what's coming' CM reads directly."""
+        best_mins = 0.0
+        for attr in ("current_joined_event_duration_in_minutes", "next_joined_event_duration_in_minutes"):
+            try:
+                mins = float(self.base.get_state_wrapper(SIG_SAVING_SESSION, attribute=attr, default=0) or 0)
+            except (TypeError, ValueError):
+                mins = 0.0
+            best_mins = max(best_mins, mins)
+        return compute_session_reserve(best_mins, cap_kw)
 
     def _set_automation(self, entity, turn_on):
         """Enable/disable an HA automation (the heartbeat register-writer)."""

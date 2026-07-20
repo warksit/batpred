@@ -170,7 +170,7 @@ def should_defer_to_charge(gshp_ch_active, soc_kw, soc_keep, was_deferring):
     return soc_kw < threshold
 
 
-def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_keep):
+def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_keep=None):
     """R54 with diagnostic source tracking.
 
     Same formula as R54:
@@ -196,17 +196,13 @@ def compute_floor_with_source(reserve, p10_recovery, overflow_floor, effective_k
     term that was already determining the active control). This matters
     most for the typical case where effective_keep == p10_recovery numerically.
     """
-    if effective_keep <= overflow_floor:
-        inner_min = effective_keep
-        inner_source = "Overnight Need"
-    else:
-        inner_min = overflow_floor
-        inner_source = "Curtailment Buffer"
-
-    # Outer max: pick the largest of [reserve, p10_recovery, inner_min].
-    # Tie-breaking preference: inner_source > p10_recovery > reserve.
-    floor = inner_min
-    source = inner_source
+    # v31 (2026-07-19): pure-curtailment floor + recovery floor. effective_keep
+    # (R55 overnight target) is no longer a drain target — it's dropped. The
+    # floor is the higher of the curtailment headroom need (overflow_floor) and
+    # the evening-reserve recovery floor (p10_recovery = overnight load + saving
+    # session, netted against remaining PV), never below the hardware reserve.
+    floor = overflow_floor
+    source = "Curtailment Buffer"
     if p10_recovery > floor:
         floor = p10_recovery
         source = "P10 Recovery"
@@ -290,29 +286,40 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - net_charging)
 
 
-def compute_drain_above(reserve, overflow_floor, effective_keep):
-    """Drain target: lowest SOC we'd drain to in pursuit of curtailment-buffer
-    headroom. Independent of p10_recovery — if recovery requirements raise the
-    overall floor higher, that affects charge_below not drain_above.
+def compute_session_reserve(duration_minutes, cap_kw):
+    """Battery energy (kWh) to reserve for a saving-session export: run at the
+    export cap for the session duration. Feeds the recovery-floor target on top
+    of the overnight LOAD need (they don't overlap — load is consumption, the
+    session is discretionary export). Zero if no session.
 
-    Returns: max(reserve, DEEP_DISCHARGE_FLOOR_KWH,
-                 min(overflow_floor, effective_keep))
-
-    Inner min picks the lower of the two "drain to" targets:
-      - overflow_floor: drain to here to make room for forecast overflow
-      - effective_keep: don't drain below overnight need (R55)
-    Outer max ensures we never drain through the hardware reserve, nor below
-    the DEEP_DISCHARGE_FLOOR_KWH buffer. On an extreme-overflow day
-    overflow_floor is 0 and R48 has relaxed effective_keep to 0.5; the inner
-    min(0, 0.5)=0 would drain the cell to absolute empty. The 0.5 kWh floor
-    keeps a small deep-discharge buffer — negligible curtailment headroom lost,
-    real battery protection gained (R54).
-
-    Pairs with compute_p10_recovery_floor(): on cloudy/deficit days
-    p10_recovery > drain_above (Charge wins, no Drain). On sunny days
-    drain_above >> charge_below (wide Hold band, drain to make room).
+        session_reserve = (duration_minutes / 60) * cap_kw
     """
-    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, min(overflow_floor, effective_keep))
+    try:
+        mins = float(duration_minutes)
+    except (TypeError, ValueError):
+        return 0.0
+    if mins <= 0:
+        return 0.0
+    return (mins / 60.0) * cap_kw
+
+
+def compute_drain_above(reserve, overflow_floor, effective_keep=None):
+    """Drain target: the SOC above which CM drains (Max Export) — PURE
+    CURTAILMENT (v31, 2026-07-19). Drain only to make room for forecast
+    overflow; NEVER to an overnight/evening reserve (that's Predbat's job, and
+    the recovery floor in charge_below is what keeps us from handing back too
+    low). So effective_keep (R55) is no longer a drain target — the param is
+    kept optional/ignored for back-compat.
+
+    Returns: max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor)
+
+    Outer max keeps us off the hardware reserve and the deep-discharge buffer.
+    On a big-overflow day overflow_floor is low → drain hard for headroom. On a
+    small/no-overflow day overflow_floor ≈ soc_max → drain_above high → CM Holds
+    (doesn't drain to a reserve); compute_charge_below / p10_recovery is the
+    "don't hand off below the evening need" backstop.
+    """
+    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor)
 
 
 def compute_charge_below(p10_recovery_floor, soc_keep):
