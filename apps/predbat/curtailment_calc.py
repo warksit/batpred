@@ -303,7 +303,7 @@ def compute_session_reserve(duration_minutes, cap_kw):
     return (mins / 60.0) * cap_kw
 
 
-def compute_drain_above(reserve, overflow_floor, effective_keep=None):
+def compute_drain_above(reserve, overflow_floor, effective_keep=None, session_protect_kwh=0.0):
     """Drain target: the SOC above which CM drains (Max Export) — PURE
     CURTAILMENT (v31, 2026-07-19). Drain only to make room for forecast
     overflow; NEVER to an overnight/evening reserve (that's Predbat's job, and
@@ -311,15 +311,22 @@ def compute_drain_above(reserve, overflow_floor, effective_keep=None):
     low). So effective_keep (R55) is no longer a drain target — the param is
     kept optional/ignored for back-compat.
 
-    Returns: max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor)
+    Returns: max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor,
+                 session_protect_kwh)
 
     Outer max keeps us off the hardware reserve and the deep-discharge buffer.
     On a big-overflow day overflow_floor is low → drain hard for headroom. On a
     small/no-overflow day overflow_floor ≈ soc_max → drain_above high → CM Holds
     (doesn't drain to a reserve); compute_charge_below / p10_recovery is the
     "don't hand off below the evening need" backstop.
+
+    v32(a): session_protect_kwh (overnight target + saving-session reserve) is a
+    lower bound while a session is UPCOMING — CM won't drain the reserve away
+    before it. 0 when no session is scheduled, so days without a session keep the
+    pure-curtailment drain target unchanged. The session is dumped live via a
+    Max Export override, not via this floor.
     """
-    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor)
+    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor, session_protect_kwh)
 
 
 def compute_charge_below(p10_recovery_floor, soc_keep):

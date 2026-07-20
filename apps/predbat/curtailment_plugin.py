@@ -101,6 +101,9 @@ POLICY_PREDBAT = "Predbat"
 SIG_SAVING_SESSION = "binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
 HA_EARLY_HANDBACK_BUFFER = "input_number.curtailment_early_handback_buffer_kwh"
 EARLY_HANDBACK_BUFFER_DEFAULT = 1.5
+# v32: the "overflow fits headroom" buffer is now a Hold gate (not a deactivate
+# trigger). Hysteresis so we don't flap Hold<->Drain right at the boundary.
+FITS_HYST_KWH = 0.5
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
@@ -235,6 +238,19 @@ class CurtailmentPlugin(PredBatPlugin):
         # tracks whether WE set base.set_read_only so we only ever clear our own.
         self._read_only_set = None
         self._session_reserve_kwh = 0.0
+        # v32 evening lifecycle (2026-07-20). The plugin stays active to sundown
+        # (no early-handback / no safe_time deactivation); the policy override says
+        # what to do inside the window when the SOC-vs-band Schmitt is not the right
+        # call: "hold" (overflow already fits headroom, or past safe_time — battery
+        # flat, sell surplus at the cap, never MSC round-trip), "max_export" (a
+        # saving session is live — dump the reserve at the cap), or None (Schmitt
+        # makes room). _overflow_fits_latched adds hysteresis so Hold/Drain doesn't
+        # flap at the fits boundary (observed 2026-07-20). _session_protect_kwh
+        # raises drain_above ahead of a known session so the reserve isn't drained.
+        self._policy_override = None
+        self._overflow_fits_latched = False
+        self._session_active = False
+        self._session_protect_kwh = 0.0
         # Single-writer handoff: True while CM controls (heartbeat enabled). None =
         # unknown on first run (adopt from read_only). Edge-triggered so we don't
         # spam turn_on/off or overwrite a manual EMS mode every cycle.
@@ -444,6 +460,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_recovered = False
         self._keep_drained_today = False
         self._r48_engaged_today = False
+        self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
+        self._policy_override = None
         self._logged_once = set()  # re-arm the once-per-day fallback logs
         self._state_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -1058,6 +1076,14 @@ class CurtailmentPlugin(PredBatPlugin):
         if self._state_date is not None and self._state_date != today:
             self._reset_for_new_day()
 
+        # v32: default the evening-lifecycle override + session protection to
+        # neutral each cycle. Only the main active path (after the sundown/Hold
+        # gate) sets them; the pre-PV drain and other early-return paths must not
+        # inherit a stale "hold" (which would block the pre-PV drain) or a stale
+        # session floor from yesterday evening.
+        self._policy_override = None
+        self._session_protect_kwh = 0.0
+
         # R55: refresh overnight_target sensor every cycle. calculate() runs
         # via on_update which fires AFTER calculate_plan in update_pred, so
         # pv_forecast_minute_step is populated here (unlike on_before_plan
@@ -1327,46 +1353,62 @@ class CurtailmentPlugin(PredBatPlugin):
 
         will_fill = total_excess > battery_headroom
 
-        # RD6/R6 (v30): CM owns the curtailment window ONLY. Deactivate at safe_time
-        # (primary) — past it PV can't exceed the export cap, so there is no
-        # curtailment to manage and the whole machine hands back to Predbat (evening
-        # export, saving sessions, overnight reserve are Predbat's, not CM's). This
-        # supersedes R56 (CM must NOT stay active to drain the battery in the evening).
+        # v32 evening lifecycle (2026-07-20, supersedes v31 early-handback + RD6
+        # "deactivate at safe_time"). The plugin stays ACTIVE for the whole PV
+        # window and only deactivates at SUNDOWN (peak observed, actual PV ≈ 0),
+        # handing the machine back to Predbat for the night. safe_time and
+        # "overflow fits headroom" NO LONGER deactivate — they now drive a Hold
+        # override (below). Reason: the v31 early-handback released to EMS-MSC while
+        # PV still flowed; MSC stops exporting at the cap and banks the excess into
+        # the battery, which round-trips back out later (~10% loss). Observed live
+        # 2026-07-20. Keeping CM in Hold pins export at the cap and only banks the
+        # TRUE excess (PV−cap−load) — Hold and Max Export are physically identical
+        # whenever PV surplus ≥ cap (heartbeat ceiling clamp), so this is safe.
         #
-        # past_safe is a HARD stop on solar geometry alone — it must NOT depend on
-        # the observed peak, because the end-of-day peak reset (below) zeroes
-        # _peak_pv in the evening; a dusk PV blip (>0.1, so it skips the "no PV yet"
-        # early return) would then leave peaked False, the guard would stop firing,
-        # and calculate() would fall through to its "active" default → spurious dusk
-        # re-activation. Pre-dawn is already handled by the "no PV yet" early return
-        # BEFORE this block, so geometry alone is safe. Sundown (peak observed, PV
-        # ≤ 0.1) stays as a BACKSTOP for days where safe_time can't be computed.
+        # sundown must be peak-guarded: pre-dawn is handled by the "no PV yet" early
+        # return above, so a genuine end-of-day PV≈0 is the only path here.
         peaked = self._peak_pv > 0.5
         past_safe = reached_safe_time
         sundown = peaked and actual_pv < 0.1
-        # v31 early handback: once the battery can absorb ALL remaining p90
-        # (pessimistic/"what if the clouds clear") overflow with a buffer to
-        # spare, there is no clipping risk left even if CM does nothing — so hand
-        # the afternoon back to Predbat instead of squatting on control to
-        # safe_time. Good days: p90 stays big → exit at safe_time. Fizzled days:
-        # exits early, Predbat gets the afternoon. peaked-guarded so it can't fire
-        # before real PV.
+        if sundown:
+            self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
+            self._floor_ratchet = None
+            self._floor_source = "Overnight Reserve"
+            self._policy_override = None
+            self._overflow_fits_latched = False
+            # v32: do NOT reset _peak_pv here. It must persist through the evening so
+            # `peaked` stays True and sundown keeps returning off every cycle until
+            # PV=0 overnight. The old evening reset (minutes>1200) combined with the
+            # removed past_safe deactivation would leave peaked False on a dusk PV
+            # blip and strand the plugin active overnight. _reset_for_new_day clears
+            # peak at the midnight rollover (pre-dawn is the "no PV yet" early return).
+            self._save_state()
+            return soc_max, "off"
+
+        # Hold gate (ex-early-handback condition, correct action). Once the battery
+        # headroom can absorb ALL remaining p90 ("what if the clouds clear")
+        # overflow with a buffer to spare, there is nothing left to make room for →
+        # Hold (battery flat, export surplus at the cap), NOT drain. Hysteresis
+        # (FITS_HYST_KWH) so we don't flap Hold↔Drain right at the boundary — the
+        # v31 handback oscillated there on 2026-07-20. past_safe (solar geometry
+        # says no clip possible) also forces Hold. A live saving session overrides
+        # everything with Max Export (dump the reserve — set below once we know it).
         try:
             early_buffer = float(self.base.get_state_wrapper(HA_EARLY_HANDBACK_BUFFER, default=EARLY_HANDBACK_BUFFER_DEFAULT))
         except (TypeError, ValueError):
             early_buffer = EARLY_HANDBACK_BUFFER_DEFAULT
-        overflow_fits = peaked and (battery_headroom - overflow_p90) >= early_buffer
-        if past_safe or sundown or overflow_fits:
-            trigger = "safe_time" if past_safe else ("overflow-fits" if overflow_fits else "sundown")
-            self._last_decision = "off: {} (peak={:.1f}, actual_pv={:.2f}, p90={:.1f}, room={:.1f})".format(trigger, self._peak_pv, actual_pv, overflow_p90, battery_headroom)
-            self._floor_ratchet = None
-            self._floor_source = "Overnight Reserve"
-            # End-of-day reset: clear peak so tomorrow starts fresh
-            if minutes_now > 1200:
-                self._peak_pv = 0.0
-                self._peak_pv_time = 0
-            self._save_state()
-            return soc_max, "off"
+        fits_margin = battery_headroom - overflow_p90
+        if self._overflow_fits_latched:
+            self._overflow_fits_latched = peaked and fits_margin >= (early_buffer - FITS_HYST_KWH)
+        else:
+            self._overflow_fits_latched = peaked and fits_margin >= early_buffer
+        self._session_active = self._is_saving_session_active()
+        if self._session_active:
+            self._policy_override = "max_export"
+        elif self._overflow_fits_latched or past_safe:
+            self._policy_override = "hold"
+        else:
+            self._policy_override = None
 
         # Active: compute floor (R9/R10)
         soc_keep = getattr(self.base, "best_soc_keep", 0)
@@ -1512,7 +1554,21 @@ class CurtailmentPlugin(PredBatPlugin):
         # thing CM needs to be aware of that Predbat "sees"; the drain target
         # (drain_above) stays pure curtailment.
         self._session_reserve_kwh = round(self._get_session_reserve_kwh(dno_limit_kw), 2)
-        overnight_for_recovery = (self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep) + self._session_reserve_kwh
+        # v32(a): ahead of a KNOWN saving session, keep session_reserve = duration ×
+        # cap in the battery so there is something to sell at the peak. Raise both
+        # the recovery target (charge_below) AND the drain floor (drain_above, via
+        # _session_protect_kwh — compute_drain_above is otherwise pure curtailment).
+        # During the session itself we DUMP the reserve (Max Export override), so
+        # only protect it while the session is upcoming, not active. This pulls
+        # session handling back into CM until the RD7 Predbat mapper lands.
+        overnight_target = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
+        if self._session_reserve_kwh > 0 and not self._session_active:
+            reserve_for_recovery = self._session_reserve_kwh
+            self._session_protect_kwh = min(soc_max, overnight_target + self._session_reserve_kwh)
+        else:
+            reserve_for_recovery = 0.0
+            self._session_protect_kwh = 0.0
+        overnight_for_recovery = overnight_target + reserve_for_recovery
         p10_recovery = compute_p10_recovery_floor(
             overnight_target_kwh=overnight_for_recovery,
             p10_pv_remaining_kwh=p10_pv_remaining,
@@ -1866,7 +1922,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
             charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
-            drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh), 2)
+            drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh), 2)
         else:
             charge_below = 0.0
             drain_above = round(soc_max, 2)
@@ -2002,6 +2058,16 @@ class CurtailmentPlugin(PredBatPlugin):
             best_mins = max(best_mins, mins)
         return compute_session_reserve(best_mins, cap_kw)
 
+    def _is_saving_session_active(self):
+        """True while an Octopus saving session is currently running (the binary
+        sensor is 'on'). v32(b): during a live session CM forces Max Export to dump
+        the reserved energy at the cap, then resumes the lifecycle when it ends."""
+        try:
+            state = str(self.base.get_state_wrapper(SIG_SAVING_SESSION, default="off")).lower()
+        except (TypeError, ValueError):
+            return False
+        return state in ("on", "true")
+
     def _set_automation(self, entity, turn_on):
         """Enable/disable an HA automation (the heartbeat register-writer)."""
         service = "automation/turn_on" if turn_on else "automation/turn_off"
@@ -2047,10 +2113,22 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Decide the intended policy + keep floor (pure decision, no side effects yet)
         if plugin_active and soc_pct > low_soc:
-            schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
+            # v32 evening lifecycle override (set in calculate()): "max_export" =
+            # dump the saving-session reserve at the cap; "hold" = overflow already
+            # fits headroom or past safe_time → battery flat, sell surplus, no
+            # MSC round-trip. None → the SOC-vs-band Schmitt makes room as before.
+            # Hold and Max Export are physically identical whenever PV surplus ≥ cap
+            # (heartbeat ceiling clamp), so the override only bites below the cap.
+            if self._policy_override == "max_export":
+                schmitt = "Drain"
+            elif self._policy_override == "hold":
+                schmitt = "Hold"
+            else:
+                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
             intended_policy = phase_to_policy(schmitt)
             intended_keep = min(max(floor_kwh / max(soc_max, 0.1) * 100, 5.0), 95.0)
-            reason = "active {} | soc {:.0f}% band [{:.1f}, {:.1f}] kWh".format(schmitt, soc_pct, self._charge_below, self._drain_above)
+            ovr = " (override {})".format(self._policy_override) if self._policy_override else ""
+            reason = "active {}{} | soc {:.0f}% band [{:.1f}, {:.1f}] kWh".format(schmitt, ovr, soc_pct, self._charge_below, self._drain_above)
         elif plugin_active:
             intended_policy = POLICY_PREDBAT
             intended_keep = None

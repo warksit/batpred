@@ -1166,3 +1166,60 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   `predbat_requested_mode`, gated by read_only / CM phase so mapper and CM never both
   write the select). Until this lands, `read_only=False` lets Predbat *plan* but not
   *act* (mapper off), so evening export + saving sessions stay MANUAL.
+
+---
+
+## v32 — Evening lifecycle + saving sessions (2026-07-20)
+
+**Status: IMPLEMENTED (TDD).** Replaces the v31 early-handback (RD6 "deactivate at
+safe_time" + the "overflow fits → hand back to Predbat" trigger), which released the
+machine to EMS-MSC **while PV was still flowing**. MSC stops exporting at the cap and
+banks the excess PV into the battery, which then round-trips back out later (~10%
+loss). Observed live 2026-07-20 ~15:02: handed back at SOC 79%, PV 2.3 kW, `grid=0.0`,
+battery charging. The plugin flapped Max Export ↔ Predbat and never held.
+
+**Key physics (Andrew, 2026-07-20):** `Hold Battery` and `Max Export` are *physically
+identical* whenever PV surplus ≥ cap — the heartbeat clamps both dispatch setpoints to
+`load + cap`, so export pins at the cap and the excess PV charges the battery either
+way (`sig_dispatch_heartbeat.yaml` line 57). They differ **only** when surplus < cap:
+Max Export drains the battery to grid to fill the cap; Hold keeps the battery flat and
+exports only the surplus. So Hold-vs-Max-Export is purely a *battery-drain* decision,
+and the natural switch is **SOC reaching the floor** (the existing Schmitt).
+
+- **RD11 — Deactivate only at sundown.** The plugin stays ACTIVE for the whole PV
+  window and hands back to Predbat only at **sundown** (`peaked and actual_pv < 0.1`).
+  `safe_time` and "overflow fits headroom" NO LONGER deactivate (they drive the Hold
+  override, RD12). This restores the original "CM runs until PV≈0" design that RD6
+  wrongly cut short. The observed peak (`_peak_pv`) PERSISTS through the evening (no
+  evening reset) so `peaked` stays True and sundown fires reliably; `_reset_for_new_day`
+  clears it at midnight, and pre-dawn is the "no PV yet" early return.
+- **RD12 — Evening policy override (Hold gate).** Inside the active window the policy is:
+  1. **Saving session live** → `Max Export` (dump the reserve at the cap, RD14b).
+  2. **`overflow_fits`** (`battery_headroom − overflow_p90 ≥ early_buffer`, the
+     ex-early-handback condition) OR **past safe_time** → `Hold Battery` — battery flat,
+     export the surplus at the cap, never drain-to-grid, never MSC round-trip. Reuses
+     the v31 `curtailment_early_handback_buffer_kwh` helper (default 1.5 kWh) as the
+     Hold gate. Hysteresis `FITS_HYST_KWH = 0.5` prevents Hold↔Drain flap at the
+     boundary (the v31 flap on 2026-07-20).
+  3. **else** → the existing SOC-vs-band Schmitt makes room (Max Export drains to the
+     curtailment floor / Hold / Solar Charge).
+  The override is reset to neutral at the top of `calculate()` so the pre-PV drain and
+  other early-return paths never inherit a stale Hold.
+- **RD14 — Saving session (two things, pulls sessions back into CM until RD7).** Uses
+  the existing `SIG_SAVING_SESSION` binary_sensor + `_get_session_reserve_kwh`
+  (`duration × cap`):
+    - **(a) Reserve ahead of a session** — while a session is UPCOMING (scheduled, not
+    yet active), `session_protect_kwh = min(soc_max, overnight_target + session_reserve)`
+    raises `drain_above` (via `compute_drain_above`) so CM does not drain the reserve
+    away before the session. `compute_drain_above` is otherwise pure-curtailment (v31);
+    `session_protect` is 0 on days with no session, so those days are unchanged. The
+    reserve also feeds `charge_below` (recovery) as before.
+    - **(b) Dump during the session** — while the session is LIVE, the RD12 override forces
+    `Max Export` to sell the reserve at the cap; protection drops (reserve not re-added),
+    so it drains to the overnight target. Resumes the lifecycle when the session ends.
+    - **Scope note:** running CM into the evening overlaps saving-session hours, so this
+    partially reverses "Predbat owns saving sessions" (RD7) until the Predbat mapper
+    lands. Trade-off on an overflow day WITH an evening session: `drain_above` won't go
+    below `overnight_target + reserve`, reducing curtailment headroom (possible extra
+    midday clip) in exchange for having the reserve to sell at the peak — accepted
+    (Andrew, 2026-07-20).

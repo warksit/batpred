@@ -2538,7 +2538,7 @@ def test_phase_managed_above_floor():
 # Plugin integration tests
 # ============================================================================
 
-from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY
+from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY, SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY
 
 
 class MockBase:
@@ -2972,12 +2972,11 @@ def test_on_update_stays_off_low_pv():
     print("  test_on_update_stays_off_low_pv: PASSED")
 
 
-def test_deactivation_at_safe_time():
-    """RD6/R6 (v30): CM owns the curtailment window ONLY and hands back to
-    Predbat at safe_time. Once PV can no longer exceed the export cap there is
-    no curtailment to manage, so the plugin deactivates at safe_time — it does
-    NOT stay active into the evening to drain the battery (that £-optimisation
-    is Predbat's job, R56 removed).
+def test_holds_past_safe_time_until_sundown():
+    """v32 (supersedes RD6 deactivate-at-safe_time): past safe_time with PV still
+    flowing (>0.1), the plugin stays ACTIVE and Holds — it must NOT hand back to
+    Predbat/MSC while PV flows (that round-trips the excess). It only deactivates
+    at sundown (PV≈0).
     """
     from datetime import datetime, timezone
 
@@ -3000,16 +2999,23 @@ def test_deactivation_at_safe_time():
     plugin.on_update()
     assert plugin.last_phase == "active", "Should activate at noon (mid-overflow)"
 
-    # Jump past safe_time — sun geometry is now below the export threshold, so
-    # PV can no longer overflow the cap. RD6: hand the machine back to Predbat.
+    # Past safe_time but PV still 0.3 kW (>0.1) → stay active + Hold, not off.
     base.minutes_now = 18 * 60 + 30
     base.now_utc = datetime(2025, 7, 12, 18, 30, tzinfo=timezone.utc)
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.3
     base.services.clear()
     plugin.base = base
     plugin.on_update()
-    assert plugin.last_phase == "off", "RD6: deactivate at safe_time, hand back to Predbat"
-    print("  test_deactivation_at_safe_time: PASSED (RD6: off at safe_time)")
+    assert plugin.last_phase == "active", "v32: stay active past safe_time while PV flows"
+    assert plugin._policy_override == "hold", f"v32: Hold past safe_time, got {plugin._policy_override}"
+
+    # Now PV falls to ≈0 → sundown → deactivate.
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.05
+    base.minutes_now = 19 * 60
+    base.now_utc = datetime(2025, 7, 12, 19, 0, tzinfo=timezone.utc)
+    plugin.on_update()
+    assert plugin.last_phase == "off", "v32: deactivate at sundown (PV≈0)"
+    print("  test_holds_past_safe_time_until_sundown: PASSED")
 
 
 def test_defers_to_charge_window():
@@ -3152,10 +3158,12 @@ def test_R54_target_uses_keep_when_lower_than_overflow_floor():
     )
     plugin = CurtailmentPlugin(base)
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    # v31: this small overflow already fits the battery (16 kWh headroom vs a
-    # small p90 overflow) → early handback to Predbat instead of holding a floor.
-    assert phase == "off", f"small overflow fits → early handback to Predbat, got {phase}"
-    print("  test_R54_target_uses_keep_when_lower_than_overflow_floor: PASSED (early handback, off)")
+    # v32: this small overflow already fits the battery headroom → the plugin stays
+    # ACTIVE and Holds (battery flat, export surplus at cap), NOT deactivate to MSC
+    # (the v31 early-handback round-tripped PV on 2026-07-20).
+    assert phase == "active", f"v32: small overflow fits → active + Hold (not off), got {phase}"
+    assert plugin._policy_override == "hold", f"v32: overflow-fits → Hold override, got {plugin._policy_override}"
+    print("  test_R54_target_uses_keep_when_lower_than_overflow_floor: PASSED (active + Hold)")
 
 
 def test_R54_target_uses_overflow_when_lower_than_keep():
@@ -3219,36 +3227,6 @@ def test_R57_no_chase_to_soc_max_late_in_day():
     print(f"  test_R57_no_chase_to_soc_max_late_in_day: PASSED (R45 taper — floor={floor:.2f} kWh = {floor / BATTERY_KWH * 100:.0f}%)")
 
 
-def test_deactivate_at_safe_time_even_above_keep():
-    """RD6 (v30, supersedes R56): even with SOC well above the overnight target,
-    the plugin deactivates at safe_time. It must NOT stay active to drain the
-    battery for evening grid value — that is Predbat's £-optimisation, not CM's.
-    """
-    from datetime import datetime, timezone
-
-    pv = {m: 1.0 for m in range(0, 60, PLUGIN_STEP)}
-    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
-    sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 1.0,
-        "sensor.sigen_plant_consumed_power": 0.5,
-    }
-    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=1.0))
-    base = MockBase(
-        pv_step=pv,
-        load_step=load,
-        soc_kw=BATTERY_KWH * 0.85,  # high SOC — old R56 would drain it in the evening
-        minutes_now=1140,  # 19:00 BST — past safe_time
-        best_soc_keep=4.0,
-        now_utc=datetime(2025, 7, 12, 18, 0, tzinfo=timezone.utc),
-        sensor_overrides=sensor_overrides,
-    )
-    plugin = CurtailmentPlugin(base)
-    plugin._peak_pv = 7.5  # earlier today there was real PV, so not pre-PV path
-    floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "off", f"RD6: deactivate at safe_time regardless of SOC, got {phase}"
-    print(f"  test_deactivate_at_safe_time_even_above_keep: PASSED (off, floor={floor:.2f})")
-
-
 def test_off_at_sundown_backstop():
     """RD6 backstop: when peak PV was observed today AND actual PV is now ~0,
     plugin deactivates (sundown). This is the fallback for days where safe_time
@@ -3281,35 +3259,35 @@ def test_off_at_sundown_backstop():
 
 
 def test_no_dusk_reactivation_after_peak_reset():
-    """REGRESSION: after the end-of-day peak reset (minutes_now>1200 zeroes
-    _peak_pv), a small dusk PV blip (>0.1, so it skips the 'no PV yet' guard, but
-    <0.5 so 'peaked' is False) must NOT re-activate the plugin. Past safe_time is
-    a hard stop regardless of the observed peak — otherwise calculate() falls
-    through to its 'active' default and the plugin spuriously re-activates at night.
+    """v32 REGRESSION: the observed peak PERSISTS through the evening (no evening
+    reset), so once PV drops to ≈0 the plugin deactivates at sundown and stays off
+    — it must not strand active overnight. v32 removed the past_safe deactivation,
+    so this invariant now rests on peak persistence + the sundown (PV<0.1) trigger.
     """
     from datetime import datetime, timezone
 
-    pv = {m: 0.3 for m in range(0, 60, PLUGIN_STEP)}
+    pv = {m: 0.0 for m in range(0, 60, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
     sensor_overrides = {
-        "sensor.sigen_plant_pv_power": 0.28,  # dusk blip: >0.1 (skips 'no PV yet'), <0.5
+        "sensor.sigen_plant_pv_power": 0.05,  # night: <0.1 → sundown
         "sensor.sigen_plant_consumed_power": 0.5,
     }
-    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=0.5))
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=0.0))
     base = MockBase(
         pv_step=pv,
         load_step=load,
         soc_kw=BATTERY_KWH * 0.40,
-        minutes_now=1210,  # 20:10 BST — past the 1200 peak-reset threshold
+        minutes_now=1210,  # 20:10 BST — past the old 1200 peak-reset threshold
         best_soc_keep=4.0,
         now_utc=datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc),
         sensor_overrides=sensor_overrides,
     )
     plugin = CurtailmentPlugin(base)
-    plugin._peak_pv = 0.28  # already reset to ~0 earlier this evening, then the blip
+    plugin._peak_pv = 7.5  # real peak earlier today, persists into the evening
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "off", f"must stay OFF at dusk past safe_time despite peak reset, got {phase}"
-    print("  test_no_dusk_reactivation_after_peak_reset: PASSED (off at dusk)")
+    assert phase == "off", f"sundown must deactivate at night (peak persists), got {phase}"
+    assert plugin._peak_pv == 7.5, "v32: peak must persist through the evening (no evening reset)"
+    print("  test_no_dusk_reactivation_after_peak_reset: PASSED (off at sundown)")
 
 
 # ============================================================================
@@ -3678,13 +3656,14 @@ def test_R55_overnight_target_raises_effective_keep_in_calculate():
     # _overnight_target_kwh is set by _refresh_overnight_target inside calculate()
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     cached_target = plugin._overnight_target_kwh
-    # v31: overnight_target is STILL computed, but it now feeds the recovery floor
-    # (compute_p10_recovery_floor, unit-tested separately) — NOT effective_keep,
-    # and it is no longer a drain target. This small overflow fits the battery, so
-    # the plugin hands back early to Predbat.
+    # overnight_target is STILL computed and feeds the recovery floor
+    # (compute_p10_recovery_floor, unit-tested separately). v32: this small overflow
+    # fits the battery, so the plugin stays ACTIVE and Holds (was v31 early-handback
+    # → off, which round-tripped PV via MSC).
     assert cached_target is not None, "calculate should still cache overnight_target (feeds recovery floor)"
-    assert phase == "off", f"v31: small overflow fits → early handback, got {phase}"
-    print(f"  test_R55_overnight_target_raises_effective_keep_in_calculate: PASSED (overnight_target cached={cached_target:.2f}, early handback)")
+    assert phase == "active", f"v32: small overflow fits → active + Hold, got {phase}"
+    assert plugin._policy_override == "hold", f"v32: overflow-fits → Hold override, got {plugin._policy_override}"
+    print(f"  test_R55_...: PASSED (overnight_target cached={cached_target:.2f}, active+Hold)")
 
 
 # ============================================================================
@@ -4713,6 +4692,186 @@ def test_load_state_logs_corruption():
 
 
 # ============================================================================
+# v32 evening lifecycle (2026-07-20): overflow_fits → Hold (not deactivate),
+# stay active to sundown, saving-session reserve + dump. Replaces v31 early-
+# handback which round-tripped PV through the battery via MSC.
+# ============================================================================
+
+
+def _saving_session_sensors(active=False, current_mins=0, next_mins=0):
+    """Octopus saving-session binary_sensor override (state + joined-event
+    duration attributes read by _get_session_reserve_kwh / _is_saving_session_active)."""
+    return {
+        SIG_SAVING_SESSION_ENTITY: {
+            "state": "on" if active else "off",
+            "current_joined_event_duration_in_minutes": current_mins,
+            "next_joined_event_duration_in_minutes": next_mins,
+        }
+    }
+
+
+def test_v32_no_deactivate_past_safe_time_holds():
+    """v32: past safe_time with PV still flowing, the plugin STAYS ACTIVE and the
+    policy override is Hold (battery flat, export surplus). v31 deactivated here →
+    MSC → round-trip. Supersedes RD6 'deactivate at safe_time'."""
+    from datetime import datetime, timezone
+
+    pv = {m: 1.0 for m in range(0, 60, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 1.0, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=1.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.85,
+        minutes_now=1140,  # 19:00 BST — past safe_time
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 18, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"v32: stay active past safe_time while PV>0.1, got {phase}"
+    assert plugin._policy_override == "hold", f"v32: past safe_time → Hold override, got {plugin._policy_override}"
+    print("  test_v32_no_deactivate_past_safe_time_holds: PASSED")
+
+
+def test_v32_overflow_fits_holds_not_off():
+    """v32: mid-day, when the battery headroom can absorb all remaining p90
+    overflow (+buffer), the plugin STAYS ACTIVE with a Hold override — it does NOT
+    deactivate to Predbat/MSC (the v31 early-handback bug that round-tripped PV on
+    2026-07-20)."""
+    pv = {m: 2.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 2.0, "sensor.sigen_plant_consumed_power": 0.5}
+    # Modest remaining overflow (~4 kWh) vs 8 kWh headroom → fits with buffer,
+    # while still BEFORE safe_time (15:51) so this exercises the fits path, not
+    # the past_safe path.
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=6.0, solcast_remaining=3.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.55,  # ~8 kWh headroom ≫ remaining overflow + buffer
+        minutes_now=840,  # 14:00 BST — before safe_time
+        best_soc_keep=4.0,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5  # peak already seen today
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"v32: overflow-fits must NOT deactivate, got {phase}"
+    assert plugin._policy_override == "hold", f"v32: overflow-fits → Hold override, got {plugin._policy_override}"
+    assert plugin._safe_time_str > "14:00", f"scenario must be before safe_time to test fits path, safe={plugin._safe_time_str}"
+    print("  test_v32_overflow_fits_holds_not_off: PASSED")
+
+
+def test_v32_overflow_does_not_fit_schmitt_drives():
+    """v32: genuine mid-day overflow that does NOT fit the battery → no Hold
+    override (None), the existing SOC-vs-band Schmitt makes room (drain)."""
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.55,  # little headroom vs a big p90 overflow
+        minutes_now=720,
+        best_soc_keep=4.0,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 9.0
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"expected active, got {phase}"
+    assert plugin._policy_override is None, f"v32: overflow-doesn't-fit → no override (Schmitt drives), got {plugin._policy_override}"
+    print("  test_v32_overflow_does_not_fit_schmitt_drives: PASSED")
+
+
+def test_v32_sundown_still_deactivates():
+    """v32: sundown (peak observed today AND actual PV ≈ 0) is still the sole
+    deactivation trigger → phase off, no Hold override."""
+    from datetime import datetime, timezone
+
+    pv = {m: 0.0 for m in range(0, 60, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 60, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 0.0, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=0.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        minutes_now=1260,  # 21:00 BST
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "off", f"v32: sundown still deactivates, got {phase}"
+    print("  test_v32_sundown_still_deactivates: PASSED")
+
+
+def test_v32_saving_session_active_forces_max_export():
+    """v32(b): while a saving session is live, the policy override is Max Export —
+    dump the reserve at the cap regardless of SOC band."""
+    pv = {m: 2.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 2.0, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=8.0, solcast_remaining=2.0))
+    sensor_overrides.update(_saving_session_sensors(active=True, current_mins=90))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.60,
+        minutes_now=1050,  # ~17:30 BST, session hours
+        best_soc_keep=4.0,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"expected active during session, got {phase}"
+    assert plugin._policy_override == "max_export", f"v32: session live → Max Export override, got {plugin._policy_override}"
+    print("  test_v32_saving_session_active_forces_max_export: PASSED")
+
+
+def test_v32_upcoming_session_raises_drain_floor():
+    """v32(a): an UPCOMING (not yet active) session raises drain_above so CM does
+    not drain the reserve away before the session. Compare drain_above with vs
+    without the scheduled session, same overflow day."""
+
+    def _run(session):
+        pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+        load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+        sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+        sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+        if session:
+            sensor_overrides.update(_saving_session_sensors(active=False, next_mins=120))
+        base = MockBase(
+            pv_step=pv,
+            load_step=load,
+            soc_kw=BATTERY_KWH * 0.55,
+            minutes_now=720,
+            best_soc_keep=4.0,
+            sensor_overrides=sensor_overrides,
+        )
+        base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+        plugin = CurtailmentPlugin(base)
+        plugin._peak_pv = 9.0
+        plugin._overnight_target_kwh = 6.0
+        plugin.on_update()
+        return base.published.get("sensor.predbat_curtailment_drain_above", {}).get("value")
+
+    without = _run(session=False)
+    with_session = _run(session=True)
+    assert with_session > without + 1.0, f"v32(a): upcoming session must raise drain_above (protect reserve): with={with_session} without={without}"
+    print(f"  test_v32_upcoming_session_raises_drain_floor: PASSED (drain_above {without}->{with_session})")
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -4902,7 +5061,7 @@ def run_curtailment_tests(my_predbat=None):
     apply_tests = [
         test_on_update_full_flow,
         test_on_update_stays_off_low_pv,
-        test_deactivation_at_safe_time,
+        test_holds_past_safe_time_until_sundown,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
@@ -5059,7 +5218,6 @@ def run_curtailment_tests(my_predbat=None):
         test_R54_target_uses_keep_when_lower_than_overflow_floor,
         test_R54_target_uses_overflow_when_lower_than_keep,
         test_R57_no_chase_to_soc_max_late_in_day,
-        test_deactivate_at_safe_time_even_above_keep,
         test_off_at_sundown_backstop,
         test_no_dusk_reactivation_after_peak_reset,
     ]
@@ -5138,6 +5296,23 @@ def run_curtailment_tests(my_predbat=None):
     ]
     print("  --- R52 pre-PV drain tests ---")
     for test_fn in r52_tests:
+        try:
+            test_fn()
+        except Exception as e:
+            print(f"  {test_fn.__name__}: FAILED — {e}")
+            failed = True
+
+    # v32 evening lifecycle (overflow_fits→Hold, sundown deactivate, sessions)
+    v32_tests = [
+        test_v32_no_deactivate_past_safe_time_holds,
+        test_v32_overflow_fits_holds_not_off,
+        test_v32_overflow_does_not_fit_schmitt_drives,
+        test_v32_sundown_still_deactivates,
+        test_v32_saving_session_active_forces_max_export,
+        test_v32_upcoming_session_raises_drain_floor,
+    ]
+    print("  --- v32 evening lifecycle tests ---")
+    for test_fn in v32_tests:
         try:
             test_fn()
         except Exception as e:

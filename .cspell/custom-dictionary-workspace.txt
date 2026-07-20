@@ -161,6 +161,7 @@ houseb
 htmlcov
 husforbrukning
 hypervolt
+hyst
 iboost
 idag
 idetails
@@ -324,6 +325,7 @@ Selfrun
 Selfuse
 semodbus
 Sergoe
+setpoints
 SFMB
 sigen
 sigenergy
