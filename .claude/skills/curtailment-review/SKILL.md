@@ -89,7 +89,7 @@ For **today**, current state contains today's totals. For **past days**, you mus
   "entity_id": [
     "sensor.solcast_pv_forecast_forecast_today",
     "sensor.predbat_pv_today",
-    "sensor.sigen_plant_daily_third_party_inverter_energy",
+    "sensor.sigen_plant_daily_pv_energy",
     "sensor.sigen_plant_daily_grid_import_energy",
     "sensor.sigen_plant_daily_grid_export_energy",
     "counter.voltage_throttle_activations_today",
@@ -150,11 +150,19 @@ near-zero is by design on big-overflow days).
 ### Past-day adjustments
 
 If `is_today` is false, replace Call B's daily-total sensors with a `ha_get_history`
-**at start_time and end_time** (use `limit=2` and rely on first/last values) so you
-can compute the day's delta for the `daily_*` cumulative sensors. Call C already
+for the `daily_*` sensors over the day. **These reset at LOCAL midnight (23:00 UTC
+in BST), so the day total is the value JUST BEFORE the 23:00-UTC reset, NOT
+`.states[-1]`** — the last row (near 00:00 UTC) is already the *next* day's post-reset
+value. Extract it with jq as the max over the window, or the last state with
+`last_changed < <date>T23:00:00`. (Observed 2026-07-19: `.states[-1]` gave 10.8 kWh
+PV on a day with 24.5 kWh overflow — a reset-boundary artifact.) Call C already
 handles the two lifetime-cumulative sensors for any date. Solcast forecast for past
 days is not retained — note "forecast unavailable for past days" in the PV Accuracy
 section instead.
+
+**Phase timeline is now `input_select.sig_dispatch_policy`** (Predbat / Max Export /
+Hold Battery / Solar Charge Battery), not `input_text.curtailment_live_phase` (the
+pre-swap Charge/Drain/Hold automation, now dead).
 
 ---
 
@@ -162,7 +170,7 @@ section instead.
 
 ### From Call B (states / daily totals)
 
-1. **PV total today**: state of `sensor.sigen_plant_daily_third_party_inverter_energy`
+1. **PV total today**: state of `sensor.sigen_plant_daily_pv_energy`
 2. **PV forecast today**: state of `sensor.solcast_pv_forecast_forecast_today` (also has p10/p90 in attributes)
 3. **PV ratio**: actual / forecast
 4. **Voltage throttle activations**: state of `counter.voltage_throttle_activations_today`
