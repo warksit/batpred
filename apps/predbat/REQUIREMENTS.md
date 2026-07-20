@@ -1108,6 +1108,17 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   `sensor.sigen_plant_total_load_power` (consumed_power now includes DC battery
   charging post-swap).
 
+- **RD13 — Manual override (`input_boolean.sig_manual_override`).** When on (and the
+  policy-control gate is on), the plugin keeps the single-writer machine LIVE — enables
+  `automation.sig_dispatch_heartbeat` and holds Predbat read_only — but STOPS writing
+  `input_select.sig_dispatch_policy` and the keep floor. The user sets the policy by
+  hand and it sticks (the plugin no longer overwrites it each cycle). This is the fix
+  for "if I change the dispatch policy it just changes back". It grabs control
+  regardless of plugin_active (a failsafe manual-drive path) and never hands back while
+  on; turning it off resumes automated policy control on the next cycle. Distinct from
+  the gate (`sig_plugin_policy_control` off = plugin fully observe-only, Predbat free):
+  this override drives manually WITHOUT surrendering the heartbeat/read_only machinery.
+
 ### Implementation order (gated on review of THIS section)
 
 1. **Review + agree this diff** (Andrew). ← we are here

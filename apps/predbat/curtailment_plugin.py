@@ -80,6 +80,10 @@ HA_ENABLE = "input_boolean.curtailment_manager_enable"
 # so the plugin can be DEPLOYED dormant and staged-enabled separately from the
 # legacy curtailment_manager_enable.
 SIG_POLICY_CONTROL_ENABLE = "input_boolean.sig_plugin_policy_control"
+# RD13 manual override: when on (and the gate is on) the plugin keeps the machine
+# LIVE (heartbeat + read_only) but STOPS writing the policy select, so a hand-set
+# policy sticks instead of being overwritten every cycle. Off = automated control.
+SIG_MANUAL_OVERRIDE = "input_boolean.sig_manual_override"
 SIG_POLICY_SELECT = "input_select.sig_dispatch_policy"
 SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
 SIG_LOW_SOC_HANDOVER_HELPER = "input_number.sig_low_soc_handover_pct"
@@ -2058,6 +2062,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         gate = str(self.base.get_state_wrapper(SIG_POLICY_CONTROL_ENABLE, default="off")).lower()
         acting = gate in ("on", "true")
+        manual = str(self.base.get_state_wrapper(SIG_MANUAL_OVERRIDE, default="off")).lower() in ("on", "true")
 
         # Always publish the intended decision — this is what you watch in observe-only.
         try:
@@ -2071,8 +2076,9 @@ class CurtailmentPlugin(PredBatPlugin):
                     "keep_floor_pct": round(intended_keep, 0) if intended_keep is not None else None,
                     "low_soc_handover_pct": low_soc,
                     "soc_pct": round(soc_pct, 1),
-                    "reason": reason,
+                    "reason": reason if not (acting and manual) else "manual override — user owns policy select",
                     "acting": acting,
+                    "manual_override": manual,
                 },
             )
         except Exception as e:
@@ -2095,6 +2101,21 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._release_to_predbat()
                 self._cm_controlling = False
             self._policy_driving = False
+            return
+
+        if manual:
+            # RD13 manual override: keep the single-writer machine LIVE — enable the
+            # heartbeat and suppress Predbat — but DON'T write the policy or keep floor.
+            # The user drives input_select.sig_dispatch_policy by hand and it sticks.
+            # Grabs control regardless of plugin_active (failsafe manual drive), and
+            # never hands back while the override is on.
+            if not self._cm_controlling:
+                self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
+                self._cm_controlling = True
+            if not self._read_only_set:
+                self._set_read_only(True)
+                self._read_only_set = True
+            self._policy_driving = True
             return
 
         if plugin_active:

@@ -1257,6 +1257,58 @@ def test_read_only_untouched_observe_only():
     print("  test_read_only_untouched_observe_only: PASSED")
 
 
+def test_manual_override_keeps_machine_live_skips_policy():
+    """RD13 manual override: gate on + override on + active → keep the machine LIVE
+    (heartbeat on, read_only True) but do NOT write the policy or keep floor. The user
+    owns input_select.sig_dispatch_policy and it no longer gets overwritten each cycle."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides["input_boolean.sig_manual_override"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert not _policy_calls(base), f"manual override must NOT write policy, got {base.services}"
+    assert not _keep_floor_calls(base), f"manual override must NOT write keep floor, got {base.services}"
+    assert ("automation/turn_on", "automation.sig_dispatch_heartbeat") in _automation_calls(base), base.services
+    assert base.set_read_only is True, "manual override still suppresses Predbat (single-writer stays live)"
+    assert plugin._cm_controlling is True
+    assert plugin._policy_driving is True
+    print("  test_manual_override_keeps_machine_live_skips_policy: PASSED")
+
+
+def test_manual_override_off_resumes_policy():
+    """RD13: with the override off, automated policy control resumes normally."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides["input_boolean.sig_manual_override"] = "off"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Hold Battery"], base.services
+    print("  test_manual_override_off_resumes_policy: PASSED")
+
+
+def test_manual_override_grabs_control_even_when_inactive():
+    """RD13 failsafe: override grabs the machine regardless of CM active state — it
+    enables the heartbeat + read_only even when plugin_active is False, and never
+    hands back to Predbat, so the user's manually-set policy keeps executing."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides["input_boolean.sig_manual_override"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+    assert not _policy_calls(base), f"manual override must not hand back, got {base.services}"
+    assert ("automation/turn_on", "automation.sig_dispatch_heartbeat") in _automation_calls(base), base.services
+    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") not in _automation_calls(base), base.services
+    assert base.set_read_only is True
+    assert plugin._cm_controlling is True
+    print("  test_manual_override_grabs_control_even_when_inactive: PASSED")
+
+
 def test_proposed_phase_charge_below_floor():
     """SOC < charge_below → Charge (P10 recovery at risk)."""
     from curtailment_calc import compute_proposed_phase
@@ -4775,6 +4827,9 @@ def run_curtailment_tests(my_predbat=None):
         test_read_only_released_on_handback,
         test_read_only_released_on_low_soc_handover,
         test_read_only_untouched_observe_only,
+        test_manual_override_keeps_machine_live_skips_policy,
+        test_manual_override_off_resumes_policy,
+        test_manual_override_grabs_control_even_when_inactive,
         test_heartbeat_enabled_on_control,
         test_heartbeat_disabled_and_msc_on_handback,
         test_heartbeat_untouched_observe_only,
