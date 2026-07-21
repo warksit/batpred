@@ -62,7 +62,7 @@ def _mock(policy, pv, load, soc, cap_w=3680, hard=12):
         "sensor.sigen_plant_total_load_power": str(load),
         "sensor.sigen_plant_battery_state_of_charge": str(soc),
         "input_number.dno_export_limit_w": str(cap_w),
-        "input_number.sig_hard_floor_pct": str(hard),
+        "input_number.sig_drain_floor_pct": str(hard),
     }
 
 
@@ -110,14 +110,40 @@ def test_dispatch_high_load_uses_66():
 
 
 def test_dispatch_hard_floor_clamp():
-    # Below the hard floor, dispatch clamped to PV so battery can't discharge.
-    d = _render_dispatch(_load(), _mock("Max Export", pv=2.0, load=0.55, soc=10, hard=12))
-    assert abs(d - 2.0) < 0.01, f"below hard floor dispatch must clamp to PV=2.0, got {d}"
-    print(f"PASS  hard floor: SOC10% Max Export @PV2.0 → {d:.2f} (≤PV, no discharge)")
+    # Below the drain floor, dispatch clamps to PV so the battery can't discharge.
+    d = _render_dispatch(_load(), _mock("Max Export", pv=2.0, load=0.55, soc=2, hard=2.8))
+    assert abs(d - 2.0) < 0.01, f"below drain floor dispatch must clamp to PV=2.0, got {d}"
+    print(f"PASS  drain floor: SOC2% Max Export @PV2.0 → {d:.2f} (≤PV, no discharge)")
+
+
+def test_dispatch_drives_between_2_8_and_5():
+    # v32: SOC 4% is ABOVE the 2.8% drain floor → Max Export drains normally
+    # (cap+load), NOT clamped to PV. (Old 5% floor would have clamped here.)
+    d = _render_dispatch(_load(), _mock("Max Export", pv=2.0, load=0.55, soc=4, hard=2.8))
+    assert d > 2.5, f"SOC4% > 2.8% floor must drive (cap+load), not clamp to PV, got {d}"
+    print(f"PASS  drain floor: SOC4% Max Export → {d:.2f} (drives, above 2.8% floor)")
+
+
+def test_dispatch_drain_floor_default_2_8():
+    # No helper set → the '| float(2.8)' default applies: SOC 2% clamps to PV.
+    ctx = dict(_mock("Max Export", pv=2.0, load=0.55, soc=2))
+    del ctx["input_number.sig_drain_floor_pct"]
+    d = _render_dispatch(_load(), ctx)
+    assert abs(d - 2.0) < 0.01, f"default 2.8% floor: SOC2% must clamp to PV, got {d}"
+    print(f"PASS  drain floor default 2.8%: SOC2% → {d:.2f}")
 
 
 def main():
-    for t in (test_structural, test_live_trigger, test_dispatch_ceiling_overflow, test_dispatch_tracks_pv_on_dip, test_dispatch_high_load_uses_66, test_dispatch_hard_floor_clamp):
+    for t in (
+        test_structural,
+        test_live_trigger,
+        test_dispatch_ceiling_overflow,
+        test_dispatch_tracks_pv_on_dip,
+        test_dispatch_high_load_uses_66,
+        test_dispatch_hard_floor_clamp,
+        test_dispatch_drives_between_2_8_and_5,
+        test_dispatch_drain_floor_default_2_8,
+    ):
         t()
     print("test_yaml_heartbeat: ALL PASSED")
 

@@ -1223,3 +1223,24 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
     below `overnight_target + reserve`, reducing curtailment headroom (possible extra
     midday clip) in exchange for having the reserve to sell at the peak — accepted
     (Andrew, 2026-07-20).
+
+- **RD15 — Single drain floor `sig_drain_floor_pct` (default 2.8%, 2026-07-21).** ONE
+  helper = the SOC below which CM stops selling the battery to grid. It replaces THREE
+  coincident 5% floors that all did the same job: the heartbeat `sig_hard_floor_pct`
+  (dispatch ≤ PV clamp), the plugin `sig_low_soc_handover_pct` (low-SOC → MSC handover),
+  and the hardcoded `max(floor%, 5.0)` keep-clamp. All three now read/derive from
+  `sig_drain_floor_pct`. Default **2.8% = the deep-discharge floor (0.5 kWh)**, so the
+  pre-dawn drain can reach it; the helper can only ever RAISE the floor above 2.8%
+  (`compute_drain_above` is hard-floored at 0.5 kWh). Correction to the earlier RD4
+  rationale: the **hardware discharge cut-off is 0%** by design ("rails at device
+  extremes"), so this software floor — NOT the BMS — is the operational protection.
+  The old "PCS ignores the hardware cut-off" note is unverified (the cut-off was 0%,
+  so nothing was overridden). `sig_hard_floor_pct` + `sig_low_soc_handover_pct` retired.
+- **RD16 — Dawn-flap latch (2026-07-21).** Once the pre-PV drain fires today
+  (`_pre_pv_engaged_today`), the "no PV yet" path must NOT hand back to Predbat when
+  the drain completes while PV hasn't arrived. When the drain is done (`_pre_pv_drain
+  _decision` returns None) but overflow is still forecast and `actual_pv < 0.1`, HOLD
+  active (battery flat) instead of returning off. Reason: at dawn actual PV flickers
+  across the 0.1 kW boundary, bouncing the plugin between the pre-PV path (off) and the
+  main flow (active) — observed 2026-07-21 05:39–05:52 BST, ~4 policy/heartbeat toggles.
+  The block only runs pre-dawn (peak not yet observed), so it never affects the evening.

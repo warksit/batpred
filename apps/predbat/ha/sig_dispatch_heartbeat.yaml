@@ -17,7 +17,7 @@
 #   Solar Charge Battery → dispatch = load: absorb all PV surplus into the battery,
 #                        zero export, cover the house. (old Charge, R16)
 #
-# HARD FLOOR (live clamp): SOC ≤ input_number.sig_hard_floor_pct → dispatch ≤ PV
+# HARD FLOOR (live clamp): SOC ≤ input_number.sig_drain_floor_pct → dispatch ≤ PV
 # so the battery can never DISCHARGE below the floor for any policy.
 #
 # Triggers: 1-min backstop beat; policy change; LIVE stale-setpoint — the
@@ -51,7 +51,7 @@ trigger:
       {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
       {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
       {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
-      {% set hard = states('input_number.sig_hard_floor_pct') | float(12) %}
+      {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
       {% set raw = (cap + load) if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
       {% set pre = ([raw, pv] | min if soc <= hard else raw) %}
       {% set want = [[pre, [load + cap, 6.6] | min] | min, 0] | max %}
@@ -67,7 +67,7 @@ action:
       load_kw: "{{ [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max }}"
       pv_kw: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
       soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) }}"
-      hard_pct: "{{ states('input_number.sig_hard_floor_pct') | float(12) }}"
+      hard_pct: "{{ states('input_number.sig_drain_floor_pct') | float(2.8) }}"
       policy: "{{ states('input_select.sig_dispatch_policy') }}"
       raw_kw: "{{ (cap_kw + load_kw) if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
       # Ceiling = the most the inverter can actually push out: export-limited

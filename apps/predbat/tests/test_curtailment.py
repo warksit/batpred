@@ -1112,8 +1112,8 @@ def test_dispatch_policy_low_soc_hands_to_msc():
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     base.services.clear()
-    # 1.5 kWh of 18.08 = 8.3% < 12% handover
-    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.5, soc_max=18.08)
+    # 0.4 kWh of 18.08 = 2.2% < 2.8% drain floor → hand to MSC
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=0.4, soc_max=18.08)
     assert _policy_calls(base) == ["Predbat"], base.services
     assert plugin._policy_driving is True  # still our day; resumes when SOC recovers
     print("  test_dispatch_policy_low_soc_hands_to_msc: PASSED")
@@ -1198,7 +1198,7 @@ def test_heartbeat_stays_on_through_low_soc():
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
     base.services.clear()
     # SOC drops below the 12% handover — still in the window
-    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.5, soc_max=18.08)
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=0.4, soc_max=18.08)
     assert not any(s == "automation/turn_off" for s, _ in _automation_calls(base)), f"must NOT disable heartbeat on low-SOC, got {base.services}"
     assert plugin._cm_controlling is True
     assert _policy_calls(base) == ["Predbat"], base.services
@@ -1241,8 +1241,8 @@ def test_read_only_released_on_low_soc_handover():
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
     assert base.set_read_only is True
-    # 1.5 kWh of 18.08 = 8.3% < 12% handover → hand to Predbat
-    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.5, soc_max=18.08)
+    # 0.4 kWh of 18.08 = 2.2% < 2.8% drain floor → hand to Predbat
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=0.4, soc_max=18.08)
     assert base.set_read_only is False, "low-SOC handover must release read_only"
     print("  test_read_only_released_on_low_soc_handover: PASSED")
 
@@ -4871,6 +4871,79 @@ def test_v32_upcoming_session_raises_drain_floor():
     print(f"  test_v32_upcoming_session_raises_drain_floor: PASSED (drain_above {without}->{with_session})")
 
 
+def test_v32_drain_floor_drives_between_2_8_and_5pct():
+    """v32: with the single drain floor (2.8%), the plugin keeps driving Max Export
+    between 2.8% and the old 5% — SOC 0.7 kWh (3.9%) drives, SOC 0.4 kWh (2.2%)
+    hands to MSC. (Old 5% handover would have handed to MSC at 3.9%.)"""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 0.9
+    plugin._policy_override = None
+    base.services.clear()
+    # 0.7 kWh / 18.08 = 3.9% > 2.8% → drive (SOC above drain_above 0.9? no, 0.7<0.9
+    # → Charge). Point is it does NOT hand to MSC.
+    plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.7, soc_max=18.08)
+    assert _policy_calls(base) and _policy_calls(base)[-1] != "Predbat", f"3.9% > 2.8% floor must drive, not MSC: {base.services}"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.4, soc_max=18.08)
+    assert _policy_calls(base) == ["Predbat"], f"2.2% < 2.8% floor → MSC handover: {base.services}"
+    print("  test_v32_drain_floor_drives_between_2_8_and_5pct: PASSED")
+
+
+def test_v32_keep_floor_min_is_drain_floor_not_5():
+    """v32: the published keep-floor is clamped to the drain floor (2.8%), not the
+    old hardcoded 5%. A huge-overflow floor of 0.5 kWh publishes ~2.8%."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 0.5
+    plugin._policy_override = "max_export"  # draining
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.5, soc_kwh=6.0, soc_max=18.08)
+    kf = _keep_floor_calls(base)
+    assert kf and 2.5 <= kf[-1] <= 3.0, f"keep floor should clamp to ~2.8%, not 5%, got {kf}"
+    print("  test_v32_keep_floor_min_is_drain_floor_not_5: PASSED")
+
+
+def test_v32_drain_floor_helper_override():
+    """v32: sig_drain_floor_pct helper is honoured — set to 6%, SOC 5% hands to MSC."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides["input_number.sig_drain_floor_pct"] = "6"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 0.9
+    base.services.clear()
+    # 0.9 kWh / 18.08 = 5.0% < 6% → MSC
+    plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.9, soc_max=18.08)
+    assert _policy_calls(base) == ["Predbat"], f"5% < 6% helper floor → MSC: {base.services}"
+    print("  test_v32_drain_floor_helper_override: PASSED")
+
+
+def test_v32_pre_pv_hold_no_dawn_flap():
+    """v32 dawn-flap fix: once the pre-PV drain has fired, if PV hasn't arrived yet
+    (actual_pv<0.1) and overflow is still forecast, the plugin HOLDS active instead
+    of handing back to Predbat — no off↔active flap at the 0.1 kW dawn boundary."""
+    pv = {m: 0.0 for m in range(0, 720, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 720, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 0.05, "sensor.sigen_plant_consumed_power": 0.5}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=0.4,  # already drained below the pre-PV target → decision returns None
+        minutes_now=240,  # 04:00 — pre-dawn, PV not yet
+        best_soc_keep=4.0,
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._pre_pv_engaged_today = True  # the pre-PV drain already fired this morning
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", f"v32: hold active after pre-PV drain done, got {phase}"
+    assert plugin._policy_override == "hold", f"v32: dawn hold override, got {plugin._policy_override}"
+    print("  test_v32_pre_pv_hold_no_dawn_flap: PASSED")
+
+
 # ============================================================================
 # Test runner
 # ============================================================================
@@ -5310,6 +5383,10 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_sundown_still_deactivates,
         test_v32_saving_session_active_forces_max_export,
         test_v32_upcoming_session_raises_drain_floor,
+        test_v32_drain_floor_drives_between_2_8_and_5pct,
+        test_v32_keep_floor_min_is_drain_floor_not_5,
+        test_v32_drain_floor_helper_override,
+        test_v32_pre_pv_hold_no_dawn_flap,
     ]
     print("  --- v32 evening lifecycle tests ---")
     for test_fn in v32_tests:

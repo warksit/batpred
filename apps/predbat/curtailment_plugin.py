@@ -86,7 +86,17 @@ SIG_POLICY_CONTROL_ENABLE = "input_boolean.sig_plugin_policy_control"
 SIG_MANUAL_OVERRIDE = "input_boolean.sig_manual_override"
 SIG_POLICY_SELECT = "input_select.sig_dispatch_policy"
 SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
-SIG_LOW_SOC_HANDOVER_HELPER = "input_number.sig_low_soc_handover_pct"
+# v32 (2026-07-21): single drain-floor helper — the ONE SOC below which CM stops
+# selling the battery to grid. Replaces the three coincident 5% floors (heartbeat
+# sig_hard_floor_pct, plugin sig_low_soc_handover_pct, hardcoded keep-clamp). It
+# governs both the low-SOC→MSC handover and the published keep-floor minimum, and
+# the heartbeat reads the same helper for its dispatch≤PV clamp. Default 2.8% =
+# the deep-discharge floor (0.5 kWh), so the pre-dawn drain can reach it; it can
+# only ever RAISE the floor above 2.8% (drain_above is hard-floored at 0.5 kWh).
+# NB the hardware discharge cut-off is 0% by design (rails at device extremes),
+# so this software floor is the operational protection, not the BMS.
+SIG_DRAIN_FLOOR_HELPER = "input_number.sig_drain_floor_pct"
+DEFAULT_DRAIN_FLOOR_PCT = 2.8
 # Plugin owns the single-writer handoff: it enables the heartbeat (the register
 # writer) only while CM drives, and parks the unit in EMS-MSC on handback so
 # Predbat controls from the EMS plane. Never app modes (RD2).
@@ -94,7 +104,6 @@ SIG_HEARTBEAT_AUTOMATION = "automation.sig_dispatch_heartbeat"
 SIG_EMS_MODE_SELECT = "select.sigen_plant_remote_ems_control_mode"
 SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
-DEFAULT_LOW_SOC_HANDOVER_PCT = 12.0  # below this, hand to MSC (RD4 "A")
 POLICY_PREDBAT = "Predbat"
 # v31 floor/handback (2026-07-19): saving-session reserve (Octopus sensor CM can
 # read directly) + early-handback buffer (fit p90 overflow with this to spare).
@@ -251,6 +260,11 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_fits_latched = False
         self._session_active = False
         self._session_protect_kwh = 0.0
+        # v32 dawn-flap latch: once the pre-PV drain fires, CM owns the day. When the
+        # drain completes but PV hasn't arrived (actual_pv < 0.1) and overflow is still
+        # forecast, HOLD active instead of handing back to Predbat — otherwise the
+        # dawn 0.1kW PV boundary flaps off↔active (observed 2026-07-21 05:39-05:52).
+        self._pre_pv_engaged_today = False
         # Single-writer handoff: True while CM controls (heartbeat enabled). None =
         # unknown on first run (adopt from read_only). Edge-triggered so we don't
         # spam turn_on/off or overwrite a manual EMS mode every cycle.
@@ -461,6 +475,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_drained_today = False
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
+        self._pre_pv_engaged_today = False  # v32 dawn-flap latch
         self._policy_override = None
         self._logged_once = set()  # re-arm the once-per-day fallback logs
         self._state_date = datetime.now().strftime("%Y-%m-%d")
@@ -1201,8 +1216,26 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(target_kwh, 2)
                 self._overflow_floor_kwh = round(target_kwh, 2)
                 self._p10_recovery_floor = 0.0
+                self._pre_pv_engaged_today = True
                 self._save_state()
                 return target_kwh, "active"
+
+            # v32 dawn-flap fix: the pre-PV drain has finished (pre_pv is None) but PV
+            # hasn't arrived yet. If it fired today and overflow is still forecast,
+            # HOLD active (battery flat at the drained level) rather than handing back
+            # to Predbat/MSC — otherwise actual PV flickering across the 0.1kW boundary
+            # at dawn flaps off↔active and churns the policy/heartbeat (2026-07-21).
+            # This block only runs pre-dawn (peak not yet observed), so it can't affect
+            # the evening; Hold at PV≈0 = cover load from battery, no sell, no absorb.
+            if self._pre_pv_engaged_today and self._overflow_p90 > PRE_PV_OVERFLOW_THRESHOLD_KWH:
+                self._policy_override = "hold"
+                self._floor_source = "Pre-PV Hold"
+                self._effective_keep_kwh = round(soc_kw, 2)
+                self._overflow_floor_kwh = round(soc_kw, 2)
+                self._p10_recovery_floor = 0.0
+                self._last_decision = "active (pre-PV hold): drain done, awaiting PV"
+                self._save_state()
+                return soc_kw, "active"
 
             self._last_decision = "off: no PV yet"
             self._floor_source = "Overnight Reserve"
@@ -2106,9 +2139,9 @@ class CurtailmentPlugin(PredBatPlugin):
         handover; below it hands to MSC (RD4 "A"); on the active->off edge hands back
         to Predbat once and resets the sell floor to 38% (RD10)."""
         try:
-            low_soc = float(self.base.get_state_wrapper(SIG_LOW_SOC_HANDOVER_HELPER, default=DEFAULT_LOW_SOC_HANDOVER_PCT))
+            low_soc = float(self.base.get_state_wrapper(SIG_DRAIN_FLOOR_HELPER, default=DEFAULT_DRAIN_FLOOR_PCT))
         except (TypeError, ValueError):
-            low_soc = DEFAULT_LOW_SOC_HANDOVER_PCT
+            low_soc = DEFAULT_DRAIN_FLOOR_PCT
         soc_pct = soc_kwh / max(soc_max, 0.1) * 100
 
         # Decide the intended policy + keep floor (pure decision, no side effects yet)
@@ -2126,7 +2159,9 @@ class CurtailmentPlugin(PredBatPlugin):
             else:
                 schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
             intended_policy = phase_to_policy(schmitt)
-            intended_keep = min(max(floor_kwh / max(soc_max, 0.1) * 100, 5.0), 95.0)
+            # Keep-floor published to the guard: never below the single drain floor
+            # (v32) — one number governs the handover AND this clamp.
+            intended_keep = min(max(floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
             ovr = " (override {})".format(self._policy_override) if self._policy_override else ""
             reason = "active {}{} | soc {:.0f}% band [{:.1f}, {:.1f}] kWh".format(schmitt, ovr, soc_pct, self._charge_below, self._drain_above)
         elif plugin_active:
