@@ -10,8 +10,12 @@
 #                        control mode = Maximum Self Consumption. NEVER app modes.
 #                        Predbat controls from EMS-MSC by switching EMS modes.
 #                        Idempotent so it doesn't fight Predbat once it takes over.
-#   Max Export         → dispatch = cap + load: export pinned at 3.68, battery
-#                        discharges to hold it below PV, absorbs above. (old Drain)
+#   Max Export         → dispatch = 6.6 (inverter max): command max output and let
+#                        grid_export_limitation clamp export to the DNO cap in
+#                        hardware — export pinned at 3.68, battery discharges to hold
+#                        it below PV, absorbs above. Firmware tracks load at hardware
+#                        speed (no heartbeat lag). Drain-floor clamp still applies.
+#                        (old Drain)
 #   Hold Battery       → dispatch = max(PV, load): battery flat (never absorbs),
 #                        exports PV surplus, covers load shortfall from battery. (old Hold)
 #   Solar Charge Battery → dispatch = load: absorb all PV surplus into the battery,
@@ -54,9 +58,10 @@ trigger:
       {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
       {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
       {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
-      {% set raw = (cap + load) if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
+      {% set raw = 6.6 if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
+      {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
       {% set pre = ([raw, pv] | min if soc <= hard else raw) %}
-      {% set want = [[pre, [load + cap, 6.6] | min] | min, 0] | max %}
+      {% set want = [[pre, ceil] | min, 0] | max %}
       {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and
          is_state('switch.sigen_plant_remote_ems_controlled_by_home_assistant', 'on') and
          (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1 }}
@@ -70,12 +75,17 @@ action:
       soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) }}"
       hard_pct: "{{ states('input_number.sig_drain_floor_pct') | float(2.8) }}"
       policy: "{{ states('input_select.sig_dispatch_policy') }}"
-      raw_kw: "{{ (cap_kw + load_kw) if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
-      # Ceiling = the most the inverter can actually push out: export-limited
-      # (load + DNO cap) and never above the 6.6 kW inverter AC rating. Capping
-      # here (rather than a raw 6.0) makes the dispatch figure honest and keeps the
-      # live trigger quiet while PV sits above load+cap (the cap holds output flat).
-      ceiling_kw: "{{ [load_kw + cap_kw, 6.6] | min }}"
+      raw_kw: "{{ 6.6 if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
+      # Ceiling = the most the inverter should push out.
+      # - Max Export: 6.6 (inverter AC max) — command max output and let the SIG's
+      #   grid_export_limitation clamp export to the DNO cap in HARDWARE. Draining
+      #   the battery to hold the cap IS Max Export's intent, so no load-tracking is
+      #   needed; the firmware tracks load at hardware speed (no heartbeat lag). The
+      #   drain-floor clamp (pre) still bites below sig_drain_floor_pct.
+      # - Hold / Solar Charge: load+cap (export-limited), never above 6.6. The
+      #   load+cap ceiling is what keeps Hold FLAT (tracks PV); a flat 6.6 would turn
+      #   Hold into a battery-draining Max Export on any PV dip.
+      ceiling_kw: "{{ 6.6 if policy == 'Max Export' else [load_kw + cap_kw, 6.6] | min }}"
       dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), ceiling_kw] | min, 0] | max }}"
   - choose:
       # Release (Predbat): STAY in EMS control (RD2). Remote EMS ON, EMS control

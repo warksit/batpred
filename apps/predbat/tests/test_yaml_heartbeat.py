@@ -102,11 +102,23 @@ def test_dispatch_tracks_pv_on_dip():
     print(f"PASS  dip: Hold @PV3.0 → {d:.2f} (tracks PV)")
 
 
-def test_dispatch_high_load_uses_66():
-    # Max Export, high load → ceiling = inverter 6.6, NOT 6.0.
-    d = _render_dispatch(_load(), _mock("Max Export", pv=5.0, load=3.0, soc=50))
-    assert abs(d - 6.6) < 0.01, f"high-load Max Export must reach 6.6 (inverter max), got {d}"
-    print(f"PASS  inverter max: Max Export @load3.0 → {d:.2f} (6.6, not 6.0)")
+def test_dispatch_max_export_always_66():
+    # v32: Max Export commands 6.6 (inverter max) regardless of load — the SIG's
+    # grid_export_limitation clamps export to the DNO cap in hardware. Low load
+    # (would be load+cap=4.18 under the old formula) and high load both → 6.6.
+    d_lo = _render_dispatch(_load(), _mock("Max Export", pv=8.0, load=0.5, soc=50))
+    d_hi = _render_dispatch(_load(), _mock("Max Export", pv=5.0, load=3.0, soc=50))
+    assert abs(d_lo - 6.6) < 0.01, f"Max Export @low load must command 6.6 (not load+cap), got {d_lo}"
+    assert abs(d_hi - 6.6) < 0.01, f"Max Export @high load must command 6.6, got {d_hi}"
+    print(f"PASS  Max Export = 6.6 regardless of load: lo={d_lo:.2f} hi={d_hi:.2f}")
+
+
+def test_dispatch_hold_still_tracks_load_ceiling():
+    # Hold is UNCHANGED — it must still pin at load+cap (not 6.6), so it stays flat
+    # and doesn't drain on a PV dip. PV over cap → dispatch = load+cap.
+    d = _render_dispatch(_load(), _mock("Hold Battery", pv=8.0, load=0.5, soc=50))
+    assert abs(d - 4.18) < 0.01, f"Hold must pin at load+cap 4.18 (NOT 6.6), got {d}"
+    print(f"PASS  Hold ceiling unchanged: Hold @PV8 load0.5 → {d:.2f} (load+cap, not 6.6)")
 
 
 def test_dispatch_hard_floor_clamp():
@@ -117,11 +129,11 @@ def test_dispatch_hard_floor_clamp():
 
 
 def test_dispatch_drives_between_2_8_and_5():
-    # v32: SOC 4% is ABOVE the 2.8% drain floor → Max Export drains normally
-    # (cap+load), NOT clamped to PV. (Old 5% floor would have clamped here.)
+    # v32: SOC 4% is ABOVE the 2.8% drain floor → Max Export commands 6.6 (drives),
+    # NOT clamped to PV. (Old 5% floor would have clamped to PV here.)
     d = _render_dispatch(_load(), _mock("Max Export", pv=2.0, load=0.55, soc=4, hard=2.8))
-    assert d > 2.5, f"SOC4% > 2.8% floor must drive (cap+load), not clamp to PV, got {d}"
-    print(f"PASS  drain floor: SOC4% Max Export → {d:.2f} (drives, above 2.8% floor)")
+    assert abs(d - 6.6) < 0.01, f"SOC4% > 2.8% floor: Max Export must command 6.6, not clamp to PV, got {d}"
+    print(f"PASS  drain floor: SOC4% Max Export → {d:.2f} (drives 6.6, above 2.8% floor)")
 
 
 def test_dispatch_drain_floor_default_2_8():
@@ -139,7 +151,8 @@ def main():
         test_live_trigger,
         test_dispatch_ceiling_overflow,
         test_dispatch_tracks_pv_on_dip,
-        test_dispatch_high_load_uses_66,
+        test_dispatch_max_export_always_66,
+        test_dispatch_hold_still_tracks_load_ceiling,
         test_dispatch_hard_floor_clamp,
         test_dispatch_drives_between_2_8_and_5,
         test_dispatch_drain_floor_default_2_8,
