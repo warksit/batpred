@@ -22,9 +22,11 @@
 #
 # Triggers: 1-min backstop beat; policy change; LIVE stale-setpoint — the
 # template references PV + load, so it re-evaluates on every change and fires
-# when the wanted dispatch drifts >0.1 kW from the register for 2 s. Self-
-# limiting: the load+cap ceiling keeps `want` flat while PV > load+cap, so it
-# stays quiet through the overflow peak and only writes on real output changes.
+# IMMEDIATELY (no debounce) when the wanted dispatch drifts >0.1 kW from the
+# register. The >0.1 gate IS the write filter (no hysteresis needed): self-
+# limiting because the load+cap ceiling keeps `want` flat while PV > load+cap,
+# so it stays quiet through the overflow peak and only writes on real output
+# changes. Reacts to a load/PV step within a beat, not seconds late.
 #
 # IMPORTANT: update and commit this file before changing the automation in HA.
 # Deploy via ha_config_set_automation config: (full replacement), NOT python_transform.
@@ -58,7 +60,6 @@ trigger:
       {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and
          is_state('switch.sigen_plant_remote_ems_controlled_by_home_assistant', 'on') and
          (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1 }}
-    for: "00:00:02"
     id: stale_setpoint
 
 action:

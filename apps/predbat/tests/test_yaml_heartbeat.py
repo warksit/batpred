@@ -84,8 +84,8 @@ def test_live_trigger():
     stale = next((t for t in auto["trigger"] if t.get("id") == "stale_setpoint"), None)
     assert stale is not None, "stale_setpoint trigger missing"
     assert "> 0.1" in stale["value_template"], "live trigger must use 0.1 kW threshold"
-    assert str(stale.get("for")) in ("0:00:02", "00:00:02"), f"live trigger must debounce ~2 s, got {stale.get('for')}"
-    print("PASS  live trigger: 0.1 kW deviation, 2 s debounce")
+    assert stale.get("for") in (None, 0, "0:00:00", "00:00:00"), f"live trigger must fire immediately (no debounce), got for={stale.get('for')}"
+    print("PASS  live trigger: 0.1 kW deviation, immediate (no debounce)")
 
 
 def test_dispatch_ceiling_overflow():
