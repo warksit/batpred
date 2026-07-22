@@ -3007,7 +3007,7 @@ def test_holds_past_safe_time_until_sundown():
     plugin.base = base
     plugin.on_update()
     assert plugin.last_phase == "active", "v32: stay active past safe_time while PV flows"
-    assert plugin._policy_override == "hold", f"v32: Hold past safe_time, got {plugin._policy_override}"
+    assert plugin._policy_override == "no_drain", f"v32.1: no_drain past safe_time, got {plugin._policy_override}"
 
     # Now PV falls to ≈0 → sundown → deactivate.
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.05
@@ -3162,7 +3162,7 @@ def test_R54_target_uses_keep_when_lower_than_overflow_floor():
     # ACTIVE and Holds (battery flat, export surplus at cap), NOT deactivate to MSC
     # (the v31 early-handback round-tripped PV on 2026-07-20).
     assert phase == "active", f"v32: small overflow fits → active + Hold (not off), got {phase}"
-    assert plugin._policy_override == "hold", f"v32: overflow-fits → Hold override, got {plugin._policy_override}"
+    assert plugin._policy_override == "no_drain", f"v32.1: overflow-fits → no_drain override, got {plugin._policy_override}"
     print("  test_R54_target_uses_keep_when_lower_than_overflow_floor: PASSED (active + Hold)")
 
 
@@ -3662,7 +3662,7 @@ def test_R55_overnight_target_raises_effective_keep_in_calculate():
     # → off, which round-tripped PV via MSC).
     assert cached_target is not None, "calculate should still cache overnight_target (feeds recovery floor)"
     assert phase == "active", f"v32: small overflow fits → active + Hold, got {phase}"
-    assert plugin._policy_override == "hold", f"v32: overflow-fits → Hold override, got {plugin._policy_override}"
+    assert plugin._policy_override == "no_drain", f"v32.1: overflow-fits → no_drain override, got {plugin._policy_override}"
     print(f"  test_R55_...: PASSED (overnight_target cached={cached_target:.2f}, active+Hold)")
 
 
@@ -4733,7 +4733,7 @@ def test_v32_no_deactivate_past_safe_time_holds():
     plugin._peak_pv = 7.5
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"v32: stay active past safe_time while PV>0.1, got {phase}"
-    assert plugin._policy_override == "hold", f"v32: past safe_time → Hold override, got {plugin._policy_override}"
+    assert plugin._policy_override == "no_drain", f"v32.1: past safe_time → no_drain override, got {plugin._policy_override}"
     print("  test_v32_no_deactivate_past_safe_time_holds: PASSED")
 
 
@@ -4761,7 +4761,7 @@ def test_v32_overflow_fits_holds_not_off():
     plugin._peak_pv = 7.5  # peak already seen today
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"v32: overflow-fits must NOT deactivate, got {phase}"
-    assert plugin._policy_override == "hold", f"v32: overflow-fits → Hold override, got {plugin._policy_override}"
+    assert plugin._policy_override == "no_drain", f"v32.1: overflow-fits → no_drain override, got {plugin._policy_override}"
     assert plugin._safe_time_str > "14:00", f"scenario must be before safe_time to test fits path, safe={plugin._safe_time_str}"
     print("  test_v32_overflow_fits_holds_not_off: PASSED")
 
@@ -4942,6 +4942,63 @@ def test_v32_pre_pv_hold_no_dawn_flap():
     assert phase == "active", f"v32: hold active after pre-PV drain done, got {phase}"
     assert plugin._policy_override == "hold", f"v32: dawn hold override, got {plugin._policy_override}"
     print("  test_v32_pre_pv_hold_no_dawn_flap: PASSED")
+
+
+def test_v32_1_no_drain_allows_charge_for_evening():
+    """v32.1: under the no_drain override (overflow fits / past safe), SOC below
+    charge_below → Solar Charge Battery — bank PV for the evening reserve. This is
+    the case v32's blanket Hold masked (overcast/low-overflow day)."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    # Late-day recovery need has lifted charge_below above the low SOC.
+    plugin._charge_below, plugin._drain_above = 7.0, 14.0
+    plugin._policy_override = "no_drain"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=7.0, soc_kwh=1.4, soc_max=18.08)  # 7.7% < charge_below 7.0kWh(39%)
+    assert _policy_calls(base) == ["Solar Charge Battery"], f"v32.1: no_drain + low SOC → Solar Charge (bank for evening), got {base.services}"
+    print("  test_v32_1_no_drain_allows_charge_for_evening: PASSED")
+
+
+def test_v32_1_no_drain_suppresses_drain():
+    """v32.1: under no_drain, SOC above drain_above must NOT Max Export (that's the
+    round-trip we're avoiding) — it clamps to Hold."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 8.0
+    plugin._policy_override = "no_drain"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=16.0, soc_max=18.08)  # 88% > drain_above
+    assert _policy_calls(base) == ["Hold Battery"], f"v32.1: no_drain must clamp Drain→Hold, got {base.services}"
+    print("  test_v32_1_no_drain_suppresses_drain: PASSED")
+
+
+def test_v32_1_no_drain_holds_in_band():
+    """v32.1: under no_drain, SOC between the thresholds → Hold (unchanged)."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._policy_override = "no_drain"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Hold Battery"], f"v32.1: no_drain in-band → Hold, got {base.services}"
+    print("  test_v32_1_no_drain_holds_in_band: PASSED")
+
+
+def test_v32_1_pure_hold_override_never_charges():
+    """v32.1: the pure 'hold' override (pre-PV dawn wait) must NOT charge even at
+    low SOC — we just drained for headroom and there's no surplus to bank."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 7.0, 14.0
+    plugin._policy_override = "hold"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=7.0, soc_kwh=1.4, soc_max=18.08)
+    assert _policy_calls(base) == ["Hold Battery"], f"v32.1: pure hold must stay Hold (no Charge), got {base.services}"
+    print("  test_v32_1_pure_hold_override_never_charges: PASSED")
 
 
 # ============================================================================
@@ -5387,6 +5444,10 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_keep_floor_min_is_drain_floor_not_5,
         test_v32_drain_floor_helper_override,
         test_v32_pre_pv_hold_no_dawn_flap,
+        test_v32_1_no_drain_allows_charge_for_evening,
+        test_v32_1_no_drain_suppresses_drain,
+        test_v32_1_no_drain_holds_in_band,
+        test_v32_1_pure_hold_override_never_charges,
     ]
     print("  --- v32 evening lifecycle tests ---")
     for test_fn in v32_tests:

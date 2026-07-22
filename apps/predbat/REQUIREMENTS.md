@@ -1236,6 +1236,25 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   extremes"), so this software floor — NOT the BMS — is the operational protection.
   The old "PCS ignores the hardware cut-off" note is unverified (the cut-off was 0%,
   so nothing was overridden). `sig_hard_floor_pct` + `sig_low_soc_handover_pct` retired.
+- **RD17 — Override allows Charge, suppresses Drain (v32.1, 2026-07-22).** The
+  overflow-fits / past-safe override was a blanket `Hold`, which masked the evening-
+  reserve Charge on a low-overflow (overcast) day: the plugin sat in Hold all day,
+  exported the sub-cap surplus, and handed a near-empty battery to Predbat at dusk.
+  Changed the override to **`no_drain`**: run the SOC-vs-band Schmitt but clamp
+  `Drain→Hold` (Drain is a pointless round-trip once there's no curtailment risk).
+  So `Charge` still fires when `SOC < charge_below` (the P10 recovery floor, which
+  rises through the afternoon) — banking PV into the battery for the evening — while
+  Drain stays suppressed. The pre-PV dawn wait keeps the **pure `hold`** override
+  (no Charge: we just drained for headroom, nothing to bank). Observed 2026-07-22:
+  overcast day, SOC stuck ~7.6% in Hold, would have entered evening empty.
+- **RD18 — Single keep-floor helper range + write robustness (2026-07-22).**
+  `sig_keep_floor_pct` (the plugin-written sell target the guard enforces) had range
+  [10,60] while the plugin's intended keep is 2.8–95%. An out-of-range intended (e.g.
+  77%) was stored clamped by HA while the plugin's dedup-cache held the unclamped
+  value → the change-check skipped forever and the helper wedged (observed stuck at
+  10% since pre-dawn 2026-07-22). Fix: widen the helper to [2,100] AND clamp the
+  written value to that range in `_set_keep_floor` before the change-check, so the
+  written value equals what HA stores. Added write/skip logging for live visibility.
 - **RD16 — Dawn-flap latch (2026-07-21).** Once the pre-PV drain fires today
   (`_pre_pv_engaged_today`), the "no PV yet" path must NOT hand back to Predbat when
   the drain completes while PV hasn't arrived. When the drain is done (`_pre_pv_drain

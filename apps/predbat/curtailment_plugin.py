@@ -1439,7 +1439,14 @@ class CurtailmentPlugin(PredBatPlugin):
         if self._session_active:
             self._policy_override = "max_export"
         elif self._overflow_fits_latched or past_safe:
-            self._policy_override = "hold"
+            # v32.1 (2026-07-22): "no_drain" — no curtailment risk left (overflow
+            # fits, or past safe_time), so DRAIN is a pointless round-trip and is
+            # suppressed. But the Schmitt still runs: CHARGE fires when SOC is below
+            # the P10 recovery floor (charge_below) so we bank PV for the evening
+            # reserve on a low-overflow day, and Hold otherwise. Previously this
+            # forced Hold for all SOC, which masked the evening-reserve Charge and
+            # left the battery flat all day on an overcast/low-overflow day.
+            self._policy_override = "no_drain"
         else:
             self._policy_override = None
 
@@ -2056,16 +2063,26 @@ class CurtailmentPlugin(PredBatPlugin):
             self._log_once("policy_set_err", "Curtailment: failed to set policy {}: {}".format(policy, e))
 
     def _set_keep_floor(self, pct):
-        """Set input_number.sig_keep_floor_pct, only when it changes materially."""
+        """Set input_number.sig_keep_floor_pct, only when it changes materially.
+
+        Clamp to the helper's [2, 100] range BEFORE the change-check so the value we
+        write is exactly what HA will store — otherwise an out-of-range intended
+        (e.g. 77% vs an old max-60 helper) is stored clamped (60) while our cache
+        thinks 77, and the change-check then skips forever, wedging the helper
+        (observed 2026-07-22: stuck at 10% since pre-dawn). Log each write and skip
+        so the write path is observable live during the current investigation."""
         pct = round(float(pct), 0)
+        pct = min(max(pct, 2.0), 100.0)
         try:
             current = float(self.base.get_state_wrapper(SIG_KEEP_FLOOR_HELPER, default=-1))
         except (TypeError, ValueError):
             current = -1
         if abs(current - pct) < 0.5:
+            self.log("Curtailment: keep floor unchanged (current={:.0f} intended={:.0f})".format(current, pct))
             return
         try:
             self.base.call_service_wrapper("input_number/set_value", entity_id=SIG_KEEP_FLOOR_HELPER, value=pct)
+            self.log("Curtailment: keep floor {:.0f} -> {:.0f}".format(current, pct))
         except Exception as e:
             self._log_once("keepfloor_set_err", "Curtailment: failed to set keep floor {}: {}".format(pct, e))
 
@@ -2155,7 +2172,14 @@ class CurtailmentPlugin(PredBatPlugin):
             if self._policy_override == "max_export":
                 schmitt = "Drain"
             elif self._policy_override == "hold":
+                # Pure hold (pre-PV dawn wait): battery flat, never charge/drain.
                 schmitt = "Hold"
+            elif self._policy_override == "no_drain":
+                # overflow-fits / past-safe: run the Schmitt but clamp Drain→Hold
+                # (no round-trip). Charge still fires for the evening reserve.
+                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
+                if schmitt == "Drain":
+                    schmitt = "Hold"
             else:
                 schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
             intended_policy = phase_to_policy(schmitt)
