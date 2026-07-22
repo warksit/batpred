@@ -1255,6 +1255,16 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   10% since pre-dawn 2026-07-22). Fix: widen the helper to [2,100] AND clamp the
   written value to that range in `_set_keep_floor` before the change-check, so the
   written value equals what HA stores. Added write/skip logging for live visibility.
+- **RD19 — Pre-PV drain start-latch (v32.2, 2026-07-22).** The pre-PV drain timing
+  gate (`now < drain_start_utc → wait`) was re-evaluated every cycle. But
+  `drain_start_utc = pv_start − drain_minutes/60` and `drain_minutes = (soc−target)
+  /dno×60`, so while draining at ~dno the drain window shrinks at ~60 min/h and
+  `drain_start_utc` advances at the SAME rate as `now`. The comparison therefore
+  hovers at equality and flips on any noise → the policy oscillates Max Export↔Hold
+  (RD16 pre-PV Hold on the None branch). Observed 2026-07-22 04:27–05:47 BST (~6
+  flips). Fix: the timing gate now gates the START only (`and not
+  _pre_pv_drain_started`); once the drain begins it commits and runs to target
+  (`soc ≤ target` is the clean exit → RD16 Hold). Latch clears at the day rollover.
 - **RD16 — Dawn-flap latch (2026-07-21).** Once the pre-PV drain fires today
   (`_pre_pv_engaged_today`), the "no PV yet" path must NOT hand back to Predbat when
   the drain completes while PV hasn't arrived. When the drain is done (`_pre_pv_drain

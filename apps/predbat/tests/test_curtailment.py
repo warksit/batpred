@@ -2007,6 +2007,31 @@ def test_R52_pre_pv_drain_low_overflow_forecast():
     print("  test_R52_pre_pv_drain_low_overflow_forecast: PASSED")
 
 
+def test_R52_pre_pv_drain_no_flap_once_started():
+    """REGRESSION (2026-07-22): once the pre-PV drain starts, it must run to target
+    WITHOUT the drain_start timing knife-edge flipping it back to Hold. As SOC
+    drains at ~dno, drain_minutes shrinks at ~60min/h so drain_start_utc advances
+    at the same rate as `now` — the `now < drain_start` ("too early") check hovers
+    at equality and flips on noise, causing Max Export↔Hold flapping (observed
+    04:27-05:47 BST). The start-latch must gate the START only, then drain to target.
+    """
+    base = _make_pre_pv_base(soc_pct=0.7, gshp_ch="off", hour=4)
+    plugin = CurtailmentPlugin(base)
+    floor1, phase1 = plugin.calculate(dno_limit_kw=4.0)
+    assert phase1 == "active", f"cycle1: drain should be active, got {phase1}"
+    assert plugin._policy_override is None, f"cycle1: draining → no override, got {plugin._policy_override}"
+    assert plugin._pre_pv_drain_started, "start-latch must set once the drain begins"
+
+    # Cycle 2: SOC has drained to just above target → drain_start_utc jumps toward
+    # pv_start (in the future) → the un-latched timing check would return None
+    # ('too early') → RD16 Hold. The latch must keep it draining (override None).
+    base.soc_kw = floor1 + 0.5
+    floor2, phase2 = plugin.calculate(dno_limit_kw=4.0)
+    assert phase2 == "active", f"cycle2: must stay active (draining to target), got {phase2}"
+    assert plugin._policy_override is None, f"cycle2: must keep draining, not flap to Hold, got override={plugin._policy_override}"
+    print("  test_R52_pre_pv_drain_no_flap_once_started: PASSED")
+
+
 # ============================================================================
 # R9a: LoadML smoothing tests (v20)
 # ============================================================================
@@ -5423,6 +5448,7 @@ def run_curtailment_tests(my_predbat=None):
         test_R62_pre_pv_publish_thresholds_not_stale,
         test_R52_pre_pv_drain_already_below_target,
         test_R52_pre_pv_drain_low_overflow_forecast,
+        test_R52_pre_pv_drain_no_flap_once_started,
     ]
     print("  --- R52 pre-PV drain tests ---")
     for test_fn in r52_tests:

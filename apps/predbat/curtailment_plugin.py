@@ -265,6 +265,12 @@ class CurtailmentPlugin(PredBatPlugin):
         # forecast, HOLD active instead of handing back to Predbat — otherwise the
         # dawn 0.1kW PV boundary flaps off↔active (observed 2026-07-21 05:39-05:52).
         self._pre_pv_engaged_today = False
+        # v32.2 (2026-07-22): start-latch for the pre-PV drain. Once the drain_start
+        # timing gate first passes, commit to draining to target — don't re-gate on
+        # `now < drain_start` each cycle. drain_start_utc tracks `now` as SOC drains
+        # (drain at ~dno shrinks drain_minutes at ~60min/h), so re-gating flips on
+        # noise → Max Export↔Hold flapping (observed 2026-07-22 04:27-05:47 BST).
+        self._pre_pv_drain_started = False
         # Single-writer handoff: True while CM controls (heartbeat enabled). None =
         # unknown on first run (adopt from read_only). Edge-triggered so we don't
         # spam turn_on/off or overwrite a manual EMS mode every cycle.
@@ -476,6 +482,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
         self._pre_pv_engaged_today = False  # v32 dawn-flap latch
+        self._pre_pv_drain_started = False  # v32.2 pre-PV drain start-latch
         self._policy_override = None
         self._logged_once = set()  # re-arm the once-per-day fallback logs
         self._state_date = datetime.now().strftime("%Y-%m-%d")
@@ -1019,8 +1026,15 @@ class CurtailmentPlugin(PredBatPlugin):
         drain_minutes = drain_amount / dno_limit_kw * 60.0
         drain_start_utc = pv_start_utc - drain_minutes / 60.0
 
-        if utc_hours < drain_start_utc:
-            return None  # too early — wait
+        # v32.2: the timing gate is a START gate ONLY. drain_start_utc tracks `now`
+        # as SOC drains (draining at ~dno shrinks drain_minutes at ~60min/h), so
+        # re-checking `now < drain_start` every cycle hovers at equality and flips
+        # on noise → Max Export↔Hold flapping. Once the drain has begun, commit and
+        # run to target (the soc<=target check above is the clean exit). Latch clears
+        # at the day rollover.
+        if utc_hours < drain_start_utc and not self._pre_pv_drain_started:
+            return None  # too early — wait (only gates the START)
+        self._pre_pv_drain_started = True
 
         # Safe-time string for dashboard
         pv_start_local = pv_start_utc + local_offset
