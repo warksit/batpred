@@ -2197,9 +2197,23 @@ class CurtailmentPlugin(PredBatPlugin):
             else:
                 schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
             intended_policy = phase_to_policy(schmitt)
-            # Keep-floor published to the guard: never below the single drain floor
-            # (v32) — one number governs the handover AND this clamp.
-            intended_keep = min(max(floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
+            # Sell floor (v32.3): the guard's "stop Max Export at this SOC" level.
+            # Use the curtailment drain target (floor_kwh = overflow_floor) ONLY
+            # during a genuine curtailment drain (Schmitt Drain, no override) —
+            # incl. the pre-PV drain — so the big-overflow deep drain still works.
+            # Otherwise (session dump, Hold, Charge, no_drain) use the overnight
+            # reserve, the level we actually preserve. Publishing the rising
+            # overflow_floor as the sell floor while Holding read as nonsense on a
+            # low-overflow morning (climbed to ~68% at 8% SOC) and under-sold saving
+            # sessions (stopped the dump at 68% instead of the overnight reserve).
+            is_curtailment_drain = self._policy_override is None and schmitt == "Drain"
+            if is_curtailment_drain:
+                sell_floor_kwh = floor_kwh
+            elif self._overnight_target_kwh:
+                sell_floor_kwh = self._overnight_target_kwh
+            else:
+                sell_floor_kwh = DEFAULT_KEEP_FLOOR_PCT / 100.0 * soc_max
+            intended_keep = min(max(sell_floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
             ovr = " (override {})".format(self._policy_override) if self._policy_override else ""
             reason = "active {}{} | soc {:.0f}% band [{:.1f}, {:.1f}] kWh".format(schmitt, ovr, soc_pct, self._charge_below, self._drain_above)
         elif plugin_active:

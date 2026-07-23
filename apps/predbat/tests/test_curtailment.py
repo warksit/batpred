@@ -1079,16 +1079,19 @@ def test_dispatch_policy_gated_off_publishes_intended_only():
 
 
 def test_dispatch_policy_drives_hold_when_enabled():
-    """Gate on + active + SOC in band → Hold Battery + keep floor set."""
+    """Gate on + active + SOC in band → Hold Battery + keep floor set. v32.3: Hold
+    is not a curtailment drain, so the sell floor is the overnight reserve
+    (overnight_target), NOT the overflow_floor drain target."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._overnight_target_kwh = 8.0  # ~44%
     base.services.clear()
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
     assert _policy_calls(base) == ["Hold Battery"], base.services
     kf = _keep_floor_calls(base)
-    assert kf and abs(kf[-1] - 44) <= 1, f"keep floor ~44%, got {kf}"
+    assert kf and abs(kf[-1] - 44) <= 1, f"Hold sell floor = overnight reserve ~44%, got {kf}"
     assert plugin._policy_driving is True
     print("  test_dispatch_policy_drives_hold_when_enabled: PASSED")
 
@@ -1138,6 +1141,61 @@ def test_dispatch_policy_handback_once_on_deactivate():
     plugin._publish_dispatch_policy(False, 18.08, 10.0, 18.08)
     assert not _policy_calls(base), f"no repeat handback, got {base.services}"
     print("  test_dispatch_policy_handback_once_on_deactivate: PASSED")
+
+
+def test_sell_floor_overnight_reserve_when_not_draining():
+    """v32.3: the sell floor (keep_floor) must NOT track the rising overflow_floor
+    while Holding — on a low-overflow morning that climbs to ~68% and reads as
+    nonsense (we're not selling). When not curtailment-draining, publish the
+    overnight reserve (~overnight_target), the level we actually preserve."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 12.3  # low-overflow: high drain_above
+    plugin._policy_override = "no_drain"
+    plugin._overnight_target_kwh = 7.0  # ~39%
+    base.services.clear()
+    # floor_kwh = overflow_floor 12.3 (68%) — the OLD (misleading) sell floor.
+    plugin._publish_dispatch_policy(True, floor_kwh=12.3, soc_kwh=1.5, soc_max=18.08)
+    kf = _keep_floor_calls(base)
+    assert kf and 37 <= kf[-1] <= 40, f"sell floor should be overnight reserve ~39%, not overflow_floor 68%, got {kf}"
+    print("  test_sell_floor_overnight_reserve_when_not_draining: PASSED")
+
+
+def test_sell_floor_overflow_floor_during_curtailment_drain():
+    """v32.3: during a genuine curtailment drain (Schmitt Drain, no override), the
+    sell floor MUST stay = overflow_floor (drain target) so the big-overflow deep
+    drain still works — unchanged from before."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 5.0  # big-overflow: low drain_above
+    plugin._policy_override = None
+    plugin._overnight_target_kwh = 7.0
+    base.services.clear()
+    # SOC above drain_above → Schmitt Drain. floor_kwh = overflow_floor 0.9 (5%).
+    plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=10.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Max Export"], base.services
+    kf = _keep_floor_calls(base)
+    assert kf and abs(kf[-1] - 5) <= 1, f"curtailment drain: sell floor = overflow_floor ~5%, got {kf}"
+    print("  test_sell_floor_overflow_floor_during_curtailment_drain: PASSED")
+
+
+def test_sell_floor_session_dumps_to_overnight_reserve():
+    """v32.3: a saving-session Max Export must dump down to the overnight reserve,
+    NOT stop at the (high) overflow_floor — otherwise it under-sells the session."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 12.3  # low-overflow day
+    plugin._policy_override = "max_export"  # session dump
+    plugin._overnight_target_kwh = 7.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=12.3, soc_kwh=10.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Max Export"], base.services
+    kf = _keep_floor_calls(base)
+    assert kf and 37 <= kf[-1] <= 40, f"session dump sell floor = overnight reserve ~39%, not 68%, got {kf}"
+    print("  test_sell_floor_session_dumps_to_overnight_reserve: PASSED")
 
 
 def _automation_calls(base):
@@ -4917,15 +4975,17 @@ def test_v32_drain_floor_drives_between_2_8_and_5pct():
 
 
 def test_v32_keep_floor_min_is_drain_floor_not_5():
-    """v32: the published keep-floor is clamped to the drain floor (2.8%), not the
-    old hardcoded 5%. A huge-overflow floor of 0.5 kWh publishes ~2.8%."""
+    """v32: on a huge-overflow CURTAILMENT drain (Schmitt Drain, no override) the
+    published keep-floor reaches the drain floor (2.8%), not the old hardcoded 5%.
+    A floor_kwh of 0.5 kWh publishes ~2.8% (v32.3: curtailment drain uses floor_kwh)."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
-    plugin._charge_below, plugin._drain_above = 0.5, 0.5
-    plugin._policy_override = "max_export"  # draining
+    plugin._charge_below, plugin._drain_above = 0.5, 0.5  # deep drain target
+    # override None + SOC above drain_above → Schmitt Drain (curtailment drain)
     base.services.clear()
     plugin._publish_dispatch_policy(True, floor_kwh=0.5, soc_kwh=6.0, soc_max=18.08)
+    assert _policy_calls(base) == ["Max Export"], base.services
     kf = _keep_floor_calls(base)
     assert kf and 2.5 <= kf[-1] <= 3.0, f"keep floor should clamp to ~2.8%, not 5%, got {kf}"
     print("  test_v32_keep_floor_min_is_drain_floor_not_5: PASSED")
@@ -5137,6 +5197,9 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_max_export_high_soc,
         test_dispatch_policy_low_soc_hands_to_msc,
         test_dispatch_policy_handback_once_on_deactivate,
+        test_sell_floor_overnight_reserve_when_not_draining,
+        test_sell_floor_overflow_floor_during_curtailment_drain,
+        test_sell_floor_session_dumps_to_overnight_reserve,
         test_read_only_set_when_cm_driving,
         test_read_only_released_on_handback,
         test_read_only_released_on_low_soc_handover,

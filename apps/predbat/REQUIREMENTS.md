@@ -1265,6 +1265,19 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   flips). Fix: the timing gate now gates the START only (`and not
   _pre_pv_drain_started`); once the drain begins it commits and runs to target
   (`soc ≤ target` is the clean exit → RD16 Hold). Latch clears at the day rollover.
+- **RD20 — Sell floor tracks drain intent, not overflow_floor (v32.3, 2026-07-23).**
+  The published sell floor (`sig_keep_floor_pct`, the guard's "stop Max Export at
+  this SOC") was always set to `floor_kwh` (= `overflow_floor`). But `overflow_floor`
+  RISES toward 100% as the forecast overflow winds down (R13), so on a low-overflow
+  morning the sell floor climbed to ~68% while the plugin was Holding at 8% SOC —
+  meaningless (nothing selling) and it would have under-sold a saving session
+  (stopping the dump at 68% instead of the overnight reserve). Fix: use
+  `overflow_floor` as the sell floor ONLY during a genuine curtailment drain
+  (`_policy_override is None and schmitt == "Drain"`, which includes the pre-PV
+  drain) so the big-overflow deep drain is unchanged; otherwise (session Max Export,
+  Hold, Charge, no_drain) use the overnight reserve (`_overnight_target_kwh`, else
+  the 38% RD10 default). Observed 2026-07-23: sell floor ramped 10%→55%→68% while
+  Holding.
 - **RD16 — Dawn-flap latch (2026-07-21).** Once the pre-PV drain fires today
   (`_pre_pv_engaged_today`), the "no PV yet" path must NOT hand back to Predbat when
   the drain completes while PV hasn't arrived. When the drain is done (`_pre_pv_drain
