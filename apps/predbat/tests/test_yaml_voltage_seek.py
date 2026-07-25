@@ -1,0 +1,262 @@
+# -----------------------------------------------------------------------------
+# Predbat voltage seek controller — HA automation YAML test harness
+#
+# Loads ha/voltage_seek_controller.yaml at runtime, extracts the
+# action[].variables block, and renders each Jinja template against a
+# fixture matrix using a mocked HA context (states/state_attr).
+#
+# Why this exists: on 2026-05-06 a python_transform-based edit appended
+# `ramp_zero_v` and `ramp_full_v` AFTER the `new_cap` template that referenced
+# them. HA evaluates variables top-down, so `new_cap` saw them as Undefined,
+# every branch silently fell to `else { cap }`, and the seek controller froze
+# the cap for ~2 hours during peak PV — contributing to a SIG OVP trip.
+# StrictUndefined here will raise on any reference-before-definition, catching
+# this exact class of bug pre-deploy.
+#
+# Run: cd apps/predbat && python3 tests/test_yaml_voltage_seek.py
+# -----------------------------------------------------------------------------
+
+import os
+import sys
+from dataclasses import dataclass
+
+import jinja2
+import yaml
+
+YAML_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "ha",
+    "voltage_seek_controller.yaml",
+)
+DNO = 4.0
+
+
+# ---------- Mock HA layer ------------------------------------------------------
+
+
+class HAState:
+    def __init__(self, states):
+        self._states = states
+
+    def states(self, entity_id):
+        v = self._states.get(entity_id)
+        if v is None:
+            return "unknown"
+        return v if isinstance(v, str) else str(v)
+
+
+# ---------- YAML loader --------------------------------------------------------
+
+
+def load_variables_from_yaml(path):
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    for step in doc.get("action", []):
+        if isinstance(step, dict) and "variables" in step:
+            return step["variables"]
+    raise RuntimeError(f"No 'variables' block found in {path}")
+
+
+def load_set_value_template(path):
+    """The action that writes to filtered_cap — usually `{{ new_cap | float | round(2) }}`."""
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    for step in doc.get("action", []):
+        if isinstance(step, dict) and step.get("action") == "input_number.set_value":
+            return step["data"]["value"]
+    raise RuntimeError(f"No input_number.set_value action found in {path}")
+
+
+# ---------- Variable evaluator -------------------------------------------------
+
+
+def _coerce(s):
+    if not isinstance(s, str):
+        return s
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+
+def _new_env(ha):
+    env = jinja2.Environment(
+        undefined=jinja2.StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    env.globals["states"] = ha.states
+    return env
+
+
+def evaluate(variables, set_value_tpl, states):
+    """Render variables in declaration order, then the set_value template.
+
+    Returns the final cap value the automation would write.
+    """
+    ha = HAState(states)
+    env = _new_env(ha)
+    ctx = {}
+    for name, raw in variables.items():
+        if isinstance(raw, str) and ("{{" in raw or "{%" in raw):
+            rendered = env.from_string(raw).render(**ctx)
+            ctx[name] = _coerce(rendered)
+        else:
+            ctx[name] = raw
+    final = env.from_string(set_value_tpl).render(**ctx)
+    return float(final)
+
+
+# ---------- Fixture builder ----------------------------------------------------
+
+
+def build_states(v, cap, target=250.0, range_v=8.0, deadband=0.5):
+    return {
+        "sensor.sigen_inverter_phase_a_voltage": str(v),
+        "input_number.voltage_throttle_filtered_cap": str(cap),
+        "input_number.voltage_seek_target_v": str(target),
+        "input_number.voltage_seek_range_v": str(range_v),
+        "input_number.voltage_seek_deadband_v": str(deadband),
+    }
+
+
+# ---------- Scenarios ----------------------------------------------------------
+
+
+@dataclass
+class Scenario:
+    name: str
+    v: float
+    cap: float
+    expected: float
+    target: float = 250.0
+    range_v: float = 8.0
+    deadband: float = 0.5
+    tol: float = 0.01
+
+
+SCENARIOS = [
+    # target=250, range_v=8, deadband=0.5 (default) → hold band [249.5, 250.5];
+    # ramp engages at V>250.5, cap=0 at V=258.5. Climb fires at V<249.5.
+    # ----- Hold band (symmetric hysteresis around target) -----
+    Scenario("V=target → hold (centre of band)", v=250.0, cap=3.0, expected=3.0),
+    Scenario("V=target+0.3 → hold (inside band)", v=250.3, cap=3.0, expected=3.0),
+    Scenario("V=target+0.5 → hold (boundary, > strict)", v=250.5, cap=4.0, expected=4.0),
+    Scenario("V=target-0.3 → hold (inside band)", v=249.7, cap=2.0, expected=2.0),
+    Scenario("V=target-0.5 → hold (boundary, < strict)", v=249.5, cap=2.0, expected=2.0),
+    # ----- Ramp DOWN: anchored at (target + deadband), slope = dno/range_v -----
+    Scenario("V=target+0.7 → cap_max=4-0.5*0.2=3.9", v=250.7, cap=4.0, expected=3.9),
+    Scenario("V=target+1 → cap_max=4-0.5*0.5=3.75", v=251.0, cap=4.0, expected=3.75),
+    Scenario("V=target+2 → cap_max=4-0.5*1.5=3.25", v=252.0, cap=4.0, expected=3.25),
+    Scenario("V=target+2 → cap stays if already < cap_max", v=252.0, cap=2.5, expected=2.5),
+    Scenario("V=target+4 → cap_max=4-0.5*3.5=2.25", v=254.0, cap=4.0, expected=2.25),
+    Scenario("V=target+6 → cap_max=4-0.5*5.5=1.25", v=256.0, cap=4.0, expected=1.25),
+    Scenario("V=target+8 → cap_max=4-0.5*7.5=0.25", v=258.0, cap=4.0, expected=0.25),
+    Scenario("V=target+8.5 → cap=0 (ramp_zero)", v=258.5, cap=4.0, expected=0.0),
+    Scenario("V=target+9 → cap=0 (beyond ramp_zero)", v=259.0, cap=4.0, expected=0.0),
+    Scenario("V=263 (real spike) → cap=0", v=263.0, cap=3.5, expected=0.0),
+    # ----- Climb (V below hold band) -----
+    Scenario("V=target-0.7 → climb base", v=249.3, cap=2.0, expected=2.05),
+    Scenario("V=target-1 → climb base (under_v=1, step=base)", v=249.0, cap=0.0, expected=0.05),
+    Scenario("V=246 climb adaptive (under_v=4 → step=0.20)", v=246.0, cap=0.0, expected=0.20),
+    Scenario("V=245 climb (under_v=5 → step=0.25)", v=245.0, cap=0.0, expected=0.25),
+    Scenario("V=240 climb clamped to step_up_max=0.4", v=240.0, cap=0.0, expected=0.4),
+    Scenario("climb saturates at DNO", v=240.0, cap=4.0, expected=4.0),
+    # ----- Deadband=0 (no hysteresis) — equivalent to old behaviour -----
+    Scenario("deadband=0: V=target+1 → cap_max=3.5", v=251.0, cap=4.0, expected=3.5, deadband=0.0),
+    Scenario("deadband=0: V=target+8 → cap=0", v=258.0, cap=4.0, expected=0.0, deadband=0.0),
+    Scenario("deadband=0: V=target → hold", v=250.0, cap=3.0, expected=3.0, deadband=0.0),
+    Scenario("deadband=0: V=target-0.1 → climb", v=249.9, cap=2.0, expected=2.05, deadband=0.0),
+    # ----- Wider deadband -----
+    Scenario("deadband=1.0: V=target+0.8 → hold", v=250.8, cap=3.0, expected=3.0, deadband=1.0),
+    Scenario("deadband=1.0: V=target+1.5 → cap_max=4-0.5*0.5=3.75", v=251.5, cap=4.0, expected=3.75, deadband=1.0),
+    Scenario("deadband=1.0: V=target-0.8 → hold", v=249.2, cap=2.0, expected=2.0, deadband=1.0),
+    # ----- Adjustable target (deadband=0.5 default) -----
+    Scenario("target=253 V=253.4 → hold (inside band)", v=253.4, cap=4.0, expected=4.0, target=253.0),
+    Scenario("target=253 V=255 → cap_max=4-0.5*1.5=3.25", v=255.0, cap=4.0, expected=3.25, target=253.0),
+    Scenario("target=253 V=261.5 → cap=0 (target+8.5)", v=261.5, cap=4.0, expected=0.0, target=253.0),
+    # ----- Adjustable range (deadband=0.5 default) -----
+    Scenario("range=4: V=target+1.5 → cap_max=4-1.0*1.0=3", v=251.5, cap=4.0, expected=3.0, range_v=4.0),
+    Scenario("range=4: V=target+4.5 → cap=0", v=254.5, cap=4.0, expected=0.0, range_v=4.0),
+]
+
+
+# ---------- Regression test: bug-pattern detection -----------------------------
+
+
+def test_bug_pattern_caught():
+    """Move ramp_zero_v / ramp_full_v after new_cap and confirm StrictUndefined raises.
+
+    This is the exact bug shape from 2026-05-06: a python_transform appended
+    those constants at the end of the variables dict, leaving `new_cap` to
+    reference Undefined values. Without StrictUndefined the controller silently
+    fell through every branch to `else { cap }` and froze the cap for ~2 hours.
+    """
+    variables = load_variables_from_yaml(YAML_PATH)
+    set_value_tpl = load_set_value_template(YAML_PATH)
+    states = build_states(v=256.0, cap=3.16)
+
+    # Reorder: move ramp_start_v to AFTER new_cap (it's referenced inside new_cap).
+    # This is the exact mechanism that broke us on 2026-05-06 — out-of-order
+    # variables that new_cap depends on, evaluated as Undefined under HA's
+    # loose semantics, falling through every branch to else { cap }.
+    broken = {}
+    moved = {}
+    for k, v in variables.items():
+        if k == "ramp_start_v":
+            moved[k] = v
+        else:
+            broken[k] = v
+    broken.update(moved)
+
+    try:
+        evaluate(broken, set_value_tpl, states)
+    except jinja2.UndefinedError:
+        return True  # expected — harness caught the bug
+    raise AssertionError("Bug pattern NOT caught — out-of-order variables should raise UndefinedError under StrictUndefined")
+
+
+# ---------- Test runner --------------------------------------------------------
+
+
+def main():
+    variables = load_variables_from_yaml(YAML_PATH)
+    set_value_tpl = load_set_value_template(YAML_PATH)
+
+    # Bug-pattern regression test runs first (fast, separate from scenarios).
+    try:
+        test_bug_pattern_caught()
+        print("PASS  bug-pattern regression: out-of-order vars raise UndefinedError")
+    except AssertionError as e:
+        print(f"FAIL  bug-pattern regression: {e}")
+        sys.exit(1)
+
+    failed = 0
+    for s in SCENARIOS:
+        states = build_states(s.v, s.cap, s.target, s.range_v, s.deadband)
+        try:
+            actual = evaluate(variables, set_value_tpl, states)
+        except jinja2.UndefinedError as e:
+            print(f"FAIL  {s.name}: UndefinedError {e}")
+            failed += 1
+            continue
+        except Exception as e:
+            print(f"FAIL  {s.name}: {type(e).__name__}: {e}")
+            failed += 1
+            continue
+        ok = abs(actual - s.expected) <= s.tol
+        marker = "PASS" if ok else "FAIL"
+        if not ok:
+            failed += 1
+        print(f"{marker}  {s.name}: V={s.v}, cap={s.cap}, target={s.target} → got {actual} expected {s.expected}")
+
+    print()
+    if failed:
+        print(f"{failed}/{len(SCENARIOS)} scenarios failed")
+        sys.exit(1)
+    print(f"All {len(SCENARIOS)} scenarios passed")
+
+
+if __name__ == "__main__":
+    main()

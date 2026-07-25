@@ -1,0 +1,80 @@
+# Predbat Requested Mode → SIG EMS mode mapper
+#
+# Predbat (SIG refactor architecture) publishes its desired inverter mode to
+# input_select.predbat_requested_mode; this automation maps it onto the SIG
+# remote EMS control mode entity.
+#
+# Mode map:
+#   Demand             → Maximum Self Consumption
+#   Charging           → Command Charging (Grid First)
+#   Freeze Charging    → Maximum Self Consumption (+ grid import limit 0)
+#   Discharging        → Command Discharging (PV First)
+#   Freeze Discharging → Maximum Self Consumption (+ grid import limit 0)
+#
+# 2026-06-12: Charging changed PV First → Grid First. A Predbat charge window
+# is a grid charge (cheap-rate slot, usually overnight with zero PV).
+# "Command Charging (PV First)" cannot be relied on to pull from grid at
+# night; the March 2026 in-Predbat SIG control used Grid First for active
+# charge windows and was validated live. Trade-off: a daytime charge window
+# will draw grid (at the cheap rate Predbat chose) even when PV is available.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config:, NOT python_transform.
+
+id: "predbat_requested_mode_action"
+alias: "Predbat Requested Mode Action"
+description: >-
+  Acts as a mapper for the input_select.predbat_requested_mode to the
+  select.sigen_plant_remote_ems_control_mode
+mode: restart
+
+trigger:
+  - entity_id:
+      - input_select.predbat_requested_mode
+    platform: state
+
+action:
+  - action: select.select_option
+    target:
+      entity_id: select.sigen_plant_remote_ems_control_mode
+    data:
+      option: >-
+        {% if is_state('input_select.predbat_requested_mode', 'Demand') %}Maximum Self Consumption
+        {%- elif is_state('input_select.predbat_requested_mode', 'Charging') %}Command Charging (Grid First)
+        {%- elif is_state('input_select.predbat_requested_mode', 'Freeze Charging') %}Maximum Self Consumption
+        {%- elif is_state('input_select.predbat_requested_mode', 'Discharging') %}Command Discharging (PV First)
+        {%- elif is_state('input_select.predbat_requested_mode', 'Freeze Discharging') %}Maximum Self Consumption
+        {%- endif %}
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: input_select.predbat_requested_mode
+            state: "Freeze Charging"
+        sequence:
+          - data_template:
+              entity_id: number.sigen_plant_grid_import_limitation
+              value: 0
+            action: number.set_value
+      - conditions:
+          - condition: state
+            entity_id: input_select.predbat_requested_mode
+            state: "Freeze Discharging"
+        sequence:
+          - data_template:
+              entity_id: number.sigen_plant_grid_import_limitation
+              value: 0
+            action: number.set_value
+      - conditions:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: input_select.predbat_requested_mode
+                state: "Freeze Charging"
+              - condition: state
+                entity_id: input_select.predbat_requested_mode
+                state: "Freeze Discharging"
+        sequence:
+          - data_template:
+              entity_id: number.sigen_plant_grid_import_limitation
+              value: 100
+            action: number.set_value
