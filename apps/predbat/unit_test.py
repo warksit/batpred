@@ -39,6 +39,7 @@ from tests.test_nordpool import run_nordpool_test
 from tests.test_futurerate_auto import test_futurerate_auto
 from tests.test_car_charging_smart import run_car_charging_smart_tests
 from tests.test_plugin_startup import test_plugin_startup_order
+from tests.test_plugin_before_plan import test_plugin_before_plan
 from tests.test_active_flag import test_active_flag
 from tests.test_component_health_status import test_component_health_status
 from tests.test_optimise_levels import run_optimise_levels_tests
