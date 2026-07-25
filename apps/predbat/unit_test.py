@@ -66,6 +66,7 @@ from tests.test_futurerate_auto import test_futurerate_auto
 from tests.test_car_charging_smart import run_car_charging_smart_tests
 from tests.test_battery_accuracy import run_battery_accuracy_tests
 from tests.test_plugin_startup import test_plugin_startup_order
+from tests.test_plugin_before_plan import test_plugin_before_plan
 from tests.test_active_flag import test_active_flag
 from tests.test_time_loop_guard import test_time_loop_guard
 from tests.test_component_health_status import test_component_health_status, test_record_status_state_clamped
