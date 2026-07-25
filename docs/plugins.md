@@ -6,11 +6,13 @@
 
 - **Auto-discovery**: Automatically finds and loads plugins from multiple directories (`plugins/`, same directory, parent directory)
 - **Flexible plugin detection**: Supports multiple plugin patterns (classes ending in 'Plugin', `PREDBAT_PLUGIN` marker, `initialize_plugin()` function)
-- **Lifecycle hooks**: Provides four key integration points:
+- **Lifecycle hooks**: Provides five key integration points:
     - `on_init`: Called when plugin system initialises
+    - `on_before_plan`: Called before plan calculation; callbacks receive and return a context dict (e.g. `best_soc_keep`) and run in `priority` order (lower first)
     - `on_update`: Called during each update cycle
     - `on_shutdown`: Called during graceful shutdown
     - `on_web_start`: Called when web interface starts
+- **Hook priority**: Optional `priority` on `PredBatPlugin` (default 100); pass `plugin=self` to `register_hook` so ordering is applied
 - **Error resilience**: Continues loading other plugins even if one fails
 - **Base class**: Optional `PredBatPlugin` base class for standardized plugin development
 
@@ -23,6 +25,8 @@
 ## 🔧 Technical Details
 
 - Plugin files must end with `_plugin.py` for auto-discovery
+- `on_before_plan` hooks chain a context dict via `call_before_plan_hooks()` immediately before `calculate_plan()`
+- Use `priority` (lower runs first) when multiple plugins adjust the same plan parameters
 - Plugins can be simple classes, inherit from `PredBatPlugin`, or use initialization functions
 - Web endpoints can be registered by plugins for custom interfaces (e.g., metrics endpoints)
 - Full error handling and logging throughout the plugin lifecycle
