@@ -1,0 +1,46 @@
+# Octopus Rate Liveness Alert
+#
+# Fires when either Octopus current_rate sensor goes unknown for >30 min.
+# The 2026-05-12 incident had an invalid API key cause silent failure that
+# went unnoticed for 4 days — by which time Predbat had been planning with
+# zero price signal and overnight imports drifted up because rate arbitrage
+# couldn't kick in.
+#
+# Detection: state == "unknown" for 30 min on either import or export rate.
+# A 30-min window filters momentary integration restart hiccups but catches
+# auth-failure outages within one notification cycle.
+#
+# Resolution: single notification per outage (mode: single + tracked via
+# input_boolean) — no repeat spam. Acks itself when rates return.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+
+id: "octopus_rate_liveness_alert"
+alias: "Octopus Rate Liveness Alert"
+description: >-
+  Notify when Octopus current_rate sensors are unknown for >30 min
+  (typically expired API key). Single push per outage, no repeat spam.
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id:
+      - sensor.octopus_energy_electricity_24j0698298_1100025301348_current_rate
+      - sensor.octopus_energy_electricity_24j0698298_1170002420520_export_current_rate
+    to: "unknown"
+    for:
+      minutes: 30
+
+action:
+  - service: notify.mobile_app_andrew_iphone
+    data:
+      title: "Octopus Integration Down"
+      message: >-
+        Octopus rate sensor has been unknown for >30 min. Predbat plans will
+        run without price signal. Most likely cause: expired API key.
+        Fix: Settings, Devices, Octopus Energy, Configure, paste new key.
+      data:
+        push:
+          sound:
+            name: "default"

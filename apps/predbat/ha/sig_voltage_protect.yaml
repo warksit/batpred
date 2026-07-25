@@ -1,0 +1,141 @@
+# SIG Voltage Protect — notifications only (v3)
+#
+# As of 2026-05-06, the seek controller (automation.voltage_seek_controller)
+# is the active export-cap regulator. This automation is purely for alerting
+# and dashboard state — it triggers off grid voltage directly, not the
+# now-decoupled raw proportional cap sensor.
+#
+# Behaviour:
+#   - V > 256V (target+deadband)   → boolean ON immediately, count event
+#   - V < 254V (target-deadband)   → boolean OFF immediately
+#   - Boolean ON sustained 1 min   → push engage notification
+#   - Boolean OFF sustained 1 min after engage → push release notification
+#
+# Why voltage triggers, not cap:
+#   The seek controller adjusts cap continuously to track the target voltage.
+#   Cap dropping to 3.5 during normal operation is not a "throttle event" —
+#   it's just the controller responding to a grid up-tick. The real signal
+#   is voltage exceeding the deadband for sustained periods, which means the
+#   seek is actively dumping export to bring V back down.
+#
+# Note: the V thresholds (256/254) are hard-coded here, not read from the
+# seek target/deadband helpers. Keep in mind if the user retunes the seek
+# target — update these too.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+
+id: "sig_voltage_protect_v1"
+alias: "SIG Voltage Protect"
+description: >-
+  Two-stage. input_boolean.sig_voltage_protect_active reflects real-time
+  high-voltage state (V > 256V → on, V < 254V → off, immediate, no debounce).
+  Notifications fire only when the boolean has been sustained on/off for 1
+  minute, gated by an "alerted" flag so release alerts don't fire without a
+  preceding engage.
+
+mode: queued
+max: 6
+max_exceeded: silent
+
+trigger:
+  # Real-time boolean toggle — immediate when V crosses thresholds
+  - platform: numeric_state
+    entity_id: sensor.sigen_inverter_phase_a_voltage
+    above: 256
+    id: throttle_start
+  - platform: numeric_state
+    entity_id: sensor.sigen_inverter_phase_a_voltage
+    below: 254
+    id: throttle_end
+  # Notification triggers — debounced via state-with-for on the boolean
+  - platform: state
+    entity_id: input_boolean.sig_voltage_protect_active
+    to: "on"
+    for: "00:01:00"
+    id: notify_engage
+  - platform: state
+    entity_id: input_boolean.sig_voltage_protect_active
+    to: "off"
+    for: "00:01:00"
+    id: notify_release
+
+action:
+  - variables:
+      cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(4) }}"
+      voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') | float(240) }}"
+      soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
+
+  - choose:
+      # V crossed up over 256V — flip boolean ON immediately, count every event
+      - conditions:
+          - condition: trigger
+            id: throttle_start
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sig_voltage_protect_active
+          - action: counter.increment
+            target:
+              entity_id: counter.voltage_throttle_activations_today
+
+      # V crossed back below 254V — flip boolean OFF immediately
+      - conditions:
+          - condition: trigger
+            id: throttle_end
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.sig_voltage_protect_active
+
+      # Boolean has been ON sustained 1 min — fire engage notification once
+      - conditions:
+          - condition: trigger
+            id: notify_engage
+          - condition: state
+            entity_id: input_boolean.sig_voltage_protect_alerted
+            state: "off"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.sig_voltage_protect_alerted
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.voltage_throttle_engage_lost_start
+            data:
+              value: "{{ states('sensor.sig_voltage_throttle_lost_energy') | float(0) }}"
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "⚠️ Voltage throttle engaged (V={{ voltage }}V)"
+              message: >-
+                V > 256V sustained 1 min. Seek live cap: {{ cap }} kW.
+                SOC: {{ soc }}%
+
+      # Boolean has been OFF sustained 1 min AFTER an engage — fire release
+      - conditions:
+          - condition: trigger
+            id: notify_release
+          - condition: state
+            entity_id: input_boolean.sig_voltage_protect_alerted
+            state: "on"
+        sequence:
+          - variables:
+              alerted_since: >-
+                {{ as_timestamp(states.input_boolean.sig_voltage_protect_alerted.last_changed) }}
+              elapsed_seconds: >-
+                {{ (as_timestamp(now()) - alerted_since) | int }}
+              duration_str: >-
+                {%- set m = elapsed_seconds // 60 -%}
+                {%- set s = elapsed_seconds % 60 -%}
+                {%- if m > 0 -%}{{ m }}m {{ s }}s{%- else -%}{{ s }}s{%- endif -%}
+              lost_now: "{{ states('sensor.sig_voltage_throttle_lost_energy') | float(0) }}"
+              lost_start: "{{ states('input_number.voltage_throttle_engage_lost_start') | float(0) }}"
+              lost_session_kwh: "{{ (lost_now - lost_start) | round(2) }}"
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.sig_voltage_protect_alerted
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "✅ Voltage throttle released (V={{ voltage }}V)"
+              message: >-
+                Active {{ duration_str }}. Lost ~{{ lost_session_kwh }} kWh
+                export. Live cap: {{ cap }} kW. SOC: {{ soc }}%
