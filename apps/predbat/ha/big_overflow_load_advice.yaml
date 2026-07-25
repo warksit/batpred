@@ -1,0 +1,103 @@
+# Big Overflow Day Load Advice
+# Reminder when battery shortfall is GENUINELY too big for absorption.
+# Only fires on the rare days when extra loads are absolutely necessary.
+#
+# Behaviour: AM/PM split with timing windows.
+#
+#   Morning (09:00-13:00): shortfall ≥ 3 kWh sustained 2h
+#     - High threshold: forecast still wobbly, plenty of time later
+#     - Quiet 13:00-14:30: DHW running anyway, no point alerting
+#
+#   Afternoon (14:30+): shortfall ≥ 1 kWh sustained 30 min
+#     - Lower threshold: DHW done, day is short, even small loss matters
+#
+# Fires at most ONCE per day.
+#
+# Companion sensors:
+#   binary_sensor.big_overflow_shortfall      — ON when shortfall ≥ 1 kWh (afternoon signal)
+#   binary_sensor.big_overflow_shortfall_high — ON when shortfall ≥ 3 kWh (morning signal)
+#   shortfall = (overflow_kwh - battery_room) where battery_room = (1 - soc/100) × 18.08
+#
+# Sent to both Andrew and Shona since it's a friendly suggestion.
+
+id: "big_overflow_load_advice_v1"
+alias: "Big Overflow Day - Load Advice"
+description: >-
+  Alert when battery shortfall is genuinely too big for absorption.
+  Morning (09:00-13:00): shortfall ≥ 3 kWh sustained 2h.
+  Afternoon (14:30+): shortfall ≥ 1 kWh sustained 30 min.
+  Once per day. Quiet 13:00-14:30 (DHW window).
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: time_pattern
+    minutes: "/15"
+
+condition:
+  - condition: state
+    entity_id: sensor.predbat_curtailment_phase
+    state: "Active"
+  # Only before safe_time
+  - condition: template
+    value_template: >-
+      {{ now().strftime('%H:%M') < (state_attr('sensor.predbat_curtailment_phase', 'safe_time') or '23:59') }}
+  # Once per day max
+  - condition: template
+    value_template: >-
+      {{ this.attributes.last_triggered is none or as_timestamp(this.attributes.last_triggered) < as_timestamp(today_at()) }}
+  # Either morning (high bar, 09:00-13:00, 2h dwell) OR afternoon (low bar, post-DHW, 30min dwell)
+  - condition: or
+    conditions:
+      - condition: and
+        conditions:
+          - condition: time
+            after: "09:00:00"
+            before: "13:00:00"
+          - condition: state
+            entity_id: binary_sensor.big_overflow_shortfall_high
+            state: "on"
+          - condition: template
+            value_template: >-
+              {% set s = states.binary_sensor.big_overflow_shortfall_high %}
+              {{ (now() - s.last_changed).total_seconds() >= 7200 }}
+      - condition: and
+        conditions:
+          - condition: time
+            after: "14:30:00"
+          - condition: state
+            entity_id: binary_sensor.big_overflow_shortfall
+            state: "on"
+          - condition: template
+            value_template: >-
+              {% set s = states.binary_sensor.big_overflow_shortfall %}
+              {{ (now() - s.last_changed).total_seconds() >= 1800 }}
+
+action:
+  - variables:
+      overflow_kwh: "{{ state_attr('sensor.predbat_curtailment_phase', 'overflow_kwh') | float(0) }}"
+      soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(0) }}"
+      soc_max: 18.08
+      soc_kwh: "{{ (soc_pct / 100) * soc_max }}"
+      room_kwh: "{{ soc_max - soc_kwh }}"
+      shortfall_kwh: "{{ (overflow_kwh - room_kwh) | round(1) }}"
+      safe_time: "{{ state_attr('sensor.predbat_curtailment_phase', 'safe_time') }}"
+
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "☀️ Big PV day — run extra loads"
+      message: >-
+        ☀️ Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
+        🔋 {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
+        going to waste (until safe_time {{ safe_time }}) unless we soak it up.
+        Good time to run: 🍽️ dishwasher, 🧺 washing machine, 🚗 EV, ♨️ immersion.
+
+  - action: notify.mobile_app_shona_s_ipad
+    data:
+      title: "☀️ Big PV day — run extra loads"
+      message: >-
+        ☀️ Forecast overflow {{ overflow_kwh | round(1) }} kWh, battery room
+        🔋 {{ room_kwh | round(1) }} kWh. About {{ shortfall_kwh }} kWh of solar
+        going to waste (until safe_time {{ safe_time }}) unless we soak it up.
+        Good time to run: 🍽️ dishwasher, 🧺 washing machine, 🚗 EV, ♨️ immersion.

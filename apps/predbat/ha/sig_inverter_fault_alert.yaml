@@ -1,0 +1,72 @@
+# SIG Inverter Fault Alert
+# HA automation: detects when SIG inverter active power is stuck near zero for 2+ minutes.
+#
+# Distinguishes between:
+#   - Benign G99 protective disconnects (Shutdown/Environmental/Standby) — non-critical
+#     sound, auto-recovers 3-5 min. Message says "No action needed".
+#   - Genuine faults (Running-but-idle meter fault, unknown states) — critical sound,
+#     action required.
+#
+# Message includes voltage and frequency for diagnosis (requires
+# sensor.sigen_inverter_grid_frequency to be enabled in the Sigen integration).
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+
+id: "1774884719302"
+alias: "SIG Inverter Fault Alert"
+description: >-
+  Alert on SIG leaving Running state for >15s (catches brief protective disconnects
+  like 100-sec Environmental Abnormality events) OR active_power stuck near zero for
+  2+ minutes (meter communication fault with SIG still Running).
+  Benign G99 states (Shutdown/Environmental/Standby) use non-critical sound;
+  genuine faults use critical.
+mode: single
+max_exceeded: silent
+
+trigger:
+  # Catches brief protective disconnects (100-sec Environmental Abnormality, etc)
+  - platform: state
+    entity_id: sensor.sigen_plant_plant_running_state
+    from: "Running"
+    to:
+      - "Shutdown"
+      - "Environmental Abnormality"
+      - "Standby"
+      - "Fault"
+    for:
+      seconds: 15
+  # Catches meter comm fault (SIG still Running but active_power stuck near zero)
+  - platform: numeric_state
+    entity_id: sensor.sigen_inverter_active_power
+    above: -0.01
+    below: 0.01
+    for:
+      minutes: 2
+
+action:
+  - variables:
+      running_state: "{{ states('sensor.sigen_plant_plant_running_state') }}"
+      voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') }}"
+      freq: "{{ states('sensor.sigen_inverter_grid_frequency') }}"
+      is_protective: "{{ states('sensor.sigen_plant_plant_running_state') in ['Shutdown', 'Environmental Abnormality', 'Standby'] }}"
+      fault_type: >-
+        {% set s = states('sensor.sigen_plant_plant_running_state') %}
+        {% if s == 'Running' %}Meter Communication Fault - inverter running but idle, likely lost meter connection. ACTION: Check mySigen app for alert 4001_2. May need meter power cycle.
+        {% elif s == 'Shutdown' %}SIG Protective Disconnect (Shutdown) - G99 grid protection. Auto-recovers in 3-5 min. No action needed.
+        {% elif s == 'Environmental Abnormality' %}SIG Environmental Abnormality - grid voltage/frequency excursion. Auto-recovers in 1-2 min. No action needed.
+        {% elif s == 'Standby' %}SIG Standby - recovering from protective disconnect. No action needed.
+        {% else %}SIG Inverter Fault ({{ s }}) - check inverter.
+        {% endif %}
+      soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
+      pv: "{{ states('sensor.sigen_plant_pv_power') }}"
+
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "SIG Inverter Alert"
+      message: "{{ fault_type }}\nSOC: {{ soc }}% | PV: {{ pv }} kW | V: {{ voltage }} | f: {{ freq }} Hz"
+      data:
+        push:
+          sound:
+            name: "default"
+            critical: "{{ 0 if is_protective else 1 }}"
+            volume: 0.5

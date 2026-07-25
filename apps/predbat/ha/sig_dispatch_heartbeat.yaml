@@ -1,0 +1,154 @@
+# SIG Dispatch Heartbeat — interim v-next executor (2026-07-18 rev, renamed policies)
+#
+# THE single writer of the SigenStor control registers. Driven entirely by
+# input_select.sig_dispatch_policy — the master control surface. Everything
+# else (keep-floor/dusk guard, the future plugin, Predbat mapper, a human)
+# sets the POLICY; only this automation touches Remote EMS enable, control
+# mode, export limit and PCS dispatch.
+#
+#   Predbat            → release (RD2): STAY in EMS control — Remote EMS ON, EMS
+#                        control mode = Maximum Self Consumption. NEVER app modes.
+#                        Predbat controls from EMS-MSC by switching EMS modes.
+#                        Idempotent so it doesn't fight Predbat once it takes over.
+#   Max Export         → dispatch = 6.6 (inverter max): command max output and let
+#                        grid_export_limitation clamp export to the DNO cap in
+#                        hardware — export pinned at 3.68, battery discharges to hold
+#                        it below PV, absorbs above. Firmware tracks load at hardware
+#                        speed (no heartbeat lag). Drain-floor clamp still applies.
+#                        (old Drain)
+#   Hold Battery       → dispatch = max(PV, load): battery flat (never absorbs),
+#                        exports PV surplus, covers load shortfall from battery. (old Hold)
+#   Solar Charge Battery → dispatch = load: absorb all PV surplus into the battery,
+#                        zero export, cover the house. (old Charge, R16)
+#
+# HARD FLOOR (live clamp): SOC ≤ input_number.sig_drain_floor_pct → dispatch ≤ PV
+# so the battery can never DISCHARGE below the floor for any policy.
+#
+# Triggers: 1-min backstop beat; policy change; LIVE stale-setpoint — the
+# template references PV + load, so it re-evaluates on every change and fires
+# IMMEDIATELY (no debounce) when the wanted dispatch drifts >0.1 kW from the
+# register. The >0.1 gate IS the write filter (no hysteresis needed): self-
+# limiting because the load+cap ceiling keeps `want` flat while PV > load+cap,
+# so it stays quiet through the overflow peak and only writes on real output
+# changes. Reacts to a load/PV step within a beat, not seconds late.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config: (full replacement), NOT python_transform.
+
+id: "sig_dispatch_heartbeat"
+alias: "SIG Dispatch Heartbeat"
+description: >-
+  Sole writer of SigenStor control registers, driven by
+  input_select.sig_dispatch_policy. See repo file header
+  (apps/predbat/ha/sig_dispatch_heartbeat.yaml).
+mode: restart
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+    id: beat
+  - platform: state
+    entity_id: input_select.sig_dispatch_policy
+    id: policy_change
+  - platform: template
+    value_template: >-
+      {% set p = states('input_select.sig_dispatch_policy') %}
+      {% set cap = (states('input_number.dno_export_limit_w') | float(3680)) / 1000 %}
+      {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
+      {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
+      {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
+      {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
+      {% set raw = 6.6 if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
+      {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
+      {% set pre = ([raw, pv] | min if soc <= hard else raw) %}
+      {% set want = [[pre, ceil] | min, 0] | max %}
+      {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and
+         is_state('switch.sigen_plant_remote_ems_controlled_by_home_assistant', 'on') and
+         (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1 }}
+    id: stale_setpoint
+
+action:
+  - variables:
+      cap_kw: "{{ (states('input_number.dno_export_limit_w') | float(3680)) / 1000 }}"
+      load_kw: "{{ [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max }}"
+      pv_kw: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
+      soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) }}"
+      hard_pct: "{{ states('input_number.sig_drain_floor_pct') | float(2.8) }}"
+      policy: "{{ states('input_select.sig_dispatch_policy') }}"
+      raw_kw: "{{ 6.6 if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
+      # Ceiling = the most the inverter should push out.
+      # - Max Export: 6.6 (inverter AC max) — command max output and let the SIG's
+      #   grid_export_limitation clamp export to the DNO cap in HARDWARE. Draining
+      #   the battery to hold the cap IS Max Export's intent, so no load-tracking is
+      #   needed; the firmware tracks load at hardware speed (no heartbeat lag). The
+      #   drain-floor clamp (pre) still bites below sig_drain_floor_pct.
+      # - Hold / Solar Charge: load+cap (export-limited), never above 6.6. The
+      #   load+cap ceiling is what keeps Hold FLAT (tracks PV); a flat 6.6 would turn
+      #   Hold into a battery-draining Max Export on any PV dip.
+      ceiling_kw: "{{ 6.6 if policy == 'Max Export' else [load_kw + cap_kw, 6.6] | min }}"
+      dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), ceiling_kw] | min, 0] | max }}"
+  - choose:
+      # Release (Predbat): STAY in EMS control (RD2). Remote EMS ON, EMS control
+      # mode = Maximum Self Consumption. NEVER turn Remote EMS off / drop to app
+      # modes — that leaves the EMS plane and Predbat can't get back in. Predbat
+      # controls from EMS-MSC by switching EMS modes. Idempotent: only writes when
+      # not already in that state, so it doesn't fight Predbat once it takes over.
+      - conditions:
+          - "{{ policy == 'Predbat' }}"
+        sequence:
+          - if:
+              - condition: state
+                entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+                state: "off"
+            then:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+              - delay: "00:00:02"
+          - if:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: select.sigen_plant_remote_ems_control_mode
+                    state: "Maximum Self Consumption"
+            then:
+              - action: select.select_option
+                target:
+                  entity_id: select.sigen_plant_remote_ems_control_mode
+                data:
+                  option: "Maximum Self Consumption"
+      # Active policy: ensure session open, then re-assert export limit + dispatch
+      - conditions:
+          - "{{ policy in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] }}"
+        sequence:
+          - if:
+              - condition: state
+                entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+                state: "off"
+            then:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
+              - delay: "00:00:02"
+          - if:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: select.sigen_plant_remote_ems_control_mode
+                    state: "PCS Remote Control"
+            then:
+              - action: select.select_option
+                target:
+                  entity_id: select.sigen_plant_remote_ems_control_mode
+                data:
+                  option: "PCS Remote Control"
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_grid_export_limitation
+            data:
+              value: "{{ cap_kw | round(2) }}"
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_active_power_fixed_adjustment
+            data:
+              value: "{{ dispatch_kw | float | round(2) }}"

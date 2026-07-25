@@ -1,0 +1,266 @@
+# Curtailment Manager - Dynamic Export Limit
+# HA automation: event-driven export control for curtailment system.
+#
+# 2026-05-07: switched to split-threshold model.
+#   - charge_below_kwh = sensor.predbat_curtailment_charge_below (= P10 recovery floor)
+#   - drain_above_kwh  = sensor.predbat_curtailment_drain_above  (= curtailment buffer)
+#   - Charge only when SOC < charge_below (genuine recovery risk).
+#   - Drain only when SOC > drain_above (curtailment headroom about to be exhausted).
+#   - Hold otherwise — let PV flow naturally to grid + battery.
+#
+# Manual override: input_select.curtailment_manual_hold — Off / Charge / Hold / Drain
+#   Off:    automation/plugin controls (default)
+#   Charge: force export = 0 — battery absorbs all PV
+#   Hold:   force export = min(excess, DNO) — clamp at available PV
+#   Drain:  force export = DNO — force battery discharge to grid
+#
+# Automation-decided phases (when manual = Off and plugin active).
+# Schmitt-trigger hysteresis using current phase (input_text.curtailment_live_phase)
+# to decide the next phase:
+#   Drain:   exit → Hold at SOC ≤ drain_above_kwh   (drain to ceiling, then stop)
+#   Charge:  exit → Hold at SOC ≥ charge_below_kwh  (charge to floor, then stop)
+#   Hold:    exit → Drain  at SOC > drain_above_kwh + OUTER
+#            exit → Charge at SOC < charge_below_kwh − OUTER
+# Bootstrap (current phase = Off/unknown/Hold from prior manual): symmetric ±OUTER pick.
+# OUTER_THRESHOLD_KWH = 0.18 kWh ≈ 1% of soc_max — robust to Sigen SOC 0.1% quantisation.
+#
+# Charge phase — soft (rate-paced): export = max(0, excess − rate) where
+#   rate = max(0, charge_below_kwh − soc_kwh) / hours_until_safe_time
+# Slowest pace that closes the SOC-vs-charge_below gap by safe_time. Self-adjusts
+# to forecast error. During active overflow (excess > DNO) the DNO clamp dominates
+# and battery passively absorbs excess-DNO — no aggressive charging mid-overflow.
+#
+# EMS mode management:
+#   Manual != Off OR plugin active → Command Discharging (ESS First)
+#   Both off AND EMS == Command Discharging (ESS First) → restore MSC.
+#   Restoration ONLY reverts curtailment's own mode (D-ESS). It must never
+#   clobber a mode set by Predbat's requested-mode mapper — 2026-06-11 the
+#   old "EMS != MSC" form reverted Predbat's overnight cheap-rate charge
+#   (Command Charging) to MSC within 5 seconds; battery sat at 0% all night
+#   and the house imported at full rate.
+#
+# Voltage-based cap (input_number.voltage_throttle_filtered_cap):
+#   Continuous proportional throttle from the voltage seek controller. Min'd
+#   into every active path so it overrides phase intent during overvoltage.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config:, NOT python_transform (key reorder bug).
+
+id: "1773747411848"
+alias: "Curtailment Manager - Dynamic Export Limit"
+description: >-
+  Split-threshold curtailment control. Charge only when SOC < charge_below
+  (P10 recovery), Drain only when SOC > drain_above (curtailment buffer),
+  Hold otherwise. Manual override (Off/Charge/Hold/Drain). Schmitt-trigger
+  hysteresis ±0.18 kWh on Hold→Drain/Charge transitions.
+mode: single
+
+trigger:
+  - entity_id: sensor.sigen_plant_pv_power
+    id: pv_load_change
+    platform: state
+  - entity_id: sensor.sigen_plant_consumed_power
+    id: pv_load_change
+    platform: state
+  - entity_id: sensor.sigen_plant_battery_state_of_charge
+    id: soc_change
+    platform: state
+  - entity_id: sensor.predbat_curtailment_charge_below
+    id: threshold_change
+    platform: state
+  - entity_id: sensor.predbat_curtailment_drain_above
+    id: threshold_change
+    platform: state
+  - entity_id: input_select.curtailment_manual_hold
+    platform: state
+  # Re-evaluate when the voltage-throttle cap changes — drops are immediate
+  # (snap down on voltage spike) but rises follow the seek controller's adaptive
+  # climb. Breaks the 5s bang-bang oscillation observed with raw cap reads.
+  - entity_id: input_number.voltage_throttle_filtered_cap
+    id: voltage_cap_change
+    platform: state
+
+condition:
+  - condition: or
+    conditions:
+      # Manual override active
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.curtailment_manual_hold
+            state: "Off"
+      # Plugin active and already in D-ESS (continue managing)
+      - condition: and
+        conditions:
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.predbat_curtailment_phase
+                state:
+                  - unavailable
+                  - unknown
+                  - "Off"
+          - condition: state
+            entity_id: select.sigen_plant_remote_ems_control_mode
+            state: "Command Discharging (ESS First)"
+      # Both off and EMS still in curtailment's own mode — trigger MSC
+      # restoration. Matches Command Discharging (ESS First) specifically,
+      # NOT "anything != MSC": Predbat's requested-mode mapper may have set a
+      # charge/discharge mode while the plugin is Off (e.g. overnight cheap-
+      # rate grid charge) and this automation must not run over the top of it.
+      - condition: and
+        conditions:
+          - condition: state
+            entity_id: input_select.curtailment_manual_hold
+            state: "Off"
+          - condition: state
+            entity_id: sensor.predbat_curtailment_phase
+            state: "Off"
+          - condition: state
+            entity_id: select.sigen_plant_remote_ems_control_mode
+            state: "Command Discharging (ESS First)"
+
+action:
+  - variables:
+      soc_kwh: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) / 100.0 * 18.08 }}"
+      charge_below_kwh: "{{ states('sensor.predbat_curtailment_charge_below') | float(0) }}"
+      drain_above_kwh: "{{ states('sensor.predbat_curtailment_drain_above') | float(18.08) }}"
+      pv: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
+      load: "{{ states('sensor.sigen_plant_consumed_power') | float(0) }}"
+      excess: "{{ pv - load }}"
+      dno: 4
+      outer_threshold: 0.18
+      export_cap_raw: "{{ states('sensor.predbat_curtailment_export_target') | float(-2) }}"
+      export_cap: "{% if export_cap_raw | float(-2) >= 0 %}{{ export_cap_raw | float(dno) }}{% else %}{{ dno }}{% endif %}"
+      voltage_cap: "{{ states('input_number.voltage_throttle_filtered_cap') | float(dno) }}"
+      manual_mode: "{{ states('input_select.curtailment_manual_hold') }}"
+      current_phase: "{{ states('input_text.curtailment_live_phase') }}"
+      # Charge target = min(charge_below, drain_above). On normal days this is
+      # charge_below; on cross-over days (cb > da, deficit forecast) this is
+      # drain_above. Charging only to the lower threshold preserves curtailment
+      # headroom for surprise PV.
+      #
+      # Drain still fires above drain_above + OUTER even on cross-over days —
+      # if SOC drifts above drain_above (battery passively absorbing surplus
+      # in Hold), pull it back. Curtailment defence wins over deficit insurance;
+      # Predbat handles overnight grid-charge if needed.
+      charge_target_kwh: "{{ [charge_below_kwh, drain_above_kwh] | min }}"
+      # Schmitt-trigger phase selection on split thresholds.
+      #   charge_floor  = charge_target if current=Charge, else charge_target - OUTER
+      #   drain_ceiling = drain_above   if current=Drain,  else drain_above   + OUTER
+      # Phase: Charge if SOC < charge_floor, Drain if SOC > drain_ceiling, else Hold.
+      charge_floor: >-
+        {% if current_phase == 'Charge' %}{{ charge_target_kwh }}{% else %}{{ charge_target_kwh - outer_threshold }}{% endif %}
+      drain_ceiling: >-
+        {% if current_phase == 'Drain' %}{{ drain_above_kwh }}{% else %}{{ drain_above_kwh + outer_threshold }}{% endif %}
+      phase: >-
+        {% if manual_mode == 'Charge' %}Manual Charge
+        {% elif manual_mode == 'Hold' %}Manual Hold
+        {% elif manual_mode == 'Drain' %}Manual Drain
+        {% elif export_cap_raw < 0 %}Off
+        {% elif soc_kwh < charge_floor | float %}Charge
+        {% elif soc_kwh > drain_ceiling | float %}Drain
+        {% else %}Hold
+        {% endif %}
+      new_limit: >-
+        {# voltage_cap is a continuous proportional throttle (0..dno) tied to
+           grid voltage. min'd into every active path so an overvoltage event
+           clamps export regardless of what phase the system is in. Manual
+           Charge / explicit Charge stay at 0 (already at floor). #}
+        {% if phase == 'Manual Charge' %}
+          {{ 0 | round(1) }}
+        {% elif phase == 'Manual Hold' %}
+          {{ [[excess, 0] | max, voltage_cap, dno] | min | round(1) }}
+        {% elif phase == 'Manual Drain' %}
+          {{ [voltage_cap, dno] | min | round(1) }}
+        {% elif phase == 'Off' %}
+          {{ [voltage_cap, dno] | min | round(1) }}
+        {% elif phase == 'Drain' %}
+          {{ [[export_cap, 0] | max, voltage_cap, dno] | min | round(1) }}
+        {% elif phase == 'Charge' %}
+          {# Eager Charge — battery absorbs all available PV. export = 0
+             until SOC reaches charge_below, then phase exits to Hold.
+             Replaced soft-charge pacing 2026-05-08: the dynamic gap/hours
+             rate exported front-loaded morning PV, leaving battery short
+             on cloudy-afternoon days where every kWh of morning PV was
+             needed. Surplus PV beyond battery charge rate is clipped by SIG
+             — acceptable cost vs. round-trip drain after exporting. #}
+          {{ 0 | round(1) }}
+        {% else %}
+          {# Hold #}
+          {{ [[excess, 0] | max, export_cap | float(dno), voltage_cap, dno] | min | round(1) }}
+        {% endif %}
+      current_limit: "{{ states('number.sigen_plant_grid_export_limitation') | float(-1) | round(1) }}"
+
+  # Switch to D-ESS when manual override active
+  - if:
+      - condition: template
+        value_template: "{{ manual_mode != 'Off' and states('select.sigen_plant_remote_ems_control_mode') != 'Command Discharging (ESS First)' }}"
+    then:
+      - action: select.select_option
+        target:
+          entity_id: select.sigen_plant_remote_ems_control_mode
+        data:
+          option: "Command Discharging (ESS First)"
+
+  # Ensure SIG charge/discharge rates are at max during any active phase.
+  # Predbat owns these via input_number.charge_rate / discharge_rate, but goes
+  # read-only when the curtailment plugin activates. Whatever rate Predbat set
+  # immediately before the handoff (often 0 after exiting a charge or discharge
+  # window) sticks for the duration of curtailment control. With discharge_rate=0
+  # the SIG cannot actually discharge to grid even with EMS=Command Discharging
+  # — the YAML reports phase=Drain, export_limit=4 kW, but battery_power stays
+  # ~0 and only PV-load surplus exits. Symmetric for charge_rate=0 + Charge
+  # phase. Idempotent: only writes when the rate is below max.
+  - if:
+      - condition: template
+        value_template: "{{ phase != 'Off' and states('input_number.discharge_rate') | float(0) < 9200 }}"
+    then:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.discharge_rate
+        data:
+          value: 9200
+  - if:
+      - condition: template
+        value_template: "{{ phase != 'Off' and states('input_number.charge_rate') | float(0) < 9200 }}"
+    then:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.charge_rate
+        data:
+          value: 9200
+
+  # Restore MSC when both manual and plugin off AND the EMS is still in
+  # curtailment's own mode (D-ESS). Never reverts modes set by Predbat's
+  # requested-mode mapper (Command Charging / Command Discharging (PV First))
+  # — see 2026-06-11 incident in header.
+  - if:
+      - condition: template
+        value_template: "{{ manual_mode == 'Off' and states('sensor.predbat_curtailment_phase') == 'Off' and states('select.sigen_plant_remote_ems_control_mode') == 'Command Discharging (ESS First)' }}"
+    then:
+      - action: select.select_option
+        target:
+          entity_id: select.sigen_plant_remote_ems_control_mode
+        data:
+          option: "Maximum Self Consumption"
+
+  # Publish live phase
+  - if:
+      - condition: template
+        value_template: "{{ phase != current_phase }}"
+    then:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.curtailment_live_phase
+        data:
+          value: "{{ phase }}"
+
+  - condition: template
+    value_template: "{{ (new_limit | float - current_limit | float) | abs >= 0.05 }}"
+
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_grid_export_limitation
+    data:
+      value: "{{ new_limit }}"
