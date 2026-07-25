@@ -1,0 +1,51 @@
+alias: Curtailment Stale Phase Watchdog
+description: >-
+  Fail-safe for Predbat death mid-curtailment (unknown-unknowns review
+  2026-07-07, item 1). If Predbat dies while the plugin is Active, the phase
+  sensor freezes at "Active", the dynamic-export automation keeps acting on
+  stale thresholds, and its restore-MSC branch (which requires phase=Off) can
+  never fire — the SIG sits in Command Discharging indefinitely: battery to
+  reserve, house on grid, silently. This watchdog detects EMS=D-ESS with a
+  phase sensor that has not been re-published for 20+ minutes (4 missed
+  Predbat cycles), then fails safe: disable the 5-sec automation (it would
+  re-assert D-ESS from the frozen sensor), restore MSC, restore the export
+  limit, and notify. Recovery is self-healing: on Predbat restart the plugin's
+  _cleanup_read_only() re-enables the dynamic-export automation.
+triggers:
+  - trigger: time_pattern
+    minutes: /5
+conditions:
+  - condition: state
+    entity_id: select.sigen_plant_remote_ems_control_mode
+    state: Command Discharging (ESS First)
+  - condition: template
+    value_template: >-
+      {% set s = states.sensor.predbat_curtailment_phase %}
+      {{ s is none or (now() - s.last_reported).total_seconds() > 1200 }}
+  - condition: template
+    value_template: >-
+      {{ this.attributes.last_triggered is none or
+         (now() - this.attributes.last_triggered).total_seconds() > 1800 }}
+actions:
+  - action: automation.turn_off
+    target:
+      entity_id: automation.curtailment_manager_dynamic_export_limit
+  - action: select.select_option
+    target:
+      entity_id: select.sigen_plant_remote_ems_control_mode
+    data:
+      option: Maximum Self Consumption
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_grid_export_limitation
+    data:
+      value: 4
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "Curtailment watchdog: Predbat stale"
+      message: >-
+        predbat_curtailment_phase silent for 20+ min while EMS was D-ESS.
+        Failed safe: dynamic-export automation OFF, MSC restored, export
+        limit 4kW. Check the Predbat addon — plugin re-enables the
+        automation on restart.
+mode: single
