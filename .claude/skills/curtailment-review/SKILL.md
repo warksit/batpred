@@ -37,7 +37,7 @@ For each date compute:
 
 ---
 
-## Step 2: Pull Data — Four Calls in Parallel
+## Step 2: Pull Data — Three Calls in Parallel
 
 ### Call A: ha_get_history (sparse state changes)
 
@@ -69,7 +69,7 @@ the EMS-mode / requested-mode series let you verify no MSC-clobber regression.
 
 **Do NOT include `sensor.sigen_plant_battery_state_of_charge` here** — even with
 `significant_changes_only` it returned 142 KB and hit the 1000-row limit at
-midday, losing the afternoon trace (observed 2026-07-09). SOC comes from Call D
+midday, losing the afternoon trace (observed 2026-07-09). SOC comes from Call C
 instead; only pull raw SOC history for a narrow window (< 1 h) if a specific
 floor-crossing needs second-level timing.
 
@@ -107,30 +107,15 @@ any need to pull phase-attribute history. Daily grid import/export are the
 clearest "did the day go well" signal — near-zero import on an overflow day is
 the success marker.
 
-### Call C: ha_get_history statistics (day-deltas for lifetime-cumulative sensors)
+### Call C: ha_get_history statistics (SOC hourly + optional throttle deferred)
 
-`sensor.curtailment_overflow_energy` and `sensor.sig_voltage_throttle_lost_energy`
-are **lifetime-cumulative** (`state_class: total`, hundreds of kWh) — their current
-state is useless for a daily figure. Get the day's delta directly (works for today
-AND past days, tiny response):
+**Do NOT use any `curtailment_overflow_*` energy sensors.** They were removed
+(2026-07-26): they measured `max(pv − load − DNO cap, 0)` — export-cap *surplus*
+into the battery, not true lost generation. True PV curtailment cannot be measured
+reliably from available plant sensors (need inverter-internal clip meters). Proxy:
+SOC peak near 100% while PV > load+cap, plus daily energy balance.
 
-```json
-{
-  "source": "statistics",
-  "entity_ids": ["sensor.curtailment_overflow_energy", "sensor.sig_voltage_throttle_lost_energy"],
-  "period": "day",
-  "statistic_types": ["change"],
-  "start_time": "<date>T00:00:00+00:00",
-  "end_time": "<date+1>T00:00:00+00:00"
-}
-```
-
-`change` = the day's overflow kWh and throttle-lost kWh. (Observed 2026-07-04:
-raw states were 767 / 439 kWh cumulative; day changes were 10.87 / 5.07.)
-
-### Call D: ha_get_history statistics (SOC hourly)
-
-SOC min/peak/sunset come from hourly statistics — 24 tiny rows, works for any date:
+SOC min/peak/sunset — 24 tiny hourly rows:
 
 ```json
 {
@@ -143,6 +128,9 @@ SOC min/peak/sunset come from hourly statistics — 24 tiny rows, works for any 
 }
 ```
 
+Optional (same Call C batch or separate): day `change` on
+`sensor.sig_voltage_throttle_lost_energy` (lifetime cumulative — raw state is useless).
+
 Sunset SOC = mean of the hour containing sunset (~20:00 UTC midsummer at 52.3°N).
 Day min = min over the day (check its hour against the phase timeline: pre-PV
 near-zero is by design on big-overflow days).
@@ -154,11 +142,8 @@ for the `daily_*` sensors over the day. **These reset at LOCAL midnight (23:00 U
 in BST), so the day total is the value JUST BEFORE the 23:00-UTC reset, NOT
 `.states[-1]`** — the last row (near 00:00 UTC) is already the *next* day's post-reset
 value. Extract it with jq as the max over the window, or the last state with
-`last_changed < <date>T23:00:00`. (Observed 2026-07-19: `.states[-1]` gave 10.8 kWh
-PV on a day with 24.5 kWh overflow — a reset-boundary artifact.) Call C already
-handles the two lifetime-cumulative sensors for any date. Solcast forecast for past
-days is not retained — note "forecast unavailable for past days" in the PV Accuracy
-section instead.
+`last_changed < <date>T23:00:00`. Solcast forecast for past days is not retained —
+note "forecast unavailable for past days" in the PV Accuracy section instead.
 
 **Phase timeline is now `input_select.sig_dispatch_policy`** (Predbat / Max Export /
 Hold Battery / Solar Charge Battery), not `input_text.curtailment_live_phase` (the
@@ -174,8 +159,8 @@ pre-swap Charge/Drain/Hold automation, now dead).
 2. **PV forecast today**: state of `sensor.solcast_pv_forecast_forecast_today` (also has p10/p90 in attributes)
 3. **PV ratio**: actual / forecast
 4. **Voltage throttle activations**: state of `counter.voltage_throttle_activations_today`
-5. **Voltage throttle lost energy + curtailment overflow (day)**: the `change` values from Call C — never the raw cumulative states
-6. **Current SOC** (today: state of `sensor.sigen_plant_battery_state_of_charge`; sunset/min/peak SOC for any date: Call D hourly stats)
+5. **Voltage throttle deferred energy (day)**: optional Call C day `change` on `sig_voltage_throttle_lost_energy` — never the raw cumulative state. This is deferred export via battery, not true curtailment
+6. **Current / peak SOC** (today: state of `sensor.sigen_plant_battery_state_of_charge`; sunset/min/peak: Call C hourly stats). Peak ~100% is the only practical proxy for possible true PV clip
 
 ### From Call A (history)
 
@@ -191,11 +176,11 @@ pre-swap Charge/Drain/Hold automation, now dead).
 ### Inferred / heuristic checks (no slot-by-slot data needed)
 
 13. **Floor verdict (cheap)**: the v20 design drains to overnight need, not 100% — do NOT treat sunset SOC < 100% as failure. Instead:
-    - Near-zero daily grid import on an overflow day **and** overflow_kwh ≈ 0 (no DNO breach): floor/drain was correct ✓
+    - Near-zero daily grid import on a high-PV day and SOC peak well below 100%: floor/drain adequate ✓
     - High daily import on a day with PV ratio ≥ 0.9: drained too LOW / recovered too late
-    - Curtailment overflow > 0 or a SIG fault: drained too little / cap breached
-14. **Export verdict**: voltage throttle activation count is the proxy for "did we hit the cap". A busy 50+ kWh export day will show dozens of activations — that's normal, not a fault. Don't pull 5-min export statistics just to check max — the throttle counter and SIG faults already tell the story.
-    - **`sig_voltage_throttle_lost_energy` is a misnomer — it is DEFERRED export, not lost generation** (established 2026-07-09). The throttle caps `number.sigen_plant_grid_export_limitation` (SIG grid export); the SMA keeps generating and the surplus charges the battery, which exports it later. True cost ≈ round-trip loss only (~10% × 12p ≈ 1.2p/kWh); FIT generation is unaffected. Report it as "X kWh deferred through battery (~Yp round-trip cost)". It is only genuinely lost if the battery was FULL while the throttle was engaged — check Call D's SOC peak before calling it a loss.
+    - SOC peak ~100% while PV still high, or a SIG fault: drained too little / possible true clip
+14. **Export verdict**: voltage throttle activation count is the proxy for "did we hit the export cap". A busy 50+ kWh export day will show dozens of activations — that's normal, not a fault. Don't pull 5-min export statistics just to check max — the throttle counter and SIG faults already tell the story.
+    - **`sig_voltage_throttle_lost_energy` is a misnomer — it is DEFERRED export, not lost generation** (established 2026-07-09). The throttle caps `number.sigen_plant_grid_export_limitation` (SIG grid export); surplus charges the battery and exports later. True cost ≈ round-trip loss only (~10% × 12p ≈ 1.2p/kWh); FIT generation is unaffected. Report it as "X kWh deferred through battery (~Yp round-trip cost)". Only genuinely lost if the battery was FULL while the throttle was engaged — check Call C SOC peak.
 
 ### Step 3b — OPTIONAL deeper pull (only if Step 3 flagged an issue)
 
@@ -256,7 +241,7 @@ HH:MM  Phase         Target%  Note
 - **No curtailment activity** (phase Off all day): report "Curtailment manager inactive — no overflow detected" and skip floor/phase analysis. Still report PV total, sunset SOC, voltage throttle (if any).
 - **Today, mid-day**: state day is in progress; skip sunset SOC (use "current SOC: X%").
 - **Missing data**: report which call failed and present what you have.
-- **Voltage throttle data**: Call C's day `change` is the total daily lost energy — don't attempt per-session breakdowns from the cumulative sensor.
+- **Voltage throttle data**: optional day `change` is deferred export total — don't attempt per-session breakdowns; don't treat it as true curtailment.
 
 ---
 
