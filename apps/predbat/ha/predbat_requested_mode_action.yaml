@@ -18,6 +18,20 @@
 # charge windows and was validated live. Trade-off: a daytime charge window
 # will draw grid (at the cheap rate Predbat chose) even when PV is available.
 #
+# 2026-07-27: SINGLE-WRITER GATE. This automation was disabled at the 2026-07-15
+# inverter swap (last triggered 2026-07-14 23:34) and never re-enabled, so
+# Predbat had no control path to the inverter at all — overnight the unit simply
+# sat in Maximum Self Consumption. Re-enabling it needs a mutex, because
+# sig_dispatch_heartbeat also writes select.sigen_plant_remote_ems_control_mode.
+#
+# The mutex is input_select.sig_dispatch_policy:
+#   policy == 'Predbat'  → CM has handed back; THIS automation owns the EMS mode
+#   policy != 'Predbat'  → CM is driving; heartbeat owns it, this must stay out
+#
+# The matching half of the rule lives in sig_dispatch_heartbeat.yaml: its
+# Predbat-release branch must not re-assert MSC over a Predbat Charging/
+# Discharging mode. Change the two together.
+#
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 # Deploy via ha_config_set_automation config:, NOT python_transform.
 
@@ -25,13 +39,20 @@ id: "predbat_requested_mode_action"
 alias: "Predbat Requested Mode Action"
 description: >-
   Acts as a mapper for the input_select.predbat_requested_mode to the
-  select.sigen_plant_remote_ems_control_mode
+  select.sigen_plant_remote_ems_control_mode. Only acts while the Curtailment
+  Manager has handed back (sig_dispatch_policy == Predbat).
 mode: restart
 
 trigger:
   - entity_id:
       - input_select.predbat_requested_mode
     platform: state
+
+condition:
+  # Single-writer mutex: only map while CM has handed back to Predbat.
+  - condition: state
+    entity_id: input_select.sig_dispatch_policy
+    state: "Predbat"
 
 action:
   - action: select.select_option
