@@ -272,6 +272,7 @@ def main():
         ("add_now_to_octopus_slot", test_add_now_to_octopus_slot, "Add now to Octopus slot tests", False),
         ("octopus_slots_change", test_octopus_slots_change, "Octopus slots change-detection signature tests (in-progress re-clock vs genuine change)", False),
         ("plugin_startup", test_plugin_startup_order, "Plugin startup order tests", False),
+        ("plugin_before_plan", test_plugin_before_plan, "Plugin on_before_plan hook contract tests", False),
         ("active_flag", test_active_flag, "Active flag cleared on exception tests", False),
         ("component_health_status", test_component_health_status, "Component errors fail the recorded run status tests", False),
         ("dynamic_load_car", test_dynamic_load_car_slot_cancellation, "Dynamic load car slot cancellation tests", False),

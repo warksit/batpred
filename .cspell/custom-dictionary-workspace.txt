@@ -23,6 +23,7 @@ argname
 armhf
 armv
 ASHP
+astimezone
 asyncio
 autodocstring
 autoflake
@@ -79,6 +80,7 @@ darkgreen
 darkred
 darray
 dasharray
+datacorrect
 datain
 datalist
 datalog
@@ -89,11 +91,14 @@ dateutil
 dayname
 daynumber
 daysymbol
+deadband
 dedup
 dedupe
 dend
 denorm
+deque
 derating
+dess
 devcontainer
 devcontainers
 dexport
@@ -178,12 +183,14 @@ gridcode
 gridconsumption
 gridconsumptionpower
 growatt
+gshp
 GWMQTT
 HACS
 hadashboard
 hahistory
 hainterface
 halfhourly
+handback
 hanres
 HAOS
 hasattr
@@ -200,6 +207,7 @@ houseb
 htmlcov
 husforbrukning
 hypervolt
+hyst
 iboost
 idag
 idef
@@ -225,6 +233,7 @@ jedlix
 jsyaml
 kaiming
 keepalive
+keepfloor
 keydb
 khtml
 killall
@@ -269,6 +278,7 @@ meterpower
 metricb
 metricmid
 microinverters
+middlemuir
 minb
 minmax
 minsoc
@@ -316,7 +326,9 @@ oninput
 onmouseout
 onmouseover
 openweathermap
+overdrains
 overfitting
+overforecast
 overvoltage
 ownerapi
 parseable
@@ -398,6 +410,7 @@ Sergoe
 sess
 setattr
 setdefault
+setpoints
 SFMB
 sigcloud
 sigen
@@ -460,6 +473,7 @@ timeobj
 timestep
 timestr
 timezone
+tmpl
 tmrw
 tojson
 tottime
@@ -472,6 +486,7 @@ twinx
 tzfile
 tzpath
 unconfigured
+underforecast
 unparseable
 unsmoothed
 unstaged
@@ -479,6 +494,7 @@ urlsafe
 useid
 userinterface
 varh
+vcap
 venv
 Victron
 visibilitychange
