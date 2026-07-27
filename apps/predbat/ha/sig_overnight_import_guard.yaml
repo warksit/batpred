@@ -1,0 +1,72 @@
+# SIG Overnight Import Guard — TEMPORARY SAFETY NET (added 2026-07-27)
+#
+# WHY: 2026-07-27 was the first night Predbat could actually drive the inverter
+# since the 2026-07-15 swap (predbat_requested_mode_action had been disabled and
+# nothing re-enabled it). Tomorrow's plan contains a "HoldChrg" slot at 04:30 —
+# a charge window whose target (39%) is BELOW the projected SOC (42%), which
+# Predbat renders as HoldChrg and executes via charge_start_service.
+#
+# That maps to requested_mode "Charging" -> Command Charging (Grid First).
+# Live test 2026-07-27 21:55 on the real unit:
+#   charge cut-off 60% (below SOC 62.8) -> grid 0.42 kW (load only), battery FLAT   [safe]
+#   charge cut-off 100% (unwritten)     -> grid 7.35 kW, battery +6.29 kW charging  [runaway]
+#
+# So the only thing standing between HoldChrg and a 7 kW grid charge is Predbat
+# writing charge_limit -> number.sigen_plant_ess_charge_cut_off_state_of_charge.
+# That wiring is correct and Predbat is clearly managing a target, but it has
+# never actually run on this unit. This guard covers the gap while unattended.
+#
+# WHAT: overnight only, if grid import exceeds 2 kW for 30 s, knock
+# requested_mode back to Demand (-> Maximum Self Consumption) and post a
+# notification so there is a record in the morning.
+#
+# 2 kW threshold: overnight house load is a steady ~0.42 kW (11 nights measured,
+# 3.96-4.48 kWh per night) and the DHW cycle runs ~13:15, not overnight. So
+# anything above 2 kW at night is a charge, not the house.
+#
+# Deliberately does NOT block import outright (grid_import_limitation = 0) —
+# that is a hardware-level block and the discharge cut-off is 0%, so a hard
+# block risks leaving the house unsupplied if the battery bottoms out.
+#
+# REMOVE THIS once 04:30 HoldChrg has been observed behaving. It will fight a
+# genuine cheap-rate grid charge, which is fine tonight (SOC 63%, ~4.1 kWh
+# needed) but wrong as a permanent fixture.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Deploy via ha_config_set_automation config:, NOT python_transform.
+
+id: "sig_overnight_import_guard"
+alias: "SIG Overnight Import Guard (temporary)"
+description: >-
+  TEMPORARY. Overnight, cancel any grid charge by returning Predbat's requested
+  mode to Demand if import exceeds 2 kW. Guards the 04:30 HoldChrg slot in case
+  Predbat does not write the charge cut-off SOC. Remove once verified.
+mode: single
+
+trigger:
+  - platform: numeric_state
+    entity_id: sensor.sigen_plant_grid_active_power
+    above: 2
+    for: "00:00:30"
+
+condition:
+  - condition: time
+    after: "22:00:00"
+    before: "07:00:00"
+
+action:
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.predbat_requested_mode
+    data:
+      option: "Demand"
+  - action: persistent_notification.create
+    data:
+      # Fixed id so repeat firings replace rather than stack, and so a real
+      # firing is unambiguous in the morning.
+      notification_id: sig_import_guard
+      title: "SIG import guard fired"
+      message: >-
+        Overnight grid import exceeded 2 kW - requested_mode forced back to
+        Demand. Check whether Predbat wrote the charge cut-off SOC during its
+        charge window.
