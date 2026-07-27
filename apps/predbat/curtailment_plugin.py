@@ -46,6 +46,7 @@ from curtailment_calc import (
     compute_solcast_overflow,
     compute_expected_overflow,
     compute_p10_recovery_floor,
+    compute_charge_recovery_floor,
     compute_effective_export_cap,
     compute_charge_below,
     compute_drain_above,
@@ -313,6 +314,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_dno = 4.0
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
+        self._charge_recovery_floor = 0.0  # R59a: overflow-netted floor feeding charge_below
         # R59 inputs (diagnostic — the terms feeding p10_recovery)
         self._p10_pv_remaining_kwh = 0.0
         self._p50_pv_remaining_kwh = 0.0
@@ -1230,6 +1232,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(target_kwh, 2)
                 self._overflow_floor_kwh = round(target_kwh, 2)
                 self._p10_recovery_floor = 0.0
+                self._charge_recovery_floor = 0.0
                 self._pre_pv_engaged_today = True
                 self._save_state()
                 return target_kwh, "active"
@@ -1247,6 +1250,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(soc_kw, 2)
                 self._overflow_floor_kwh = round(soc_kw, 2)
                 self._p10_recovery_floor = 0.0
+                self._charge_recovery_floor = 0.0
                 self._last_decision = "active (pre-PV hold): drain done, awaiting PV"
                 self._save_state()
                 return soc_kw, "active"
@@ -1629,6 +1633,11 @@ class CurtailmentPlugin(PredBatPlugin):
             load_remaining_kwh=load_remaining,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
+        # R59a: charge_below's recovery floor nets against P10 OVERFLOW, not raw
+        # (PV - load). The no-charge policy is Hold, which serves the export cap
+        # before the battery, so only overflow actually charges it. Kept separate
+        # from _p10_recovery_floor so the R54 drain target below is unchanged.
+        self._charge_recovery_floor = round(compute_charge_recovery_floor(overnight_for_recovery, self._overflow_p10), 2)
         self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
         self._p50_pv_remaining_kwh = round(p50_pv_remaining, 2)
         self._load_remaining_kwh = round(load_remaining, 2)
@@ -1975,7 +1984,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # The R54 floor input (self._p10_recovery_floor) is NOT clamped so
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
-            charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
+            charge_below = round(compute_charge_below(self._charge_recovery_floor, soc_keep_kwh), 2)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh), 2)
         else:
             charge_below = 0.0

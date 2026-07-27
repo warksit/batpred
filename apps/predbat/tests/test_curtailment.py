@@ -28,6 +28,7 @@ from curtailment_calc import (
     compute_charge_below,
     compute_drain_above,
     compute_p10_recovery_floor,
+    compute_charge_recovery_floor,
     compute_effective_export_cap,
     compute_floor_with_source,
     should_defer_to_charge,
@@ -506,11 +507,23 @@ def test_activation_high_soc_low_overflow():
 
 
 def test_p10_recovery_floor_huge_pv_runway():
-    """Lots of P10 PV ahead → floor near zero (we'll easily recover)."""
+    """Lots of P10 PV ahead → floor near zero (we'll easily recover).
+
+    R59a note (2026-07-27): this is the DRAIN-side floor, which deliberately
+    keeps the (PV - load) form so a sub-cap day cannot raise the drain target
+    and strand curtailment headroom (R25/R52). For the CHARGE side the same
+    inputs are wrong — 20 kWh of P10 PV across a day peaks well under a 3.68 kW
+    export cap, so under Hold almost none of that 13 kWh reaches the battery.
+    See test_charge_recovery_floor_sub_cap_day_2026_07_27.
+    """
     floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=20.0, load_remaining_kwh=7.0)
     # potential = 20-7 = 13, target - potential = -3.6 → clamped to 0
     assert floor == 0.0, f"Expected 0.0 (huge runway), got {floor}"
-    print(f"  test_p10_recovery_floor_huge_pv_runway: PASSED (floor={floor})")
+
+    # Charge side, same day, no overflow: the full target must be charged.
+    charge_floor = compute_charge_recovery_floor(overnight_target_kwh=9.4, p10_overflow_kwh=0.0)
+    assert abs(charge_floor - 9.4) < 0.001, f"Expected 9.4 on the charge side, got {charge_floor}"
+    print(f"  test_p10_recovery_floor_huge_pv_runway: PASSED (drain={floor}, charge={charge_floor})")
 
 
 def test_p10_recovery_floor_no_pv_remaining():
@@ -523,7 +536,12 @@ def test_p10_recovery_floor_no_pv_remaining():
 
 
 def test_p10_recovery_floor_partial_charging():
-    """Mid-afternoon: P10 PV partly covers → floor = remainder."""
+    """Mid-afternoon: P10 PV partly covers → floor = remainder.
+
+    R59a note (2026-07-27): drain-side form, unchanged by design. 10 kWh of
+    remaining P10 PV is also sub-cap, so the charge side must not reuse this
+    number — see test_charge_recovery_floor_partial_overflow.
+    """
     floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=10.0, load_remaining_kwh=5.0)
     # potential = 5, floor = 9.4 - 5 = 4.4
     assert abs(floor - 4.4) < 0.001, f"Expected 4.4 (partial), got {floor}"
@@ -612,6 +630,61 @@ def test_charge_below_p10_recovery_wins():
     cb = compute_charge_below(p10_recovery_floor=4.0, soc_keep=1.5)
     assert abs(cb - 4.0) < 0.001, f"Expected 4.0 (p10_recovery), got {cb}"
     print(f"  test_charge_below_p10_recovery_wins: PASSED ({cb})")
+
+
+def test_charge_recovery_floor_sub_cap_day_2026_07_27():
+    """R59a regression — the bright-but-sub-cap day that sat in Hold at 9% SOC.
+
+    Live values 2026-07-27 12:16 BST: p10_pv_remaining=16.77, load_remaining=5.92,
+    overnight_target=7.07, overflow_p10=0.0. PV was strong (8.4 kW peak) but never
+    cleared load+3.68kW at P10, so under Hold NONE of it reached the battery.
+
+    Old R59 (PV-load) said 7.07-10.85 -> 0 -> charge_below floored to 0.5 kWh, so
+    Charge could only fire below 2.8% SOC. CM held from 05:51 at 9% SOC and was
+    projected to hit the drain floor at 18:30 with 5.7 kWh of overnight load to
+    import at 25.3p.
+    """
+    floor = compute_charge_recovery_floor(overnight_target_kwh=7.07, p10_overflow_kwh=0.0)
+    assert abs(floor - 7.07) < 0.001, f"Expected 7.07 (no overflow reaches battery under Hold), got {floor}"
+
+    cb = compute_charge_below(floor, soc_keep=0.0)
+    assert abs(cb - 7.07) < 0.001, f"Expected charge_below 7.07, got {cb}"
+
+    # SOC 9% (1.63 kWh) must be BELOW charge_below -> Charge fires
+    assert 0.09 * 18.08 < cb, "9% SOC must trigger Charge"
+    # SOC 43.5% (7.87 kWh) is ABOVE -> Hold, matching the manual call at 13:05
+    assert 0.435 * 18.08 > cb, "43.5% SOC must NOT trigger Charge"
+    print(f"  test_charge_recovery_floor_sub_cap_day_2026_07_27: PASSED (floor={floor}, charge_below={cb})")
+
+
+def test_charge_recovery_floor_overflow_day_unchanged():
+    """Genuine overflow day: surplus DOES reach the battery under Hold, so the
+    floor collapses to 0 exactly as R59 always did. Guards against R59a making
+    CM over-charge on the days it was designed for."""
+    floor = compute_charge_recovery_floor(overnight_target_kwh=7.07, p10_overflow_kwh=12.0)
+    assert floor == 0.0, f"Expected 0.0 (overflow exceeds target), got {floor}"
+    print(f"  test_charge_recovery_floor_overflow_day_unchanged: PASSED (floor={floor})")
+
+
+def test_charge_recovery_floor_partial_overflow():
+    """Partial overflow covers part of the target; the rest must be charged."""
+    floor = compute_charge_recovery_floor(overnight_target_kwh=7.07, p10_overflow_kwh=3.0)
+    assert abs(floor - 4.07) < 0.001, f"Expected 4.07 (7.07-3.0), got {floor}"
+    print(f"  test_charge_recovery_floor_partial_overflow: PASSED (floor={floor})")
+
+
+def test_charge_recovery_floor_does_not_affect_drain_target():
+    """R59a scope guard: the R54 drain target keeps the ORIGINAL PV-load recovery
+    floor, so a sub-cap day cannot raise it and strand curtailment headroom
+    (R25/R52). Uses 2026-07-27's live numbers."""
+    drain_side = compute_p10_recovery_floor(overnight_target_kwh=7.07, p10_pv_remaining_kwh=16.77, load_remaining_kwh=5.92)
+    assert drain_side == 0.0, f"Drain-side recovery floor must stay 0.0, got {drain_side}"
+
+    # overflow_floor (13.98 live) still wins the R54 outer max -> unchanged behaviour
+    floor, source = compute_floor_with_source(reserve=0.54, p10_recovery=drain_side, overflow_floor=13.98, effective_keep=7.07)
+    assert abs(floor - 13.98) < 0.001, f"Expected drain target 13.98, got {floor}"
+    assert source == "Curtailment Buffer", f"Expected 'Curtailment Buffer', got {source}"
+    print(f"  test_charge_recovery_floor_does_not_affect_drain_target: PASSED ({floor}, {source})")
 
 
 def test_no_surplus_hold_dawn_collapse():
@@ -5154,6 +5227,10 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_deep_discharge_floor,
         test_charge_below_soc_keep_wins,
         test_charge_below_p10_recovery_wins,
+        test_charge_recovery_floor_sub_cap_day_2026_07_27,
+        test_charge_recovery_floor_overflow_day_unchanged,
+        test_charge_recovery_floor_partial_overflow,
+        test_charge_recovery_floor_does_not_affect_drain_target,
         test_no_surplus_hold_dawn_collapse,
         test_no_surplus_hold_target_above_soc_unchanged,
         test_no_surplus_hold_surplus_allows_drain,
