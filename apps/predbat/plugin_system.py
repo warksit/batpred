@@ -153,9 +153,17 @@ class PluginSystem:
 
         # Plugin discovery fallthrough (try in order of preference):
 
-        # 1. MOST PREFERRED: Class name ends with "Plugin"
+        # 1. MOST PREFERRED: Class name ends with "Plugin" AND is defined in this
+        # module. inspect.getmembers() returns members ALPHABETICALLY, so without the
+        # __module__ check a plugin whose class sorts after an imported one silently
+        # gets the wrong class instantiated: `from plugin_system import PredBatPlugin`
+        # puts the base class in the namespace, and e.g. SocKeepPublishPlugin sorts
+        # after PredBatPlugin, so the abstract base was constructed instead and the
+        # plugin's hooks never registered (observed 2026-07-27 — the plugin loaded
+        # "successfully" and did nothing). Alphabetical luck is why ColdWeatherPlugin
+        # and CurtailmentPlugin were unaffected.
         for name, obj in inspect.getmembers(plugin_module, inspect.isclass):
-            if name.endswith("Plugin"):
+            if name.endswith("Plugin") and obj.__module__ == plugin_module.__name__:
                 try:
                     self.log(f"Initialising plugin class (name-based): {name}")
                     plugin_instance = obj(self.base)
