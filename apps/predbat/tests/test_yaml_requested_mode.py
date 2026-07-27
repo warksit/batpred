@@ -83,17 +83,20 @@ def _conditions_match(conditions, requested_mode):
 
 
 def check_single_writer_mutex(doc):
-    """The mapper MUST only act while CM has handed back.
+    """The mutex is enable/disable, NOT a condition in this file.
 
-    sig_dispatch_heartbeat also writes select.sigen_plant_remote_ems_control_mode.
-    Without this gate the two fight: enabling the mapper on 2026-07-27 would have
-    had Predbat's Charging/Discharging reverted to MSC by the next heartbeat.
+    curtailment_plugin._set_writer() keeps exactly one of this automation and
+    sig_dispatch_heartbeat enabled at a time, so this stays a plain stock mapper.
+    A policy condition here would put the same rule in two places — they would
+    then drift, and a stale condition could silently block Predbat entirely.
+    Enforcement of the toggle lives in test_curtailment.py
+    (test_exactly_one_writer_enabled_on_control / _on_handback).
     """
     conditions = doc.get("condition") or []
     for cond in conditions:
-        if cond.get("condition") == "state" and cond.get("entity_id") == "input_select.sig_dispatch_policy" and cond.get("state") == "Predbat":
-            return None
-    return "missing single-writer mutex: condition on input_select.sig_dispatch_policy == 'Predbat'"
+        if cond.get("entity_id") == "input_select.sig_dispatch_policy":
+            return "mapper must NOT carry a sig_dispatch_policy condition — the mutex is the plugin's enable/disable (_set_writer)"
+    return None
 
 
 def run_yaml_requested_mode_tests():
@@ -111,7 +114,7 @@ def run_yaml_requested_mode_tests():
         print(f"  mutex: FAILED — {problem}")
         failed = True
     else:
-        print("  mutex: ok (only maps while sig_dispatch_policy == 'Predbat')")
+        print("  mutex: ok (stock mapper — mutex is the plugin enable/disable)")
 
     for mode, expected_ems in EXPECTED_MAP.items():
         try:

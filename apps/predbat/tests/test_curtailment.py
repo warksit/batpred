@@ -1307,6 +1307,60 @@ def test_heartbeat_disabled_and_msc_on_handback():
     print("  test_heartbeat_disabled_and_msc_on_handback: PASSED")
 
 
+def test_exactly_one_writer_enabled_on_control():
+    """Taking control: mapper OFF before heartbeat ON — never both enabled.
+
+    Being disabled IS the mutex, so neither automation carries a condition of its
+    own. Ordering matters: a gap with neither enabled is safe (inverter holds its
+    last setpoint); an overlap is two writers fighting the same registers.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+
+    calls = _automation_calls(base)
+    assert ("automation/turn_off", "automation.predbat_requested_mode_action") in calls, base.services
+    assert ("automation/turn_on", "automation.sig_dispatch_heartbeat") in calls, base.services
+    off_idx = calls.index(("automation/turn_off", "automation.predbat_requested_mode_action"))
+    on_idx = calls.index(("automation/turn_on", "automation.sig_dispatch_heartbeat"))
+    assert off_idx < on_idx, f"mapper must be disabled BEFORE heartbeat enabled, got {calls}"
+    print("  test_exactly_one_writer_enabled_on_control: PASSED")
+
+
+def test_exactly_one_writer_enabled_on_handback():
+    """Handback: heartbeat OFF before mapper ON.
+
+    Regression 2026-07-27: the mapper had been disabled since the 2026-07-15 swap
+    and nothing re-enabled it, so Predbat had no control path at all — it asked for
+    Discharging twice overnight on 07-26 and the EMS mode select never moved.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._cm_controlling = True
+    plugin._read_only_set = True
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+
+    calls = _automation_calls(base)
+    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") in calls, base.services
+    assert ("automation/turn_on", "automation.predbat_requested_mode_action") in calls, base.services
+    off_idx = calls.index(("automation/turn_off", "automation.sig_dispatch_heartbeat"))
+    on_idx = calls.index(("automation/turn_on", "automation.predbat_requested_mode_action"))
+    assert off_idx < on_idx, f"heartbeat must be disabled BEFORE mapper enabled, got {calls}"
+
+    # The mapper must be live before read_only clears, or Predbat's first
+    # requested_mode change lands with nothing listening.
+    names = [s[0] for s in base.services]
+    if "switch/turn_off" in names:
+        assert names.index("automation/turn_on") < names.index("switch/turn_off"), f"mapper must be enabled before read_only clears, got {names}"
+    print("  test_exactly_one_writer_enabled_on_handback: PASSED")
+
+
 def test_heartbeat_untouched_observe_only():
     """Observe-only (gate off): plugin never toggles the heartbeat or EMS mode."""
     base = MockBase()  # gate defaults off
@@ -5285,6 +5339,8 @@ def run_curtailment_tests(my_predbat=None):
         test_manual_override_off_resumes_policy,
         test_manual_override_grabs_control_even_when_inactive,
         test_heartbeat_enabled_on_control,
+        test_exactly_one_writer_enabled_on_control,
+        test_exactly_one_writer_enabled_on_handback,
         test_heartbeat_disabled_and_msc_on_handback,
         test_heartbeat_untouched_observe_only,
         test_heartbeat_stays_on_through_low_soc,
