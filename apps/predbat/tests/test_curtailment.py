@@ -1361,6 +1361,30 @@ def test_exactly_one_writer_enabled_on_handback():
     print("  test_exactly_one_writer_enabled_on_handback: PASSED")
 
 
+def test_first_run_reconciles_drifted_writers():
+    """After a deploy/restart the writer enables must be reconciled, not assumed.
+
+    Every deploy resets plugin state, and the take/release toggles are EDGE-triggered
+    on _cm_controlling. First run adopts _cm_controlling from live read_only — so
+    without an explicit reconcile, a drifted pair (both automations on, or both off)
+    would persist silently for the whole window. Observed 2026-07-27: the mapper was
+    manually enabled while CM was driving, giving two live writers.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base.set_read_only = True  # adopted: CM was driving before the restart
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    assert plugin._cm_controlling is None, "fresh plugin must start with unknown control state"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+
+    calls = _automation_calls(base)
+    assert ("automation/turn_off", "automation.predbat_requested_mode_action") in calls, f"first run must disable the mapper when adopting CM control, got {calls}"
+    assert ("automation/turn_on", "automation.sig_dispatch_heartbeat") in calls, f"first run must enable the heartbeat, got {calls}"
+    print("  test_first_run_reconciles_drifted_writers: PASSED")
+
+
 def test_heartbeat_untouched_observe_only():
     """Observe-only (gate off): plugin never toggles the heartbeat or EMS mode."""
     base = MockBase()  # gate defaults off
@@ -5341,6 +5365,7 @@ def run_curtailment_tests(my_predbat=None):
         test_heartbeat_enabled_on_control,
         test_exactly_one_writer_enabled_on_control,
         test_exactly_one_writer_enabled_on_handback,
+        test_first_run_reconciles_drifted_writers,
         test_heartbeat_disabled_and_msc_on_handback,
         test_heartbeat_untouched_observe_only,
         test_heartbeat_stays_on_through_low_soc,

@@ -2291,7 +2291,8 @@ class CurtailmentPlugin(PredBatPlugin):
         # low-SOC handover). On the window edge we take/release control atomically.
         # First run: adopt live state so a restart mid-window reconciles rather than
         # stranding Predbat or double-writing.
-        if self._cm_controlling is None:
+        first_run = self._cm_controlling is None
+        if first_run:
             self._read_only_set = bool(getattr(self.base, "set_read_only", False))
             self._cm_controlling = self._read_only_set
 
@@ -2304,13 +2305,20 @@ class CurtailmentPlugin(PredBatPlugin):
             self._policy_driving = False
             return
 
+        # Every deploy/restart resets plugin state, and the take/release toggles below
+        # are EDGE-triggered on _cm_controlling — so an adopted value would leave the
+        # automation enables wherever they happened to be. `first_run` forces the edge
+        # once, in whichever branch actually applies, so a drifted pair (both on, or
+        # both off) can't persist silently for the whole window. Reconciling in a
+        # separate step ahead of the branches would double-toggle and briefly enable
+        # the wrong writer.
         if manual:
             # RD13 manual override: keep the single-writer machine LIVE — heartbeat on,
             # mapper off, Predbat suppressed — but DON'T write the policy or keep floor.
             # The user drives input_select.sig_dispatch_policy by hand and it sticks.
             # Grabs control regardless of plugin_active (failsafe manual drive), and
             # never hands back while the override is on.
-            if not self._cm_controlling:
+            if first_run or not self._cm_controlling:
                 self._set_writer(cm_driving=True)
                 self._cm_controlling = True
             if not self._read_only_set:
@@ -2322,7 +2330,7 @@ class CurtailmentPlugin(PredBatPlugin):
         if plugin_active:
             # CM window. Take the writer role (window start edge): mapper off so
             # Predbat can't write EMS modes underneath us, heartbeat on.
-            if not self._cm_controlling:
+            if first_run or not self._cm_controlling:
                 self._set_writer(cm_driving=True)
                 self._cm_controlling = True
             if soc_pct > low_soc:
@@ -2342,7 +2350,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._policy_driving = True
         else:
             # Window end (safe_time / off): hand the whole machine back to Predbat.
-            if self._cm_controlling:
+            if first_run or self._cm_controlling:
                 self._release_to_predbat()
                 self._cm_controlling = False
             self._policy_driving = False
