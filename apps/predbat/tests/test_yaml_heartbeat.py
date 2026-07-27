@@ -132,6 +132,23 @@ def test_heartbeat_and_predbat_never_drive_together():
     print("PASS  exclusion: heartbeat inert under Predbat policy (MSC one-shot on policy_change only)")
 
 
+def test_manual_override_is_a_trigger():
+    """Flipping sig_manual_override must re-evaluate dispatch immediately.
+
+    It changes who is driving (RD13); without this trigger the heartbeat waits up
+    to a minute for the beat. It carries its OWN id so the one-shot MSC handback —
+    gated on policy_change — does not re-park the unit when the override is
+    toggled while already handed back.
+    """
+    auto = _load()
+    ids = {t.get("id") for t in auto["trigger"]}
+    assert "override_change" in ids, f"manual override trigger missing, got ids {ids}"
+    ov = next(t for t in auto["trigger"] if t.get("id") == "override_change")
+    assert ov.get("entity_id") == "input_boolean.sig_manual_override", ov
+    assert ov.get("id") != "policy_change", "override must not share the policy_change id — it would re-park on every toggle"
+    print("PASS  trigger: manual override re-evaluates dispatch (own id, not policy_change)")
+
+
 def test_live_trigger():
     auto = _load()
     stale = next((t for t in auto["trigger"] if t.get("id") == "stale_setpoint"), None)
@@ -202,6 +219,7 @@ def main():
     for t in (
         test_structural,
         test_heartbeat_and_predbat_never_drive_together,
+        test_manual_override_is_a_trigger,
         test_live_trigger,
         test_dispatch_ceiling_overflow,
         test_dispatch_tracks_pv_on_dip,
