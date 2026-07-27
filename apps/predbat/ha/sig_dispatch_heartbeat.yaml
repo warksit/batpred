@@ -27,7 +27,8 @@
 # HARD FLOOR (live clamp): SOC ≤ input_number.sig_drain_floor_pct → dispatch ≤ PV
 # so the battery can never DISCHARGE below the floor for any policy.
 #
-# Triggers: 1-min backstop beat; policy change; LIVE stale-setpoint — the
+# Triggers: 1-min backstop beat; policy change; manual-override change; LIVE
+# stale-setpoint — the
 # template references PV + load, so it re-evaluates on every change and fires
 # IMMEDIATELY (no debounce) when the wanted dispatch drifts >0.1 kW from the
 # register. The >0.1 gate IS the write filter (no hysteresis needed): self-
@@ -53,6 +54,13 @@ trigger:
   - platform: state
     entity_id: input_select.sig_dispatch_policy
     id: policy_change
+  # Manual override flips who is driving (RD13), so re-evaluate dispatch at once
+  # rather than waiting up to a minute for the beat. Deliberately its OWN id: the
+  # one-shot MSC handback below is gated on policy_change only, so toggling the
+  # override while already handed back must not re-park the unit.
+  - platform: state
+    entity_id: input_boolean.sig_manual_override
+    id: override_change
   - platform: template
     value_template: >-
       {% set p = states('input_select.sig_dispatch_policy') %}
