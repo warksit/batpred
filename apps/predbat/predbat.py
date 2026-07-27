@@ -813,23 +813,12 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
             self.log("Plan was last updated on {} and is now {} minutes old".format(self.plan_last_updated, dp1(plan_age_minutes)))
 
         # Allow plugins to adjust planning parameters before plan calculation
+        # (sensor.<prefix>_best_soc_keep is published by soc_keep_publish_plugin,
+        # which runs last in the chain — keeps this file stock-identical)
         if self.plugin_system:
-            base_keep = self.best_soc_keep
-            base_weight = self.best_soc_keep_weight
             ctx = self.plugin_system.call_before_plan_hooks({"best_soc_keep": self.best_soc_keep, "best_soc_keep_weight": self.best_soc_keep_weight})
             self.best_soc_keep = ctx.get("best_soc_keep", self.best_soc_keep)
             self.best_soc_keep_weight = ctx.get("best_soc_keep_weight", self.best_soc_keep_weight)
-            self.dashboard_item(
-                "sensor.{}_best_soc_keep".format(self.prefix),
-                round(self.best_soc_keep, 2),
-                {
-                    "friendly_name": "Best SOC Keep",
-                    "unit_of_measurement": "kWh",
-                    "icon": "mdi:battery-lock",
-                    "base": round(base_keep, 2),
-                    "weight": round(self.best_soc_keep_weight, 2),
-                },
-            )
 
         # Calculate the new plan (or re-use existing)
         recompute = self.calculate_plan(recompute=recompute)

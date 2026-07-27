@@ -37,6 +37,8 @@ After changing in HA, pull the updated config and commit it so the file stays in
 - `cd apps/predbat && python3 tests/test_curtailment.py`
 - `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the curtailment HA automation YAML
 - `cd apps/predbat && python3 tests/test_yaml_voltage_seek.py` — Jinja harness for voltage_seek_controller YAML (catches variable-order bugs under StrictUndefined)
+- `cd apps/predbat && python3 tests/test_plugin_host_contract.py` — fails if the Predbat build lacks the `on_before_plan` host API
+- `cd apps/predbat && python3 tests/test_soc_keep_publish.py` — effective `best_soc_keep` sensor (read by `/soc-keep-review`)
 - `cd coverage && python3 ../apps/predbat/unit_test.py --quick`
 - **Commit before deploying** — always `git commit` before `scp`/deploy so deployed code is always in git history
 
