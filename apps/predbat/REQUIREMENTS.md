@@ -653,6 +653,48 @@ Behaviour:
 - Sunset (P10 PV → 0): p10_recovery → overnight_target → forces SOC up
   to target by sunset (replaces R57's "drain to keep, hope PV refills")
 
+### R59a — charge_below recovery nets against OVERFLOW, not raw PV (2026-07-27)
+
+**Defect in R59 as originally specified.** `p10_charging_potential` above
+uses `p10_pv_remaining - load_remaining`, which assumes all PV net of load
+reaches the battery. It does not. `charge_below` asks *"if I do NOT actively
+charge, will I still make overnight_target?"* — and the no-charge policy is
+**Hold**, which pins dispatch at `load + export_cap` and therefore serves the
+export cap **before** the battery. Under Hold the battery only receives
+`PV - load - export_cap`, i.e. the overflow.
+
+Observed 2026-07-27 (live): `p10_pv_remaining=16.77`, `load_remaining=5.92`,
+`overnight_target=7.07`, but `overflow_p10=0.0`. R59 computed
+`7.07 - 10.85 → 0` → `charge_below` floored to 0.5 kWh (2.8%). The plugin sat
+in `Hold Battery` for 6h25m from 05:51 at 9% SOC, crediting 10.85 kWh of PV
+that Hold was exporting to the grid. Projection had it hitting the 2.8% drain
+floor at 18:30 (P50) with a 5.7 kWh overnight load to import at 25.3p.
+
+**R59a**: the recovery floor feeding `charge_below` uses the P10 **overflow**:
+
+```text
+charge_recovery_floor = max(0, overnight_target_kwh - p10_overflow_kwh)
+charge_below          = max(charge_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
+```
+
+On 2026-07-27 this gives `7.07 - 0.0 = 7.07` kWh (39.1%) — Charge fires below
+that, which is the correct behaviour.
+
+**Scope — R59a applies to `charge_below` ONLY.** The R54 drain target
+(`compute_floor_with_source`) keeps the original `compute_p10_recovery_floor`.
+Rationale: on a >7.7 kWh-overflow day `overflow_floor` drops below
+`overnight_target`, so an overflow-netted recovery floor could raise the drain
+target and strand headroom — violating R25/R52. `compute_drain_above()` never
+took `p10_recovery` at all, so the Drain *threshold* is unaffected either way.
+
+**Trigger condition** (why this went unseen since 2026-05-11): it needs
+`p10_pv - load > overnight_target` while `p10_overflow ≈ 0` — a bright day whose
+PV never clears the export cap. Overflow days (R59's design case) and overcast
+days (P10 PV low, floor stays high) both mask it. Two existing unit tests
+encoded the defect as correct and were corrected with R59a:
+`test_p10_recovery_floor_huge_pv_runway` (20 kWh P10 PV over a day never nears
+a 3.68 kW cap) and `test_p10_recovery_floor_partial_charging`.
+
 ### R60 — effective export cap for overflow integral
 
 The overflow integral asks "how much PV will exceed our export ability?"

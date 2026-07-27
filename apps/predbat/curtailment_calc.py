@@ -286,6 +286,43 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - net_charging)
 
 
+def compute_charge_recovery_floor(overnight_target_kwh, p10_overflow_kwh):
+    """R59a — recovery floor for charge_below: SOC needed now to reach
+    overnight_target WITHOUT actively charging.
+
+    Formula:
+        floor = max(0, overnight_target - p10_overflow)
+
+    Why overflow and not (p10_pv - load), as R59 originally specified: the
+    no-charge policy is Hold, and Hold pins dispatch at `load + export_cap`.
+    The export cap is therefore served BEFORE the battery, so the only PV that
+    reaches the battery is what exceeds it — the overflow. Netting against raw
+    `p10_pv - load` credits the battery with energy Hold is exporting to the
+    grid.
+
+    Observed 2026-07-27: p10_pv=16.77, load=5.92, target=7.07, overflow_p10=0.0.
+    R59 gave 7.07-10.85 -> 0 (charge_below floored to 0.5 kWh = 2.8%) and CM
+    held for 6h25m from 9% SOC on a day with zero P10 overflow. R59a gives 7.07
+    (39.1%), so Charge fires.
+
+    Scope: this feeds `charge_below` ONLY. The R54 drain target keeps
+    `compute_p10_recovery_floor` — an overflow-netted floor could raise the drain
+    target on big-overflow days (where overflow_floor < overnight_target) and
+    strand curtailment headroom, violating R25/R52. `compute_drain_above` never
+    consumed a recovery floor, so the Drain threshold is unaffected either way.
+
+    Args:
+        overnight_target_kwh: required SOC by end of day.
+        p10_overflow_kwh: Solcast P10 remaining overflow (kWh) — PV above
+            load + effective export cap, i.e. what actually reaches the battery
+            under Hold. Always >= 0.
+
+    Returns:
+        kWh — minimum SOC needed now to land on overnight target without charging.
+    """
+    return max(0.0, overnight_target_kwh - max(0.0, p10_overflow_kwh))
+
+
 def compute_session_reserve(duration_minutes, cap_kw):
     """Battery energy (kWh) to reserve for a saving-session export: run at the
     export cap for the session duration. Feeds the recovery-floor target on top
