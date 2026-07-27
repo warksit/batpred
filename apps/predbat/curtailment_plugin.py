@@ -98,10 +98,19 @@ SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
 # so this software floor is the operational protection, not the BMS.
 SIG_DRAIN_FLOOR_HELPER = "input_number.sig_drain_floor_pct"
 DEFAULT_DRAIN_FLOOR_PCT = 2.8
-# Plugin owns the single-writer handoff: it enables the heartbeat (the register
-# writer) only while CM drives, and parks the unit in EMS-MSC on handback so
-# Predbat controls from the EMS plane. Never app modes (RD2).
+# Plugin owns the single-writer handoff: EXACTLY ONE of these two automations is
+# enabled at any time, so the two writers can never overlap.
+#   CM driving   → heartbeat ON,  mapper OFF
+#   handed back  → heartbeat OFF, mapper ON  (+ parked in EMS-MSC, RD2 — never app modes)
+# The mapper stays a plain stock automation with no mutex condition of its own;
+# being disabled IS the mutex.
+#
+# 2026-07-27: the mapper had been disabled since the 2026-07-15 swap and nothing
+# re-enabled it, so Predbat had no control path at all — it asked for Discharging
+# twice overnight on 07-26 and select.sigen_plant_remote_ems_control_mode never
+# moved. Toggling it here is what closes that hole.
 SIG_HEARTBEAT_AUTOMATION = "automation.sig_dispatch_heartbeat"
+PREDBAT_MAPPER_AUTOMATION = "automation.predbat_requested_mode_action"
 SIG_EMS_MODE_SELECT = "select.sigen_plant_remote_ems_control_mode"
 SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
@@ -2159,11 +2168,29 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self._log_once("ems_msc_err", "Curtailment: failed to set EMS-MSC: {}".format(e))
 
+    def _set_writer(self, cm_driving):
+        """Hand the register-writing role between the heartbeat and the Predbat mapper.
+
+        Exactly one is ever enabled — being disabled IS the mutex, so neither
+        automation needs a condition of its own. Always disable the outgoing writer
+        BEFORE enabling the incoming one: a brief gap with neither enabled is safe
+        (the inverter holds its last setpoint), whereas a brief overlap is two
+        writers fighting over the same registers.
+        """
+        if cm_driving:
+            self._set_automation(PREDBAT_MAPPER_AUTOMATION, False)
+            self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
+        else:
+            self._set_automation(SIG_HEARTBEAT_AUTOMATION, False)
+            self._set_automation(PREDBAT_MAPPER_AUTOMATION, True)
+
     def _release_to_predbat(self):
         """Window end (safe_time / off): hand the whole machine back to Predbat.
-        Order (RD2/RD6/RD10): disable the heartbeat writer, park EMS-MSC, set policy
-        Predbat, reset the sell floor, then clear read_only so Predbat resumes."""
-        self._set_automation(SIG_HEARTBEAT_AUTOMATION, False)
+        Order (RD2/RD6/RD10): swap the writer role (heartbeat off, mapper on), park
+        EMS-MSC, set policy Predbat, reset the sell floor, then clear read_only so
+        Predbat resumes. The mapper must be live BEFORE read_only clears, or
+        Predbat's first requested_mode change lands with nothing listening."""
+        self._set_writer(cm_driving=False)
         self._park_ems_msc()
         self._set_policy(POLICY_PREDBAT)
         self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
@@ -2278,13 +2305,13 @@ class CurtailmentPlugin(PredBatPlugin):
             return
 
         if manual:
-            # RD13 manual override: keep the single-writer machine LIVE — enable the
-            # heartbeat and suppress Predbat — but DON'T write the policy or keep floor.
+            # RD13 manual override: keep the single-writer machine LIVE — heartbeat on,
+            # mapper off, Predbat suppressed — but DON'T write the policy or keep floor.
             # The user drives input_select.sig_dispatch_policy by hand and it sticks.
             # Grabs control regardless of plugin_active (failsafe manual drive), and
             # never hands back while the override is on.
             if not self._cm_controlling:
-                self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
+                self._set_writer(cm_driving=True)
                 self._cm_controlling = True
             if not self._read_only_set:
                 self._set_read_only(True)
@@ -2293,9 +2320,10 @@ class CurtailmentPlugin(PredBatPlugin):
             return
 
         if plugin_active:
-            # CM window. Ensure the heartbeat writer is running (window start edge).
+            # CM window. Take the writer role (window start edge): mapper off so
+            # Predbat can't write EMS modes underneath us, heartbeat on.
             if not self._cm_controlling:
-                self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
+                self._set_writer(cm_driving=True)
                 self._cm_controlling = True
             if soc_pct > low_soc:
                 # CM drives: suppress Predbat, set the policy.
