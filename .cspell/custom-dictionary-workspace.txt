@@ -33,6 +33,7 @@ armhf
 armv
 ASHP
 asn
+astimezone
 asyncio
 atfork
 atleast
@@ -123,6 +124,7 @@ darkred
 darray
 dasharray
 Dashlane
+datacorrect
 datain
 datalist
 datalog
@@ -148,6 +150,9 @@ derating
 dess
 desync
 desynced
+deque
+derating
+dess
 devcontainer
 devcontainers
 dexport
@@ -274,6 +279,7 @@ gridconsumptionpower
 Groq
 growatt
 growattsph
+gshp
 GWMQTT
 HACS
 hadashboard
@@ -282,6 +288,7 @@ hainterface
 halfhourly
 hanchu
 hanchuess
+handback
 hanres
 HAOS
 harvi
@@ -302,6 +309,7 @@ htmlcov
 hultenvp
 husforbrukning
 hypervolt
+hyst
 iboost
 idag
 idef
@@ -334,6 +342,7 @@ jsyaml
 kaiming
 keepalive
 kellerza
+keepfloor
 keydb
 khtml
 killall
@@ -394,6 +403,7 @@ metricmid
 microinverters
 middlebox
 middleboxes
+middlemuir
 minb
 minmax
 minsoc
@@ -476,6 +486,9 @@ Opticaster
 overclaim
 overfitting
 oversizing
+overdrains
+overfitting
+overforecast
 overvoltage
 ownerapi
 pac
@@ -681,6 +694,7 @@ timestep
 timestr
 timezone
 tmpfs
+tmpl
 tmrw
 tojson
 topbar
@@ -709,6 +723,7 @@ unfetchable
 unflushed
 unindexed
 unnormalised
+underforecast
 unparseable
 unpickled
 unpickles
@@ -728,6 +743,7 @@ useid
 userinterface
 Vallery
 varh
+vcap
 venv
 Victron
 visibilitychange
