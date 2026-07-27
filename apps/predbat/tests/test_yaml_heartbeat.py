@@ -79,6 +79,59 @@ def test_structural():
     print("PASS  structural: handback EMS-MSC, never turns Remote EMS off")
 
 
+def test_heartbeat_and_predbat_never_drive_together():
+    """While policy == Predbat the heartbeat must write NOTHING but the EMS enable.
+
+    Mutual exclusion, not negotiation: the heartbeat is the sole register writer
+    for the active policies, and Predbat is the sole writer once handed back.
+
+    Regression 2026-07-27: the Predbat branch re-asserted MSC on EVERY run when
+    the EMS mode was not MSC — i.e. exactly when Predbat had just set Command
+    Charging / Command Discharging. `stale_setpoint` is already gated to the
+    active policies, but the 1-minute `beat` is not, so Predbat's mode was
+    reverted within a minute. Enabling predbat_requested_mode_action alone
+    therefore achieved nothing.
+
+    Fix: the MSC write fires only on the policy_change trigger — the transition
+    into handback. Turning Remote EMS on stays unconditional (Predbat cannot
+    control without it, and it is not a control decision).
+    """
+    auto = _load()
+    choose = auto["action"][1]["choose"]
+    predbat = next((b for b in choose if "Predbat" in " ".join(str(c) for c in b["conditions"])), None)
+    assert predbat is not None, "no Predbat handback branch"
+
+    msc_step = None
+    for step in predbat["sequence"]:
+        if not isinstance(step, dict) or "if" not in step:
+            continue
+        if any((a.get("action") or a.get("service")) == "select.select_option" and a.get("data", {}).get("option") == "Maximum Self Consumption" for a in _iter_actions(step.get("then", []))):
+            msc_step = step
+            break
+    assert msc_step is not None, "no guarded MSC write in the Predbat branch"
+
+    guard = " ".join(str(c) for c in msc_step["if"])
+    assert "policy_change" in guard, "MSC write must be gated on the policy_change trigger (one-shot handback), else the 1-min beat stomps Predbat"
+
+    # Nothing else in the Predbat branch may write a control register.
+    allowed = {"switch.turn_on", "select.select_option"}
+    for a in _iter_actions(predbat["sequence"]):
+        svc = a.get("action") or a.get("service")
+        if svc is None:
+            continue
+        assert svc in allowed, f"Predbat branch must not call {svc!r} — heartbeat must stay inert while Predbat drives"
+        if svc == "switch.turn_on":
+            assert REMOTE_EMS_SWITCH in str(a.get("target", {})), "only the Remote EMS enable may be written unconditionally"
+
+    # The live setpoint trigger must never fire under Predbat policy.
+    stale = next((t for t in auto["trigger"] if t.get("id") == "stale_setpoint"), None)
+    assert stale is not None, "stale_setpoint trigger missing"
+    assert "'Predbat'" not in stale["value_template"].replace("!= 'Predbat'", ""), "stale_setpoint must be gated to active policies only"
+    for p in ("Max Export", "Hold Battery", "Solar Charge Battery"):
+        assert p in stale["value_template"], f"stale_setpoint must list active policy {p!r}"
+    print("PASS  exclusion: heartbeat inert under Predbat policy (MSC one-shot on policy_change only)")
+
+
 def test_live_trigger():
     auto = _load()
     stale = next((t for t in auto["trigger"] if t.get("id") == "stale_setpoint"), None)
@@ -148,6 +201,7 @@ def test_dispatch_drain_floor_default_2_8():
 def main():
     for t in (
         test_structural,
+        test_heartbeat_and_predbat_never_drive_together,
         test_live_trigger,
         test_dispatch_ceiling_overflow,
         test_dispatch_tracks_pv_on_dip,
