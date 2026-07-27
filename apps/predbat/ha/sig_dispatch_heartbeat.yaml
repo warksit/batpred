@@ -6,10 +6,13 @@
 # sets the POLICY; only this automation touches Remote EMS enable, control
 # mode, export limit and PCS dispatch.
 #
-#   Predbat            → release (RD2): STAY in EMS control — Remote EMS ON, EMS
-#                        control mode = Maximum Self Consumption. NEVER app modes.
-#                        Predbat controls from EMS-MSC by switching EMS modes.
-#                        Idempotent so it doesn't fight Predbat once it takes over.
+#   Predbat            → release (RD2): ONE-SHOT handback on the policy_change
+#                        trigger only — Remote EMS ON, EMS control mode = Maximum
+#                        Self Consumption. NEVER app modes. Thereafter this
+#                        automation writes NOTHING while policy == Predbat: the
+#                        heartbeat and Predbat must never both be driving.
+#                        Predbat controls from EMS-MSC by switching EMS modes via
+#                        predbat_requested_mode_action.
 #   Max Export         → dispatch = 6.6 (inverter max): command max output and let
 #                        grid_export_limitation clamp export to the DNO cap in
 #                        hardware — export pinned at 3.68, battery discharges to hold
@@ -88,11 +91,28 @@ action:
       ceiling_kw: "{{ 6.6 if policy == 'Max Export' else [load_kw + cap_kw, 6.6] | min }}"
       dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), ceiling_kw] | min, 0] | max }}"
   - choose:
-      # Release (Predbat): STAY in EMS control (RD2). Remote EMS ON, EMS control
-      # mode = Maximum Self Consumption. NEVER turn Remote EMS off / drop to app
-      # modes — that leaves the EMS plane and Predbat can't get back in. Predbat
-      # controls from EMS-MSC by switching EMS modes. Idempotent: only writes when
-      # not already in that state, so it doesn't fight Predbat once it takes over.
+      # Release (Predbat): ONE-SHOT handback, then stay out of the way entirely.
+      # STAY in EMS control (RD2) — NEVER turn Remote EMS off / drop to app modes,
+      # that leaves the EMS plane and Predbat can't get back in. Predbat controls
+      # from within EMS by switching EMS modes via predbat_requested_mode_action.
+      #
+      # 2026-07-27 FIX — the heartbeat and Predbat must NEVER both be driving.
+      # This branch used to re-assert MSC on every run whenever the EMS mode was
+      # not MSC. The old comment called that "idempotent … doesn't fight Predbat";
+      # it is the exact inverse — it fired precisely when Predbat had just set
+      # Command Charging / Command Discharging. The `stale_setpoint` trigger is
+      # already gated to the active policies, but the 1-minute `beat` is not, so
+      # Predbat's mode was reverted within a minute, every time. That is why
+      # enabling predbat_requested_mode_action alone achieves nothing.
+      #
+      # Now the MSC write fires ONLY on the policy_change trigger — the transition
+      # into handback. On the beat this branch writes nothing at all, so while
+      # Predbat holds the wheel the heartbeat is inert. The Remote EMS check stays
+      # unconditional because Predbat cannot control at all without it, and
+      # turning it on is not a control decision.
+      #
+      # Matching half: the sig_dispatch_policy == 'Predbat' mutex condition in
+      # predbat_requested_mode_action.yaml. Change the two together.
       - conditions:
           - "{{ policy == 'Predbat' }}"
         sequence:
@@ -106,6 +126,8 @@ action:
                   entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
               - delay: "00:00:02"
           - if:
+              - condition: template
+                value_template: "{{ (trigger.id | default('')) == 'policy_change' }}"
               - condition: not
                 conditions:
                   - condition: state
