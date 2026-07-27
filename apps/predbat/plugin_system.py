@@ -87,11 +87,7 @@ class PluginSystem:
                     if isinstance(result, dict):
                         context = result
                     else:
-                        self.log(
-                            "Warning: on_before_plan callback {} returned {}, expected dict. Ignoring.".format(
-                                entry["callback"].__name__, type(result).__name__
-                            )
-                        )
+                        self.log("Warning: on_before_plan callback {} returned {}, expected dict. Ignoring.".format(entry["callback"].__name__, type(result).__name__))
                 except Exception as e:
                     self.log("Error calling on_before_plan callback {}: {}".format(entry["callback"].__name__, e))
         return context
