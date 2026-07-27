@@ -72,6 +72,29 @@ def test_publishes_chained_value_not_intermediate():
     return 0
 
 
+def test_discovery_picks_the_plugin_not_the_base_class():
+    """Auto-discovery must instantiate SocKeepPublishPlugin, not PredBatPlugin.
+
+    Regression 2026-07-27: inspect.getmembers() returns members ALPHABETICALLY and
+    the name-based strategy took the first class ending in "Plugin". Because this
+    module does `from plugin_system import PredBatPlugin`, and "PredBatPlugin" sorts
+    before "SocKeepPublishPlugin", the abstract base was constructed instead. The
+    plugin logged as loaded successfully and did nothing — sensor.predbat_best_soc_keep
+    went stale for hours. ColdWeatherPlugin/CurtailmentPlugin were spared by
+    alphabetical luck alone.
+    """
+    import inspect
+
+    import soc_keep_publish_plugin as mod
+
+    candidates = [name for name, obj in inspect.getmembers(mod, inspect.isclass) if name.endswith("Plugin") and obj.__module__ == mod.__name__]
+    assert candidates == ["SocKeepPublishPlugin"], f"discovery would instantiate {candidates}, expected only SocKeepPublishPlugin"
+
+    # The imported base must still be present but excluded by the __module__ filter.
+    assert any(name == "PredBatPlugin" for name, _ in inspect.getmembers(mod, inspect.isclass)), "test is vacuous if the base class is not imported"
+    print("  test_discovery_picks_the_plugin_not_the_base_class: PASSED")
+
+
 def test_runs_last():
     """Priority must exceed the adjusting plugins so it observes, never pre-empts."""
     assert SocKeepPublishPlugin.priority > 200, "must run after cold_weather (200)"
@@ -118,6 +141,7 @@ def run_soc_keep_publish_tests(_my_predbat=None):
     print("*** SOC keep publish plugin ***")
     for fn in (
         test_publishes_chained_value_not_intermediate,
+        test_discovery_picks_the_plugin_not_the_base_class,
         test_runs_last,
         test_does_not_modify_context,
         test_missing_key_skips_publish,
