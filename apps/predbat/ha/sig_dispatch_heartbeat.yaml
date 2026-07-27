@@ -126,8 +126,8 @@ action:
                   entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
               - delay: "00:00:02"
           - if:
-              - condition: template
-                value_template: "{{ (trigger.id | default('')) == 'policy_change' }}"
+              - condition: trigger
+                id: policy_change
               - condition: not
                 conditions:
                   - condition: state
