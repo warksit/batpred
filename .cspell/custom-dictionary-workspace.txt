@@ -159,6 +159,7 @@ deye
 deyecloud
 digestmod
 dimport
+disch
 dischargeenergytotal
 dischargefreeze
 Dischg
