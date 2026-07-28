@@ -1551,6 +1551,40 @@ def test_manual_override_grabs_control_even_when_inactive():
     print("  test_manual_override_grabs_control_even_when_inactive: PASSED")
 
 
+def test_manual_override_writer_follows_policy_to_predbat():
+    """Under manual override the WRITER ROLE must still follow the policy select.
+
+    Manual override means "the user owns the policy select", NOT "the writer role
+    goes stale". Whoever sets the policy — the user, or sig_keep_floor_guard hitting
+    the reserve — the enables and read_only have to match it.
+
+    2026-07-28: during a manual Max Export drain the keep-floor guard hit the reserve
+    and set policy -> Predbat. This branch took CM control unconditionally, so the
+    mappers stayed disabled and read_only stayed on: Predbat could not act on the
+    policy it had just been handed, and the inverter sat on its own MSC default with
+    nobody driving. The guard was right; the handover was silently incomplete.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides["input_boolean.sig_manual_override"] = "on"
+    base._sensor_overrides["input_select.sig_dispatch_policy"] = "Predbat"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._cm_controlling = True  # CM held the wheel before the guard intervened
+    plugin._read_only_set = True
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+
+    calls = _automation_calls(base)
+    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") in calls, f"policy Predbat -> heartbeat must release, got {base.services}"
+    assert ("automation/turn_on", "automation.predbat_requested_mode_action") in calls, f"policy Predbat -> mappers must be enabled, got {base.services}"
+    assert base.set_read_only is False, "read_only must clear so Predbat can act on the policy it was handed"
+    assert plugin._cm_controlling is False
+    # Still must not write the policy select — that is the user's under override.
+    assert not _policy_calls(base), f"manual override must never write the policy, got {base.services}"
+    print("  test_manual_override_writer_follows_policy_to_predbat: PASSED")
+
+
 def test_proposed_phase_charge_below_floor():
     """SOC < charge_below → Charge (P10 recovery at risk)."""
     from curtailment_calc import compute_proposed_phase
@@ -5395,6 +5429,7 @@ def run_curtailment_tests(my_predbat=None):
         test_manual_override_keeps_machine_live_skips_policy,
         test_manual_override_off_resumes_policy,
         test_manual_override_grabs_control_even_when_inactive,
+        test_manual_override_writer_follows_policy_to_predbat,
         test_heartbeat_enabled_on_control,
         test_exactly_one_writer_enabled_on_control,
         test_predbat_neutralised_before_its_chain_is_frozen,

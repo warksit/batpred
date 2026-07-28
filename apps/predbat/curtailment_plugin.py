@@ -2379,18 +2379,32 @@ class CurtailmentPlugin(PredBatPlugin):
         # separate step ahead of the branches would double-toggle and briefly enable
         # the wrong writer.
         if manual:
-            # RD13 manual override: keep the single-writer machine LIVE — heartbeat on,
-            # mapper off, Predbat suppressed — but DON'T write the policy or keep floor.
-            # The user drives input_select.sig_dispatch_policy by hand and it sticks.
-            # Grabs control regardless of plugin_active (failsafe manual drive), and
-            # never hands back while the override is on.
-            if first_run or not self._cm_controlling:
-                self._set_writer(cm_driving=True)
-                self._cm_controlling = True
-            if not self._read_only_set:
+            # RD13 manual override: the user owns the POLICY SELECT — we never write it.
+            # But the WRITER ROLE must still follow whatever the policy says, whoever
+            # set it. Manual override means "you choose the policy", not "the writer
+            # role goes stale".
+            #
+            # 2026-07-28: this branch used to take CM control unconditionally. When
+            # sig_keep_floor_guard hit the reserve during a manual Max Export drain and
+            # set policy -> Predbat, the writer role stayed with CM — mappers disabled,
+            # read_only on — so Predbat could not act on the policy it had just been
+            # handed. Result: nobody driving, inverter left on its own MSC default.
+            # The guard was right; the handover was silently incomplete.
+            policy_now = self.base.get_state_wrapper(SIG_POLICY_SELECT, default=None)
+            want_cm = policy_now != POLICY_PREDBAT
+            if first_run or self._cm_controlling != want_cm:
+                self._set_writer(cm_driving=want_cm)
+                self._cm_controlling = want_cm
+            # read_only follows the DRIVE: suppress Predbat only while CM's executor
+            # holds the wheel. On a manual hand to Predbat it must be cleared, or the
+            # mappers are live but Predbat is still muzzled.
+            if want_cm and not self._read_only_set:
                 self._set_read_only(True)
                 self._read_only_set = True
-            self._policy_driving = True
+            elif not want_cm and self._read_only_set:
+                self._set_read_only(False)
+                self._read_only_set = False
+            self._policy_driving = want_cm
             return
 
         if plugin_active:
