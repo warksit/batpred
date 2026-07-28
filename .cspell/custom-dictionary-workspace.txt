@@ -489,6 +489,7 @@ oversizing
 overdrains
 overfitting
 overforecast
+overpredict
 overvoltage
 ownerapi
 parseable
@@ -722,6 +723,9 @@ unflushed
 unindexed
 unnormalised
 underforecast
+underpredict
+underpredicted
+underpredicts
 unparseable
 unpickled
 unpickles
