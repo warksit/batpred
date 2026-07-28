@@ -106,6 +106,7 @@ deye
 deyecloud
 digestmod
 dimport
+disch
 dischargeenergytotal
 dischargefreeze
 diverter
