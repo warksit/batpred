@@ -330,6 +330,7 @@ openweathermap
 overdrains
 overfitting
 overforecast
+overpredict
 overvoltage
 ownerapi
 parseable
@@ -488,6 +489,9 @@ tzfile
 tzpath
 unconfigured
 underforecast
+underpredict
+underpredicted
+underpredicts
 unparseable
 unsmoothed
 unstaged
