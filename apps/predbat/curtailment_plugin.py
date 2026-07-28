@@ -88,7 +88,19 @@ SIG_POLICY_CONTROL_ENABLE = "input_boolean.sig_plugin_policy_control"
 # RD13 manual override: when on (and the gate is on) the plugin keeps the machine
 # LIVE (heartbeat + read_only) but STOPS writing the policy select, so a hand-set
 # policy sticks instead of being overwritten every cycle. Off = automated control.
-SIG_MANUAL_OVERRIDE = "input_boolean.sig_manual_override"
+# RD13a (2026-07-28): manual override is ONE entity. Override is active iff the
+# select is anything but "Off"; the value IS the policy to hold.
+#   Off / Max Export / Hold Battery / Solar Charge Battery
+# NO Predbat option — handing back is the plugin's decision (RD6), not a manual
+# mode, and "Off" already means "you decide".
+#
+# The old input_boolean.sig_manual_override is GONE. It was redundant state
+# derivable from the select, so all it could add was divergence: the select
+# reading "Max Export" while the boolean said off (plugin quietly back in
+# control), or the reverse. A first attempt kept both and bridged them with an
+# automation — a shim for a problem that only existed because of the second entity.
+SIG_OVERRIDE_SELECT = "input_select.sig_override"
+OVERRIDE_OFF = "Off"
 SIG_POLICY_SELECT = "input_select.sig_dispatch_policy"
 SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
 # v32 (2026-07-21): single drain-floor helper — the ONE SOC below which CM stops
@@ -2474,7 +2486,8 @@ class CurtailmentPlugin(PredBatPlugin):
 
         gate = str(self.base.get_state_wrapper(SIG_POLICY_CONTROL_ENABLE, default="off")).lower()
         acting = gate in ("on", "true")
-        manual = str(self.base.get_state_wrapper(SIG_MANUAL_OVERRIDE, default="off")).lower() in ("on", "true")
+        override_choice = str(self.base.get_state_wrapper(SIG_OVERRIDE_SELECT, default=OVERRIDE_OFF) or OVERRIDE_OFF)
+        manual = override_choice not in (OVERRIDE_OFF, "unknown", "unavailable", "")
 
         # Always publish the intended decision — this is what you watch in observe-only.
         try:
