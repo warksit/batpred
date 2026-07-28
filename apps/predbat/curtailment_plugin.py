@@ -1615,10 +1615,20 @@ class CurtailmentPlugin(PredBatPlugin):
             self._r63_engaged = False
         self._r63_needed_kwh = round(needed_kwh, 2)
 
+        # RD14c (2026-07-28): the plugin no longer drives DISPATCH for a saving
+        # session — the heartbeat does, natively off the Octoplus calendar.
+        # _session_active is still read because the PLANNING half below uses it
+        # (reserve energy ahead of a session, but stop protecting it once the
+        # session is running and we are meant to be selling it).
+        #
+        # Why this moved out: the plugin's override PINNED the select to Max
+        # Export. At session end the heartbeat computes policy = raw_policy —
+        # still Max Export — so dumping continued until the plugin's next 5-min
+        # cycle. Measured 2026-07-28: session ended 19:30:00, released 19:35:46,
+        # 5 min 46 s of selling the battery past the paid window. The heartbeat
+        # cannot fix that edge while the plugin overrides the select.
         self._session_active = self._is_saving_session_active()
-        if self._session_active:
-            self._policy_override = "max_export"
-        elif self._r63_engaged:
+        if self._r63_engaged:
             # Outranks no_drain: that says "it fits right now", R63 says "it won't
             # fit later and this is the last chance to do anything about it".
             self._policy_override = "max_export"
