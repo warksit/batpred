@@ -286,41 +286,53 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - net_charging)
 
 
-def compute_charge_recovery_floor(overnight_target_kwh, p10_overflow_kwh):
-    """R59a — recovery floor for charge_below: SOC needed now to reach
-    overnight_target WITHOUT actively charging.
+def compute_charge_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh):
+    """R59b — recovery floor for charge_below: SOC needed now to land on
+    overnight_target, given the P10 GENERATION still available to refill us.
 
-    Formula:
-        floor = max(0, overnight_target - p10_overflow)
+    Formula (identical to compute_p10_recovery_floor):
+        floor = max(0, overnight_target - (p10_pv_remaining - load_remaining))
 
-    Why overflow and not (p10_pv - load), as R59 originally specified: the
-    no-charge policy is Hold, and Hold pins dispatch at `load + export_cap`.
-    The export cap is therefore served BEFORE the battery, so the only PV that
-    reaches the battery is what exceeds it — the overflow. Netting against raw
-    `p10_pv - load` credits the battery with energy Hold is exporting to the
-    grid.
+    **Generation, not overflow.** Overflow is a curtailment quantity — PV above
+    load + export cap. Generation is what can actually be used to fill the
+    battery. R59a (2026-07-27) netted against overflow on the argument that the
+    no-charge policy is Hold, and Hold serves the export cap before the battery.
+    That reasoning is circular: this floor's job is to *choose* the policy, so
+    assuming Hold bakes the answer in. Under it the floor can only ever equal
+    overnight_target, so Charge fires from dawn no matter how much free PV is
+    coming.
 
-    Observed 2026-07-27: p10_pv=16.77, load=5.92, target=7.07, overflow_p10=0.0.
-    R59 gave 7.07-10.85 -> 0 (charge_below floored to 0.5 kWh = 2.8%) and CM
-    held for 6h25m from 9% SOC on a day with zero P10 overflow. R59a gives 7.07
-    (39.1%), so Charge fires.
+    Observed 2026-07-28: charge_below went 0.54 -> 7.20 kWh at 06:01 and stayed
+    flat all day, blocking the morning drain on a day forecasting 12.28 kWh of
+    P90 overflow — the exact inverse of R25 (headroom is cheap early and
+    impossible late).
 
-    Scope: this feeds `charge_below` ONLY. The R54 drain target keeps
-    `compute_p10_recovery_floor` — an overflow-netted floor could raise the drain
-    target on big-overflow days (where overflow_floor < overnight_target) and
-    strand curtailment headroom, violating R25/R52. `compute_drain_above` never
-    consumed a recovery floor, so the Drain threshold is unaffected either way.
+    **The Schmitt band supplies the timing, not this floor.** The floor starts
+    near 0 on a bright morning (Hold — keep SOC low, preserve headroom for
+    afternoon PV) and rises as remaining generation shrinks, crossing SOC and
+    flipping Hold -> Solar Charge by itself. Banking happens as late as it
+    safely can. That is the 2026-07-27 case handled correctly, without R59a's
+    charge-from-dawn.
+
+    Note CM stays in control for the whole curtailment window rather than
+    handing back when overflow is momentarily zero: Predbat has no curtailment
+    awareness, and PV arriving in the afternoon still needs managing.
 
     Args:
         overnight_target_kwh: required SOC by end of day.
-        p10_overflow_kwh: Solcast P10 remaining overflow (kWh) — PV above
-            load + effective export cap, i.e. what actually reaches the battery
-            under Hold. Always >= 0.
+        p10_pv_remaining_kwh: Solcast P10 PV remaining (kWh).
+        load_remaining_kwh: forecast load remaining today (kWh). If this exceeds
+            PV the net is negative and the floor is raised above the target to
+            cover the through-day deficit.
 
     Returns:
-        kWh — minimum SOC needed now to land on overnight target without charging.
+        kWh — minimum SOC needed now to land on overnight target.
     """
-    return max(0.0, overnight_target_kwh - max(0.0, p10_overflow_kwh))
+    return compute_p10_recovery_floor(
+        overnight_target_kwh=overnight_target_kwh,
+        p10_pv_remaining_kwh=p10_pv_remaining_kwh,
+        load_remaining_kwh=load_remaining_kwh,
+    )
 
 
 def compute_session_reserve(duration_minutes, cap_kw):
