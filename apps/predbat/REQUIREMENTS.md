@@ -70,6 +70,12 @@ the ones we keep wishing we had.
 **Implemented in:** file.py:function — so drift is findable.
 ```
 
+**If a requirement has no recorded Why, do not guess it — and do not act on the
+requirement until you have one.** Ask the user at the point it becomes relevant,
+then write the answer down. A reconstructed-sounding rationale is worse than a
+blank, because it stops anyone asking. Mark unknowns explicitly:
+`**Why:** not recorded — ask before relying on this.`
+
 **"Removing this would" is the field that matters most.** The drain mechanism
 has been removed twice by people who could not see why it was there, and
 restored twice. If a requirement cannot say what breaks without it, that is
@@ -109,6 +115,24 @@ Practically: every override, latch and fallback appears in the `reason` string
 on `sensor.predbat_curtailment_intended_policy`, and any quantity that can come
 from two sources publishes its source alongside its value. A mechanism you
 cannot see is a mechanism you will misdiagnose — and then "fix" something else.
+
+### The dashboard must mirror the plugin, not re-derive it
+
+**After any change to plugin decision logic, check the "Why This Mode" card and
+make it match exactly.** The card is the observability surface required above; a
+card that disagrees with the plugin is worse than no card, because it is trusted.
+
+It must **report** the plugin's decision (`intended_policy` + its `reason`), never
+recompute it. On 2026-07-28 the card did its own Schmitt comparison and read
+"Hold" while the plugin was in "Solar Charge Battery (override no_drain)" — it
+knew nothing about the overrides. Any threshold shown on the card is context for
+the decision, not the decision.
+
+Checklist after a logic change:
+
+1. Does the card still show every input the decision now uses?
+2. Does any new override appear in the `reason` string?
+3. Does the card still report rather than re-derive?
 
 ### Why the Charter exists
 
@@ -156,15 +180,15 @@ else in this file.
 | R8 | IN FORCE | |
 | R9, R9a | IN FORCE | **Tapered cap IS present** (`curtailment_plugin.py:1624`), contradicting v20's claim it was removed. |
 | R10 | IN FORCE (v20 form) | `max(min(curtailment_floor, effective_keep), reserve, deep floor)` |
-| R11 | ⚠️ **IN FORCE, DISPUTED** | Rationale contradicts mechanism — see *Open questions*. |
+| R11 | ❌ **REMOVED** | Floor ratchet. Rationale contradicted mechanism; escape hatch (R43) gone; locked the floor for a full day on 2026-07-28. |
 | R12 | ❌ REMOVED | v20. |
 | R13 | IN FORCE | |
 | R14–R18, R38 | ❌ **REMOVED** | The 5-second three-phase export-limit automation is retired (v30, DC-coupled). |
 | R19, R20, R21 | IN FORCE | safe_time is a control input again (drives Hold), not just a diagnostic. |
-| R25 | ⚠️ **IN FORCE, DISPUTED** | Says geometry is ground truth; R53 made Solcast per-slot primary with geometry as *fallback*. See *Open questions*. |
+| R25 | IN FORCE | Geometry IS the ground truth (resolved 2026-07-28). R53 currently contradicts this in code — tracked as follow-up. |
 | R26–R30 | IN FORCE | |
 | R34–R37 | IN FORCE | Testing discipline. R36 (TDD) and R37 (never break production for tests). |
-| R39 | IN FORCE | Restates R11. |
+| R39 | ❌ **REMOVED** | Restated R11's ratchet; removed with it. |
 | R42 | **DEMOTED** | No longer structural — a calibration knob feeding R58. |
 | R43 | ❌ **REPLACED by R58** | `floor_scale = max(p90, actual)` is **gone**: `curtailment_plugin.py:1050` sets `floor_scale = p90_scale`. **Do not cite as authority.** |
 | R44 | IN FORCE | |
@@ -175,7 +199,8 @@ else in this file.
 | R50 | **DORMANT** | Code retained; re-enabled by setting `curtailment_confidence_high` < 1.0. Not the live path. |
 | R50a | IN FORCE | Live path is `overflow_p90`. **Its citations of R7/R42/R43 are to dead requirements** — the conclusion rests on R25's worst-case logic instead. |
 | R52 | IN FORCE | Pre-PV drain. Already contains a time-to-drain calculation — the ancestor of R63. |
-| R53, R54, R55 | IN FORCE | |
+| R53 | ⚠️ **CONFLICTS WITH R25** | Solcast per-slot is primary in code; R25 says geometry. R53's original justification (actual_scale extrapolation) died with R43. Follow-up. |
+| R54, R55 | IN FORCE | |
 | R56 | ❌ SUPERSEDED | by R6/RD6 — CM must not own the evening. |
 | R57, R58 | IN FORCE | |
 | R59 | ❌ SUPERSEDED by R59b | |
@@ -215,12 +240,28 @@ deadline (R63).
 on marginal days and silently curtails on the days that matter — exactly what
 R50's confidence blend did before R50a retired it.
 
-**Disputed — see Open questions.** This section also historically claimed the
-overflow *integral* comes from solar geometry because per-slot forecast is too
-noisy. R53 changed that: Solcast per-slot is now primary, geometry is the
-fallback when fewer than 4 detailed slots are available
-(`curtailment_plugin.py:909`). The "act early, worst case" principle above is
-unaffected and remains in force.
+**Geometry is the ground truth for the overflow integral** (resolved 2026-07-28).
+
+**Why:** we are protecting against the *maximum*, and once PV − load exceeds the
+export cap there are no levers left. The smooth `scale × sin(elev)` curve gives a
+stable worst-case envelope. Solcast per-slot values move a lot cycle-to-cycle, and
+driving the floor from them made the whole system jump around.
+
+**Removing this would:** reintroduce a floor that chases per-slot noise, so the
+drain decision changes every cycle and the headroom commitment is never stable.
+
+**Known conflict — R53 currently contradicts this in code.** `_compute_overflow_band`
+uses Solcast per-slot whenever `detailed` has ≥ 4 slots and only falls back to
+geometry below that (`curtailment_plugin.py:909`), i.e. Solcast is primary in
+practice. R53 was introduced in v20 to fix a specific failure: `actual_scale`
+being extrapolated across the whole day (clear morning → cloudy afternoon →
+16 kWh of phantom overflow). **That failure mode is already gone** — R43 was
+replaced by R58 and `floor_scale = p90_scale` unconditionally
+(`curtailment_plugin.py:1050`), so nothing extrapolates a live scale any more.
+R53's original justification therefore no longer applies.
+
+Restoring geometry as primary is a live behavioural change and is tracked as
+follow-up work, not done inline. See *Open questions*.
 
 ## Safety
 
@@ -318,14 +359,33 @@ unaffected and remains in force.
   06:11–09:58 BST before this fix). Engagement latch clears when
   `_keep_recovered = True` (drain cycle complete). All three flags persisted
   via state file; reset on day rollover.
-- **R11**: Floor ratchet applies to the OVERFLOW-DERIVED floor only, not the
-  final floor after soc_keep/reserve clamps. `soc_keep` and `reserve` are
-  DYNAMIC — when cold weather boost ends or on_before_plan reduces keep, the
-  final floor follows. Only the `soc_max - overflow × safety_factor` component
-  ratchets (the actual headroom reservation we've committed to).
-  Exception: ratchet is bypassed when `floor_scale` increased from previous
-  cycle (R43 triggered — sunnier than forecast, more headroom needed, allow
-  floor to drop). Reset on deactivation.
+- **R11** — ❌ **REMOVED 2026-07-28.** See History for the original text and the
+  reasoning behind removal.
+
+  **What it did:** clamped the overflow-derived floor with
+  `overflow_floor = max(overflow_floor, previous_floor)`, so the floor could only
+  ever rise within a day, bypassed only when `floor_scale` increased.
+
+  **Why it was removed:**
+  1. **Its rationale contradicted its mechanism.** It was justified as *"headroom
+     already reserved cannot be reclaimed"*, but a *rising* floor means draining
+     to a *higher* SOC — i.e. reserving *less* headroom. The stated intent would
+     have required `min()`.
+  2. **Its escape hatch no longer exists.** The bypass fired when `floor_scale`
+     rose (R43). R43 is gone — `floor_scale = p90_scale` unconditionally — so the
+     ratchet could never release, whatever the forecast did.
+  3. **It caused a real failure.** On 2026-07-28 it locked the floor at 15.76 kWh
+     (87%) from an early-morning moment when remaining overflow was 0.44 kWh, and
+     held it there all day while p90 overflow rose to 12.28 kWh. Formula value was
+     8.55 kWh (47%). No drain could fire until the persisted value was cleared by
+     hand.
+  4. **Whatever it was originally defending is handled elsewhere.** Floor
+     stability now comes from the inputs being stable: `floor_scale` is p90-derived
+     and does not jump, and R25 keeps the integral on the smooth geometry curve.
+
+  **Removing this would (i.e. what we lose):** nothing identified. If a
+  floor-instability failure reappears, fix it at the input that is unstable —
+  do not reinstate a one-way clamp on the output.
 - **R46**: Deactivation uses `safe_time`, not the forecast integral. Plugin goes
   Off only when `now >= safe_time` (solar geometry past overflow threshold) or
   when the battery-fill check fails. The LoadML-driven integral can under-
@@ -649,9 +709,9 @@ next minor SOC drift.
 
 ## Floor Stability
 
-- **R39**: Floor ratchet (R11): floor never falls within a day. No separate rate
-  limit needed — the integral naturally falls smoothly as sin(elev) decreases.
-  Safe_time only moves later until scale is confirmed (R21).
+- **R39** — ❌ **REMOVED 2026-07-28** with R11; it only restated the ratchet.
+  Floor stability now comes from stable *inputs* (p90-derived `floor_scale`, the
+  smooth geometry integral per R25), not from clamping the output.
 
 ## Testing
 
