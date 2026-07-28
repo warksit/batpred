@@ -74,7 +74,7 @@ trigger:
   # one-shot MSC handback below is gated on policy_change only, so toggling the
   # override while already handed back must not re-park the unit.
   - platform: state
-    entity_id: input_boolean.sig_manual_override
+    entity_id: input_select.sig_override
     id: override_change
   # RD14c: NATIVE calendar triggers. The Octoplus saving-sessions calendar is
   # "on when a saving session that the account has joined is active", and HA
@@ -128,6 +128,9 @@ action:
       # 5-min cycle — the end edge measured 5 min 46 s late, dumping the battery
       # at the cap past the paid window. ~15% of a 30-min session at each edge.
       session_live: "{{ is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') }}"
+      # RD13a: manual override is the select alone — active iff not "Off", and
+      # its value IS the policy. No boolean; there is no second entity to diverge.
+      override_choice: "{{ states('input_select.sig_override') }}"
       raw_policy: "{{ states('input_select.sig_dispatch_policy') }}"
       # `| bool` is load-bearing: HA renders `variables` to strings in some
       # contexts and the string "False" is TRUTHY in Jinja — without it a session
@@ -138,7 +141,12 @@ action:
       # wheel. If we have handed back, Predbat owns the machine and its mappers
       # are enabled — seizing control here would put two writers on the registers
       # (the 2026-07-26 / 2026-07-28 failures).
-      policy: "{{ 'Max Export' if (session_live | bool and raw_policy != 'Predbat') else raw_policy }}"
+      # Precedence: manual override > live saving session > the plugin's select.
+      # A human holding a policy outranks the session dump — they can see something
+      # we cannot.
+      # ONE expression, not a folded block: a `>-` block leaves trailing whitespace,
+      # so "Max Export " would fail every `policy in [...]` comparison below.
+      policy: "{{ override_choice if override_choice not in ['Off', 'unknown', 'unavailable', ''] else ('Max Export' if (session_live | bool and raw_policy != 'Predbat') else raw_policy) }}"
       raw_kw: "{{ 6.6 if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
       # Ceiling = the most the inverter should push out.
       # - Max Export: 6.6 (inverter AC max) — command max output and let the SIG's
