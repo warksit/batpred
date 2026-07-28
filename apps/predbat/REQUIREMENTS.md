@@ -134,6 +134,31 @@ Checklist after a logic change:
 2. Does any new override appear in the `reason` string?
 3. Does the card still report rather than re-derive?
 
+### Complexity ratchet
+
+`.flake8` has set `max-complexity = 15` for a long time, but **flake8 is not in
+`.pre-commit-config.yaml`**, so the limit has never been enforced. Measured
+2026-07-28: `calculate()` is at 49 (ruff's count), 608 lines, ~30 order-dependent
+locals. Across the whole tree, 147 functions exceed 15 — but most are upstream
+Predbat files that are not ours to fix.
+
+A `ruff --select=C901` hook now gates **only the curtailment files we maintain**,
+pinned at **49** — today's worst. It cannot go up. Lower it whenever a function
+is split; never raise it to make a commit pass. If a change needs the number
+raised, split something instead.
+
+**Why this matters beyond tidiness.** On 2026-07-28 a one-block move inside
+`calculate()` broke three things in sequence — `effective_max_reserved`,
+`solcast_so_far`, `sig_daily_pv`, `max_target_soc` — because everything in that
+function is shared sequential local state. Extracting a method instead worked
+first time, because the dependencies became explicit parameters. Long functions
+here are not a style preference; they are why edits are risky.
+
+**Tracked follow-up:** split `calculate()` along the phase boundaries its own
+comments already mark (pre-dawn/pre-PV decision, band computation, override
+selection, floor computation, publish). One extraction per commit, verified
+against the full suite each time.
+
 ### Why the Charter exists
 
 Concrete failures caused by not doing the above, all confirmed live:

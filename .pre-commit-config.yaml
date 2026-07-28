@@ -24,6 +24,20 @@ repos:
   # Run the linter.
   - id: ruff
     args: [--select=F401, --fix]
+  # Complexity RATCHET for the curtailment code we maintain (not upstream
+  # Predbat files — those have 147 functions over the .flake8 limit and are not
+  # ours to fix). .flake8 sets max-complexity=15 but flake8 is not run by
+  # pre-commit, so that limit has never been enforced.
+  #
+  # 49 is `calculate`'s complexity as of 2026-07-28 — the point of this hook is
+  # that nothing gets WORSE. Lower the number as functions are split; never
+  # raise it. Splitting `calculate` along its existing phase boundaries is the
+  # tracked follow-up.
+  - id: ruff
+    alias: ruff-complexity-ratchet
+    name: ruff complexity ratchet (curtailment)
+    args: [--select=C901, --config, "lint.mccabe.max-complexity=49"]
+    files: ^apps/predbat/(curtailment_plugin|curtailment_calc|cold_weather_plugin|soc_keep_publish_plugin)\.py$
 - repo: https://github.com/psf/black
   rev: 23.11.0
   hooks:
