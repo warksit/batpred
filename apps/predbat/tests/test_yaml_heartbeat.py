@@ -78,13 +78,10 @@ def _mock(policy, pv, load, soc, cap_w=3680, hard=12):
     }
 
 
-def _session_mock(policy, start, end, now_dt, pv=2.0, load=0.5, soc=60):
-    """Mock carrying a PLANNED saving-session window (RD14c)."""
+def _session_mock(policy, session_on, pv=2.0, load=0.5, soc=60):
+    """Mock with the Octoplus saving-session CALENDAR on or off (RD14c)."""
     m = _mock(policy, pv, load, soc)
-    m["__now__"] = now_dt
-    if start is not None:
-        m["binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions|current_joined_event_start"] = start
-        m["binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions|current_joined_event_end"] = end
+    m["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"] = "on" if session_on else "off"
     return m
 
 
@@ -286,76 +283,77 @@ def test_dispatch_drain_floor_default_2_8():
     print(f"PASS  drain floor default 2.8%: SOC2% → {d:.2f}")
 
 
-def test_rd14c_session_forces_max_export_from_its_planned_start():
-    """RD14c: the session window comes from its PLANNED times, not the binary
-    sensor. Octopus published the sensor at 19:00:57 for a 19:00:00 session
-    (observed 2026-07-28) and the plugin only re-evaluates every 5 min, so up to
-    ~5 min of a 30-min session was lost — roughly 15% of its value.
-
-    At exactly 19:00:00 the select still says Hold; dispatch must already be
-    Max Export.
+def test_rd14c_live_session_forces_max_export():
+    """RD14c: a live saving session forces Max Export even though the policy
+    select still says Hold. Source is the Octoplus CALENDAR, which is "on when a
+    saving session that the account has joined is active" — joined-only, so an
+    un-joined session can never make us export for free.
     """
-    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
-    at_start = _dt.datetime.fromisoformat(st)
-    _render_dispatch(_load(), _session_mock("Hold Battery", st, en, at_start))
+    _render_dispatch(_load(), _session_mock("Hold Battery", session_on=True))
     ctx = _render_dispatch.ctx
-    assert ctx["session_live"] == "True", f"planned window must be live at its start instant: {ctx['session_live']}"
     assert ctx["policy"] == "Max Export", f"live session must force Max Export, got {ctx['policy']}"
     assert ctx["raw_policy"] == "Hold Battery", "the select itself must be untouched"
-    print("PASS  RD14c: Max Export at the planned start instant")
+    print("PASS  RD14c: live session -> Max Export")
 
 
 def test_rd14c_releases_at_the_planned_end():
-    """The end edge the binary sensor cannot fix: the plugin pins the select to
-    Max Export, so waiting for the sensor plus a 5-min cycle keeps dumping past
-    the session. At 19:30:00 exactly, release."""
-    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
-    _render_dispatch(_load(), _session_mock("Hold Battery", st, en, _dt.datetime.fromisoformat(en)))
+    """The edge that was actually measured wrong: on 2026-07-28 the plugin
+    released Max Export at 19:35:46 for a session that ended at 19:30:00 —
+    5 min 46 s of dumping the battery at the cap past the paid window.
+
+    The moment the calendar clears, dispatch must fall back to the select. This
+    is also the `| bool` regression guard: `session_live` renders to the STRING
+    "False", which is truthy in Jinja, so without the filter a session would
+    start correctly and never release.
+    """
+    _render_dispatch(_load(), _session_mock("Hold Battery", session_on=False))
     ctx = _render_dispatch.ctx
-    assert ctx["session_live"] == "False", "window is half-open: the end instant is NOT live"
-    assert ctx["policy"] == "Hold Battery", f"must fall back to the select at the planned end, got {ctx['policy']}"
-    print("PASS  RD14c: released at the planned end")
+    assert ctx["policy"] == "Hold Battery", f"must fall back to the select when the calendar clears, got {ctx['policy']}"
+    print("PASS  RD14c: calendar off -> released to the select")
 
 
 def test_rd14c_does_not_seize_control_from_predbat():
     """Writer ownership: if CM has handed back, Predbat's mappers are enabled.
     Forcing Max Export would put two writers on the registers — the 2026-07-26
-    and 2026-07-28 failure. A session must NOT override handback."""
-    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
-    mid = _dt.datetime.fromisoformat("2026-07-28T19:15:00+01:00")
-    _render_dispatch(_load(), _session_mock("Predbat", st, en, mid))
-    ctx = _render_dispatch.ctx
-    assert ctx["session_live"] == "True"
-    assert ctx["policy"] == "Predbat", f"must stay handed back during a session, got {ctx['policy']}"
+    and 2026-07-28 failures. A session must NOT override handback."""
+    _render_dispatch(_load(), _session_mock("Predbat", session_on=True))
+    assert _render_dispatch.ctx["policy"] == "Predbat", "must stay handed back during a session"
     print("PASS  RD14c: does not seize control from Predbat")
 
 
-def test_rd14c_outside_window_and_no_session():
-    """Before the window, and with no session at all, the select rules."""
-    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
-    before = _dt.datetime.fromisoformat("2026-07-28T18:59:00+01:00")
-    _render_dispatch(_load(), _session_mock("Hold Battery", st, en, before))
-    assert _render_dispatch.ctx["policy"] == "Hold Battery", "not yet in the window"
-    _render_dispatch(_load(), _session_mock("Hold Battery", None, None, _dt.datetime.fromisoformat("2026-07-28T19:15:00+01:00")))
-    assert _render_dispatch.ctx["policy"] == "Hold Battery", "missing attributes must not crash or force export"
-    print("PASS  RD14c: outside window / no session -> select rules")
+def test_rd14c_uses_native_calendar_triggers():
+    """Native calendar triggers, not a template window. HA schedules these at the
+    exact event boundary; the previous template approach depended on the beat and
+    duplicated the window expression between trigger and action."""
+    trigs = _load()["trigger"]
+    ids = [t.get("id") for t in trigs]
+    assert "session_start" in ids and "session_end" in ids, f"calendar triggers missing: {ids}"
+    cal = [t for t in trigs if t.get("platform") == "calendar"]
+    assert len(cal) == 2, f"expected exactly 2 calendar triggers, got {len(cal)}"
+    assert {t.get("event") for t in cal} == {"start", "end"}, f"need both edges: {cal}"
+    for t in cal:
+        assert "octoplus_saving_sessions" in t.get("entity_id", ""), t
+    print("PASS  RD14c: native calendar start/end triggers")
 
 
-def test_rd14c_boundary_trigger_present():
-    """The beat alone is 60 s granular; an explicit boundary trigger keeps both
-    edges tight and independent of the sensor's publish lag."""
-    ids = [t.get("id") for t in _load()["trigger"]]
-    assert "session_boundary" in ids, f"session boundary trigger missing: {ids}"
-    print("PASS  RD14c: boundary trigger present")
+def test_rd14c_no_template_window_math_remains():
+    """Guard against reintroducing the hand-rolled window. The calendar entity is
+    the single source of truth for whether a session is live."""
+    import yaml as _y
+
+    dumped = _y.dump(_load())
+    assert "as_datetime" not in dumped, "template window math must not return"
+    assert "next_joined_event" not in dumped, "must not fall back to the lagging binary sensor"
+    print("PASS  RD14c: no window math / binary-sensor fallback remains")
 
 
 def main():
     for t in (
-        test_rd14c_session_forces_max_export_from_its_planned_start,
+        test_rd14c_live_session_forces_max_export,
         test_rd14c_releases_at_the_planned_end,
         test_rd14c_does_not_seize_control_from_predbat,
-        test_rd14c_outside_window_and_no_session,
-        test_rd14c_boundary_trigger_present,
+        test_rd14c_uses_native_calendar_triggers,
+        test_rd14c_no_template_window_math_remains,
         test_structural,
         test_heartbeat_and_predbat_never_drive_together,
         test_active_policy_reopens_ess_and_import_limits,
