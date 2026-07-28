@@ -214,8 +214,8 @@ else in this file.
 | R26–R30 | IN FORCE | |
 | R34–R37 | IN FORCE | Testing discipline. R36 (TDD) and R37 (never break production for tests). |
 | R39 | ❌ **REMOVED** | Restated R11's ratchet; removed with it. |
-| R42 | **DEMOTED** | No longer structural — a calibration knob feeding R58. |
-| R43 | ❌ **REPLACED by R58** | `floor_scale = max(p90, actual)` is **gone**: `curtailment_plugin.py:1050` sets `floor_scale = p90_scale`. **Do not cite as authority.** |
+| R42 | **IN FORCE** | p90 scale from Solcast. v20 demoted it to a calibration knob for R58; the code still uses it structurally as one half of R43's max(). |
+| R43 | **IN FORCE** | `floor_scale = max(p90_scale, actual_scale)` is live at `curtailment_plugin.py:1414`. v20 says R58 replaced it; the code kept BOTH. Observed live 2026-07-28 18:00: actual 11.9 > p90 8.5, floor using actual. |
 | R44 | IN FORCE | |
 | R45 | **IN FORCE** | v20 says "removed, replaced by R57" — **wrong**, the tapered buffer is live and load-bearing. |
 | R46 | ❌ REMOVED | v20 lists it under *both* Amended and Removed; Removed is correct. |
@@ -414,6 +414,14 @@ follow-up work, not done inline. See *Open questions*.
   ever rise within a day, bypassed only when `floor_scale` increased.
 
   **Why it was removed:**
+  0. **Correction (2026-07-28):** reason 2 below asserted R43 was gone. It is
+     not — `floor_scale = max(p90_scale, actual_scale)` is live at
+     `curtailment_plugin.py:1414`, so the ratchet's bypass DOES still have a
+     trigger. Reasons 1, 3 and 4 stand on their own and the removal is still
+     correct: the mechanism contradicted its rationale, it locked the floor for
+     a full day on 2026-07-28, and floor stability comes from stable inputs.
+     But the removal was argued partly from a false premise — recorded here
+     rather than quietly fixed.
   1. **Its rationale contradicted its mechanism.** It was justified as *"headroom
      already reserved cannot be reclaimed"*, but a *rising* floor means draining
      to a *higher* SOC — i.e. reserving *less* headroom. The stated intent would
@@ -529,13 +537,14 @@ over-drain costs one round-trip; an under-drain costs the whole clipped surplus
 and cannot be undone. p90 is the worst-case band, and that asymmetry is the
 entire basis of the floor.
 
-> **Citation correction (2026-07-28).** This section originally justified itself
-> on R7, R42 and R43. Per the status index all three are dead: R7 REMOVED
-> (superseded by R53), R42 demoted to a calibration knob, R43 REPLACED by R58 —
-> `floor_scale = p90_scale` at `curtailment_plugin.py:1050`, the
-> `max(p90, actual)` collapse is gone. The conclusion stands on R25 alone; the
-> citations did not. This is exactly the Charter failure "citing a removed
-> requirement".
+> **Citation correction (2026-07-28, twice).** This section originally cited R7,
+> R42 and R43. R7 *is* dead (superseded by R53) and citing it was wrong. R42 and
+> R43 were then ALSO marked dead here — which was itself wrong, from reading a
+> single assignment (`curtailment_plugin.py:1101`, the pre-PV path) and
+> generalising. The post-PV path at `:1414` still runs
+> `floor_scale = max(p90_scale, actual_scale)`; observed live the same evening
+> with actual 11.9 against p90 8.5. **R42 and R43 are in force.** The conclusion
+> holds on R25 and on R43's stated asymmetry; only the R7 citation was bad.
 
 R50 inverted exactly that: on a low-confidence day it blends toward p10 — i.e.
 assumes *no* overflow — which is the one assumption R25 forbids.
