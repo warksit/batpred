@@ -211,6 +211,79 @@ reserved cannot be reclaimed.
   _high, curtailment_confidence_low) exposed on the dashboard. Constraint
   enforced in plugin: 0 ≤ low < high ≤ 1.
 
+### R50a — confidence blend RETIRED as the live path (2026-07-28)
+
+**R50 is superseded for the floor calculation. The live path returns to
+`overflow_p90` per R7/R42/R43.** The blend code and both tunable helpers stay in
+place; setting `input_number.curtailment_confidence_high` below 1.0 re-enables
+R50 from the dashboard with no code change.
+
+**Why R50 contradicted the core design.** R25 says the overflow energy comes from
+the solar geometry curve because *"forecast per-slot data is too noisy to be
+trusted"*. R7 says *"Solcast p90 only"*. R42 picks p90 as *"the worst case for
+overflow headroom"*. R43 makes the scale choice deliberately asymmetric — always
+the LARGER of p90/actual, because *"bigger overflow estimate → lower floor → more
+drain → safer"*. R11 forbids ever lowering the floor: *"headroom already reserved
+cannot be reclaimed."* The whole strategy is worst-case and one-directional,
+because (R25) headroom is cheap to create early and impossible to create late.
+
+R50 inverted exactly that: on a low-confidence day it blends toward p10 — i.e.
+assumes *no* overflow — which is the one assumption R25 forbids.
+
+**Why its justification does not hold.** R50 cites 2026-04-28: drained ~9.5 kWh,
+day gave ~5 kWh, battery hit 1.9%. Replaying that day's Solcast fixture through
+the current floor formula:
+
+```text
+2026-04-28   overflow_p10 1.51   overflow_p90 7.56
+             pure-p90 floor -> drain_above 7.21 kWh (39.9%)
+             R59a          -> charge_below 5.49 kWh (30.4%)
+             band [30.4%, 39.9%] -> drains to 39.9%, then Holds
+```
+
+The p90 estimate floors that day at **39.9%**, not 1.9%. So the p90 overflow
+estimate cannot have caused the bottom-out — the floor formula already prevented
+it. The true cause was elsewhere (most likely R48 relaxing `effective_keep` to
+0.5 kWh, or the pre-PV target), which R50 does not address. R50 made the overflow
+estimate pessimistic to fix a failure the floor was already handling.
+
+Caveat: that is today's formula and constants replayed on April's forecast. April's
+`effective_keep`/R48 state is unknown, so this shows the p90 estimate was not the
+cause — not what was.
+
+**What R50 actually cost.** Across the 11 April/May fixtures, all variants agree on
+8 days (drain to ~3%). They diverge only on LOW-overflow days, where the blend says
+*hold*. So R50's whole practical effect is "do not drain on marginal days" — exactly
+the days where the forecast under-calls and the result is curtailment.
+
+Observed 2026-07-27 and 2026-07-28, two consecutive clear days:
+
+```text
+              forecast overflow   actual
+2026-07-27    2.35 kWh            ~13 kWh absorbed above the cap
+2026-07-28    0.92 kWh (blended)  p90 said 13.03 kWh
+```
+
+On 2026-07-28 at 09:00, SOC 8.05 kWh with 10.03 kWh headroom against a p90 overflow
+of 13.03 kWh — already short — and the blend still said Hold:
+
+```text
+R50 blend (c=0.35)   expected  0.92 -> drain_above 16.07 kWh (88.9%) -> HOLD
+pure p90 (R7/R42/R43) expected 13.03 -> drain_above  0.64 kWh ( 3.6%) -> MAX EXPORT
+```
+
+**Over-drain protection is now R59a's job, and only R59a's.** R59a (2026-07-27) puts
+a real floor under the drain via `charge_below`. Until that fix `charge_below`
+collapsed to the 0.5 kWh deep-discharge floor and protected nothing — so for the
+whole period R50 existed, the mechanism that should have prevented a bottom-out was
+broken. With R59a working, R50's pessimism is redundant and costs headroom on
+precisely the days curtailment matters.
+
+**Known consequence.** On marginal days p90 can put `charge_below` ABOVE
+`drain_above` (e.g. 2026-05-02: 29.2% vs 15.3%). That is the documented
+split-threshold case — Charge wins, no Drain — so it degrades safely, but it is
+more common under p90 than under the blend.
+
 - **R52** (v22 pre-PV drain timing): activate the plugin BEFORE sunrise on
   confirmed-overflow days so we drain at full DNO rate while drain capacity
   is uncontested by PV. Two-stage drain:

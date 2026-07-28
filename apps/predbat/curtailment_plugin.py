@@ -198,8 +198,23 @@ PV_HISTORY_LEN = 15  # 15 × 5 min = 75 min — enough room for 60-min lookback
 
 # v21 confidence-weighted overflow (R50): blend three forecast bands by Solcast
 # analysis.confidence. Tunable via input_number helpers.
-CONFIDENCE_HIGH_DEFAULT = 0.85  # ≥ this → use overflow_p90 (current pre-R50)
-CONFIDENCE_LOW_DEFAULT = 0.60  # < this → blend toward overflow_p10
+#
+# R50a (2026-07-28): the blend is RETIRED as the live path — the floor uses
+# overflow_p90 per R7/R42/R43. HIGH now defaults to 1.0, which the gate in
+# _expected_overflow() reads as "never blend". Set
+# input_number.curtailment_confidence_high below 1.0 to re-enable R50 from the
+# dashboard with no code change; the blend function and both helpers are intact.
+#
+# Why: R25 derives overflow from solar geometry precisely because forecast data is
+# too noisy, R7 says p90 only, R42 picks p90 as the worst case, R43 is deliberately
+# asymmetric toward MORE drain, and R11 forbids ever lowering the floor — headroom
+# is cheap early and impossible late. Blending toward p10 assumes NO overflow, which
+# is the one assumption R25 rules out. Replaying R50's own justification day
+# (2026-04-28) shows the p90 floor stops the drain at 39.9%, not the 1.9% it cites,
+# so p90 was never the cause; over-drain protection is R59a's job and now works.
+CONFIDENCE_BLEND_OFF = 1.0  # HIGH at/above this → pure p90, no blending (R50a)
+CONFIDENCE_HIGH_DEFAULT = 1.0  # R50a: was 0.85. ≥ CONFIDENCE_BLEND_OFF → always p90
+CONFIDENCE_LOW_DEFAULT = 0.60  # only used when the blend is re-enabled
 # Default to HIGH when Solcast doesn't expose confidence — preserves
 # pre-R50 behaviour (always-p90) on environments without the attribute
 # (tests, integrations that don't pass it through). Real Solcast always
@@ -941,6 +956,28 @@ class CurtailmentPlugin(PredBatPlugin):
         low = max(0.0, min(high - 0.05, low))
         return low, high
 
+    def _expected_overflow(self):
+        """R50a: the overflow estimate feeding the floor. p90 unless the blend is on.
+
+        Single gate for both consumers (the R62 pre-PV target and the live R9 floor)
+        so they can never disagree about which estimate the day is being sized on.
+
+        Default is pure p90 (R7/R42/R43). Setting
+        input_number.curtailment_confidence_high below 1.0 re-enables the R50 blend
+        from the dashboard without a code change.
+        """
+        low, high = self._get_confidence_thresholds()
+        if high >= CONFIDENCE_BLEND_OFF:
+            return self._overflow_p90
+        return compute_expected_overflow(
+            p10=self._overflow_p10,
+            p50=self._overflow_p50,
+            p90=self._overflow_p90,
+            confidence=self._confidence,
+            low=low,
+            high=high,
+        )
+
     def _get_solcast_confidence(self):
         """Read Solcast analysis.confidence; fall back to CONFIDENCE_DEFAULT.
 
@@ -1020,15 +1057,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # effective cap) by Solcast confidence, then let the R54-shaped
         # overflow floor set the drain depth. The legacy soc_keep + buffer%
         # value survives as a ceiling only.
-        conf_low, conf_high = self._get_confidence_thresholds()
-        expected_overflow = compute_expected_overflow(
-            p10=self._overflow_p10,
-            p50=self._overflow_p50,
-            p90=self._overflow_p90,
-            confidence=self._confidence,
-            low=conf_low,
-            high=conf_high,
-        )
+        expected_overflow = self._expected_overflow()
         # Dawn load: house load the battery must carry from PV-start until PV
         # covers load (the R61 no-drain window). Crossing at base load + the
         # pv_covering margin; falls back to ~1h of base load if no crossing.
@@ -1404,23 +1433,15 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Read confidence and tunable thresholds from helpers
         confidence = self._get_solcast_confidence()
-        conf_low, conf_high = self._get_confidence_thresholds()
 
-        # R50 blend: confidence-weighted expected overflow.
-        # Replaces the always-p90 single-integral approach.
-        remaining_overflow = compute_expected_overflow(
-            p10=overflow_p10,
-            p50=overflow_p50,
-            p90=overflow_p90,
-            confidence=confidence,
-            low=conf_low,
-            high=conf_high,
-        )
-        # Diagnostics
+        # Diagnostics must be stashed BEFORE _expected_overflow() reads them.
         self._overflow_p10 = round(overflow_p10, 2)
         self._overflow_p50 = round(overflow_p50, 2)
         self._overflow_p90 = round(overflow_p90, 2)
         self._confidence = round(confidence, 2)
+
+        # R50a: p90 per R7/R42/R43 unless the blend is re-enabled from the dashboard.
+        remaining_overflow = self._expected_overflow()
         self._remaining_overflow = round(remaining_overflow, 2)
 
         # Activation check (R5): overflow predicted AND battery would fill
