@@ -1686,11 +1686,20 @@ class CurtailmentPlugin(PredBatPlugin):
             load_remaining_kwh=load_remaining,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
-        # R59a: charge_below's recovery floor nets against P10 OVERFLOW, not raw
-        # (PV - load). The no-charge policy is Hold, which serves the export cap
-        # before the battery, so only overflow actually charges it. Kept separate
-        # from _p10_recovery_floor so the R54 drain target below is unchanged.
-        self._charge_recovery_floor = round(compute_charge_recovery_floor(overnight_for_recovery, self._overflow_p10), 2)
+        # R59b: charge_below's recovery floor nets against P10 GENERATION still
+        # available to refill the battery — not against overflow (a curtailment
+        # quantity). R59a's overflow form pinned the floor at overnight_target
+        # from dawn and blocked the morning drain. The Schmitt band supplies the
+        # timing: this rises as generation runs out, crossing SOC to flip
+        # Hold -> Solar Charge late in the day.
+        self._charge_recovery_floor = round(
+            compute_charge_recovery_floor(
+                overnight_target_kwh=overnight_for_recovery,
+                p10_pv_remaining_kwh=p10_pv_remaining,
+                load_remaining_kwh=load_remaining,
+            ),
+            2,
+        )
         self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
         self._p50_pv_remaining_kwh = round(p50_pv_remaining, 2)
         self._load_remaining_kwh = round(load_remaining, 2)
