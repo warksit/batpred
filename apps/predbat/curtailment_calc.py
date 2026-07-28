@@ -13,6 +13,10 @@ SAFE_PV_THRESHOLD_KW = 2.0
 
 MIN_BASE_LOAD_KW = 0.5
 
+# R63 drain-deadline release band (kWh). Draining CLEARS the breach, so this is
+# hysteresis on a closed loop, not a latch — see drain_deadline_breached().
+R63_HYST_KWH = 0.5
+
 # Deep-discharge floor (~2.8% of an 18 kWh battery). Applies symmetrically to
 # both charge_below and drain_above — the system must never report a target
 # below this, so charge_target = min(charge_below, drain_above) and the YAML
@@ -751,6 +755,144 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
 
 
 CALIBRATION_RATIO_MAX = 1.5
+
+
+def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_factor=1.2, max_reserved_kwh=1.8):
+    """Headroom margin against the SAFETY-FACTORED overflow requirement, kWh.
+
+        margin = headroom - (safety_factor × overflow + min(max_reserved, overflow))
+
+    This is the same requirement the Headroom Floor (`overflow_floor`) applies,
+    exposed so the `no_drain` veto can key off it too. Positive = the surplus
+    genuinely fits with the p90 defence intact; negative = we are short and must
+    still be draining.
+
+    Why it matters (2026-07-28): `no_drain` previously compared bare overflow
+    against headroom with a flat buffer. On SOC 10.03 / headroom 8.05 / p90 6.60
+    that read "fits" (margin 1.45) while the Headroom Floor wanted 9.72 kWh —
+    short by 1.67. The band correctly put SOC above drain_above and the weaker
+    veto forced Hold anyway. R25/R42/R43 are one-directional (bigger overflow
+    estimate → more drain → safer), so the margin-carrying test must win.
+
+    Args:
+        battery_headroom_kwh: soc_max - soc.
+        overflow_kwh: remaining forecast overflow (p90 per R7/R42).
+        safety_factor: OVERFLOW_SAFETY_FACTOR.
+        max_reserved_kwh: R45 tapered reserve ceiling.
+
+    Returns:
+        float kWh — signed margin. Positive means it fits.
+    """
+    required = safety_factor * max(0.0, overflow_kwh) + min(max_reserved_kwh, max(0.0, overflow_kwh))
+    return battery_headroom_kwh - required
+
+
+def compute_shed_rate(pv_kw, load_kw, export_cap_kw):
+    """R63 — the rate at which the battery can actually be drained, kW.
+
+        shed_rate = export_cap - max(0, pv - load)
+
+    The drain lever is not the export cap: PV is refilling the battery at the
+    same time we are selling. What we can genuinely shed is the cap MINUS the
+    surplus already flowing into it.
+
+    Goes NEGATIVE once `pv - load > export_cap` — past that point we export flat
+    out and the battery still charges from the excess, so no headroom can be
+    made at all. That crossing is R63's T_lockout, and it is the exact moment
+    R25's "no levers" begins.
+
+    Args:
+        pv_kw: current/forecast PV generation, kW.
+        load_kw: current/forecast house load, kW.
+        export_cap_kw: effective export ceiling (DNO or R60 effective cap), kW.
+
+    Returns:
+        float kW — signed. Positive = headroom can be made at this rate.
+    """
+    return export_cap_kw - max(0.0, pv_kw - load_kw)
+
+
+def compute_max_sheddable(scale, lat_deg, lon_deg, day_of_year, from_utc_hours, lockout_utc_hours, export_cap_kw, base_load=MIN_BASE_LOAD_KW, step_minutes=5, load_forecast_kw=None):
+    """R63 — how much headroom can still be made before the lever inverts, kWh.
+
+        max_sheddable = ∫ max(0, shed_rate(t)) dt   from now to T_lockout
+
+    Integrated, not sampled: `shed_rate` falls continuously as PV climbs, so the
+    instantaneous rate materially over-states what remains achievable. Negative
+    instantaneous rates contribute 0 rather than subtracting — this measures
+    drain CAPACITY, not the net SOC trajectory.
+
+    Uses the same clear-sky geometry model as compute_solar_overflow
+    (pv(t) = scale × sin(elev(t))). Per R9 geometry is preferred over per-slot
+    forecast, which is too noisy to time a deadline against.
+
+    Args:
+        scale: float kW — clear-sky scale (peak_pv / sin(elevation_at_peak)).
+        lat_deg, lon_deg: location.
+        day_of_year: 1-366.
+        from_utc_hours: integration start (decimal UTC hours, i.e. now).
+        lockout_utc_hours: T_lockout — when pv - load first exceeds the cap.
+        export_cap_kw: effective export ceiling, kW.
+        base_load: minimum household load offsetting PV, kW.
+        step_minutes: integration step size.
+        load_forecast_kw: optional list of kW per step from from_utc_hours.
+
+    Returns:
+        float kWh — drain capacity remaining before lockout. 0.0 if the window
+        is empty, inverted, or already past.
+    """
+    if scale <= 0 or lockout_utc_hours <= from_utc_hours:
+        return 0.0
+    step_hours = step_minutes / 60.0
+    total = 0.0
+    t = from_utc_hours
+    idx = 0
+    while t < lockout_utc_hours:
+        elev = solar_elevation(lat_deg, lon_deg, t, day_of_year)
+        pv_kw = scale * max(0.0, math.sin(math.radians(elev)))
+        if load_forecast_kw is not None and idx < len(load_forecast_kw):
+            load_kw = max(base_load, load_forecast_kw[idx])
+        else:
+            load_kw = base_load
+        rate = compute_shed_rate(pv_kw, load_kw, export_cap_kw)
+        if rate > 0:
+            total += rate * min(step_hours, lockout_utc_hours - t)
+        t += step_hours
+        idx += 1
+    return total
+
+
+def drain_deadline_breached(headroom_needed_kwh, max_sheddable_kwh, engaged=False, hyst_kwh=R63_HYST_KWH):
+    """R63 — is the drain still achievable before the lever inverts?
+
+    True when we need more headroom than we can still make by T_lockout, i.e.
+    we are already behind and must be at Max Export now.
+
+    It can only ever fire EARLIER than the plain energy test
+    (`SOC > drain_above`), never later, so on days with slack it is silent and
+    behaviour is unchanged. That is what makes it safe on a live control path.
+
+    **Hysteresis, not a latch.** Draining is what CLEARS this condition —
+    headroom grows, so headroom_needed falls. The loop is self-correcting and
+    must stay closed; a one-way latch would hold Max Export after the drain had
+    succeeded and empty the battery. `engaged` widens the release threshold by
+    `hyst_kwh` so it doesn't chatter at the boundary.
+
+    Args:
+        headroom_needed_kwh: safety × remaining_overflow + buffer − current
+            headroom. <= 0 means we already have enough room.
+        max_sheddable_kwh: from compute_max_sheddable().
+        engaged: whether R63 is currently driving (previous cycle's result).
+        hyst_kwh: release band, kWh.
+
+    Returns:
+        bool — True if the drain cannot be completed in the time remaining.
+    """
+    if headroom_needed_kwh <= 0:
+        return False
+    if engaged:
+        return headroom_needed_kwh > (max_sheddable_kwh - hyst_kwh)
+    return headroom_needed_kwh > max_sheddable_kwh
 
 
 def compute_solcast_overflow(
