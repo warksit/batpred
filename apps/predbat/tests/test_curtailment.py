@@ -28,10 +28,10 @@ from curtailment_calc import (
     compute_charge_below,
     compute_drain_above,
     compute_p10_recovery_floor,
-    compute_charge_recovery_floor,
     compute_shed_rate,
     compute_overflow_fits_margin,
     smooth_overflow_samples,
+    required_headroom_kwh,
     compute_max_sheddable,
     drain_deadline_breached,
     compute_effective_export_cap,
@@ -523,7 +523,7 @@ def test_p10_recovery_floor_huge_pv_runway():
     # potential = 20-7 = 13, target - potential = -3.6 → clamped to 0
     assert floor == 0.0, f"Expected 0.0 (huge runway), got {floor}"
 
-    charge_floor = compute_charge_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=20.0, load_remaining_kwh=7.0)
+    charge_floor = compute_p10_recovery_floor(overnight_target_kwh=9.4, p10_pv_remaining_kwh=20.0, load_remaining_kwh=7.0)
     assert charge_floor == floor, f"charge side must agree with drain side, got {charge_floor} vs {floor}"
     print(f"  test_p10_recovery_floor_huge_pv_runway: PASSED (drain={floor}, charge={charge_floor})")
 
@@ -686,13 +686,66 @@ def test_R50a_incident_day_still_floored_by_r59b():
 
     # Bright late-April morning: generation still to come comfortably exceeds
     # the 7.0 kWh overnight target, so the recovery floor collapses to 0.
-    recovery = compute_charge_recovery_floor(overnight_target_kwh=7.0, p10_pv_remaining_kwh=15.0, load_remaining_kwh=6.0)
+    recovery = compute_p10_recovery_floor(overnight_target_kwh=7.0, p10_pv_remaining_kwh=15.0, load_remaining_kwh=6.0)
     assert recovery == 0.0, f"PV runway ahead -> recovery floor 0, got {recovery}"
     charge_below = compute_charge_below(recovery, 4.0)
 
     assert drain_above / soc_max > 0.30, f"p90 must floor the incident day well above 1.9%, got {drain_above / soc_max:.1%}"
     assert charge_below < drain_above, f"R59b floor must sit below the drain target: {charge_below:.2f} vs {drain_above:.2f}"
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
+
+
+def test_required_headroom_is_defined_once():
+    """Charter: one quantity, one definition. "How much headroom does the forecast
+    overflow require?" was expressed in FIVE places in THREE different formulas —
+    two with no buffer term, two with the MAX_RESERVED constant, one with the
+    R49-reduced effective_max_reserved. On 2026-07-28 the weakest of them vetoed a
+    drain the strongest had correctly called (no_drain vs the Headroom Floor),
+    leaving the battery 1.67 kWh short of its p90 defence.
+
+    Every site must now call required_headroom_kwh(). Differences between sites
+    must be explicit ARGUMENTS, not separate expressions that can drift.
+    """
+    # Matches the Headroom Floor: safety x overflow + tapered reserve.
+    assert abs(required_headroom_kwh(6.6, 1.8) - (1.2 * 6.6 + 1.8)) < 1e-9
+    # Tapered: reserve cannot exceed the overflow itself.
+    assert abs(required_headroom_kwh(1.0, 1.8) - (1.2 * 1.0 + 1.0)) < 1e-9
+    # R49-reduced buffer must flow through, not be hardcoded to the constant.
+    assert required_headroom_kwh(6.6, 1.26) < required_headroom_kwh(6.6, 1.8)
+    # Planning sites deliberately carry no reserve — expressed as an argument.
+    assert abs(required_headroom_kwh(6.6, 0.0) - 1.2 * 6.6) < 1e-9
+    # Degenerate inputs are safe.
+    assert required_headroom_kwh(0.0, 1.8) == 0.0
+    assert required_headroom_kwh(-5.0, 1.8) == 0.0
+    print("  test_required_headroom_is_defined_once: PASSED")
+
+
+def test_no_drain_and_floor_agree_when_r49_reduces_the_buffer():
+    """The R49 inconsistency left behind on 2026-07-28: no_drain used the
+    MAX_RESERVED constant (1.8) while the floor used effective_max_reserved,
+    which R49 cuts to 1.26 on confirmed-cloudy afternoons. They then disagreed by
+    up to 0.54 kWh on exactly those days — a latent repeat of the bug being fixed.
+
+    Both must consume the same buffer value.
+    """
+    headroom, overflow, reduced = 8.05, 6.6, 1.26
+    fits = compute_overflow_fits_margin(headroom, overflow, 1.2, reduced)
+    assert abs(fits - (headroom - required_headroom_kwh(overflow, reduced))) < 1e-9, "fits-margin must be headroom minus the shared requirement"
+    # And it must actually differ from the constant-buffer answer, or the test proves nothing.
+    assert abs(compute_overflow_fits_margin(headroom, overflow, 1.2, 1.8) - fits) > 0.5
+    print("  test_no_drain_and_floor_agree_when_r49_reduces_the_buffer: PASSED")
+
+
+def test_recovery_floor_is_a_single_quantity():
+    """R59b made the charge-side and drain-side recovery floors identical — same
+    inputs, same formula. Two names for one number is drift waiting to happen, so
+    there is now one function and one state field."""
+    import curtailment_calc as _cc
+
+    assert not hasattr(_cc, "compute_charge_recovery_floor"), "the duplicate charge-side function must be gone"
+    a = compute_p10_recovery_floor(overnight_target_kwh=7.07, p10_pv_remaining_kwh=16.77, load_remaining_kwh=5.92)
+    assert a == 0.0
+    print("  test_recovery_floor_is_a_single_quantity: PASSED")
 
 
 def test_overflow_smoothing_rejects_a_single_spike():
@@ -946,7 +999,7 @@ def test_charge_recovery_floor_nets_against_generation_not_overflow():
     BLOCKED the morning drain on a day with 12.28 kWh of overflow risk, the exact
     inverse of R25 (headroom must be made before overflow, never after).
     """
-    floor = compute_charge_recovery_floor(
+    floor = compute_p10_recovery_floor(
         overnight_target_kwh=6.60,
         p10_pv_remaining_kwh=16.77,
         load_remaining_kwh=5.92,
@@ -972,7 +1025,7 @@ def test_charge_recovery_floor_ramps_up_as_generation_runs_out():
     target = 7.07
 
     def floor_at(pv_remaining, load_remaining):
-        return compute_charge_recovery_floor(
+        return compute_p10_recovery_floor(
             overnight_target_kwh=target,
             p10_pv_remaining_kwh=pv_remaining,
             load_remaining_kwh=load_remaining,
@@ -1003,7 +1056,7 @@ def test_charge_recovery_floor_overcast_day_charges():
     floor must be raised ABOVE overnight_target by that deficit, matching the
     drain-side behaviour asserted in test_p10_recovery_floor_load_exceeds_pv.
     """
-    floor = compute_charge_recovery_floor(overnight_target_kwh=7.07, p10_pv_remaining_kwh=3.00, load_remaining_kwh=5.92)
+    floor = compute_p10_recovery_floor(overnight_target_kwh=7.07, p10_pv_remaining_kwh=3.00, load_remaining_kwh=5.92)
     # net = 3.00 - 5.92 = -2.92 deficit -> floor = 7.07 + 2.92 = 9.99
     assert abs(floor - 9.99) < 0.001, f"deficit must raise the floor above target, got {floor}"
     print(f"  test_charge_recovery_floor_overcast_day_charges: PASSED (floor={floor})")
@@ -1014,7 +1067,7 @@ def test_charge_recovery_floor_matches_drain_side_recovery():
     'can P10 generation refill me?'. R59a's split existed only to justify the
     overflow netting; with that gone the two must not diverge."""
     kwargs = dict(overnight_target_kwh=7.07, p10_pv_remaining_kwh=16.77, load_remaining_kwh=5.92)
-    charge_side = compute_charge_recovery_floor(**kwargs)
+    charge_side = compute_p10_recovery_floor(**kwargs)
     drain_side = compute_p10_recovery_floor(**kwargs)
     assert charge_side == drain_side, f"charge {charge_side} != drain {drain_side}"
 
@@ -5828,6 +5881,9 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_required_headroom_is_defined_once,
+        test_no_drain_and_floor_agree_when_r49_reduces_the_buffer,
+        test_recovery_floor_is_a_single_quantity,
         test_overflow_smoothing_rejects_a_single_spike,
         test_overflow_smoothing_tracks_the_real_trend,
         test_overflow_smoothing_lags_conservatively_not_optimistically,
