@@ -632,6 +632,58 @@ def test_charge_below_p10_recovery_wins():
     print(f"  test_charge_below_p10_recovery_wins: PASSED ({cb})")
 
 
+def test_R50a_floor_uses_p90_not_the_confidence_blend():
+    """R50a: the live floor uses overflow_p90 (R7/R42/R43), not the R50 blend.
+
+    Live 2026-07-28 09:00: p10=0.0, p50=1.57, p90=13.03, confidence=0.35,
+    SOC 8.05 kWh, headroom 10.03 kWh against a p90 overflow of 13.03 kWh — already
+    short of the headroom needed, and the blend still said Hold:
+
+        blend (c=0.35)  expected  0.92 -> drain_above 16.07 kWh (88.9%) -> HOLD
+        pure p90        expected 13.03 -> drain_above  0.64 kWh ( 3.6%) -> MAX EXPORT
+
+    R25 forbids assuming no overflow: headroom is cheap to create early and
+    impossible to create late. R43 is deliberately asymmetric toward MORE drain.
+    Blending toward p10 inverted both.
+    """
+    soc_max, reserve = 18.08, 0.542
+    p10, p50, p90 = 0.0, 1.57, 13.03
+
+    def floor_from(overflow):
+        return max(0.0, (soc_max - min(MAX_RESERVED_KWH, overflow)) - overflow * OVERFLOW_SAFETY_FACTOR)
+
+    # The blend is what we are moving AWAY from — assert it would have held.
+    blended = compute_expected_overflow(p10, p50, p90, 0.35, 0.60, 0.85)
+    assert abs(blended - 0.92) < 0.05, f"expected the documented 0.92 blend, got {blended}"
+    assert 8.05 < compute_drain_above(reserve, floor_from(blended)), "blend must be the HOLD case this test exists to replace"
+
+    # R50a: p90 is the live path -> Drain.
+    drain_above_p90 = compute_drain_above(reserve, floor_from(p90))
+    assert drain_above_p90 < 1.0, f"p90 floor should be near-empty, got {drain_above_p90}"
+    assert 8.05 > drain_above_p90, "SOC above drain_above -> Max Export, which is the point"
+    print(f"  test_R50a_floor_uses_p90_not_the_confidence_blend: PASSED (p90 drain_above={drain_above_p90:.2f})")
+
+
+def test_R50a_incident_day_still_floored_by_r59a():
+    """R50a: 2026-04-28 (R50's own justification) is safe under p90 + R59a.
+
+    R50 exists because the battery hit 1.9% that day. Replaying its Solcast
+    fixture through today's formula, the p90 floor stops the drain at 39.9% —
+    so the p90 overflow estimate cannot have caused the bottom-out. R59a then
+    puts charge_below at 30.4%, below drain_above, giving a valid Schmitt band.
+    """
+    soc_max, reserve = 18.08, 0.542
+    p10_2804, p90_2804 = 1.51, 7.56  # from solcast_2026_04_28.json, DNO 4.0 (pre-swap)
+
+    floor = max(0.0, (soc_max - min(MAX_RESERVED_KWH, p90_2804)) - p90_2804 * OVERFLOW_SAFETY_FACTOR)
+    drain_above = compute_drain_above(reserve, floor)
+    charge_below = compute_charge_below(compute_charge_recovery_floor(7.0, p10_2804), 4.0)
+
+    assert drain_above / soc_max > 0.30, f"p90 must floor the incident day well above 1.9%, got {drain_above / soc_max:.1%}"
+    assert charge_below < drain_above, f"R59a floor must sit below the drain target: {charge_below:.2f} vs {drain_above:.2f}"
+    print(f"  test_R50a_incident_day_still_floored_by_r59a: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
+
+
 def test_charge_recovery_floor_sub_cap_day_2026_07_27():
     """R59a regression — the bright-but-sub-cap day that sat in Hold at 9% SOC.
 
@@ -5372,6 +5424,8 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_deep_discharge_floor,
         test_charge_below_soc_keep_wins,
         test_charge_below_p10_recovery_wins,
+        test_R50a_floor_uses_p90_not_the_confidence_blend,
+        test_R50a_incident_day_still_floored_by_r59a,
         test_charge_recovery_floor_sub_cap_day_2026_07_27,
         test_charge_recovery_floor_overflow_day_unchanged,
         test_charge_recovery_floor_partial_overflow,
