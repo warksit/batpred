@@ -163,12 +163,22 @@ def test_active_policy_reopens_ess_and_import_limits():
         assert reg in writes, f"active policy must re-open {reg} — a Predbat freeze would otherwise persist"
     assert str(writes["number.sigen_plant_grid_import_limitation"]) == "100", f"import limit must be re-opened to 100, got {writes['number.sigen_plant_grid_import_limitation']!r}"
 
+    # The ESS registers are DERIVED from the rate helpers by
+    # predbat_max_(dis)charging_limit_action. Resetting only the register leaves the
+    # helper at 0, so the next state change on it re-clamps — reset the source too.
+    helpers = {}
+    for a in _iter_actions(active["sequence"]):
+        if (a.get("action") or a.get("service")) == "input_number.set_value":
+            helpers[str(a.get("target", {}).get("entity_id", ""))] = a.get("data", {}).get("value")
+    for h in ("input_number.discharge_rate", "input_number.charge_rate"):
+        assert h in helpers, f"active policy must reset {h} — it is the SOURCE of the ESS clamp"
+
     # And the trigger must notice a clamp, not just a dispatch drift.
     stale = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
     tmpl = stale["value_template"]
     assert "ess_max_discharging_limit" in tmpl, "stale_setpoint must fire on a clamped discharge limit"
     assert "grid_import_limitation" in tmpl, "stale_setpoint must fire on a blocked import limit"
-    print("PASS  re-open: active policy clears ESS discharge/charge + import clamps")
+    print("PASS  re-open: active policy clears ESS + import clamps and resets the rate helpers")
 
 
 def test_manual_override_is_a_trigger():
