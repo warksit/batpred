@@ -109,8 +109,31 @@ DEFAULT_DRAIN_FLOOR_PCT = 2.8
 # re-enabled it, so Predbat had no control path at all — it asked for Discharging
 # twice overnight on 07-26 and select.sigen_plant_remote_ems_control_mode never
 # moved. Toggling it here is what closes that hole.
+# 2026-07-28: the Predbat->SIG chain is THREE automations, not one. Toggling only
+# the mode mapper left the other two live, and they write PLANT registers:
+#   predbat_requested_mode_action        -> EMS control mode + grid_import_limitation
+#   predbat_max_discharging_limit_action -> ess_max_discharging_limit  (from
+#                                           input_number.discharge_rate)
+#   predbat_max_charging_limit_action    -> ess_max_charging_limit     (from
+#                                           input_number.charge_rate)
+# Predbat's Freeze Charging sets discharge_rate=0, so the discharging mapper wrote
+# ess_max_discharging_limit=0 at 04:01:14 — eight seconds BEFORE the mode mapper —
+# and stayed enabled while CM drove, hardware-locking the battery for 4.5 hours.
+# The mutex must disable the whole CHAIN, not just its front door.
 SIG_HEARTBEAT_AUTOMATION = "automation.sig_dispatch_heartbeat"
-PREDBAT_MAPPER_AUTOMATION = "automation.predbat_requested_mode_action"
+PREDBAT_MAPPER_AUTOMATIONS = (
+    "automation.predbat_requested_mode_action",
+    "automation.predbat_max_discharging_limit_action",
+    "automation.predbat_max_charging_limit_action",
+)
+# Predbat's own inputs — set back to neutral before freezing its mapper chain, so
+# Predbat's mappers undo whatever registers they wrote (see _neutralise_predbat).
+PREDBAT_MODE_SELECT = "input_select.predbat_requested_mode"
+PREDBAT_MODE_DEMAND = "Demand"
+PREDBAT_DISCHARGE_RATE = "input_number.discharge_rate"
+PREDBAT_CHARGE_RATE = "input_number.charge_rate"
+SIG_RATED_DISCHARGE_SENSOR = "sensor.sigen_plant_ess_rated_discharging_power"
+SIG_RATED_CHARGE_SENSOR = "sensor.sigen_plant_ess_rated_charging_power"
 SIG_EMS_MODE_SELECT = "select.sigen_plant_remote_ems_control_mode"
 SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
@@ -2168,6 +2191,45 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self._log_once("ems_msc_err", "Curtailment: failed to set EMS-MSC: {}".format(e))
 
+    def _neutralise_predbat(self):
+        """Drive Predbat's OWN inputs back to neutral, so Predbat's OWN mappers undo
+        the plant registers it clamped — before we disable that chain.
+
+        Principle (Andrew, 2026-07-28): the writer that changed a register should be
+        the one to change it back. CM enumerating Predbat's registers is a losing
+        game — we already missed ess_max_discharging_limit and grid_import_limitation,
+        and a future Predbat mapper would be missed the same way.
+
+        Setting the SOURCE helpers back to neutral makes the existing mappers unwind
+        the registers for us, whatever they happen to be:
+            requested_mode  = Demand  -> EMS mode = MSC, grid_import_limitation = 100
+            discharge_rate  = rated   -> ess_max_discharging_limit = rated
+            charge_rate     = rated   -> ess_max_charging_limit    = rated
+
+        Must run BEFORE the mappers are disabled — a disabled mapper cannot relay.
+        The heartbeat's own re-open of those registers stays as a backstop for the
+        case where this silently fails (both this and _set_automation swallow errors).
+        """
+        rated_d = self._float_state(SIG_RATED_DISCHARGE_SENSOR, 6.6)
+        rated_c = self._float_state(SIG_RATED_CHARGE_SENSOR, 6.6)
+        for entity, service, kwargs in (
+            (PREDBAT_MODE_SELECT, "input_select/select_option", {"option": PREDBAT_MODE_DEMAND}),
+            (PREDBAT_DISCHARGE_RATE, "input_number/set_value", {"value": int(rated_d * 1000)}),
+            (PREDBAT_CHARGE_RATE, "input_number/set_value", {"value": int(rated_c * 1000)}),
+        ):
+            try:
+                self.base.call_service_wrapper(service, entity_id=entity, **kwargs)
+            except Exception as e:
+                self._log_once("neutralise_err", "Curtailment: failed to neutralise {}: {}".format(entity, e))
+        self.log("Curtailment: Predbat neutralised (mode=Demand, rates={:.0f}/{:.0f} W) before taking control".format(rated_d * 1000, rated_c * 1000))
+
+    def _float_state(self, entity, default):
+        """Read a numeric entity state, falling back on unknown/unavailable."""
+        try:
+            return float(self.base.get_state_wrapper(entity, default=default))
+        except (TypeError, ValueError):
+            return default
+
     def _set_writer(self, cm_driving):
         """Hand the register-writing role between the heartbeat and the Predbat mapper.
 
@@ -2178,11 +2240,15 @@ class CurtailmentPlugin(PredBatPlugin):
         writers fighting over the same registers.
         """
         if cm_driving:
-            self._set_automation(PREDBAT_MAPPER_AUTOMATION, False)
+            # Let Predbat undo its OWN register writes before we freeze its chain.
+            self._neutralise_predbat()
+            for auto in PREDBAT_MAPPER_AUTOMATIONS:
+                self._set_automation(auto, False)
             self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
         else:
             self._set_automation(SIG_HEARTBEAT_AUTOMATION, False)
-            self._set_automation(PREDBAT_MAPPER_AUTOMATION, True)
+            for auto in PREDBAT_MAPPER_AUTOMATIONS:
+                self._set_automation(auto, True)
 
     def _release_to_predbat(self):
         """Window end (safe_time / off): hand the whole machine back to Predbat.

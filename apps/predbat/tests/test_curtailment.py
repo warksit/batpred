@@ -1327,7 +1327,40 @@ def test_exactly_one_writer_enabled_on_control():
     off_idx = calls.index(("automation/turn_off", "automation.predbat_requested_mode_action"))
     on_idx = calls.index(("automation/turn_on", "automation.sig_dispatch_heartbeat"))
     assert off_idx < on_idx, f"mapper must be disabled BEFORE heartbeat enabled, got {calls}"
+
+    # The WHOLE Predbat chain must be frozen, not just the mode mapper. The
+    # discharging-limit mapper wrote ess_max_discharging_limit=0 at 04:01 on
+    # 2026-07-28 and stayed enabled while CM drove, locking the battery for 4.5 h.
+    for auto in ("automation.predbat_max_discharging_limit_action", "automation.predbat_max_charging_limit_action"):
+        assert ("automation/turn_off", auto) in calls, f"{auto} must also be disabled — it writes plant registers"
     print("  test_exactly_one_writer_enabled_on_control: PASSED")
+
+
+def test_predbat_neutralised_before_its_chain_is_frozen():
+    """Predbat must undo its own register writes before we disable its mappers.
+
+    The writer that changed a register should change it back. Enumerating Predbat's
+    registers in CM is a losing game — ess_max_discharging_limit and
+    grid_import_limitation were both missed, and a future mapper would be too.
+
+    So set the SOURCE helpers back to neutral and let Predbat's own mappers unwind
+    the registers. This must happen BEFORE the mappers are disabled — a disabled
+    mapper cannot relay.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+
+    names = [(s[0], s[1].get("entity_id")) for s in base.services]
+    neutralised = [i for i, (svc, ent) in enumerate(names) if ent in ("input_select.predbat_requested_mode", "input_number.discharge_rate", "input_number.charge_rate")]
+    assert len(neutralised) == 3, f"must neutralise mode + both rate helpers, got {names}"
+
+    first_disable = next(i for i, (svc, ent) in enumerate(names) if svc == "automation/turn_off" and str(ent).startswith("automation.predbat_"))
+    assert max(neutralised) < first_disable, f"neutralise must precede disabling the mappers, got {names}"
+    print("  test_predbat_neutralised_before_its_chain_is_frozen: PASSED")
 
 
 def test_exactly_one_writer_enabled_on_handback():
@@ -5364,6 +5397,7 @@ def run_curtailment_tests(my_predbat=None):
         test_manual_override_grabs_control_even_when_inactive,
         test_heartbeat_enabled_on_control,
         test_exactly_one_writer_enabled_on_control,
+        test_predbat_neutralised_before_its_chain_is_frozen,
         test_exactly_one_writer_enabled_on_handback,
         test_first_run_reconciles_drifted_writers,
         test_heartbeat_disabled_and_msc_on_handback,

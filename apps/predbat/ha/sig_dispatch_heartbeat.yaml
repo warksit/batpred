@@ -228,6 +228,23 @@ action:
             data:
               value: 100
             alias: "Re-open grid import (undo Predbat freeze)"
+          # Mirror the rate helpers back to rated too. The ESS registers above are
+          # DERIVED from these by predbat_max_(dis)charging_limit_action — Predbat's
+          # freeze sets discharge_rate=0 and that mapper clamps the register. Writing
+          # only the register leaves the helper at 0, so the next state change on it
+          # re-clamps and the two fight. Resetting the source stops that at origin.
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.discharge_rate
+            data:
+              value: "{{ (rated_discharge_kw | float(6.6) * 1000) | int }}"
+            alias: "Mirror discharge_rate helper (source of the ESS clamp)"
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.charge_rate
+            data:
+              value: "{{ (rated_charge_kw | float(6.6) * 1000) | int }}"
+            alias: "Mirror charge_rate helper"
           - action: number.set_value
             target:
               entity_id: number.sigen_plant_active_power_fixed_adjustment
