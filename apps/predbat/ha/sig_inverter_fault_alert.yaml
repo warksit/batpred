@@ -49,9 +49,22 @@ action:
       voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') }}"
       freq: "{{ states('sensor.sigen_inverter_grid_frequency') }}"
       is_protective: "{{ states('sensor.sigen_plant_plant_running_state') in ['Shutdown', 'Environmental Abnormality', 'Standby'] }}"
+      # 2026-07-28: "Running but idle" has TWO causes and they need different actions.
+      # This alert used to assume a meter fault and send you to mySigen. On 2026-07-28
+      # it fired correctly at 05:33 — the battery was hardware-clamped by a stale
+      # Predbat freeze (ess_max_discharging_limit=0 since 04:01, Max Export commanding
+      # 6.6 kW into a locked battery) — but mySigen showed no alerts, so it read as a
+      # false alarm and was dismissed. The lockout then ran until 08:35.
+      # Correct detection, wrong diagnosis, so the alert trained us to ignore it.
+      # Both registers are already in HA, so distinguish them here.
+      disch_limit: "{{ states('number.sigen_plant_ess_max_discharging_limit') | float(0) }}"
+      rated_disch: "{{ states('sensor.sigen_plant_ess_rated_discharging_power') | float(9.6) }}"
+      import_limit: "{{ states('number.sigen_plant_grid_import_limitation') | float(100) }}"
+      is_clamped: "{{ disch_limit < (rated_disch * 0.5) or import_limit < 1 }}"
       fault_type: >-
         {% set s = states('sensor.sigen_plant_plant_running_state') %}
-        {% if s == 'Running' %}Meter Communication Fault - inverter running but idle, likely lost meter connection. ACTION: Check mySigen app for alert 4001_2. May need meter power cycle.
+        {% if s == 'Running' and is_clamped %}Battery CLAMPED - inverter running but idle because the ESS limits are shut, not a meter fault. discharge_limit={{ disch_limit }}kW (rated {{ rated_disch }}), import_limit={{ import_limit }}. Usually a stale Predbat freeze the heartbeat has not re-opened. ACTION: check sig_dispatch_heartbeat is enabled and input_number.discharge_rate is not 0.
+        {% elif s == 'Running' %}Meter Communication Fault - inverter running but idle, limits are open so likely lost meter connection. ACTION: Check mySigen app for alert 4001_2. May need meter power cycle.
         {% elif s == 'Shutdown' %}SIG Protective Disconnect (Shutdown) - G99 grid protection. Auto-recovers in 3-5 min. No action needed.
         {% elif s == 'Environmental Abnormality' %}SIG Environmental Abnormality - grid voltage/frequency excursion. Auto-recovers in 1-2 min. No action needed.
         {% elif s == 'Standby' %}SIG Standby - recovering from protective disconnect. No action needed.
