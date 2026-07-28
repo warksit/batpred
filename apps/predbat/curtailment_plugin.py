@@ -235,8 +235,9 @@ PRE_PV_BUFFER_PCT_DEFAULT = 20.0
 PRE_PV_OVERFLOW_THRESHOLD_KWH = 1.0  # Min forecast overflow to bother with pre-PV drain
 PV_START_THRESHOLD_KW = 0.5  # PV "started" when scale × sin(elev) ≥ this
 
-# State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time,
-# _floor_ratchet across plugin restarts within the same day.
+# State persistence file (Bug 2 / R46): preserves _peak_pv, _peak_pv_time and the
+# R48/R49 latches across plugin restarts within the same day. `floor_ratchet` is no
+# longer written (R11 removed 2026-07-28); stale keys in existing files are ignored.
 STATE_FILE_NAME = "curtailment_state.json"
 
 
@@ -284,8 +285,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_drained_today = False
         self._keep_recovered = False
         self._r48_engaged_today = False
-        # Floor ratchet: floor can only rise (R11)
-        self._floor_ratchet = None
         # R63 drain-deadline engagement (hysteresis, NOT a latch — draining is
         # what clears the breach, so the loop must stay closed).
         self._r63_engaged = False
@@ -430,8 +429,6 @@ class CurtailmentPlugin(PredBatPlugin):
             return  # stale — belongs to a previous day, ignore
         self._peak_pv = float(data.get("peak_pv_kw", 0.0))
         self._peak_pv_time = int(data.get("peak_pv_time", 0))
-        ratchet = data.get("floor_ratchet")
-        self._floor_ratchet = float(ratchet) if ratchet is not None else None
         self._last_floor_scale = float(data.get("last_floor_scale", 0.0))
         self._keep_recovered = bool(data.get("keep_recovered", False))
         self._keep_drained_today = bool(data.get("keep_drained_today", False))
@@ -469,10 +466,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._state_date = today
         try:
             self.log(
-                "Curtailment: restored state from {} (peak={:.2f}kW, ratchet={}, pv_history={} entries)".format(
+                "Curtailment: restored state from {} (peak={:.2f}kW, pv_history={} entries)".format(
                     path,
                     self._peak_pv,
-                    self._floor_ratchet,
                     len(self._pv_history),
                 )
             )
@@ -496,7 +492,6 @@ class CurtailmentPlugin(PredBatPlugin):
             "date": today,
             "peak_pv_kw": self._peak_pv,
             "peak_pv_time": self._peak_pv_time,
-            "floor_ratchet": self._floor_ratchet,
             "last_floor_scale": self._last_floor_scale,
             "keep_recovered": self._keep_recovered,
             "keep_drained_today": self._keep_drained_today,
@@ -531,7 +526,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._cap_samples.clear()
         self._peak_pv = 0.0
         self._peak_pv_time = 0
-        self._floor_ratchet = None
         self._last_floor_scale = 0.0
         self._r63_engaged = False
         self._r63_needed_kwh = 0.0
@@ -1288,7 +1282,6 @@ class CurtailmentPlugin(PredBatPlugin):
             if pre_pv is not None:
                 target_kwh, decision_str = pre_pv
                 self._last_decision = "active (pre-PV): " + decision_str
-                self._floor_ratchet = target_kwh
                 self._last_floor_scale = 0.0
                 self._floor_source = "Pre-PV Drain"
                 # R62: stamp the published-threshold inputs with the pre-PV
@@ -1485,7 +1478,6 @@ class CurtailmentPlugin(PredBatPlugin):
         sundown = peaked and actual_pv < 0.1
         if sundown:
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
-            self._floor_ratchet = None
             self._floor_source = "Overnight Reserve"
             self._policy_override = None
             self._overflow_fits_latched = False
@@ -1626,13 +1618,16 @@ class CurtailmentPlugin(PredBatPlugin):
         overflow_floor = max_target_soc - remaining_overflow * OVERFLOW_SAFETY_FACTOR
         overflow_floor = max(overflow_floor, 0.0)
 
-        # Overflow floor ratchet (R11): only the overflow reservation ratchets.
-        # Bypassed when floor_scale has increased (R43 safety path — sunnier than
-        # forecast means MORE headroom needed, so allow floor to drop).
-        scale_rose = floor_scale > self._last_floor_scale + 0.01
-        if self._floor_ratchet is not None and not scale_rose:
-            overflow_floor = max(overflow_floor, self._floor_ratchet)
-        self._floor_ratchet = overflow_floor
+        # R11 floor ratchet REMOVED 2026-07-28. It clamped
+        # `overflow_floor = max(overflow_floor, previous)`, so the floor could only
+        # rise within a day — reserving LESS headroom over time, the opposite of its
+        # stated rationale ("headroom already reserved cannot be reclaimed"). Its
+        # only release was `floor_scale` rising (R43), and R43 is gone
+        # (floor_scale = p90_scale unconditionally), so it could never let go: on
+        # 2026-07-28 it held the floor at 15.76 kWh from a 0.44 kWh-overflow moment
+        # at dawn while p90 climbed to 12.28 kWh, blocking the drain all day.
+        # Floor stability now comes from stable INPUTS (p90-derived floor_scale, the
+        # smooth geometry integral per R25), not from clamping the output.
         self._last_floor_scale = floor_scale
 
         # Bug 8 (R48): relaxed soc_keep when BOTH (a) overflow won't fit with base

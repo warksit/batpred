@@ -694,6 +694,48 @@ def test_R50a_incident_day_still_floored_by_r59b():
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
 
 
+def test_R11_removed_floor_follows_the_formula_down():
+    """R11 REMOVED (2026-07-28): the overflow floor must track its formula in BOTH
+    directions. It used to be clamped by `max(overflow_floor, previous_floor)`, so
+    it could only rise within a day.
+
+    Live failure: the ratchet locked at 15.76 kWh (87%) from an early-morning
+    moment when remaining overflow was 0.44 kWh, and held there all day while p90
+    overflow climbed to 12.28 kWh. Formula value was 8.55 kWh (47%). No drain
+    could fire until the persisted value was cleared by hand.
+
+    Its bypass fired only when `floor_scale` rose (R43) — and R43 is gone, so the
+    clamp could never release whatever the forecast did.
+    """
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+
+    def floor_for(solcast_remaining, peak_kw):
+        overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+        overrides.update(_make_p90_sensors(p90_peak_kw=peak_kw, solcast_remaining=solcast_remaining))
+        base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.55, minutes_now=720, best_soc_keep=4.0, sensor_overrides=overrides)
+        base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+        plugin = CurtailmentPlugin(base)
+        plugin._peak_pv = peak_kw
+        plugin._overnight_target_kwh = 6.0
+        plugin.on_update()
+        return plugin, base.published.get("sensor.predbat_curtailment_drain_above", {}).get("value")
+
+    # Small forecast overflow -> high floor (little headroom needed).
+    plugin, high = floor_for(solcast_remaining=8.0, peak_kw=5.0)
+    # Same plugin instance, forecast now says a BIG overflow -> floor must DROP.
+    overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    plugin.base._sensor_overrides.update(overrides)
+    plugin._peak_pv = 9.0
+    plugin.on_update()
+    low = plugin.base.published.get("sensor.predbat_curtailment_drain_above", {}).get("value")
+
+    assert low < high, f"floor must fall when forecast overflow rises: {high} -> {low} (ratchet would have held it at {high})"
+    assert not hasattr(plugin, "_floor_ratchet") or plugin._floor_ratchet is None, "the ratchet state must be gone, not merely bypassed"
+    print(f"  test_R11_removed_floor_follows_the_formula_down: PASSED ({high} -> {low})")
+
+
 def test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor():
     """The `no_drain` veto must apply the SAME headroom requirement as the
     Headroom Floor, or a weaker test silently overrules the stronger one.
@@ -5738,6 +5780,7 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_R11_removed_floor_follows_the_formula_down,
         test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor,
         test_R63_shed_rate_inverts_once_pv_exceeds_the_cap,
         test_R63_max_sheddable_integrates_a_falling_rate,
