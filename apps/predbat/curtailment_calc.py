@@ -290,55 +290,6 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - net_charging)
 
 
-def compute_charge_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_remaining_kwh):
-    """R59b — recovery floor for charge_below: SOC needed now to land on
-    overnight_target, given the P10 GENERATION still available to refill us.
-
-    Formula (identical to compute_p10_recovery_floor):
-        floor = max(0, overnight_target - (p10_pv_remaining - load_remaining))
-
-    **Generation, not overflow.** Overflow is a curtailment quantity — PV above
-    load + export cap. Generation is what can actually be used to fill the
-    battery. R59a (2026-07-27) netted against overflow on the argument that the
-    no-charge policy is Hold, and Hold serves the export cap before the battery.
-    That reasoning is circular: this floor's job is to *choose* the policy, so
-    assuming Hold bakes the answer in. Under it the floor can only ever equal
-    overnight_target, so Charge fires from dawn no matter how much free PV is
-    coming.
-
-    Observed 2026-07-28: charge_below went 0.54 -> 7.20 kWh at 06:01 and stayed
-    flat all day, blocking the morning drain on a day forecasting 12.28 kWh of
-    P90 overflow — the exact inverse of R25 (headroom is cheap early and
-    impossible late).
-
-    **The Schmitt band supplies the timing, not this floor.** The floor starts
-    near 0 on a bright morning (Hold — keep SOC low, preserve headroom for
-    afternoon PV) and rises as remaining generation shrinks, crossing SOC and
-    flipping Hold -> Solar Charge by itself. Banking happens as late as it
-    safely can. That is the 2026-07-27 case handled correctly, without R59a's
-    charge-from-dawn.
-
-    Note CM stays in control for the whole curtailment window rather than
-    handing back when overflow is momentarily zero: Predbat has no curtailment
-    awareness, and PV arriving in the afternoon still needs managing.
-
-    Args:
-        overnight_target_kwh: required SOC by end of day.
-        p10_pv_remaining_kwh: Solcast P10 PV remaining (kWh).
-        load_remaining_kwh: forecast load remaining today (kWh). If this exceeds
-            PV the net is negative and the floor is raised above the target to
-            cover the through-day deficit.
-
-    Returns:
-        kWh — minimum SOC needed now to land on overnight target.
-    """
-    return compute_p10_recovery_floor(
-        overnight_target_kwh=overnight_target_kwh,
-        p10_pv_remaining_kwh=p10_pv_remaining_kwh,
-        load_remaining_kwh=load_remaining_kwh,
-    )
-
-
 def compute_session_reserve(duration_minutes, cap_kw):
     """Battery energy (kWh) to reserve for a saving-session export: run at the
     export cap for the session duration. Feeds the recovery-floor target on top
@@ -795,6 +746,39 @@ def smooth_overflow_samples(samples, now_minutes, window_minutes=30):
     return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
+def required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor=1.2):
+    """**The** definition of "how much battery headroom does the forecast overflow
+    require?". Every site that asks this question calls this function.
+
+        required = safety_factor x overflow + min(max_reserved, overflow)
+
+    Two terms: the R9 safety multiplier (forecast error *during* overflow) and the
+    R45 tapered reserve, which cannot exceed the overflow itself — near safe_time
+    it tapers to 0 so the battery can fill.
+
+    **Why this exists as a function.** The same question was expressed in five
+    places in three different formulas: two with no reserve term, two with the
+    MAX_RESERVED constant, one with the R49-reduced `effective_max_reserved`. On
+    2026-07-28 the weakest version (`no_drain`) vetoed a drain the strongest
+    version (the Headroom Floor) had correctly called, leaving the battery 1.67
+    kWh short of its p90 defence on a clear day. Differences between callers must
+    be explicit arguments, never separate expressions — see the Charter,
+    *One quantity, one definition*.
+
+    Args:
+        overflow_kwh: remaining forecast overflow (p90 per R7/R42, smoothed R64).
+        max_reserved_kwh: the R45 reserve ceiling for this caller. Pass
+            `effective_max_reserved` (R49 may have reduced it), or 0.0 for the
+            planning-time callers that deliberately hold no reserve.
+        safety_factor: OVERFLOW_SAFETY_FACTOR.
+
+    Returns:
+        float kWh — headroom the battery must have for the overflow to fit.
+    """
+    ov = max(0.0, overflow_kwh)
+    return safety_factor * ov + min(max_reserved_kwh, ov)
+
+
 def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_factor=1.2, max_reserved_kwh=1.8):
     """Headroom margin against the SAFETY-FACTORED overflow requirement, kWh.
 
@@ -821,8 +805,7 @@ def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_fact
     Returns:
         float kWh — signed margin. Positive means it fits.
     """
-    required = safety_factor * max(0.0, overflow_kwh) + min(max_reserved_kwh, max(0.0, overflow_kwh))
-    return battery_headroom_kwh - required
+    return battery_headroom_kwh - required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor)
 
 
 def compute_shed_rate(pv_kw, load_kw, export_cap_kw):
