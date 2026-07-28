@@ -185,7 +185,7 @@ else in this file.
 | R13 | IN FORCE | |
 | R14–R18, R38 | ❌ **REMOVED** | The 5-second three-phase export-limit automation is retired (v30, DC-coupled). |
 | R19, R20, R21 | IN FORCE | safe_time is a control input again (drives Hold), not just a diagnostic. |
-| R25 | IN FORCE | Geometry IS the ground truth (resolved 2026-07-28). R53 currently contradicts this in code — tracked as follow-up. |
+| R25 | IN FORCE (principle) / ⚠️ **REOPENED** (estimator) | "Worst case, act early" in force. Whether geometry or Solcast per-slot feeds the integral is reopened — fixture replay favours Solcast. |
 | R26–R30 | IN FORCE | |
 | R34–R37 | IN FORCE | Testing discipline. R36 (TDD) and R37 (never break production for tests). |
 | R39 | ❌ **REMOVED** | Restated R11's ratchet; removed with it. |
@@ -199,7 +199,7 @@ else in this file.
 | R50 | **DORMANT** | Code retained; re-enabled by setting `curtailment_confidence_high` < 1.0. Not the live path. |
 | R50a | IN FORCE | Live path is `overflow_p90`. **Its citations of R7/R42/R43 are to dead requirements** — the conclusion rests on R25's worst-case logic instead. |
 | R52 | IN FORCE | Pre-PV drain. Already contains a time-to-drain calculation — the ancestor of R63. |
-| R53 | ⚠️ **CONFLICTS WITH R25** | Solcast per-slot is primary in code; R25 says geometry. R53's original justification (actual_scale extrapolation) died with R43. Follow-up. |
+| R53 | IN FORCE | Solcast per-slot is primary. Fixture replay over 11 days shows it beats geometry as a worst-case estimator on 11/11 (mean error 10.77 vs 15.71 kWh). See *Open questions*. |
 | R54, R55 | IN FORCE | |
 | R56 | ❌ SUPERSEDED | by R6/RD6 — CM must not own the evening. |
 | R57, R58 | IN FORCE | |
@@ -240,7 +240,12 @@ deadline (R63).
 on marginal days and silently curtails on the days that matter — exactly what
 R50's confidence blend did before R50a retired it.
 
-**Geometry is the ground truth for the overflow integral** (resolved 2026-07-28).
+**Geometry vs Solcast per-slot — REOPENED 2026-07-28, do not act on this yet.**
+
+> This was resolved in favour of geometry earlier the same day. Fixture replay
+> completed afterwards contradicts that and the question is reopened pending a
+> decision. See *Open questions*. The "worst case, act early" principle above is
+> not in doubt — only which estimator best serves it.
 
 **Why:** we are protecting against the *maximum*, and once PV − load exceeds the
 export cap there are no levers left. The smooth `scale × sin(elev)` curve gives a
