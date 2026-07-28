@@ -49,6 +49,7 @@ from curtailment_calc import (
     compute_charge_recovery_floor,
     compute_max_sheddable,
     compute_overflow_fits_margin,
+    smooth_overflow_samples,
     drain_deadline_breached,
     compute_effective_export_cap,
     compute_charge_below,
@@ -164,6 +165,11 @@ SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 # ~3.6 kWh total protection against LoadML over-prediction errors (~2 kW of
 # phantom load over a 2h window). Yesterday's LoadML contamination was ~6 kWh
 # — this doesn't fully cover that but substantially reduces breach probability.
+# R64: trailing window for the overflow-estimate median. 30 min ~= 6 plugin
+# cycles — long enough to reject single-slot Solcast revisions, short enough to
+# follow the day burning off (measured lag ~+0.3 kWh on a falling series).
+OVERFLOW_SMOOTH_WINDOW_MIN = 30
+
 OVERFLOW_SAFETY_FACTOR = 1.2
 
 # v19 tapered cap (R45): reserved headroom = min(MAX_RESERVED_KWH, remaining_overflow).
@@ -350,6 +356,12 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_p10 = 0.0
         self._overflow_p50 = 0.0
         self._overflow_p90 = 0.0
+        # R64: raw (unsmoothed) bands, kept so the dashboard can show the
+        # divergence — a smoothed value that silently differs from its input is
+        # exactly the "silent mechanism" the Charter forbids.
+        self._overflow_raw = {"p10": 0.0, "p50": 0.0, "p90": 0.0}
+        # (minute, p10, p50, p90) samples for the rolling median.
+        self._overflow_history = deque(maxlen=24)
         self._confidence = CONFIDENCE_DEFAULT
         # R55: overnight_target cached from on_before_plan, used by calculate()
         # as the effective_keep floor. None until first plan cycle has run.
@@ -527,6 +539,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._peak_pv = 0.0
         self._peak_pv_time = 0
         self._last_floor_scale = 0.0
+        self._overflow_history.clear()
         self._r63_engaged = False
         self._r63_needed_kwh = 0.0
         self._keep_recovered = False
@@ -1436,6 +1449,24 @@ class CurtailmentPlugin(PredBatPlugin):
         # Read confidence and tunable thresholds from helpers
         confidence = self._get_solcast_confidence()
 
+        # R64: rolling median over OVERFLOW_SMOOTH_WINDOW_MIN. The raw estimate
+        # wobbles ~2.16x its net daily movement (measured 2026-07-28), which reaches
+        # the floor at 1.2x and chatters whatever threshold SOC is sitting on.
+        # Median (not mean) so a single-slot Solcast revision is rejected outright.
+        # On a falling series this lags HIGH -> more assumed overflow -> lower floor
+        # -> more drain, which is R25's safe direction.
+        self._overflow_raw = {"p10": round(overflow_p10, 2), "p50": round(overflow_p50, 2), "p90": round(overflow_p90, 2)}
+        self._overflow_history.append((minutes_now, overflow_p10, overflow_p50, overflow_p90))
+        for idx, raw in ((1, overflow_p10), (2, overflow_p50), (3, overflow_p90)):
+            sm = smooth_overflow_samples([(h[0], h[idx]) for h in self._overflow_history], minutes_now, OVERFLOW_SMOOTH_WINDOW_MIN)
+            if sm is not None:
+                if idx == 1:
+                    overflow_p10 = sm
+                elif idx == 2:
+                    overflow_p50 = sm
+                else:
+                    overflow_p90 = sm
+
         # Diagnostics must be stashed BEFORE _expected_overflow() reads them.
         self._overflow_p10 = round(overflow_p10, 2)
         self._overflow_p50 = round(overflow_p50, 2)
@@ -2166,16 +2197,21 @@ class CurtailmentPlugin(PredBatPlugin):
         # statistics (state_class=measurement) for trend graphs and forecast-vs-actual
         # analysis. Same values as the corresponding overflow_p* attributes on
         # sensor.{prefix}_curtailment_phase.
-        for suffix, value, friendly in (
-            ("overflow_p10", self._overflow_p10, "Curtailment Overflow P10"),
-            ("overflow_p50", self._overflow_p50, "Curtailment Overflow P50"),
-            ("overflow_p90", self._overflow_p90, "Curtailment Overflow P90"),
+        for suffix, value, friendly, raw_key in (
+            ("overflow_p10", self._overflow_p10, "Curtailment Overflow P10", "p10"),
+            ("overflow_p50", self._overflow_p50, "Curtailment Overflow P50", "p50"),
+            ("overflow_p90", self._overflow_p90, "Curtailment Overflow P90", "p90"),
         ):
             self.base.dashboard_item(
                 "sensor.{}_curtailment_{}".format(prefix, suffix),
                 value,
                 {
                     "friendly_name": friendly,
+                    # R64: state is the SMOOTHED value (what drives the floor);
+                    # the raw estimate is published alongside so the filter is
+                    # never a silent mechanism.
+                    "raw_kwh": self._overflow_raw.get(raw_key),
+                    "smoothing_window_min": OVERFLOW_SMOOTH_WINDOW_MIN,
                     "unit_of_measurement": "kWh",
                     "device_class": "energy",
                     "state_class": "measurement",

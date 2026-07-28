@@ -757,6 +757,44 @@ def solar_elevation(lat_deg, lon_deg, utc_hours, day_of_year):
 CALIBRATION_RATIO_MAX = 1.5
 
 
+def smooth_overflow_samples(samples, now_minutes, window_minutes=30):
+    """R64 — rolling MEDIAN of the overflow estimate over a trailing window.
+
+    The Solcast-derived overflow estimate is noisy cycle-to-cycle. Measured
+    2026-07-28 09:00-14:40: the value fell 13.01 -> 6.53 kWh (a real -6.48 kWh
+    trend as the day burned off) but moved UP on 27 of 59 steps, +3.77 kWh in
+    total. Path length 14.02 kWh against a net 6.48 — a **2.16x noise ratio**.
+    That wobble reaches the floor at 1.2x and chatters any threshold SOC happens
+    to be sitting on.
+
+    **Median, not mean.** Solcast revisions arrive as single-slot jumps. A median
+    rejects a one-cycle spike outright; a mean folds 1/N of it into the floor.
+
+    **Direction matters (R25).** On a falling series — the normal shape of a day —
+    the median sits ABOVE the raw value, so we assume slightly MORE overflow, take
+    a slightly LOWER floor, and drain slightly MORE. That is the safe direction:
+    over-drain costs one round-trip, under-drain costs the whole clipped surplus.
+
+    Args:
+        samples: list of (minute, value) tuples, any order.
+        now_minutes: current minute-of-day.
+        window_minutes: trailing window width.
+
+    Returns:
+        float — median of in-window samples, or None if there are none (caller
+        should fall back to the raw value; history is empty after every restart).
+    """
+    if not samples:
+        return None
+    cutoff = now_minutes - window_minutes
+    vals = sorted(v for m, v in samples if m >= cutoff)
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
 def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_factor=1.2, max_reserved_kwh=1.8):
     """Headroom margin against the SAFETY-FACTORED overflow requirement, kWh.
 
