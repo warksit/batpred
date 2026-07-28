@@ -115,6 +115,7 @@ crosscharge
 ctrdis
 ctypes
 customauthorizer
+crtld
 customisation
 Customise
 cvalue
@@ -184,6 +185,7 @@ elif
 elinter
 eload
 EMEA
+emlite
 emqx
 emszzzz
 Encharge
@@ -218,10 +220,13 @@ EVDC
 evergen
 evilspringfall
 evse
+excs
 exog
 expmsg
 exportlimit
 exportvalue
+exprt
+fcst
 fdpwr
 fdsoc
 feedin
@@ -250,6 +255,7 @@ gaierror
 gcoan
 gecloud
 gekey
+generac
 generationmix
 generationpower
 geserial
@@ -466,6 +472,10 @@ Ohme
 ohmepy
 Okabe
 ollama
+ofgem
+Ohme
+ohmepy
+omada
 onblur
 onchange
 oncharge
@@ -485,6 +495,7 @@ overdrains
 overfitting
 overforecast
 overpredict
+oversizing
 overvoltage
 ownerapi
 parseable
@@ -553,6 +564,7 @@ rarr
 reactivepower
 readback
 readbacks
+recalc
 recp
 redownload
 Referer
@@ -577,6 +589,7 @@ rowspan
 rstart
 rstrip
 rtol
+rsyncs
 rtype
 ruamel
 RUSAGE
@@ -635,6 +648,7 @@ sourcery
 Southwell
 sparkline
 spki
+spct
 springfall
 starthour
 startminute
@@ -650,6 +664,7 @@ Strømligning
 subclassing
 submessage
 substep
+sunforte
 sunspec
 sunsynk
 supabase
@@ -716,6 +731,7 @@ unfetchable
 unflushed
 unindexed
 unnormalised
+undeployed
 underforecast
 underpredict
 underpredicted
