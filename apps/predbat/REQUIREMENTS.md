@@ -233,6 +233,7 @@ else in this file.
 | R59b | IN FORCE | Recovery floor nets against P10 **generation**. |
 | R60, R61, R62, R63 | IN FORCE | R63 = drain deadline (2026-07-28). |
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
+| RD14c | IN FORCE | Saving sessions driven by planned times, not the binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
 
 ## Goal
@@ -1266,6 +1267,52 @@ is R52/R62's job — decided pre-dawn with a fresher forecast. R56's "evening
 kWh has higher grid value" rationale belonged to the old deemed-£0 tariff.
 Do not "fix" the dusk asymmetry; revisit only if the export tariff becomes
 time-of-use.
+
+### RD14c — saving sessions run off their PLANNED times (2026-07-28)
+
+**What:** the heartbeat derives the session window from
+`current_joined_event_start/end` (falling back to `next_*`) and compares `now()`
+to it, forcing `policy = 'Max Export'` while inside — **only when the select is
+not `Predbat`**. Added as a `session_boundary` trigger too, so both edges land
+within one beat.
+
+**Why:** RD14b's session dump was driven by the binary sensor plus the plugin's
+5-minute cycle, and both lag. The planned times are known hours ahead, so the
+clock is the reliable source.
+
+**Evidence (2026-07-28, the first session run under CM):**
+
+```text
+19:00:00  session starts
+19:00:27  plugin cycle — sensor still 'off', correctly holds
+19:00:57  Octopus publishes the sensor  (57 s late)
+19:30:00  session ends
+19:35:46  plugin released Max Export    (5 min 46 s late)
+```
+
+Start would have been ~5 min late; the end was **measured** at 5 m 46 s late,
+dumping the battery at the cap well past the window. Roughly 15% of a 30-minute
+session at each edge.
+
+**Removing this would:** return both edges to the sensor's publish lag plus the
+plugin's 5-minute cycle, losing ~10 minutes of every 30-minute session and
+selling the battery outside the paid window.
+
+**Trade-off:** duplicates the window expression in the trigger and the action
+(HA gives no shared scope between them). Both are asserted by the harness so
+they cannot drift.
+
+**`| bool` is load-bearing.** HA renders `variables` to strings in some contexts,
+and the string `"False"` is TRUTHY in Jinja — without the filter a session would
+start correctly and then never release. Caught by
+`test_rd14c_releases_at_the_planned_end`, not by review.
+
+**Predbat guard.** A session must not override a handback: if the select says
+`Predbat`, its mappers are enabled and forcing Max Export would put two writers
+on the registers (the 2026-07-26 and 2026-07-28 failures).
+
+**Implemented in:** `ha/sig_dispatch_heartbeat.yaml`; tests
+`tests/test_yaml_heartbeat.py::test_rd14c_*`.
 
 ### R64 — smooth the overflow estimate (2026-07-28)
 

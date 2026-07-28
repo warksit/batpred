@@ -13,6 +13,8 @@
 import os
 import sys
 
+import datetime as _dt
+
 import jinja2
 import yaml
 
@@ -41,17 +43,27 @@ def _render_dispatch(auto, states):
     """Render the action `variables` block in order with a mock states()."""
     variables = auto["action"][0]["variables"]
     env = jinja2.Environment()
+    # HA provides a `bool` filter; plain Jinja does not. Mirror it so the harness
+    # sees the same truthiness rules the automation will.
+    env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes", "on")
 
     def states_fn(entity):
         return states.get(entity, "unknown")
 
-    ctx = {"states": states_fn, "is_state": lambda e, v: states.get(e) == v}
+    ctx = {
+        "states": states_fn,
+        "is_state": lambda e, v: states.get(e) == v,
+        "state_attr": lambda e, a: states.get("{}|{}".format(e, a)),
+        "now": lambda: states.get("__now__", _dt.datetime(2026, 7, 28, 12, 0, tzinfo=_dt.timezone.utc)),
+        "as_datetime": lambda v: v if isinstance(v, _dt.datetime) else _dt.datetime.fromisoformat(str(v)),
+    }
     for key, tmpl in variables.items():
         rendered = env.from_string(tmpl).render(**ctx).strip()
         try:
             ctx[key] = float(rendered)
         except ValueError:
             ctx[key] = rendered
+    _render_dispatch.ctx = ctx
     return ctx["dispatch_kw"]
 
 
@@ -64,6 +76,16 @@ def _mock(policy, pv, load, soc, cap_w=3680, hard=12):
         "input_number.dno_export_limit_w": str(cap_w),
         "input_number.sig_drain_floor_pct": str(hard),
     }
+
+
+def _session_mock(policy, start, end, now_dt, pv=2.0, load=0.5, soc=60):
+    """Mock carrying a PLANNED saving-session window (RD14c)."""
+    m = _mock(policy, pv, load, soc)
+    m["__now__"] = now_dt
+    if start is not None:
+        m["binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions|current_joined_event_start"] = start
+        m["binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions|current_joined_event_end"] = end
+    return m
 
 
 def test_structural():
@@ -264,8 +286,76 @@ def test_dispatch_drain_floor_default_2_8():
     print(f"PASS  drain floor default 2.8%: SOC2% → {d:.2f}")
 
 
+def test_rd14c_session_forces_max_export_from_its_planned_start():
+    """RD14c: the session window comes from its PLANNED times, not the binary
+    sensor. Octopus published the sensor at 19:00:57 for a 19:00:00 session
+    (observed 2026-07-28) and the plugin only re-evaluates every 5 min, so up to
+    ~5 min of a 30-min session was lost — roughly 15% of its value.
+
+    At exactly 19:00:00 the select still says Hold; dispatch must already be
+    Max Export.
+    """
+    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
+    at_start = _dt.datetime.fromisoformat(st)
+    _render_dispatch(_load(), _session_mock("Hold Battery", st, en, at_start))
+    ctx = _render_dispatch.ctx
+    assert ctx["session_live"] == "True", f"planned window must be live at its start instant: {ctx['session_live']}"
+    assert ctx["policy"] == "Max Export", f"live session must force Max Export, got {ctx['policy']}"
+    assert ctx["raw_policy"] == "Hold Battery", "the select itself must be untouched"
+    print("PASS  RD14c: Max Export at the planned start instant")
+
+
+def test_rd14c_releases_at_the_planned_end():
+    """The end edge the binary sensor cannot fix: the plugin pins the select to
+    Max Export, so waiting for the sensor plus a 5-min cycle keeps dumping past
+    the session. At 19:30:00 exactly, release."""
+    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
+    _render_dispatch(_load(), _session_mock("Hold Battery", st, en, _dt.datetime.fromisoformat(en)))
+    ctx = _render_dispatch.ctx
+    assert ctx["session_live"] == "False", "window is half-open: the end instant is NOT live"
+    assert ctx["policy"] == "Hold Battery", f"must fall back to the select at the planned end, got {ctx['policy']}"
+    print("PASS  RD14c: released at the planned end")
+
+
+def test_rd14c_does_not_seize_control_from_predbat():
+    """Writer ownership: if CM has handed back, Predbat's mappers are enabled.
+    Forcing Max Export would put two writers on the registers — the 2026-07-26
+    and 2026-07-28 failure. A session must NOT override handback."""
+    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
+    mid = _dt.datetime.fromisoformat("2026-07-28T19:15:00+01:00")
+    _render_dispatch(_load(), _session_mock("Predbat", st, en, mid))
+    ctx = _render_dispatch.ctx
+    assert ctx["session_live"] == "True"
+    assert ctx["policy"] == "Predbat", f"must stay handed back during a session, got {ctx['policy']}"
+    print("PASS  RD14c: does not seize control from Predbat")
+
+
+def test_rd14c_outside_window_and_no_session():
+    """Before the window, and with no session at all, the select rules."""
+    st, en = "2026-07-28T19:00:00+01:00", "2026-07-28T19:30:00+01:00"
+    before = _dt.datetime.fromisoformat("2026-07-28T18:59:00+01:00")
+    _render_dispatch(_load(), _session_mock("Hold Battery", st, en, before))
+    assert _render_dispatch.ctx["policy"] == "Hold Battery", "not yet in the window"
+    _render_dispatch(_load(), _session_mock("Hold Battery", None, None, _dt.datetime.fromisoformat("2026-07-28T19:15:00+01:00")))
+    assert _render_dispatch.ctx["policy"] == "Hold Battery", "missing attributes must not crash or force export"
+    print("PASS  RD14c: outside window / no session -> select rules")
+
+
+def test_rd14c_boundary_trigger_present():
+    """The beat alone is 60 s granular; an explicit boundary trigger keeps both
+    edges tight and independent of the sensor's publish lag."""
+    ids = [t.get("id") for t in _load()["trigger"]]
+    assert "session_boundary" in ids, f"session boundary trigger missing: {ids}"
+    print("PASS  RD14c: boundary trigger present")
+
+
 def main():
     for t in (
+        test_rd14c_session_forces_max_export_from_its_planned_start,
+        test_rd14c_releases_at_the_planned_end,
+        test_rd14c_does_not_seize_control_from_predbat,
+        test_rd14c_outside_window_and_no_session,
+        test_rd14c_boundary_trigger_present,
         test_structural,
         test_heartbeat_and_predbat_never_drive_together,
         test_active_policy_reopens_ess_and_import_limits,
