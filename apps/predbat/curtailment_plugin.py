@@ -2061,16 +2061,23 @@ class CurtailmentPlugin(PredBatPlugin):
             "sensor.{}_curtailment_charge_below".format(prefix),
             charge_below,
             {
-                "friendly_name": "Curtailment Charge Below (P10 Recovery)",
+                # "Overnight Floor": the SOC we must stay ABOVE to get through
+                # tonight. Driven by P10 GENERATION still available to refill us
+                # (R59b). Deliberately named to contrast with the Headroom Floor
+                # below, which is driven by P90 overflow and pulls the other way.
+                "friendly_name": "Overnight Floor (P10 generation)",
                 "unit_of_measurement": "kWh",
                 "device_class": "energy",
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-up",
+                "soc_pct": round(charge_below / soc_max * 100.0, 1) if soc_max else None,
                 "p10_pv_remaining_kwh": self._p10_pv_remaining_kwh,
                 "p50_pv_remaining_kwh": self._p50_pv_remaining_kwh,
                 "load_remaining_kwh": self._load_remaining_kwh,
+                "p10_surplus_kwh": round(max(0.0, self._p10_pv_remaining_kwh - self._load_remaining_kwh), 2),
                 "overnight_target_kwh": round(self._overnight_target_kwh, 2) if self._overnight_target_kwh is not None else None,
                 "confidence": self._confidence,
+                "drives": "SOC below this -> Solar Charge (bank PV for tonight)",
             },
         )
         self.base.dashboard_item(
@@ -2099,11 +2106,19 @@ class CurtailmentPlugin(PredBatPlugin):
             "sensor.{}_curtailment_drain_above".format(prefix),
             drain_above,
             {
-                "friendly_name": "Curtailment Drain Above (Curt Floor)",
+                # "Headroom Floor": the SOC we must drain DOWN to so today's
+                # forecast surplus fits in the battery. Driven by P90 OVERFLOW
+                # (R7/R42/R43). Pulls against the Overnight Floor above; the gap
+                # between them is the Hold band.
+                "friendly_name": "Headroom Floor (P90 overflow)",
                 "unit_of_measurement": "kWh",
                 "device_class": "energy",
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-down",
+                "soc_pct": round(drain_above / soc_max * 100.0, 1) if soc_max else None,
+                "overflow_p90_kwh": self._overflow_p90,
+                "overflow_floor_kwh": round(self._overflow_floor_kwh, 2) if self._overflow_floor_kwh is not None else None,
+                "drives": "SOC above this -> Max Export (sell down to make room)",
             },
         )
         # R50 diagnostics promoted to dedicated sensors so HA recorder retains
