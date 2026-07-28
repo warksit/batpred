@@ -46,9 +46,9 @@ from curtailment_calc import (
     compute_solcast_overflow,
     compute_expected_overflow,
     compute_p10_recovery_floor,
-    compute_charge_recovery_floor,
     compute_max_sheddable,
     compute_overflow_fits_margin,
+    required_headroom_kwh,
     smooth_overflow_samples,
     drain_deadline_breached,
     compute_effective_export_cap,
@@ -379,7 +379,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_dno = 4.0
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
-        self._charge_recovery_floor = 0.0  # R59a: overflow-netted floor feeding charge_below
         # R59 inputs (diagnostic — the terms feeding p10_recovery)
         self._p10_pv_remaining_kwh = 0.0
         self._p50_pv_remaining_kwh = 0.0
@@ -694,7 +693,10 @@ class CurtailmentPlugin(PredBatPlugin):
         current_keep = context["best_soc_keep"]
 
         headroom_with_current_keep = soc_max - current_keep
-        if remaining_overflow_total * OVERFLOW_SAFETY_FACTOR <= headroom_with_current_keep:
+        # max_reserved=0: the plan-time keep adjustment deliberately holds no R45
+        # reserve — that buffer belongs to the live drain target. An explicit
+        # ARGUMENT, so the difference is visible rather than drifting (Charter).
+        if required_headroom_kwh(remaining_overflow_total, 0.0, OVERFLOW_SAFETY_FACTOR) <= headroom_with_current_keep:
             self._publish_offset(0.0, {"morning_gap_kwh": round(morning_gap_load, 2), "overflow_kwh": round(remaining_overflow_total, 2), "original_keep": round(current_keep, 2), "reason": "overflow_fits_in_headroom"})
             self._cached_keep = current_keep
             self._cached_at = minutes_now
@@ -901,6 +903,48 @@ class CurtailmentPlugin(PredBatPlugin):
             # meaningful (could be sunrise/sunset edge). Don't scale.
             return 1.0
         return max(0.0, delta_actual / delta_solcast)
+
+    def _refresh_effective_max_reserved(self, minutes_now, solcast_remaining):
+        """R49 buffer reduction — sets self._effective_max_reserved for this cycle.
+
+        Called BEFORE any consumer of the buffer (the no_drain fits-check, R63's
+        headroom_needed, and the Headroom Floor). Previously this ran inline just
+        above the floor, so the two earlier callers used the raw MAX_RESERVED_KWH
+        constant and disagreed with the floor by up to 0.54 kWh on exactly the
+        cloudy afternoons R49 fires on — a latent repeat of the 2026-07-28
+        no_drain defect. One quantity, one definition (Charter).
+        """
+        try:
+            solcast_today_kwh = float(self.base.get_state_wrapper(SOLCAST_TODAY, default=0))
+        except (ValueError, TypeError):
+            solcast_today_kwh = 0.0
+        try:
+            sig_daily_pv = float(self.base.get_state_wrapper(SIG_DAILY_PV, default=0))
+        except (ValueError, TypeError):
+            sig_daily_pv = 0.0
+        solcast_so_far = max(0.0, solcast_today_kwh - solcast_remaining)
+
+        effective = MAX_RESERVED_KWH
+        self._buffer_reduced = False
+        if minutes_now >= BUFFER_REDUCE_MIN_LOCAL_HOUR * 60 and solcast_so_far > BUFFER_REDUCE_MIN_SOLCAST_KWH:
+            cumulative_ratio = sig_daily_pv / solcast_so_far if solcast_so_far > 0 else 1.0
+            target_past = minutes_now - 60
+            oldest = None
+            for entry in self._pv_history:
+                if abs(entry[0] - target_past) <= 10:
+                    oldest = entry
+                    break
+            if oldest is not None:
+                delta_solcast = solcast_so_far - oldest[1]
+                delta_actual = sig_daily_pv - oldest[2]
+                recent_ratio = delta_actual / delta_solcast if delta_solcast > 0.1 else 1.0
+                if cumulative_ratio < BUFFER_REDUCE_CUMULATIVE_RATIO and recent_ratio < BUFFER_REDUCE_RECENT_RATIO:
+                    effective = max(BUFFER_REDUCE_FLOOR_KWH, MAX_RESERVED_KWH * BUFFER_REDUCE_FACTOR)
+                    self._buffer_reduced = True
+        # Append after the lookup so the current sample doesn't match itself
+        self._pv_history.append((minutes_now, solcast_so_far, sig_daily_pv))
+        self._effective_max_reserved = effective
+        return effective
 
     def _compute_overflow_band(self, band, scale_fallback, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed):
         """R53/R50/R58: compute overflow integral for one Solcast band.
@@ -1308,7 +1352,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(target_kwh, 2)
                 self._overflow_floor_kwh = round(target_kwh, 2)
                 self._p10_recovery_floor = 0.0
-                self._charge_recovery_floor = 0.0
                 self._pre_pv_engaged_today = True
                 self._save_state()
                 return target_kwh, "active"
@@ -1326,7 +1369,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(soc_kw, 2)
                 self._overflow_floor_kwh = round(soc_kw, 2)
                 self._p10_recovery_floor = 0.0
-                self._charge_recovery_floor = 0.0
                 self._last_decision = "active (pre-PV hold): drain done, awaiting PV"
                 self._save_state()
                 return soc_kw, "active"
@@ -1521,6 +1563,8 @@ class CurtailmentPlugin(PredBatPlugin):
             self._save_state()
             return soc_max, "off"
 
+        self._refresh_effective_max_reserved(minutes_now, solcast_remaining)
+
         # Hold gate (ex-early-handback condition, correct action). Once the battery
         # headroom can absorb ALL remaining p90 ("what if the clouds clear")
         # overflow with a buffer to spare, there is nothing left to make room for →
@@ -1540,7 +1584,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # Key off the same safety-factored requirement (R25/R42/R43 are
         # one-directional: bigger estimate → more drain → safer). Low-overflow
         # days still report fits, preserving RD17's evening-reserve Charge.
-        fits_margin = compute_overflow_fits_margin(battery_headroom, overflow_p90, OVERFLOW_SAFETY_FACTOR, MAX_RESERVED_KWH)
+        fits_margin = compute_overflow_fits_margin(battery_headroom, overflow_p90, OVERFLOW_SAFETY_FACTOR, self._effective_max_reserved)
         if self._overflow_fits_latched:
             self._overflow_fits_latched = peaked and fits_margin >= (early_buffer - FITS_HYST_KWH)
         else:
@@ -1552,7 +1596,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # fires mid-peak has no authority left (R25). Fire early when the headroom
         # we will need can no longer be shed before lockout. Only meaningful
         # BEFORE lockout — past it there is no action left to take.
-        needed_kwh = OVERFLOW_SAFETY_FACTOR * remaining_overflow + min(MAX_RESERVED_KWH, max(0.0, remaining_overflow)) - battery_headroom
+        needed_kwh = required_headroom_kwh(remaining_overflow, self._effective_max_reserved, OVERFLOW_SAFETY_FACTOR) - battery_headroom
         lock_mins, lock_utc = compute_pv_start_time(floor_scale, lat, lon, doy, self._effective_dno + MIN_BASE_LOAD_KW, utc_hours)
         if lock_utc is not None and lock_mins is not None and lock_mins > 0:
             # The R45-tapered buffer is computed further down; MAX_RESERVED_KWH is
@@ -1623,31 +1667,13 @@ class CurtailmentPlugin(PredBatPlugin):
             sig_daily_pv = 0.0
         solcast_so_far = max(0.0, solcast_today_kwh - solcast_remaining)
 
-        effective_max_reserved = MAX_RESERVED_KWH
-        self._buffer_reduced = False
-        if minutes_now >= BUFFER_REDUCE_MIN_LOCAL_HOUR * 60 and solcast_so_far > BUFFER_REDUCE_MIN_SOLCAST_KWH:
-            cumulative_ratio = sig_daily_pv / solcast_so_far if solcast_so_far > 0 else 1.0
-            target_past = minutes_now - 60
-            oldest = None
-            for entry in self._pv_history:
-                if abs(entry[0] - target_past) <= 10:
-                    oldest = entry
-                    break
-            if oldest is not None:
-                delta_solcast = solcast_so_far - oldest[1]
-                delta_actual = sig_daily_pv - oldest[2]
-                recent_ratio = delta_actual / delta_solcast if delta_solcast > 0.1 else 1.0
-                if cumulative_ratio < BUFFER_REDUCE_CUMULATIVE_RATIO and recent_ratio < BUFFER_REDUCE_RECENT_RATIO:
-                    effective_max_reserved = max(BUFFER_REDUCE_FLOOR_KWH, MAX_RESERVED_KWH * BUFFER_REDUCE_FACTOR)
-                    self._buffer_reduced = True
-        # Append after the lookup so the current sample doesn't match itself
-        self._pv_history.append((minutes_now, solcast_so_far, sig_daily_pv))
-        self._effective_max_reserved = effective_max_reserved
-
-        buffer_kwh = min(effective_max_reserved, max(0.0, remaining_overflow))
-        max_target_soc = soc_max - buffer_kwh
-        overflow_floor = max_target_soc - remaining_overflow * OVERFLOW_SAFETY_FACTOR
-        overflow_floor = max(overflow_floor, 0.0)
+        # R49 already ran earlier this cycle (_refresh_effective_max_reserved), so
+        # the fits-check, R63 and this floor all share one buffer value.
+        # R45 tapered reserve alone (no safety multiplier) — the ceiling the battery
+        # may charge to. R48 compares against this, so it stays separate from the
+        # full requirement below.
+        max_target_soc = soc_max - min(self._effective_max_reserved, max(0.0, remaining_overflow))
+        overflow_floor = max(soc_max - required_headroom_kwh(remaining_overflow, self._effective_max_reserved, OVERFLOW_SAFETY_FACTOR), 0.0)
 
         # R11 floor ratchet REMOVED 2026-07-28. It clamped
         # `overflow_floor = max(overflow_floor, previous)`, so the floor could only
@@ -1674,7 +1700,8 @@ class CurtailmentPlugin(PredBatPlugin):
             actual_load = 0.0
 
         room_with_base_keep = max_target_soc - soc_keep
-        needs_room = remaining_overflow * OVERFLOW_SAFETY_FACTOR > room_with_base_keep
+        # max_reserved=0 as above — R48 is a keep-relaxation decision, not the drain target.
+        needs_room = required_headroom_kwh(remaining_overflow, 0.0, OVERFLOW_SAFETY_FACTOR) > room_with_base_keep
         pv_covering = (self._actual_pv_kw - actual_load) > PV_MARGIN_KW
 
         # R48 latch: only mark "recovered" after we've actually been drained
@@ -1758,20 +1785,6 @@ class CurtailmentPlugin(PredBatPlugin):
             load_remaining_kwh=load_remaining,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
-        # R59b: charge_below's recovery floor nets against P10 GENERATION still
-        # available to refill the battery — not against overflow (a curtailment
-        # quantity). R59a's overflow form pinned the floor at overnight_target
-        # from dawn and blocked the morning drain. The Schmitt band supplies the
-        # timing: this rises as generation runs out, crossing SOC to flip
-        # Hold -> Solar Charge late in the day.
-        self._charge_recovery_floor = round(
-            compute_charge_recovery_floor(
-                overnight_target_kwh=overnight_for_recovery,
-                p10_pv_remaining_kwh=p10_pv_remaining,
-                load_remaining_kwh=load_remaining,
-            ),
-            2,
-        )
         self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
         self._p50_pv_remaining_kwh = round(p50_pv_remaining, 2)
         self._load_remaining_kwh = round(load_remaining, 2)
@@ -2118,7 +2131,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # The R54 floor input (self._p10_recovery_floor) is NOT clamped so
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
-            charge_below = round(compute_charge_below(self._charge_recovery_floor, soc_keep_kwh), 2)
+            charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh), 2)
         else:
             charge_below = 0.0
