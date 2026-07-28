@@ -696,6 +696,38 @@ def test_R50a_incident_day_still_floored_by_r59b():
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
 
 
+def test_override_is_the_select_alone_no_boolean():
+    """RD13a (2026-07-28): manual override is ONE entity — `input_select.sig_override`.
+    Override is on iff the select is anything but "Off".
+
+    The boolean is gone. It was redundant state derivable from the select, so the
+    only thing it could ever add was divergence: select says "Max Export" while
+    the boolean says off (plugin quietly back in control), or the reverse. The
+    first version of this change kept both and bridged them with an automation —
+    a shim for a problem that only existed because of the second entity.
+    """
+    import curtailment_plugin as _cp
+
+    assert not hasattr(_cp, "SIG_OVERRIDE_SELECT") or "input_boolean" not in getattr(_cp, "SIG_OVERRIDE_SELECT", ""), "the override boolean must be gone, not merely unused"
+    assert _cp.SIG_OVERRIDE_SELECT == "input_select.sig_override"
+
+    def override_state(value):
+        base = MockBase()
+        base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+        base._sensor_overrides[_cp.SIG_OVERRIDE_SELECT] = value
+        plugin = CurtailmentPlugin(base)
+        plugin._charge_below, plugin._drain_above = 8.0, 15.0
+        plugin._policy_override = None
+        base.services.clear()
+        plugin._publish_dispatch_policy(True, floor_kwh=15.0, soc_kwh=5.0, soc_max=18.08)
+        return base.published.get("sensor.predbat_curtailment_intended_policy", {}).get("attrs", {}).get("manual_override")
+
+    assert override_state("Off") is False, "Off -> plugin drives"
+    for held in ("Max Export", "Hold Battery", "Solar Charge Battery"):
+        assert override_state(held) is True, f"{held} -> override active"
+    print("  test_override_is_the_select_alone_no_boolean: PASSED")
+
+
 def test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin():
     """RD14c: the plugin must NOT drive the policy select for a saving session.
 
@@ -1947,7 +1979,7 @@ def test_manual_override_keeps_machine_live_skips_policy():
     owns input_select.sig_dispatch_policy and it no longer gets overwritten each cycle."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides["input_boolean.sig_manual_override"] = "on"
+    base._sensor_overrides["input_select.sig_override"] = "Hold Battery"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     base.services.clear()
@@ -1965,7 +1997,7 @@ def test_manual_override_off_resumes_policy():
     """RD13: with the override off, automated policy control resumes normally."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides["input_boolean.sig_manual_override"] = "off"
+    base._sensor_overrides["input_select.sig_override"] = "Off"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     base.services.clear()
@@ -1980,7 +2012,7 @@ def test_manual_override_grabs_control_even_when_inactive():
     hands back to Predbat, so the user's manually-set policy keeps executing."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides["input_boolean.sig_manual_override"] = "on"
+    base._sensor_overrides["input_select.sig_override"] = "Hold Battery"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     base.services.clear()
@@ -2008,7 +2040,7 @@ def test_manual_override_writer_follows_policy_to_predbat():
     """
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides["input_boolean.sig_manual_override"] = "on"
+    base._sensor_overrides["input_select.sig_override"] = "Hold Battery"
     base._sensor_overrides["input_select.sig_dispatch_policy"] = "Predbat"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
@@ -3281,7 +3313,7 @@ def test_phase_managed_above_floor():
 # Plugin integration tests
 # ============================================================================
 
-from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY, SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY, SIG_POLICY_SELECT, SIG_MANUAL_OVERRIDE
+from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY, SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY, SIG_POLICY_SELECT, SIG_OVERRIDE_SELECT
 
 
 class MockBase:
@@ -5705,7 +5737,7 @@ def test_policy_is_reasserted_when_the_select_drifts():
     anything that moves the select externally (a manual tap on the dashboard
     tile, the keep-floor guard) is corrected on the next cycle. This is what
     keeps RD13's invariant honest: either the plugin drives, or
-    sig_manual_override says it doesn't. There is no third state where someone
+    the override select says it doesn't. There is no third state where someone
     else quietly owns the inverter.
 
     Untested until 2026-07-28, when a single missing log line was misread as
@@ -5751,7 +5783,7 @@ def test_manual_override_does_not_reassert_the_policy():
     reason re-assertion above is safe to be unconditional otherwise."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides[SIG_MANUAL_OVERRIDE] = "on"
+    base._sensor_overrides[SIG_OVERRIDE_SELECT] = "Hold Battery"
     base._sensor_overrides[SIG_POLICY_SELECT] = "Hold Battery"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 0.5, 0.9
@@ -5944,6 +5976,7 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_override_is_the_select_alone_no_boolean,
         test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
         test_session_reserve_still_protects_the_drain_floor,
         test_required_headroom_is_defined_once,

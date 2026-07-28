@@ -235,6 +235,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
+| RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
 
@@ -1552,7 +1553,43 @@ from an export limit to **(a) a dispatch policy and (b) floor numbers** (RD9).
   `sensor.sigen_plant_total_load_power` (consumed_power now includes DC battery
   charging post-swap).
 
-- **RD13 — Manual override (`input_boolean.sig_manual_override`).** When on (and the
+### RD13a — manual override is ONE select (2026-07-28)
+
+**What:** `input_select.sig_override` — `Off` / `Max Export` / `Hold Battery` /
+`Solar Charge Battery`. Override is active **iff the select is not "Off"**, and
+its value IS the policy to hold. There is no boolean.
+
+**Why:** the old design needed two actions in the right order — set
+`sig_dispatch_policy`, then turn on `sig_manual_override`. Set the policy and
+forget the toggle (or do them in the wrong order) and the plugin re-asserts its
+own policy within ~5 minutes, silently discarding the manual choice. Hit live on
+2026-07-28 at 19:04.
+
+**Why no boolean:** it was redundant state derivable from the select, so the only
+thing it could add was **divergence** — the select reading "Max Export" while the
+boolean said off (plugin quietly back in control), or the reverse. A first attempt
+at this kept both and bridged them with a `sig_override_control` automation: a
+shim for a problem that only existed because of the second entity. Deleted.
+
+**No `Predbat` option, by design.** Handing back is the plugin's decision (RD6
+safe_time handback), not a manual mode; "Off" already means "you decide".
+Offering Predbat would let a human park the machine somewhere the plugin then
+has to fight.
+
+**Precedence in the heartbeat:** manual override > live saving session > the
+plugin's `sig_dispatch_policy`. A human holding a policy outranks the session
+dump — they can see something the automation cannot.
+
+**Removing this would:** return manual control to a two-entity dance whose
+failure mode is silent (your choice vanishes ~5 minutes later with no
+indication).
+
+**Implemented in:** `curtailment_plugin.py` (`SIG_OVERRIDE_SELECT`),
+`ha/sig_dispatch_heartbeat.yaml` (`override_choice` in the policy chain),
+`ha/sig_manual_override_failsafe_off.yaml` (nightly return to "Off").
+Tests: `test_override_is_the_select_alone_no_boolean`, `test_rd13a_*`.
+
+- **RD13 — Manual override (SUPERSEDED by RD13a; was `input_boolean.sig_manual_override`).** When on (and the
   policy-control gate is on), the plugin keeps the single-writer machine LIVE — enables
   `automation.sig_dispatch_heartbeat` and holds Predbat read_only — but STOPS writing
   `input_select.sig_dispatch_policy` and the keep floor. The user sets the policy by

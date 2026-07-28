@@ -40,7 +40,6 @@ After changing in HA, pull the updated config and commit it so the file stays in
 - `cd apps/predbat && python3 tests/test_yaml_heartbeat.py` — heartbeat dispatch + the ESS/import limit re-open (regressed twice; see below)
 - `cd apps/predbat && python3 tests/test_yaml_inverter_fault_alert.py` — fault-alert diagnosis (clamped battery vs meter fault)
 - `cd apps/predbat && python3 tests/test_yaml_requested_mode.py` — Predbat→SIG mode mapper
-- `cd apps/predbat && python3 tests/test_yaml_override_control.py` — single-select manual override (order is load-bearing)
 - `cd apps/predbat && python3 tests/test_plugin_host_contract.py` — fails if the Predbat build lacks the `on_before_plan` host API
 - `cd apps/predbat && python3 tests/test_soc_keep_publish.py` — effective `best_soc_keep` sensor (read by `/soc-keep-review`)
 - `cd coverage && python3 ../apps/predbat/unit_test.py --quick`

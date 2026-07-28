@@ -1,19 +1,27 @@
 alias: SIG Manual Override Failsafe Off
 description: >-
-  Nightly failsafe: clears input_boolean.sig_manual_override at 23:00 (after
+  Nightly failsafe: returns input_select.sig_override to "Off" at 23:00 (after
   sundown, before any pre-dawn curtailment drain window ~01:00-04:00). A left-on
   manual override blocks the plugin's automated pre-PV drain because the plugin
-  skips policy writes while it is on (RD13). This ensures a forgotten override
-  never silently disables the morning drain.
+  skips policy writes while an override is held (RD13). This ensures a forgotten
+  override never silently disables the morning drain.
+
+  RD13a (2026-07-28): override is the SELECT alone — active iff not "Off". The
+  old input_boolean.sig_manual_override is gone, so this clears the select.
 trigger:
   - platform: time
     at: "23:00:00"
 condition:
-  - condition: state
-    entity_id: input_boolean.sig_manual_override
-    state: "on"
+  # Anything but "Off" means an override is being held.
+  - condition: not
+    conditions:
+      - condition: state
+        entity_id: input_select.sig_override
+        state: "Off"
 action:
-  - service: input_boolean.turn_off
+  - action: input_select.select_option
     target:
-      entity_id: input_boolean.sig_manual_override
+      entity_id: input_select.sig_override
+    data:
+      option: "Off"
 mode: single

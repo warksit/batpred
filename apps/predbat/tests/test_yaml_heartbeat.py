@@ -69,6 +69,7 @@ def _render_dispatch(auto, states):
 
 def _mock(policy, pv, load, soc, cap_w=3680, hard=12):
     return {
+        "input_select.sig_override": "Off",
         "input_select.sig_dispatch_policy": policy,
         "sensor.sigen_plant_pv_power": str(pv),
         "sensor.sigen_plant_total_load_power": str(load),
@@ -82,6 +83,7 @@ def _session_mock(policy, session_on, pv=2.0, load=0.5, soc=60):
     """Mock with the Octoplus saving-session CALENDAR on or off (RD14c)."""
     m = _mock(policy, pv, load, soc)
     m["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"] = "on" if session_on else "off"
+    m.setdefault("input_select.sig_override", "Off")
     return m
 
 
@@ -201,7 +203,7 @@ def test_active_policy_reopens_ess_and_import_limits():
 
 
 def test_manual_override_is_a_trigger():
-    """Flipping sig_manual_override must re-evaluate dispatch immediately.
+    """Flipping the override select must re-evaluate dispatch immediately.
 
     It changes who is driving (RD13); without this trigger the heartbeat waits up
     to a minute for the beat. It carries its OWN id so the one-shot MSC handback —
@@ -212,7 +214,7 @@ def test_manual_override_is_a_trigger():
     ids = {t.get("id") for t in auto["trigger"]}
     assert "override_change" in ids, f"manual override trigger missing, got ids {ids}"
     ov = next(t for t in auto["trigger"] if t.get("id") == "override_change")
-    assert ov.get("entity_id") == "input_boolean.sig_manual_override", ov
+    assert ov.get("entity_id") == "input_select.sig_override", ov
     assert ov.get("id") != "policy_change", "override must not share the policy_change id — it would re-park on every toggle"
     print("PASS  trigger: manual override re-evaluates dispatch (own id, not policy_change)")
 
@@ -347,8 +349,59 @@ def test_rd14c_no_template_window_math_remains():
     print("PASS  RD14c: no window math / binary-sensor fallback remains")
 
 
+def test_rd13a_override_select_outranks_everything():
+    """RD13a: manual override is the SELECT alone — active iff not "Off", and its
+    value IS the policy. It outranks a live saving session: a human holding a
+    policy can see something the automation cannot.
+
+    There is no boolean. It was redundant state derivable from the select, so the
+    only thing it could add was divergence.
+    """
+    m = _session_mock("Hold Battery", session_on=True)
+    m["input_select.sig_override"] = "Solar Charge Battery"
+    _render_dispatch(_load(), m)
+    ctx = _render_dispatch.ctx
+    assert ctx["policy"] == "Solar Charge Battery", f"override must outrank the session dump, got {ctx['policy']}"
+    print("PASS  RD13a: override select outranks a live session")
+
+
+def test_rd13a_off_hands_back_to_the_plugin():
+    """ "Off" means the plugin decides — the select must contribute nothing."""
+    m = _session_mock("Hold Battery", session_on=False)
+    m["input_select.sig_override"] = "Off"
+    _render_dispatch(_load(), m)
+    assert _render_dispatch.ctx["policy"] == "Hold Battery", "Off -> plugin's select rules"
+    print("PASS  RD13a: Off -> plugin's select rules")
+
+
+def test_rd13a_policy_has_no_stray_whitespace():
+    """The policy expression must be ONE line. A folded `>-` block leaves trailing
+    whitespace, so "Max Export " silently fails every `policy in [...]` comparison
+    in the choose below — dispatch would do nothing at all."""
+    pol = _load()["action"][0]["variables"]["policy"]
+    assert "\n" not in pol, "policy must be a single expression, not a folded block"
+    m = _session_mock("Hold Battery", session_on=True)
+    m["input_select.sig_override"] = "Max Export"
+    _render_dispatch(_load(), m)
+    got = _render_dispatch.ctx["policy"]
+    assert got == got.strip() and got == "Max Export", f"policy must render clean, got {got!r}"
+    print("PASS  RD13a: policy renders with no stray whitespace")
+
+
+def test_rd13a_no_override_boolean_anywhere():
+    """The boolean is deleted, not merely unused."""
+    import yaml as _y
+
+    assert "sig_manual_override" not in _y.dump(_load()), "the override boolean must be gone from the heartbeat"
+    print("PASS  RD13a: no override boolean in the heartbeat")
+
+
 def main():
     for t in (
+        test_rd13a_override_select_outranks_everything,
+        test_rd13a_off_hands_back_to_the_plugin,
+        test_rd13a_policy_has_no_stray_whitespace,
+        test_rd13a_no_override_boolean_anywhere,
         test_rd14c_live_session_forces_max_export,
         test_rd14c_releases_at_the_planned_end,
         test_rd14c_does_not_seize_control_from_predbat,
