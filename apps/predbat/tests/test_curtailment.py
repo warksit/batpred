@@ -2936,7 +2936,7 @@ def test_phase_managed_above_floor():
 # Plugin integration tests
 # ============================================================================
 
-from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY, SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY
+from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY, SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY, SIG_POLICY_SELECT, SIG_MANUAL_OVERRIDE
 
 
 class MockBase:
@@ -5339,6 +5339,71 @@ def test_v32_drain_floor_drives_between_2_8_and_5pct():
     print("  test_v32_drain_floor_drives_between_2_8_and_5pct: PASSED")
 
 
+def test_policy_is_reasserted_when_the_select_drifts():
+    """The plugin must re-assert its intended policy whenever the LIVE select
+    disagrees — not merely when its own decision changes.
+
+    `_set_policy` compares against `get_state_wrapper(SIG_POLICY_SELECT)`, so
+    anything that moves the select externally (a manual tap on the dashboard
+    tile, the keep-floor guard) is corrected on the next cycle. This is what
+    keeps RD13's invariant honest: either the plugin drives, or
+    sig_manual_override says it doesn't. There is no third state where someone
+    else quietly owns the inverter.
+
+    Untested until 2026-07-28, when a single missing log line was misread as
+    "the plugin only writes on its own change" and nearly became a redundant
+    re-assert loop. It already re-asserts; this pins it.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    # SOC 5.0 kWh sits BELOW charge_below -> intent is Solar Charge, so a select
+    # hand-set to Hold genuinely disagrees. (27.6% is clear of the 2.8% handover.)
+    plugin._charge_below, plugin._drain_above = 8.0, 15.0
+    plugin._policy_override = None
+
+    base._sensor_overrides[SIG_POLICY_SELECT] = "Hold Battery"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=15.0, soc_kwh=5.0, soc_max=18.08)
+    drifted = _policy_calls(base)
+    assert drifted, f"a drifted select must be re-asserted, got no write: {base.services}"
+    assert drifted[-1] != "Hold Battery", f"must correct away from the hand-set value: {drifted}"
+
+    # Select already matches intent -> no write, so we don't spam it every cycle.
+    base._sensor_overrides[SIG_POLICY_SELECT] = drifted[-1]
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=15.0, soc_kwh=5.0, soc_max=18.08)
+    assert not _policy_calls(base), f"matching select must not be rewritten: {base.services}"
+
+    # The case that distinguishes a LIVE comparison from a cached one: the
+    # plugin's own decision is UNCHANGED and only the select has drifted away
+    # again. A cached "did I already write this?" check would skip here and
+    # silently leave the hand-set value in force. Must re-assert.
+    base._sensor_overrides[SIG_POLICY_SELECT] = "Hold Battery"
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=15.0, soc_kwh=5.0, soc_max=18.08)
+    again = _policy_calls(base)
+    assert again == [drifted[-1]], f"unchanged intent + drifted select must still re-assert: {base.services}"
+    print(f"  test_policy_is_reasserted_when_the_select_drifts: PASSED (re-asserted {drifted[-1]})")
+
+
+def test_manual_override_does_not_reassert_the_policy():
+    """RD13: under manual override the user owns the POLICY SELECT, so a drifted
+    select is left alone. This is the sanctioned way to hold a policy — and the
+    reason re-assertion above is safe to be unconditional otherwise."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_MANUAL_OVERRIDE] = "on"
+    base._sensor_overrides[SIG_POLICY_SELECT] = "Hold Battery"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 0.9
+    plugin._policy_override = None
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.7, soc_max=18.08)
+    assert not _policy_calls(base), f"manual override must not write the policy select: {base.services}"
+    print("  test_manual_override_does_not_reassert_the_policy: PASSED")
+
+
 def test_v32_keep_floor_min_is_drain_floor_not_5():
     """v32: on a huge-overflow CURTAILMENT drain (Schmitt Drain, no override) the
     published keep-floor reaches the drain floor (2.8%), not the old hardcoded 5%.
@@ -5907,6 +5972,8 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_upcoming_session_raises_drain_floor,
         test_two_floors_are_named_and_sourced_distinctly,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
+        test_policy_is_reasserted_when_the_select_drifts,
+        test_manual_override_does_not_reassert_the_policy,
         test_v32_keep_floor_min_is_drain_floor_not_5,
         test_v32_drain_floor_helper_override,
         test_v32_pre_pv_hold_no_dawn_flap,
