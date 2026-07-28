@@ -1,0 +1,63 @@
+{
+  "backup_date": "2026-03-23",
+  "reason": "Replaced by cold_weather_plugin.py",
+  "automations": {
+    "cold_soc_keep_set_overnight": {
+      "id": "1773422245844",
+      "alias": "Cold SOC Keep - Set Overnight",
+      "description": "At 20:00, calculate best_soc_keep based on forecast overnight min temperature. Formula: baseline + per_degree * max(0, threshold - min_temp). Caps at 8 kWh.",
+      "mode": "single",
+      "trigger": [{"platform": "time", "at": "20:00:00"}],
+      "action": [
+        {"variables": {"results": "{{ state_attr('sensor.predbat_temperature', 'results') }}", "baseline": "{{ states('input_number.cold_soc_baseline') | float(3.5) }}", "per_degree": "{{ states('input_number.cold_soc_per_degree') | float(0.5) }}", "threshold": "{{ states('input_number.cold_soc_threshold') | float(8) }}", "now_ts": "{{ as_timestamp(now()) }}", "end_ts": "{{ as_timestamp((now() + timedelta(days=1)).strftime('%Y-%m-%d') + 'T10:00:00+00:00') }}"}},
+        {"variables": {"min_temp": "{% set ns = namespace(min_val=99) %}{% if results %}{% for key, val in results.items() %}{% set key_ts = as_timestamp(key) %}{% if key_ts >= now_ts and key_ts <= end_ts %}{% if val < ns.min_val %}{% set ns.min_val = val %}{% endif %}{% endif %}{% endfor %}{% endif %}{{ ns.min_val }}"}},
+        {"variables": {"raw_keep": "{{ (baseline | float + per_degree | float * [0, threshold | float - min_temp | float] | max) | round(1) }}", "soc_keep": "{{ [raw_keep | float, 8] | min }}"}},
+        {"target": {"entity_id": "input_number.predbat_best_soc_keep"}, "data": {"value": "{{ soc_keep }}"}, "action": "input_number.set_value"},
+        {"data": {"name": "Cold SOC Keep", "message": "Set best_soc_keep to {{ soc_keep }} kWh (min forecast temp {{ min_temp }}°C, baseline {{ baseline }}, per_degree {{ per_degree }}, threshold {{ threshold }})"}, "action": "logbook.log"}
+      ]
+    },
+    "cold_soc_keep_track_morning_min": {
+      "id": "1773422257004",
+      "alias": "Cold SOC Keep - Track Morning Min",
+      "description": "Every 5 minutes between 07:00-10:00, reset best_soc_keep to baseline (daytime value) and track the lowest battery SOC seen for the daily review.",
+      "mode": "single",
+      "trigger": [{"platform": "time_pattern", "minutes": "/5"}],
+      "condition": [{"condition": "time", "after": "07:00:00", "before": "10:00:00"}],
+      "action": [
+        {"target": {"entity_id": "input_number.predbat_best_soc_keep"}, "data": {"value": "{{ states('input_number.cold_soc_baseline') | float(2.0) }}"}, "action": "input_number.set_value"},
+        {"variables": {"current_soc": "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(100) }}", "tracked_min": "{{ states('input_number.cold_morning_min_soc') | float(100) }}"}},
+        {"condition": "template", "value_template": "{{ current_soc < tracked_min }}"},
+        {"target": {"entity_id": "input_number.cold_morning_min_soc"}, "data": {"value": "{{ current_soc }}"}, "action": "input_number.set_value"}
+      ]
+    },
+    "cold_soc_keep_morning_review": {
+      "id": "1773422272871",
+      "alias": "Cold SOC Keep - Morning Review",
+      "description": "At 10:00, review overnight performance. If SOC hit <5%, increase per_degree by 0.1 (fast). If SOC stayed >20% on a cold night, decrease by 0.03 (slow). Reset morning min tracker to 100.",
+      "mode": "single",
+      "trigger": [{"platform": "time", "at": "10:00:00"}],
+      "action": [
+        {"variables": {"min_soc": "{{ states('input_number.cold_morning_min_soc') | float(100) }}", "per_degree": "{{ states('input_number.cold_soc_per_degree') | float(0.5) }}", "soc_keep": "{{ states('input_number.predbat_best_soc_keep') | float(3.5) }}", "baseline": "{{ states('input_number.cold_soc_baseline') | float(3.5) }}", "was_cold_night": "{{ soc_keep | float > baseline | float + 0.5 }}"}},
+        {"choose": [
+          {"conditions": [{"condition": "template", "value_template": "{{ min_soc < 5 }}"}], "sequence": [
+            {"variables": {"new_per_degree": "{{ [[per_degree | float + 0.1, 0.1] | max, 2.0] | min }}"}},
+            {"target": {"entity_id": "input_number.cold_soc_per_degree"}, "data": {"value": "{{ new_per_degree }}"}, "action": "input_number.set_value"},
+            {"data": {"name": "Cold SOC Review", "message": "SOC hit {{ min_soc }}% — INCREASED per_degree"}, "action": "logbook.log"}
+          ]},
+          {"conditions": [{"condition": "template", "value_template": "{{ min_soc > 20 and was_cold_night }}"}], "sequence": [
+            {"variables": {"new_per_degree": "{{ [[per_degree | float - 0.03, 0.1] | max, 2.0] | min }}"}},
+            {"target": {"entity_id": "input_number.cold_soc_per_degree"}, "data": {"value": "{{ new_per_degree }}"}, "action": "input_number.set_value"},
+            {"data": {"name": "Cold SOC Review", "message": "SOC stayed at {{ min_soc }}% on cold night — decreased per_degree"}, "action": "logbook.log"}
+          ]}
+        ], "default": [{"data": {"name": "Cold SOC Review", "message": "No adjustment needed"}, "action": "logbook.log"}]},
+        {"target": {"entity_id": "input_number.cold_morning_min_soc"}, "data": {"value": 100}, "action": "input_number.set_value"}
+      ]
+    }
+  },
+  "helpers": {
+    "input_number.cold_soc_baseline": "2.0 kWh — daytime baseline",
+    "input_number.cold_soc_per_degree": "0.75 kWh/°C — learned rate",
+    "input_number.cold_soc_threshold": "8.0°C — cold threshold",
+    "input_number.cold_morning_min_soc": "tracking helper — morning min SOC"
+  }
+}

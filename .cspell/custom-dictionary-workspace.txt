@@ -72,6 +72,7 @@ coro
 cprofile
 creds
 crosscharge
+crtld
 customisation
 Customise
 cvalue
@@ -120,6 +121,7 @@ eauth
 Eddi
 elif
 EMEA
+emlite
 emqx
 emszzzz
 Encharge
@@ -147,9 +149,12 @@ euids
 EVDC
 evergen
 evse
+excs
 exog
 exportlimit
 exportvalue
+exprt
+fcst
 fdpwr
 fdsoc
 feedin
@@ -171,11 +176,13 @@ funcs
 futurerate
 gecloud
 gekey
+generac
 generationmix
 generationpower
 geserial
 geseriale
 getall
+getattr
 Ginlong
 GivEnergy
 givtcp
@@ -318,8 +325,10 @@ OCPP
 octo
 octoplus
 octopoints
+ofgem
 Ohme
 ohmepy
+omada
 onblur
 onchange
 oncharge
@@ -331,6 +340,7 @@ overdrains
 overfitting
 overforecast
 overpredict
+oversizing
 overvoltage
 ownerapi
 parseable
@@ -377,6 +387,8 @@ pytz
 randn
 rarr
 reactivepower
+readback
+recalc
 recp
 redownload
 Referer
@@ -394,6 +406,7 @@ Roboto
 rowspan
 rstart
 rstrip
+rsyncs
 rtype
 ruamel
 Rvrt
@@ -437,6 +450,7 @@ solisx
 sourcery
 Southwell
 sparkline
+spct
 springfall
 starthour
 startminute
@@ -450,6 +464,7 @@ Strømligning
 subclassing
 submessage
 substep
+sunforte
 sunspec
 sunsynk
 supabase
@@ -488,6 +503,7 @@ twinx
 tzfile
 tzpath
 unconfigured
+undeployed
 underforecast
 underpredict
 underpredicted

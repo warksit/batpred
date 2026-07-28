@@ -108,3 +108,7 @@ it
 
 # Runtime-generated manifest
 apps/predbat/manifest.yaml
+
+# Local rollback tarballs — 34 MB each, keep the rollback script + filelist in
+# git but never the archive itself.
+.claude/backup/*.tar.gz
