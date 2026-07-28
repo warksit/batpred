@@ -32,6 +32,7 @@ from curtailment_calc import (
     compute_overflow_fits_margin,
     smooth_overflow_samples,
     required_headroom_kwh,
+    compute_session_reserve,
     compute_max_sheddable,
     drain_deadline_breached,
     compute_effective_export_cap,
@@ -693,6 +694,55 @@ def test_R50a_incident_day_still_floored_by_r59b():
     assert drain_above / soc_max > 0.30, f"p90 must floor the incident day well above 1.9%, got {drain_above / soc_max:.1%}"
     assert charge_below < drain_above, f"R59b floor must sit below the drain target: {charge_below:.2f} vs {drain_above:.2f}"
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
+
+
+def test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin():
+    """RD14c: the plugin must NOT drive the policy select for a saving session.
+
+    Two separate concerns, and mixing them broke the end edge:
+      - PLANNING (plugin): reserve energy ahead of the session so there is
+        something to sell — `_session_protect_kwh` raising `drain_above`.
+      - DISPATCH (heartbeat): dump it at the cap during the session window,
+        driven natively by the Octoplus calendar.
+
+    While the plugin also forced `_policy_override = "max_export"`, it PINNED the
+    select to Max Export. At session end the heartbeat computes
+    `policy = raw_policy` — still Max Export — so dumping continued until the
+    plugin's next 5-minute cycle. Measured 2026-07-28: session ended 19:30:00,
+    released 19:35:46, 5 min 46 s of exporting the battery past the paid window.
+
+    The heartbeat cannot fix that edge while the plugin overrides the select, so
+    the dispatch half moves out of the plugin entirely.
+    """
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    overrides[SIG_SAVING_SESSION_ENTITY] = "on"
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.55, minutes_now=720, best_soc_keep=4.0, sensor_overrides=overrides)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 9.0
+    plugin._overnight_target_kwh = 6.0
+    plugin.calculate(dno_limit_kw=3.68)
+
+    assert plugin._is_saving_session_active(), "fixture must have a live session"
+    assert plugin._policy_override != "max_export" or plugin._r63_engaged, f"a live session must not by itself force max_export — that is the heartbeat's job now (override={plugin._policy_override})"
+    print("  test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin: PASSED")
+
+
+def test_session_reserve_still_protects_the_drain_floor():
+    """The PLANNING half stays: ahead of a known session, keep duration x cap in
+    the battery so there is something to sell. Without this the curtailment drain
+    would empty the battery before the session ever starts."""
+    reserve = compute_session_reserve(30.0, 3.68)
+    assert abs(reserve - 1.84) < 0.01, f"30 min at 3.68 kW = 1.84 kWh, got {reserve}"
+    protect = min(18.08, 6.6 + reserve)
+    without = compute_drain_above(0.54, 2.0, None, 0.0)
+    with_session = compute_drain_above(0.54, 2.0, None, protect)
+    assert with_session > without, f"an upcoming session must raise the drain floor: {without} -> {with_session}"
+    assert abs(with_session - protect) < 0.01, f"drain floor must be the protect level, got {with_session}"
+    print(f"  test_session_reserve_still_protects_the_drain_floor: PASSED ({without} -> {with_session})")
 
 
 def test_required_headroom_is_defined_once():
@@ -5507,9 +5557,21 @@ def test_v32_sundown_still_deactivates():
     print("  test_v32_sundown_still_deactivates: PASSED")
 
 
-def test_v32_saving_session_active_forces_max_export():
-    """v32(b): while a saving session is live, the policy override is Max Export —
-    dump the reserve at the cap regardless of SOC band."""
+def test_v32_saving_session_plugin_stays_active_but_delegates_dispatch():
+    """RD14c (2026-07-28) SUPERSEDES v32(b): the plugin stays ACTIVE through a
+    live session but no longer sets the dispatch override — the heartbeat drives
+    Max Export natively off the Octoplus calendar.
+
+    v32(b) asserted `_policy_override == "max_export"` here. That behaviour moved,
+    it was not lost: see tests/test_yaml_heartbeat.py::test_rd14c_*. It had to
+    move because the plugin PINNED the select to Max Export, so at session end the
+    heartbeat saw `raw_policy = Max Export` and kept exporting until the plugin's
+    next 5-minute cycle — measured at 5 min 46 s past the paid window on
+    2026-07-28.
+
+    What must still hold here: the plugin remains active (so its floors and the
+    session reserve keep working) and does NOT claim dispatch.
+    """
     pv = {m: 2.0 for m in range(0, 480, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
     sensor_overrides = {"sensor.sigen_plant_pv_power": 2.0, "sensor.sigen_plant_consumed_power": 0.5}
@@ -5527,8 +5589,9 @@ def test_v32_saving_session_active_forces_max_export():
     plugin._peak_pv = 7.5
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     assert phase == "active", f"expected active during session, got {phase}"
-    assert plugin._policy_override == "max_export", f"v32: session live → Max Export override, got {plugin._policy_override}"
-    print("  test_v32_saving_session_active_forces_max_export: PASSED")
+    assert plugin._session_active, "plugin must still SEE the session (planning half depends on it)"
+    assert plugin._policy_override != "max_export", f"RD14c: dispatch is the heartbeat's job now, plugin set {plugin._policy_override}"
+    print("  test_v32_saving_session_active_forces_max_export: PASSED (RD14c: plugin active, dispatch delegated)")
 
 
 def test_v32_upcoming_session_raises_drain_floor():
@@ -5881,6 +5944,8 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
+        test_session_reserve_still_protects_the_drain_floor,
         test_required_headroom_is_defined_once,
         test_no_drain_and_floor_agree_when_r49_reduces_the_buffer,
         test_recovery_floor_is_a_single_quantity,
@@ -6278,7 +6343,7 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_overflow_fits_holds_not_off,
         test_v32_overflow_does_not_fit_schmitt_drives,
         test_v32_sundown_still_deactivates,
-        test_v32_saving_session_active_forces_max_export,
+        test_v32_saving_session_plugin_stays_active_but_delegates_dispatch,
         test_v32_upcoming_session_raises_drain_floor,
         test_two_floors_are_named_and_sourced_distinctly,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
