@@ -185,7 +185,7 @@ else in this file.
 | R13 | IN FORCE | |
 | R14–R18, R38 | ❌ **REMOVED** | The 5-second three-phase export-limit automation is retired (v30, DC-coupled). |
 | R19, R20, R21 | IN FORCE | safe_time is a control input again (drives Hold), not just a diagnostic. |
-| R25 | IN FORCE (principle) / ⚠️ **REOPENED** (estimator) | "Worst case, act early" in force. Whether geometry or Solcast per-slot feeds the integral is reopened — fixture replay favours Solcast. |
+| R25 | IN FORCE | "Worst case, act early". Geometry owns **timing**, Solcast per-slot owns **energy** — resolved 2026-07-28 on 11-fixture replay. |
 | R26–R30 | IN FORCE | |
 | R34–R37 | IN FORCE | Testing discipline. R36 (TDD) and R37 (never break production for tests). |
 | R39 | ❌ **REMOVED** | Restated R11's ratchet; removed with it. |
@@ -199,7 +199,7 @@ else in this file.
 | R50 | **DORMANT** | Code retained; re-enabled by setting `curtailment_confidence_high` < 1.0. Not the live path. |
 | R50a | IN FORCE | Live path is `overflow_p90`. **Its citations of R7/R42/R43 are to dead requirements** — the conclusion rests on R25's worst-case logic instead. |
 | R52 | IN FORCE | Pre-PV drain. Already contains a time-to-drain calculation — the ancestor of R63. |
-| R53 | IN FORCE | Solcast per-slot is primary. Fixture replay over 11 days shows it beats geometry as a worst-case estimator on 11/11 (mean error 10.77 vs 15.71 kWh). See *Open questions*. |
+| R53 | IN FORCE | Solcast per-slot is primary for the energy estimate; beats geometry on 11/11 fixtures (mean error 10.77 vs 15.71 kWh). Smoothed by R64. |
 | R54, R55 | IN FORCE | |
 | R56 | ❌ SUPERSEDED | by R6/RD6 — CM must not own the evening. |
 | R57, R58 | IN FORCE | |
@@ -207,6 +207,7 @@ else in this file.
 | R59a | ❌ **WITHDRAWN** | Circular reasoning; blocked the morning drain. **Do not implement.** |
 | R59b | IN FORCE | Recovery floor nets against P10 **generation**. |
 | R60, R61, R62, R63 | IN FORCE | R63 = drain deadline (2026-07-28). |
+| R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
 
 ## Goal
@@ -240,12 +241,28 @@ deadline (R63).
 on marginal days and silently curtails on the days that matter — exactly what
 R50's confidence blend did before R50a retired it.
 
-**Geometry vs Solcast per-slot — REOPENED 2026-07-28, do not act on this yet.**
+**Geometry and Solcast have separate jobs** (resolved 2026-07-28).
 
-> This was resolved in favour of geometry earlier the same day. Fixture replay
-> completed afterwards contradicts that and the question is reopened pending a
-> decision. See *Open questions*. The "worst case, act early" principle above is
-> not in doubt — only which estimator best serves it.
+| Question | Model | Why |
+|---|---|---|
+| **When** the overflow window opens/closes, and how much drain capacity is left | **Geometry** | The smooth curve is stable and monotone — exactly what timing needs. Feeds safe_time (R19), T_lockout and `max_sheddable` (R63), and the pre-PV drain start (R52). |
+| **How much** overflow energy | **Solcast per-slot p90** (R53) | Keeps the forecast day-shape. Geometry as fallback only, below 4 detailed slots. |
+
+**Why not geometry for the energy too**, despite it being the more conservative-
+looking choice: geometry scales a *clear-sky* curve off the single highest p90
+slot, producing a fictional day worse than the p90 forecast itself. Replaying 11
+April/May fixtures, geometry over-predicts above-cap overflow on **11/11 days**,
+mean error **15.71 kWh** against Solcast per-slot's **10.77 kWh**.
+
+On 2026-04-28 geometry said **21.54 kWh** where the actual above-cap overflow was
+**2.60 kWh** and Solcast said 7.56. That 8x over-estimate is what drove the ~9.5
+kWh drain that left the battery at ~2% with 5.76 kWh of load still to cover. A
+replay of that day at every starting SOC from 2.8% to 100% curtails **0.00 kWh** —
+there was nothing to make room for at all.
+
+Solcast p90 per-slot *is* the worst case, at every slot, and it keeps the shape.
+That serves "protect against the maximum" better than a fiction that is worse
+than the worst case.
 
 **Why:** we are protecting against the *maximum*, and once PV − load exceeds the
 export cap there are no levers left. The smooth `scale × sin(elev)` curve gives a
@@ -1215,6 +1232,41 @@ is R52/R62's job — decided pre-dawn with a fresher forecast. R56's "evening
 kWh has higher grid value" rationale belonged to the old deemed-£0 tariff.
 Do not "fix" the dusk asymmetry; revisit only if the export tariff becomes
 time-of-use.
+
+### R64 — smooth the overflow estimate (2026-07-28)
+
+**What:** rolling **median** over a 30-minute trailing window, applied to
+`overflow_p10/p50/p90` before they feed the floor. Raw values are published
+alongside as sensor attributes.
+
+**Why:** the Solcast-derived estimate is noisy cycle-to-cycle, and that noise
+reaches the floor multiplied by `OVERFLOW_SAFETY_FACTOR`, chattering any
+threshold SOC happens to be resting on. Median rather than mean because Solcast
+revisions arrive as single-slot jumps: a median rejects a one-cycle spike
+outright, a mean folds 1/N of it in.
+
+**Evidence:** 2026-07-28, 09:00–14:40 live trace. The estimate fell 13.01 → 6.53
+kWh — a genuine −6.48 kWh trend — but moved *up* on 27 of 59 steps, +3.77 kWh
+total, path length 14.02 kWh: a **2.16x noise ratio**. Replayed through the
+filter: noise **1.24x**, upward wobble **+0.75 kWh** (down 80%), net trend
+preserved at −6.19 kWh.
+
+**Direction is deliberate.** On a falling series — the normal shape of a day —
+the median sits *above* the raw value (+0.29 kWh at the end of that trace). More
+assumed overflow → lower floor → more drain. That is R25's safe direction: an
+over-drain costs one round-trip, an under-drain costs the whole clipped surplus.
+
+**Removing this would:** return the drain/hold decision to flapping at threshold
+boundaries whenever SOC sits near a floor, and re-expose the floor to single-slot
+forecast revisions. Note the previous damper for this was the R11 ratchet, which
+was removed for unrelated and good reasons — do not reinstate that instead.
+
+**Trade-off:** ~15 minutes of lag against genuine forecast change, in the
+conservative direction. After a restart the history is empty and the raw value is
+used until the window fills.
+
+**Implemented in:** `curtailment_calc.py:smooth_overflow_samples`,
+`curtailment_plugin.py` (`_overflow_history`, `OVERFLOW_SMOOTH_WINDOW_MIN`).
 
 ### R63 — drain deadline: the trigger needs TIME, not just energy (2026-07-28)
 

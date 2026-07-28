@@ -31,6 +31,7 @@ from curtailment_calc import (
     compute_charge_recovery_floor,
     compute_shed_rate,
     compute_overflow_fits_margin,
+    smooth_overflow_samples,
     compute_max_sheddable,
     drain_deadline_breached,
     compute_effective_export_cap,
@@ -692,6 +693,53 @@ def test_R50a_incident_day_still_floored_by_r59b():
     assert drain_above / soc_max > 0.30, f"p90 must floor the incident day well above 1.9%, got {drain_above / soc_max:.1%}"
     assert charge_below < drain_above, f"R59b floor must sit below the drain target: {charge_below:.2f} vs {drain_above:.2f}"
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
+
+
+def test_overflow_smoothing_rejects_a_single_spike():
+    """R64: a median window rejects a one-cycle forecast spike outright, where a
+    mean would fold ~1/N of it into the floor. Solcast revisions arrive as
+    single-slot jumps, which is exactly the shape a median kills."""
+    base = [(0, 10.0), (5, 10.1), (10, 9.9), (15, 10.0)]
+    clean = smooth_overflow_samples(base, now_minutes=15, window_minutes=30)
+    spiked = smooth_overflow_samples(base + [(20, 18.0)], now_minutes=20, window_minutes=30)
+    assert abs(spiked - clean) < 0.2, f"a single 18 kWh spike must not move the estimate: {clean} -> {spiked}"
+    print(f"  test_overflow_smoothing_rejects_a_single_spike: PASSED ({clean:.2f} -> {spiked:.2f})")
+
+
+def test_overflow_smoothing_tracks_the_real_trend():
+    """It must not be so heavy that it stops following the day burning off.
+    Today's trace fell 13.01 -> 6.53 kWh over 5h40m; the smoothed value has to
+    follow that within roughly half the window."""
+    samples = [(i * 5, 13.0 - i * 0.1) for i in range(20)]  # steady decline
+    now = samples[-1][0]
+    sm = smooth_overflow_samples(samples, now_minutes=now, window_minutes=30)
+    raw = samples[-1][1]
+    lag = sm - raw
+    assert 0 < lag < 0.5, f"lag on a falling series should be small and positive (conservative), got {lag:.2f}"
+    print(f"  test_overflow_smoothing_tracks_the_real_trend: PASSED (raw {raw:.2f}, smoothed {sm:.2f}, lag +{lag:.2f})")
+
+
+def test_overflow_smoothing_lags_conservatively_not_optimistically():
+    """R25 direction check: on a FALLING series the smoothed value must sit ABOVE
+    the raw one (more overflow assumed -> lower floor -> more drain -> safer).
+    A filter that lagged the other way would under-provision headroom."""
+    falling = [(i * 5, 12.0 - i * 0.5) for i in range(8)]
+    now = falling[-1][0]
+    assert smooth_overflow_samples(falling, now, 30) > falling[-1][1], "must lag high on a falling series"
+    rising = [(i * 5, 4.0 + i * 0.5) for i in range(8)]
+    now = rising[-1][0]
+    assert smooth_overflow_samples(rising, now, 30) < rising[-1][1], "lags low on a rising series (raw already used for activation)"
+    print("  test_overflow_smoothing_lags_conservatively_not_optimistically: PASSED")
+
+
+def test_overflow_smoothing_degrades_safely_on_short_history():
+    """After a deploy the history is empty. Smoothing must return the current
+    value rather than 0 — plugin restarts happen constantly during live work."""
+    assert smooth_overflow_samples([], now_minutes=100, window_minutes=30) is None
+    assert smooth_overflow_samples([(100, 7.5)], 100, 30) == 7.5
+    # Samples older than the window are dropped entirely.
+    assert smooth_overflow_samples([(0, 99.0), (100, 7.5)], 100, 30) == 7.5
+    print("  test_overflow_smoothing_degrades_safely_on_short_history: PASSED")
 
 
 def test_R11_removed_floor_follows_the_formula_down():
@@ -5780,6 +5828,10 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_overflow_smoothing_rejects_a_single_spike,
+        test_overflow_smoothing_tracks_the_real_trend,
+        test_overflow_smoothing_lags_conservatively_not_optimistically,
+        test_overflow_smoothing_degrades_safely_on_short_history,
         test_R11_removed_floor_follows_the_formula_down,
         test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor,
         test_R63_shed_rate_inverts_once_pv_exceeds_the_cap,
