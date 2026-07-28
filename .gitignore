@@ -124,3 +124,6 @@ apps/predbat/git_version.txt
 
 # Claude Code local worktrees
 .claude/worktrees/
+# Local rollback tarballs — 34 MB each, keep the rollback script + filelist in
+# git but never the archive itself.
+.claude/backup/*.tar.gz
