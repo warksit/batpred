@@ -27,6 +27,21 @@
 # HARD FLOOR (live clamp): SOC ≤ input_number.sig_drain_floor_pct → dispatch ≤ PV
 # so the battery can never DISCHARGE below the floor for any policy.
 #
+# ESS / IMPORT LIMIT RE-OPEN (5bbdedeb, re-applied 2026-07-28): on every
+# active-policy run, set
+#   number.sigen_plant_ess_max_discharging_limit = rated discharge
+#   number.sigen_plant_ess_max_charging_limit    = rated charge
+#   number.sigen_plant_grid_import_limitation    = 100
+# Predbat's Freeze Charging/Discharging locks the battery via discharge=0 and
+# blocks import via import=0. Those are PLANT registers — disabling the mapper
+# does not clear them, so without this the heartbeat writes dispatch into a
+# hardware-locked battery. The stale-setpoint trigger also fires when discharge
+# is <50% of rated or import is 0, so a freeze is cleared within a beat rather
+# than waiting for a dispatch drift.
+# Seen twice: 2026-07-26 (fixed by 5bbdedeb) and 2026-07-28 (the v8.46.4 port
+# predated that commit, so re-deploying from the ported file regressed it —
+# SOC flat 44.6% for 4.5 h under Max Export on a clear morning).
+#
 # Triggers: 1-min backstop beat; policy change; manual-override change; LIVE
 # stale-setpoint — the
 # template references PV + load, so it re-evaluates on every change and fires
@@ -73,9 +88,14 @@ trigger:
       {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
       {% set pre = ([raw, pv] | min if soc <= hard else raw) %}
       {% set want = [[pre, ceil] | min, 0] | max %}
+      {% set rated_d = states('sensor.sigen_inverter_ess_rated_discharge_power') | float(6.6) %}
+      {% set disc = states('number.sigen_plant_ess_max_discharging_limit') | float(0) %}
+      {% set imp = states('number.sigen_plant_grid_import_limitation') | float(100) %}
       {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and
          is_state('switch.sigen_plant_remote_ems_controlled_by_home_assistant', 'on') and
-         (states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1 }}
+         ((states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1
+          or disc < (rated_d * 0.5)
+          or imp < 1) }}
     id: stale_setpoint
 
 action:
@@ -98,6 +118,10 @@ action:
       #   Hold into a battery-draining Max Export on any PV dip.
       ceiling_kw: "{{ 6.6 if policy == 'Max Export' else [load_kw + cap_kw, 6.6] | min }}"
       dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if soc_pct <= hard_pct else raw_kw), ceiling_kw] | min, 0] | max }}"
+      rated_discharge_kw: "{{ states('sensor.sigen_inverter_ess_rated_discharge_power') | float(6.6) }}"
+      rated_charge_kw: "{{ states('sensor.sigen_inverter_ess_rated_charge_power') | float(6.6) }}"
+      max_discharge_kw: "{{ rated_discharge_kw | float(6.6) | round(2) }}"
+      max_charge_kw: "{{ rated_charge_kw | float(6.6) | round(2) }}"
   - choose:
       # Release (Predbat): ONE-SHOT handback, then stay out of the way entirely.
       # STAY in EMS control (RD2) — NEVER turn Remote EMS off / drop to app modes,
@@ -177,6 +201,33 @@ action:
               entity_id: number.sigen_plant_grid_export_limitation
             data:
               value: "{{ cap_kw | round(2) }}"
+          # 2026-07-28: undo any state a PREVIOUS writer left behind. Predbat's
+          # Freeze Charging/Discharging locks the battery via
+          # ess_max_discharging_limit=0 and blocks import via
+          # grid_import_limitation=0. Those are plant registers, not owned by the
+          # policy select, so disabling the mapper does NOT clear them — the
+          # heartbeat has to re-open them or Max Export writes dispatch into a
+          # hardware-locked battery. Regressed twice now (2026-07-26 and again
+          # 2026-07-28 when the v8.46.4 port dropped commit 5bbdedeb), both times
+          # showing as SOC flat all morning under an active policy.
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_ess_max_discharging_limit
+            data:
+              value: "{{ max_discharge_kw }}"
+            alias: "Open ESS max discharge (undo Predbat freeze)"
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_ess_max_charging_limit
+            data:
+              value: "{{ max_charge_kw }}"
+            alias: "Open ESS max charge"
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_grid_import_limitation
+            data:
+              value: 100
+            alias: "Re-open grid import (undo Predbat freeze)"
           - action: number.set_value
             target:
               entity_id: number.sigen_plant_active_power_fixed_adjustment

@@ -132,6 +132,45 @@ def test_heartbeat_and_predbat_never_drive_together():
     print("PASS  exclusion: heartbeat inert under Predbat policy (MSC one-shot on policy_change only)")
 
 
+def test_active_policy_reopens_ess_and_import_limits():
+    """An active policy MUST re-open the registers a Predbat freeze leaves clamped.
+
+    Predbat's Freeze Charging/Discharging locks the battery with
+    ess_max_discharging_limit=0 and blocks import with grid_import_limitation=0.
+    Those are PLANT registers, not owned by the policy select — disabling the
+    mapper does not clear them. Without this the heartbeat writes dispatch into a
+    hardware-locked battery and nothing moves.
+
+    Regressed TWICE:
+      2026-07-26  fixed by 5bbdedeb
+      2026-07-28  the v8.46.4 port predated 5bbdedeb, so re-deploying the
+                  heartbeat from the ported file dropped it again — SOC sat flat
+                  at 44.6% for 4.5 h under Max Export on a clear morning.
+    Hence this test.
+    """
+    auto = _load()
+    choose = auto["action"][1]["choose"]
+    active = next((b for b in choose if "Max Export" in " ".join(str(c) for c in b["conditions"])), None)
+    assert active is not None, "no active-policy branch"
+
+    writes = {}
+    for a in _iter_actions(active["sequence"]):
+        if (a.get("action") or a.get("service")) == "number.set_value":
+            ent = str(a.get("target", {}).get("entity_id", ""))
+            writes[ent] = a.get("data", {}).get("value")
+
+    for reg in ("number.sigen_plant_ess_max_discharging_limit", "number.sigen_plant_ess_max_charging_limit", "number.sigen_plant_grid_import_limitation"):
+        assert reg in writes, f"active policy must re-open {reg} — a Predbat freeze would otherwise persist"
+    assert str(writes["number.sigen_plant_grid_import_limitation"]) == "100", f"import limit must be re-opened to 100, got {writes['number.sigen_plant_grid_import_limitation']!r}"
+
+    # And the trigger must notice a clamp, not just a dispatch drift.
+    stale = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
+    tmpl = stale["value_template"]
+    assert "ess_max_discharging_limit" in tmpl, "stale_setpoint must fire on a clamped discharge limit"
+    assert "grid_import_limitation" in tmpl, "stale_setpoint must fire on a blocked import limit"
+    print("PASS  re-open: active policy clears ESS discharge/charge + import clamps")
+
+
 def test_manual_override_is_a_trigger():
     """Flipping sig_manual_override must re-evaluate dispatch immediately.
 
@@ -219,6 +258,7 @@ def main():
     for t in (
         test_structural,
         test_heartbeat_and_predbat_never_drive_together,
+        test_active_policy_reopens_ess_and_import_limits,
         test_manual_override_is_a_trigger,
         test_live_trigger,
         test_dispatch_ceiling_overflow,
