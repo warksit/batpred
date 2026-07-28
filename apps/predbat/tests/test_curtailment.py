@@ -5269,6 +5269,56 @@ def test_v32_upcoming_session_raises_drain_floor():
     print(f"  test_v32_upcoming_session_raises_drain_floor: PASSED (drain_above {without}->{with_session})")
 
 
+def test_two_floors_are_named_and_sourced_distinctly():
+    """The two SOC floors pull in OPPOSITE directions and must be readable as
+    such on the dashboard, or the plugin's mode is unexplainable:
+
+      Overnight Floor (P10 generation) — stay ABOVE this to make it through
+                                          tonight; below it -> Solar Charge
+      Headroom Floor  (P90 overflow)   — drain DOWN to this so today's surplus
+                                          fits; above it -> Max Export
+
+    Guards against the pre-2026-07-28 naming ("Charge Below (P10 Recovery)" /
+    "Drain Above (Curt Floor)"), which named the comparison operator rather than
+    the thing being protected, and against a future edit re-pointing one floor at
+    the other's driver — the R59a defect, where the overnight floor was driven by
+    overflow and so blocked the morning drain.
+    """
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.55, minutes_now=720, best_soc_keep=4.0, sensor_overrides=sensor_overrides)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 9.0
+    plugin._overnight_target_kwh = 6.0
+    plugin.on_update()
+
+    overnight = base.published["sensor.predbat_curtailment_charge_below"]["attrs"]
+    headroom = base.published["sensor.predbat_curtailment_drain_above"]["attrs"]
+
+    assert "Overnight Floor" in overnight["friendly_name"], overnight["friendly_name"]
+    assert "Headroom Floor" in headroom["friendly_name"], headroom["friendly_name"]
+    assert overnight["friendly_name"] != headroom["friendly_name"]
+
+    # Each floor must name its own driver, and must NOT claim the other's.
+    assert "P10" in overnight["friendly_name"] and "P90" not in overnight["friendly_name"]
+    assert "P90" in headroom["friendly_name"] and "P10" not in headroom["friendly_name"]
+
+    # The driver values themselves must be published alongside each floor, so the
+    # dashboard can show cause next to effect.
+    for key in ("p10_pv_remaining_kwh", "load_remaining_kwh", "p10_surplus_kwh", "overnight_target_kwh"):
+        assert key in overnight, f"Overnight Floor missing driver {key}"
+    assert "overflow_p90_kwh" in headroom, "Headroom Floor missing its P90 overflow driver"
+
+    # Both expose a percentage so they can be read against SOC%, which is how the
+    # battery is displayed everywhere else.
+    assert overnight["soc_pct"] is not None and headroom["soc_pct"] is not None
+    assert "Solar Charge" in overnight["drives"] and "Max Export" in headroom["drives"]
+    print(f"  test_two_floors_are_named_and_sourced_distinctly: PASSED ({overnight['soc_pct']}% / {headroom['soc_pct']}%)")
+
+
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
     """v32: with the single drain floor (2.8%), the plugin keeps driving Max Export
     between 2.8% and the old 5% — SOC 0.7 kWh (3.9%) drives, SOC 0.4 kWh (2.2%)
@@ -5855,6 +5905,7 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_sundown_still_deactivates,
         test_v32_saving_session_active_forces_max_export,
         test_v32_upcoming_session_raises_drain_floor,
+        test_two_floors_are_named_and_sourced_distinctly,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
         test_v32_keep_floor_min_is_drain_floor_not_5,
         test_v32_drain_floor_helper_override,
