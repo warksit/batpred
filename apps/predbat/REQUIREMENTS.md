@@ -233,7 +233,7 @@ else in this file.
 | R59b | IN FORCE | Recovery floor nets against P10 **generation**. |
 | R60, R61, R62, R63 | IN FORCE | R63 = drain deadline (2026-07-28). |
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
-| RD14c | IN FORCE | Saving sessions driven by planned times, not the binary sensor (2026-07-28). |
+| RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
 
 ## Goal
@@ -1270,15 +1270,30 @@ time-of-use.
 
 ### RD14c — saving sessions run off their PLANNED times (2026-07-28)
 
-**What:** the heartbeat derives the session window from
-`current_joined_event_start/end` (falling back to `next_*`) and compares `now()`
-to it, forcing `policy = 'Max Export'` while inside — **only when the select is
-not `Predbat`**. Added as a `session_boundary` trigger too, so both edges land
-within one beat.
+**What:** the heartbeat forces `policy = 'Max Export'` while the **Octoplus
+saving-sessions calendar** is `on` — **only when the select is not `Predbat`** —
+with native `calendar` start/end triggers.
 
-**Why:** RD14b's session dump was driven by the binary sensor plus the plugin's
-5-minute cycle, and both lag. The planned times are known hours ahead, so the
-clock is the reliable source.
+```yaml
+- platform: calendar
+  entity_id: calendar.octopus_energy_..._octoplus_saving_sessions
+  event: start            # and a matching event: end
+session_live: "{{ is_state('calendar...octoplus_saving_sessions', 'on') }}"
+```
+
+**Why the calendar, not the binary sensor or a hand-rolled window.** The
+calendar is *"on when a saving session that the account has joined is active"* —
+**joined-only**, so an un-joined session can never make us export for free — and
+HA schedules `calendar` triggers to fire at the exact event boundary. No polling,
+no `now()` window math, and no duplication between trigger and action.
+
+An intermediate version of this requirement derived the window from the binary
+sensor's `*_joined_event_start/end` attributes and compared `now()` to them. It
+worked, but it hand-rolled what HA provides natively: two template triggers, the
+window expression duplicated in trigger and action, and 60 s granularity from the
+beat instead of exact firing. Superseded within the hour it was written — the
+calendar entity is documented at
+<https://bottlecapdave.github.io/HomeAssistant-OctopusEnergy/entities/octoplus/#saving-sessions-calendar>.
 
 **Evidence (2026-07-28, the first session run under CM):**
 
@@ -1298,9 +1313,8 @@ session at each edge.
 plugin's 5-minute cycle, losing ~10 minutes of every 30-minute session and
 selling the battery outside the paid window.
 
-**Trade-off:** duplicates the window expression in the trigger and the action
-(HA gives no shared scope between them). Both are asserted by the harness so
-they cannot drift.
+**Trade-off:** none material. The calendar is a single source of truth for
+"is a session live", and the native triggers remove the polling entirely.
 
 **`| bool` is load-bearing.** HA renders `variables` to strings in some contexts,
 and the string `"False"` is TRUTHY in Jinja — without the filter a session would
