@@ -47,6 +47,9 @@ from curtailment_calc import (
     compute_expected_overflow,
     compute_p10_recovery_floor,
     compute_charge_recovery_floor,
+    compute_max_sheddable,
+    compute_overflow_fits_margin,
+    drain_deadline_breached,
     compute_effective_export_cap,
     compute_charge_below,
     compute_drain_above,
@@ -283,6 +286,10 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
+        # R63 drain-deadline engagement (hysteresis, NOT a latch — draining is
+        # what clears the breach, so the loop must stay closed).
+        self._r63_engaged = False
+        self._r63_needed_kwh = 0.0
         self._actual_pv_kw = 0.0
         # v30 policy control (RD9): split thresholds stored by publish() this cycle
         self._charge_below = 0.0
@@ -526,6 +533,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._peak_pv_time = 0
         self._floor_ratchet = None
         self._last_floor_scale = 0.0
+        self._r63_engaged = False
+        self._r63_needed_kwh = 0.0
         self._keep_recovered = False
         self._keep_drained_today = False
         self._r48_engaged_today = False
@@ -1501,13 +1510,50 @@ class CurtailmentPlugin(PredBatPlugin):
             early_buffer = float(self.base.get_state_wrapper(HA_EARLY_HANDBACK_BUFFER, default=EARLY_HANDBACK_BUFFER_DEFAULT))
         except (TypeError, ValueError):
             early_buffer = EARLY_HANDBACK_BUFFER_DEFAULT
-        fits_margin = battery_headroom - overflow_p90
+        # 2026-07-28: this compared BARE p90 against headroom, while the Headroom
+        # Floor requires safety_factor × p90 + the R45 reserve. On a 6.6 kWh
+        # overflow the two differ by 1.67 kWh, so the weaker test vetoed a drain
+        # the band had correctly called — leaving us short of the p90 defence.
+        # Key off the same safety-factored requirement (R25/R42/R43 are
+        # one-directional: bigger estimate → more drain → safer). Low-overflow
+        # days still report fits, preserving RD17's evening-reserve Charge.
+        fits_margin = compute_overflow_fits_margin(battery_headroom, overflow_p90, OVERFLOW_SAFETY_FACTOR, MAX_RESERVED_KWH)
         if self._overflow_fits_latched:
             self._overflow_fits_latched = peaked and fits_margin >= (early_buffer - FITS_HYST_KWH)
         else:
             self._overflow_fits_latched = peaked and fits_margin >= early_buffer
+        # R63 drain deadline: the fits-check above is a pure ENERGY test — it asks
+        # "does the surplus fit", never "can I still MAKE it fit". Shed rate is
+        # cap - max(0, pv - load), which inverts once PV-load clears the cap
+        # (T_lockout, the rising mirror of safe_time), so a trigger that first
+        # fires mid-peak has no authority left (R25). Fire early when the headroom
+        # we will need can no longer be shed before lockout. Only meaningful
+        # BEFORE lockout — past it there is no action left to take.
+        needed_kwh = OVERFLOW_SAFETY_FACTOR * remaining_overflow + min(MAX_RESERVED_KWH, max(0.0, remaining_overflow)) - battery_headroom
+        lock_mins, lock_utc = compute_pv_start_time(floor_scale, lat, lon, doy, self._effective_dno + MIN_BASE_LOAD_KW, utc_hours)
+        if lock_utc is not None and lock_mins is not None and lock_mins > 0:
+            # The R45-tapered buffer is computed further down; MAX_RESERVED_KWH is
+            # its ceiling, so using it here can only make R63 fire slightly EARLY,
+            # which is the safe direction.
+            sheddable_kwh = compute_max_sheddable(floor_scale, lat, lon, doy, utc_hours, lock_utc, self._effective_dno)
+            was_engaged = self._r63_engaged
+            self._r63_engaged = drain_deadline_breached(needed_kwh, sheddable_kwh, engaged=was_engaged)
+            if self._r63_engaged and not was_engaged:
+                self.log("Curtailment: R63 drain deadline — need {:.2f} kWh headroom, only {:.2f} kWh sheddable before lockout {:.2f}Z -> Max Export".format(needed_kwh, sheddable_kwh, lock_utc))
+            elif was_engaged and not self._r63_engaged:
+                self.log("Curtailment: R63 cleared — need {:.2f} kWh, {:.2f} kWh sheddable".format(needed_kwh, sheddable_kwh))
+        else:
+            # Past lockout (or no crossing today): the lever has no authority, so
+            # R63 has no answer. Release rather than hold Max Export pointlessly.
+            self._r63_engaged = False
+        self._r63_needed_kwh = round(needed_kwh, 2)
+
         self._session_active = self._is_saving_session_active()
         if self._session_active:
+            self._policy_override = "max_export"
+        elif self._r63_engaged:
+            # Outranks no_drain: that says "it fits right now", R63 says "it won't
+            # fit later and this is the last chance to do anything about it".
             self._policy_override = "max_export"
         elif self._overflow_fits_latched or past_safe:
             # v32.1 (2026-07-22): "no_drain" — no curtailment risk left (overflow

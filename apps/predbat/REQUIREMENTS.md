@@ -1172,6 +1172,80 @@ kWh has higher grid value" rationale belonged to the old deemed-£0 tariff.
 Do not "fix" the dusk asymmetry; revisit only if the export tariff becomes
 time-of-use.
 
+### R63 — drain deadline: the trigger needs TIME, not just energy (2026-07-28)
+
+**Defect.** The drain trigger (`SOC > drain_above`) reduces to a pure energy test:
+
+```text
+drain when:  headroom  <  OVERFLOW_SAFETY_FACTOR × remaining_overflow + buffer
+```
+
+It asks *"will the surplus fit?"* and never *"can I still make it fit in time?"*
+Those come apart, because the rate at which we can shed is not constant — it is
+the export cap **minus whatever PV is simultaneously refilling the battery**:
+
+```text
+shed_rate(t) = export_cap − max(0, PV(t) − load(t))
+```
+
+Worked on a clear July day (cap 3.68 kW), for 5 kWh of headroom:
+
+| Time  | PV − load | shed_rate | time to shed 5 kWh |
+|-------|-----------|-----------|--------------------|
+| 06:00 | ~0 kW     | 3.68 kW   | 82 min             |
+| 11:00 | 2.5 kW    | 1.18 kW   | 4h 14m             |
+| 13:00 | 7.5 kW    | −3.8 kW   | never — filling    |
+
+Once `PV − load > export_cap` the lever inverts: we export flat out at the cap
+and the battery still charges from the excess. Call that crossing **T_lockout**
+— it is the exact moment R25's "no levers" begins.
+
+**Why the energy test fires too late.** Through the day `remaining_overflow`
+shrinks (pushing the trigger away) while SOC rises (pulling it closer), so the
+crossing drifts toward midday — the one window where acting achieves nothing.
+The test can say "act now" precisely when it is already too late to act.
+
+**R63**: gate the drain on achievability, not only on fit.
+
+```text
+headroom_needed = safety × remaining_overflow + buffer − current_headroom
+max_sheddable   = ∫ shed_rate(t) dt   from now to T_lockout
+
+if headroom_needed > max_sheddable:  → Max Export now, and latch
+```
+
+- **Integrate, don't sample.** `shed_rate` is falling continuously, so the
+  instantaneous rate over-estimates what remains achievable.
+- **T_lockout is the rising mirror of safe_time.** Same threshold
+  (`dno + MIN_BASE_LOAD_KW`), same geometry model — `compute_pv_start_time`
+  (R52) already computes the ascending crossing. Use geometry, not Solcast
+  per-slot: R9 rejects per-slot forecast as too noisy, and this is the same
+  decision.
+- **Hysteresis, NOT a latch.** An earlier draft of this requirement said to
+  latch on the reasoning "once behind, extra PV only makes it worse". That is
+  wrong, and dangerously so: draining is precisely what clears the breach —
+  `headroom` grows, so `headroom_needed` falls. A one-way latch would hold Max
+  Export after the drain had succeeded and empty the battery. The feedback loop
+  is self-correcting and must be left closed. Use a hysteresis band
+  (`R63_HYST_KWH`) to stop chatter at the boundary: engage when
+  `needed > sheddable`, disengage only once `needed < sheddable − hyst`.
+- **It can only fire EARLIER, never later.** On days with slack it never
+  triggers and behaviour is identical to today. That is what makes it safe to
+  add to a live control path.
+
+**Relationship to R62.** R62 (pre-PV drain) is already the dawn half of this
+reasoning — it drains before sunrise precisely because `shed_rate` is at its
+maximum there. R63 extends the same argument into the day, covering the case
+where the forecast moves after the pre-PV decision was taken.
+
+**Tension with R59b, deliberately surfaced.** Draining earlier and harder costs
+round-trip and eats the evening reserve, which is what the R59b Overnight Floor
+rising through the afternoon defends. The two floors then bracket the day:
+*shed by this deadline* against *bank by that deadline*. When they cannot both
+be met the floors invert, and that inversion is the honest signal that the day
+is over-subscribed — surfaced on the dashboard rather than silently resolved.
+Overnight need wins (importing at 25p is worse than curtailing free surplus).
+
 ---
 
 ## v30 — DC-Coupled Architecture (2026-07-18)

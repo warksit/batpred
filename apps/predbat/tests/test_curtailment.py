@@ -29,6 +29,10 @@ from curtailment_calc import (
     compute_drain_above,
     compute_p10_recovery_floor,
     compute_charge_recovery_floor,
+    compute_shed_rate,
+    compute_overflow_fits_margin,
+    compute_max_sheddable,
+    drain_deadline_breached,
     compute_effective_export_cap,
     compute_floor_with_source,
     should_defer_to_charge,
@@ -688,6 +692,154 @@ def test_R50a_incident_day_still_floored_by_r59b():
     assert drain_above / soc_max > 0.30, f"p90 must floor the incident day well above 1.9%, got {drain_above / soc_max:.1%}"
     assert charge_below < drain_above, f"R59b floor must sit below the drain target: {charge_below:.2f} vs {drain_above:.2f}"
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
+
+
+def test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor():
+    """The `no_drain` veto must apply the SAME headroom requirement as the
+    Headroom Floor, or a weaker test silently overrules the stronger one.
+
+    Live 2026-07-28 14:37: SOC 10.03 kWh, headroom 8.05, p90 overflow 6.60.
+      no_drain (bare p90 + flat 1.5 buffer): 6.60 <= 8.05 - 1.5  -> "fits", veto
+      Headroom Floor (R42/R43 safety):      1.2*6.60 + 1.8 = 9.72 > 8.05 -> drain
+    The band put SOC above drain_above (46.8%) and no_drain still forced Hold,
+    leaving us 1.67 kWh short of the p90 defence. Same defect shape as R59a:
+    an override derived from a different, weaker quantity beating the mechanism.
+
+    R25/R42/R43 are one-directional — bigger overflow estimate, more drain,
+    safer — so the margin-carrying test must win.
+    """
+    soc_max, p90 = 18.08, 6.60
+    headroom = soc_max - 10.03  # 8.05
+
+    required = OVERFLOW_SAFETY_FACTOR * p90 + min(MAX_RESERVED_KWH, p90)
+    assert required > headroom, "fixture must be a day that does NOT genuinely fit"
+
+    # The safety-factored margin is what no_drain must key off.
+    assert compute_overflow_fits_margin(headroom, p90) < 0, "must not report 'fits' when short of the p90 defence"
+
+    # A genuinely low-overflow day must still report fits, so RD17's
+    # evening-reserve Charge is preserved on overcast days.
+    assert compute_overflow_fits_margin(soc_max - 2.0, 1.5) > 0, "low-overflow day must still suppress the pointless drain"
+    print("  test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor: PASSED")
+
+
+def test_R63_shed_rate_inverts_once_pv_exceeds_the_cap():
+    """R63 — the drain lever's authority is `cap − max(0, PV − load)`, which goes
+    NEGATIVE once PV-load clears the export cap. Past that point we export flat
+    out and the battery still charges from the excess: no headroom can be made.
+    """
+    cap = 3.68
+    # Dawn: no PV, full authority.
+    assert abs(compute_shed_rate(pv_kw=0.0, load_kw=0.5, export_cap_kw=cap) - cap) < 1e-9
+    # Mid-morning: PV eating into it.
+    assert abs(compute_shed_rate(pv_kw=3.0, load_kw=0.5, export_cap_kw=cap) - (cap - 2.5)) < 1e-9
+    # Peak: PV-load 7.5 kW > cap -> lever inverted, we are filling.
+    rate = compute_shed_rate(pv_kw=8.0, load_kw=0.5, export_cap_kw=cap)
+    assert rate < 0, f"past lockout the shed rate must be negative, got {rate}"
+    assert abs(rate - (cap - 7.5)) < 1e-9
+    print(f"  test_R63_shed_rate_inverts_once_pv_exceeds_the_cap: PASSED (peak rate {rate:.2f} kW)")
+
+
+def test_R63_max_sheddable_integrates_a_falling_rate():
+    """R63: `shed_rate` falls continuously as PV climbs, so sampling the current
+    rate over-states what is still achievable. Must integrate to T_lockout."""
+    lat, lon, doy, cap = 52.33, -1.32, 209, 3.68
+    scale = 9.0
+    # 05:00 UTC, integrating to a lockout two hours out.
+    sheddable = compute_max_sheddable(scale, lat, lon, doy, from_utc_hours=5.0, lockout_utc_hours=7.0, export_cap_kw=cap)
+    naive = compute_shed_rate(scale * 0.0, 0.5, cap) * 2.0  # instantaneous-at-start × hours
+
+    assert sheddable > 0, f"there must be real drain capacity before lockout, got {sheddable}"
+    assert sheddable < naive, f"integral must be BELOW the naive constant-rate estimate ({sheddable:.2f} vs {naive:.2f})"
+    # Zero-width and inverted windows are safe.
+    assert compute_max_sheddable(scale, lat, lon, doy, 7.0, 7.0, cap) == 0.0
+    assert compute_max_sheddable(scale, lat, lon, doy, 8.0, 7.0, cap) == 0.0
+    print(f"  test_R63_max_sheddable_integrates_a_falling_rate: PASSED ({sheddable:.2f} kWh vs naive {naive:.2f})")
+
+
+def test_R63_deadline_breach_fires_only_when_drain_is_unachievable():
+    """R63: the gate is achievability. Slack -> silent (behaviour unchanged);
+    behind -> fire. This is what makes it safe on a live control path: it can
+    only ever fire EARLIER than the plain energy test, never later."""
+    # Plenty of capacity to shed what's needed -> must NOT fire.
+    assert not drain_deadline_breached(headroom_needed_kwh=2.0, max_sheddable_kwh=6.0)
+    # Needed exceeds what's still achievable -> fire.
+    assert drain_deadline_breached(headroom_needed_kwh=6.0, max_sheddable_kwh=2.0)
+    # Nothing needed -> never fires, even with zero capacity left (post-lockout).
+    assert not drain_deadline_breached(headroom_needed_kwh=0.0, max_sheddable_kwh=0.0)
+    assert not drain_deadline_breached(headroom_needed_kwh=-1.5, max_sheddable_kwh=0.0)
+    # Exactly on the boundary is not a breach.
+    assert not drain_deadline_breached(headroom_needed_kwh=3.0, max_sheddable_kwh=3.0)
+    print("  test_R63_deadline_breach_fires_only_when_drain_is_unachievable: PASSED")
+
+
+def test_R63_draining_clears_the_breach_it_must_not_latch():
+    """R63 is a CLOSED LOOP and must not latch. Draining is precisely what
+    clears the breach: headroom grows, so headroom_needed falls.
+
+    A one-way latch — which an early draft of R63 specified, on the reasoning
+    "once behind, more PV only makes it worse" — would hold Max Export after the
+    drain had succeeded and empty the battery. This test exists to stop that
+    reasoning being reinstated.
+    """
+    soc_max, sheddable = 18.08, 3.0
+    remaining_overflow = 7.0
+
+    def needed_at(soc):
+        return 1.2 * remaining_overflow + min(1.8, remaining_overflow) - (soc_max - soc)
+
+    # Battery full-ish: badly behind, R63 engages.
+    assert drain_deadline_breached(needed_at(14.0), sheddable), "full battery must breach"
+    # Now drain 6 kWh. The SAME overflow and the SAME deadline, but the breach
+    # must clear — otherwise Max Export never stops.
+    assert not drain_deadline_breached(needed_at(8.0), sheddable, engaged=True), "draining must clear the breach even while engaged"
+    print("  test_R63_draining_clears_the_breach_it_must_not_latch: PASSED")
+
+
+def test_R63_hysteresis_band_stops_boundary_chatter():
+    """Engage at needed > sheddable; release only once needed < sheddable - hyst.
+    Inside the band an engaged R63 stays engaged, so it can't flap Max Export
+    against Hold every cycle at the crossing."""
+    sheddable = 3.0
+    # Just inside the band, coming from disengaged -> stays off.
+    assert not drain_deadline_breached(2.8, sheddable, engaged=False)
+    # Same value, coming from engaged -> stays ON (that's the hysteresis).
+    assert drain_deadline_breached(2.8, sheddable, engaged=True)
+    # Clear of the band -> releases regardless.
+    assert not drain_deadline_breached(2.4, sheddable, engaged=True, hyst_kwh=0.5)
+    # Above the engage threshold -> on regardless.
+    assert drain_deadline_breached(3.5, sheddable, engaged=False)
+    print("  test_R63_hysteresis_band_stops_boundary_chatter: PASSED")
+
+
+def test_R63_fires_before_the_plain_energy_test_would():
+    """R63's whole purpose: on a morning where the surplus still 'fits' today,
+    but won't be sheddable by the time it stops fitting, R63 must act while the
+    lever still has authority. The plain energy test stays silent here.
+    """
+    soc_max, cap = 18.08, 3.68
+    lat, lon, doy = 52.33, -1.32, 209
+    scale = 10.2
+    lockout = 7.33  # UTC hour where shed_rate crosses zero on this fixture
+    soc, remaining_overflow = 12.0, 5.5
+    headroom = soc_max - soc  # 6.08
+
+    # The plain energy test is SILENT here: 5.5 kWh of overflow fits in 6.08.
+    assert remaining_overflow <= headroom, "fixture must be a day where the plain test is still silent"
+    needed = 1.2 * remaining_overflow + min(1.8, remaining_overflow) - headroom  # 2.32
+
+    # 05:00 UTC — still 3.88 kWh of drain capacity before lockout. Not behind.
+    early = compute_max_sheddable(scale, lat, lon, doy, 5.0, lockout, cap)
+    assert not drain_deadline_breached(needed, early), f"at 05:00 there is still time: need {needed:.2f}, can shed {early:.2f}"
+
+    # 06:00 UTC — one hour later PV has eaten the lever; only 1.20 kWh left.
+    # Same day, same overflow, same SOC: only the DEADLINE has moved.
+    late = compute_max_sheddable(scale, lat, lon, doy, 6.0, lockout, cap)
+    assert late > 0, "fixture must still be pre-lockout, not the trivial zero-capacity case"
+    assert drain_deadline_breached(needed, late), f"by 06:00 the drain is unachievable: need {needed:.2f}, can shed {late:.2f}"
+
+    assert late < early, "drain capacity must fall as lockout approaches"
+    print(f"  test_R63_fires_before_the_plain_energy_test_would: PASSED (need {needed:.2f}; 05:00 shed {early:.2f} ok, 06:00 shed {late:.2f} behind)")
 
 
 def test_charge_recovery_floor_nets_against_generation_not_overflow():
@@ -5586,6 +5738,13 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor,
+        test_R63_shed_rate_inverts_once_pv_exceeds_the_cap,
+        test_R63_max_sheddable_integrates_a_falling_rate,
+        test_R63_deadline_breach_fires_only_when_drain_is_unachievable,
+        test_R63_draining_clears_the_breach_it_must_not_latch,
+        test_R63_hysteresis_band_stops_boundary_chatter,
+        test_R63_fires_before_the_plain_energy_test_would,
         test_charge_recovery_floor_nets_against_generation_not_overflow,
         test_charge_recovery_floor_ramps_up_as_generation_runs_out,
         test_charge_recovery_floor_overcast_day_charges,
