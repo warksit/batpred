@@ -1,4 +1,5 @@
 # Custom Dictionary Words
+achievability
 activepower
 adata
 adbase
@@ -427,6 +428,7 @@ setattr
 setdefault
 setpoints
 SFMB
+sheddable
 sigcloud
 sigen
 sigencloud

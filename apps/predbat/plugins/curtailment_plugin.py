@@ -46,10 +46,6 @@ from curtailment_calc import (
     compute_solcast_overflow,
     compute_expected_overflow,
     compute_p10_recovery_floor,
-    compute_charge_recovery_floor,
-    compute_max_sheddable,
-    compute_overflow_fits_margin,
-    drain_deadline_breached,
     compute_effective_export_cap,
     compute_charge_below,
     compute_drain_above,
@@ -101,42 +97,10 @@ SIG_KEEP_FLOOR_HELPER = "input_number.sig_keep_floor_pct"
 # so this software floor is the operational protection, not the BMS.
 SIG_DRAIN_FLOOR_HELPER = "input_number.sig_drain_floor_pct"
 DEFAULT_DRAIN_FLOOR_PCT = 2.8
-# Plugin owns the single-writer handoff: EXACTLY ONE of these two automations is
-# enabled at any time, so the two writers can never overlap.
-#   CM driving   → heartbeat ON,  mapper OFF
-#   handed back  → heartbeat OFF, mapper ON  (+ parked in EMS-MSC, RD2 — never app modes)
-# The mapper stays a plain stock automation with no mutex condition of its own;
-# being disabled IS the mutex.
-#
-# 2026-07-27: the mapper had been disabled since the 2026-07-15 swap and nothing
-# re-enabled it, so Predbat had no control path at all — it asked for Discharging
-# twice overnight on 07-26 and select.sigen_plant_remote_ems_control_mode never
-# moved. Toggling it here is what closes that hole.
-# 2026-07-28: the Predbat->SIG chain is THREE automations, not one. Toggling only
-# the mode mapper left the other two live, and they write PLANT registers:
-#   predbat_requested_mode_action        -> EMS control mode + grid_import_limitation
-#   predbat_max_discharging_limit_action -> ess_max_discharging_limit  (from
-#                                           input_number.discharge_rate)
-#   predbat_max_charging_limit_action    -> ess_max_charging_limit     (from
-#                                           input_number.charge_rate)
-# Predbat's Freeze Charging sets discharge_rate=0, so the discharging mapper wrote
-# ess_max_discharging_limit=0 at 04:01:14 — eight seconds BEFORE the mode mapper —
-# and stayed enabled while CM drove, hardware-locking the battery for 4.5 hours.
-# The mutex must disable the whole CHAIN, not just its front door.
+# Plugin owns the single-writer handoff: it enables the heartbeat (the register
+# writer) only while CM drives, and parks the unit in EMS-MSC on handback so
+# Predbat controls from the EMS plane. Never app modes (RD2).
 SIG_HEARTBEAT_AUTOMATION = "automation.sig_dispatch_heartbeat"
-PREDBAT_MAPPER_AUTOMATIONS = (
-    "automation.predbat_requested_mode_action",
-    "automation.predbat_max_discharging_limit_action",
-    "automation.predbat_max_charging_limit_action",
-)
-# Predbat's own inputs — set back to neutral before freezing its mapper chain, so
-# Predbat's mappers undo whatever registers they wrote (see _neutralise_predbat).
-PREDBAT_MODE_SELECT = "input_select.predbat_requested_mode"
-PREDBAT_MODE_DEMAND = "Demand"
-PREDBAT_DISCHARGE_RATE = "input_number.discharge_rate"
-PREDBAT_CHARGE_RATE = "input_number.charge_rate"
-SIG_RATED_DISCHARGE_SENSOR = "sensor.sigen_plant_ess_rated_discharging_power"
-SIG_RATED_CHARGE_SENSOR = "sensor.sigen_plant_ess_rated_charging_power"
 SIG_EMS_MODE_SELECT = "select.sigen_plant_remote_ems_control_mode"
 SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
@@ -201,23 +165,8 @@ PV_HISTORY_LEN = 15  # 15 × 5 min = 75 min — enough room for 60-min lookback
 
 # v21 confidence-weighted overflow (R50): blend three forecast bands by Solcast
 # analysis.confidence. Tunable via input_number helpers.
-#
-# R50a (2026-07-28): the blend is RETIRED as the live path — the floor uses
-# overflow_p90 per R7/R42/R43. HIGH now defaults to 1.0, which the gate in
-# _expected_overflow() reads as "never blend". Set
-# input_number.curtailment_confidence_high below 1.0 to re-enable R50 from the
-# dashboard with no code change; the blend function and both helpers are intact.
-#
-# Why: R25 derives overflow from solar geometry precisely because forecast data is
-# too noisy, R7 says p90 only, R42 picks p90 as the worst case, R43 is deliberately
-# asymmetric toward MORE drain, and R11 forbids ever lowering the floor — headroom
-# is cheap early and impossible late. Blending toward p10 assumes NO overflow, which
-# is the one assumption R25 rules out. Replaying R50's own justification day
-# (2026-04-28) shows the p90 floor stops the drain at 39.9%, not the 1.9% it cites,
-# so p90 was never the cause; over-drain protection is R59a's job and now works.
-CONFIDENCE_BLEND_OFF = 1.0  # HIGH at/above this → pure p90, no blending (R50a)
-CONFIDENCE_HIGH_DEFAULT = 1.0  # R50a: was 0.85. ≥ CONFIDENCE_BLEND_OFF → always p90
-CONFIDENCE_LOW_DEFAULT = 0.60  # only used when the blend is re-enabled
+CONFIDENCE_HIGH_DEFAULT = 0.85  # ≥ this → use overflow_p90 (current pre-R50)
+CONFIDENCE_LOW_DEFAULT = 0.60  # < this → blend toward overflow_p10
 # Default to HIGH when Solcast doesn't expose confidence — preserves
 # pre-R50 behaviour (always-p90) on environments without the attribute
 # (tests, integrations that don't pass it through). Real Solcast always
@@ -286,10 +235,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         # Floor ratchet: floor can only rise (R11)
         self._floor_ratchet = None
-        # R63 drain-deadline engagement (hysteresis, NOT a latch — draining is
-        # what clears the breach, so the loop must stay closed).
-        self._r63_engaged = False
-        self._r63_needed_kwh = 0.0
         self._actual_pv_kw = 0.0
         # v30 policy control (RD9): split thresholds stored by publish() this cycle
         self._charge_below = 0.0
@@ -368,7 +313,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_dno = 4.0
         # R59: current cycle's P10 recovery floor (diagnostic + use in R54)
         self._p10_recovery_floor = 0.0
-        self._charge_recovery_floor = 0.0  # R59a: overflow-netted floor feeding charge_below
         # R59 inputs (diagnostic — the terms feeding p10_recovery)
         self._p10_pv_remaining_kwh = 0.0
         self._p50_pv_remaining_kwh = 0.0
@@ -533,8 +477,6 @@ class CurtailmentPlugin(PredBatPlugin):
         self._peak_pv_time = 0
         self._floor_ratchet = None
         self._last_floor_scale = 0.0
-        self._r63_engaged = False
-        self._r63_needed_kwh = 0.0
         self._keep_recovered = False
         self._keep_drained_today = False
         self._r48_engaged_today = False
@@ -965,28 +907,6 @@ class CurtailmentPlugin(PredBatPlugin):
         low = max(0.0, min(high - 0.05, low))
         return low, high
 
-    def _expected_overflow(self):
-        """R50a: the overflow estimate feeding the floor. p90 unless the blend is on.
-
-        Single gate for both consumers (the R62 pre-PV target and the live R9 floor)
-        so they can never disagree about which estimate the day is being sized on.
-
-        Default is pure p90 (R7/R42/R43). Setting
-        input_number.curtailment_confidence_high below 1.0 re-enables the R50 blend
-        from the dashboard without a code change.
-        """
-        low, high = self._get_confidence_thresholds()
-        if high >= CONFIDENCE_BLEND_OFF:
-            return self._overflow_p90
-        return compute_expected_overflow(
-            p10=self._overflow_p10,
-            p50=self._overflow_p50,
-            p90=self._overflow_p90,
-            confidence=self._confidence,
-            low=low,
-            high=high,
-        )
-
     def _get_solcast_confidence(self):
         """Read Solcast analysis.confidence; fall back to CONFIDENCE_DEFAULT.
 
@@ -1066,7 +986,15 @@ class CurtailmentPlugin(PredBatPlugin):
         # effective cap) by Solcast confidence, then let the R54-shaped
         # overflow floor set the drain depth. The legacy soc_keep + buffer%
         # value survives as a ceiling only.
-        expected_overflow = self._expected_overflow()
+        conf_low, conf_high = self._get_confidence_thresholds()
+        expected_overflow = compute_expected_overflow(
+            p10=self._overflow_p10,
+            p50=self._overflow_p50,
+            p90=self._overflow_p90,
+            confidence=self._confidence,
+            low=conf_low,
+            high=conf_high,
+        )
         # Dawn load: house load the battery must carry from PV-start until PV
         # covers load (the R61 no-drain window). Crossing at base load + the
         # pv_covering margin; falls back to ~1h of base load if no crossing.
@@ -1302,7 +1230,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(target_kwh, 2)
                 self._overflow_floor_kwh = round(target_kwh, 2)
                 self._p10_recovery_floor = 0.0
-                self._charge_recovery_floor = 0.0
                 self._pre_pv_engaged_today = True
                 self._save_state()
                 return target_kwh, "active"
@@ -1320,7 +1247,6 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(soc_kw, 2)
                 self._overflow_floor_kwh = round(soc_kw, 2)
                 self._p10_recovery_floor = 0.0
-                self._charge_recovery_floor = 0.0
                 self._last_decision = "active (pre-PV hold): drain done, awaiting PV"
                 self._save_state()
                 return soc_kw, "active"
@@ -1442,15 +1368,23 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Read confidence and tunable thresholds from helpers
         confidence = self._get_solcast_confidence()
+        conf_low, conf_high = self._get_confidence_thresholds()
 
-        # Diagnostics must be stashed BEFORE _expected_overflow() reads them.
+        # R50 blend: confidence-weighted expected overflow.
+        # Replaces the always-p90 single-integral approach.
+        remaining_overflow = compute_expected_overflow(
+            p10=overflow_p10,
+            p50=overflow_p50,
+            p90=overflow_p90,
+            confidence=confidence,
+            low=conf_low,
+            high=conf_high,
+        )
+        # Diagnostics
         self._overflow_p10 = round(overflow_p10, 2)
         self._overflow_p50 = round(overflow_p50, 2)
         self._overflow_p90 = round(overflow_p90, 2)
         self._confidence = round(confidence, 2)
-
-        # R50a: p90 per R7/R42/R43 unless the blend is re-enabled from the dashboard.
-        remaining_overflow = self._expected_overflow()
         self._remaining_overflow = round(remaining_overflow, 2)
 
         # Activation check (R5): overflow predicted AND battery would fill
@@ -1510,50 +1444,13 @@ class CurtailmentPlugin(PredBatPlugin):
             early_buffer = float(self.base.get_state_wrapper(HA_EARLY_HANDBACK_BUFFER, default=EARLY_HANDBACK_BUFFER_DEFAULT))
         except (TypeError, ValueError):
             early_buffer = EARLY_HANDBACK_BUFFER_DEFAULT
-        # 2026-07-28: this compared BARE p90 against headroom, while the Headroom
-        # Floor requires safety_factor × p90 + the R45 reserve. On a 6.6 kWh
-        # overflow the two differ by 1.67 kWh, so the weaker test vetoed a drain
-        # the band had correctly called — leaving us short of the p90 defence.
-        # Key off the same safety-factored requirement (R25/R42/R43 are
-        # one-directional: bigger estimate → more drain → safer). Low-overflow
-        # days still report fits, preserving RD17's evening-reserve Charge.
-        fits_margin = compute_overflow_fits_margin(battery_headroom, overflow_p90, OVERFLOW_SAFETY_FACTOR, MAX_RESERVED_KWH)
+        fits_margin = battery_headroom - overflow_p90
         if self._overflow_fits_latched:
             self._overflow_fits_latched = peaked and fits_margin >= (early_buffer - FITS_HYST_KWH)
         else:
             self._overflow_fits_latched = peaked and fits_margin >= early_buffer
-        # R63 drain deadline: the fits-check above is a pure ENERGY test — it asks
-        # "does the surplus fit", never "can I still MAKE it fit". Shed rate is
-        # cap - max(0, pv - load), which inverts once PV-load clears the cap
-        # (T_lockout, the rising mirror of safe_time), so a trigger that first
-        # fires mid-peak has no authority left (R25). Fire early when the headroom
-        # we will need can no longer be shed before lockout. Only meaningful
-        # BEFORE lockout — past it there is no action left to take.
-        needed_kwh = OVERFLOW_SAFETY_FACTOR * remaining_overflow + min(MAX_RESERVED_KWH, max(0.0, remaining_overflow)) - battery_headroom
-        lock_mins, lock_utc = compute_pv_start_time(floor_scale, lat, lon, doy, self._effective_dno + MIN_BASE_LOAD_KW, utc_hours)
-        if lock_utc is not None and lock_mins is not None and lock_mins > 0:
-            # The R45-tapered buffer is computed further down; MAX_RESERVED_KWH is
-            # its ceiling, so using it here can only make R63 fire slightly EARLY,
-            # which is the safe direction.
-            sheddable_kwh = compute_max_sheddable(floor_scale, lat, lon, doy, utc_hours, lock_utc, self._effective_dno)
-            was_engaged = self._r63_engaged
-            self._r63_engaged = drain_deadline_breached(needed_kwh, sheddable_kwh, engaged=was_engaged)
-            if self._r63_engaged and not was_engaged:
-                self.log("Curtailment: R63 drain deadline — need {:.2f} kWh headroom, only {:.2f} kWh sheddable before lockout {:.2f}Z -> Max Export".format(needed_kwh, sheddable_kwh, lock_utc))
-            elif was_engaged and not self._r63_engaged:
-                self.log("Curtailment: R63 cleared — need {:.2f} kWh, {:.2f} kWh sheddable".format(needed_kwh, sheddable_kwh))
-        else:
-            # Past lockout (or no crossing today): the lever has no authority, so
-            # R63 has no answer. Release rather than hold Max Export pointlessly.
-            self._r63_engaged = False
-        self._r63_needed_kwh = round(needed_kwh, 2)
-
         self._session_active = self._is_saving_session_active()
         if self._session_active:
-            self._policy_override = "max_export"
-        elif self._r63_engaged:
-            # Outranks no_drain: that says "it fits right now", R63 says "it won't
-            # fit later and this is the last chance to do anything about it".
             self._policy_override = "max_export"
         elif self._overflow_fits_latched or past_safe:
             # v32.1 (2026-07-22): "no_drain" — no curtailment risk left (overflow
@@ -1732,20 +1629,6 @@ class CurtailmentPlugin(PredBatPlugin):
             load_remaining_kwh=load_remaining,
         )
         self._p10_recovery_floor = round(p10_recovery, 2)
-        # R59b: charge_below's recovery floor nets against P10 GENERATION still
-        # available to refill the battery — not against overflow (a curtailment
-        # quantity). R59a's overflow form pinned the floor at overnight_target
-        # from dawn and blocked the morning drain. The Schmitt band supplies the
-        # timing: this rises as generation runs out, crossing SOC to flip
-        # Hold -> Solar Charge late in the day.
-        self._charge_recovery_floor = round(
-            compute_charge_recovery_floor(
-                overnight_target_kwh=overnight_for_recovery,
-                p10_pv_remaining_kwh=p10_pv_remaining,
-                load_remaining_kwh=load_remaining,
-            ),
-            2,
-        )
         self._p10_pv_remaining_kwh = round(p10_pv_remaining, 2)
         self._p50_pv_remaining_kwh = round(p50_pv_remaining, 2)
         self._load_remaining_kwh = round(load_remaining, 2)
@@ -2092,7 +1975,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # The R54 floor input (self._p10_recovery_floor) is NOT clamped so
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
-            charge_below = round(compute_charge_below(self._charge_recovery_floor, soc_keep_kwh), 2)
+            charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh), 2)
         else:
             charge_below = 0.0
@@ -2107,23 +1990,16 @@ class CurtailmentPlugin(PredBatPlugin):
             "sensor.{}_curtailment_charge_below".format(prefix),
             charge_below,
             {
-                # "Overnight Floor": the SOC we must stay ABOVE to get through
-                # tonight. Driven by P10 GENERATION still available to refill us
-                # (R59b). Deliberately named to contrast with the Headroom Floor
-                # below, which is driven by P90 overflow and pulls the other way.
-                "friendly_name": "Overnight Floor (P10 generation)",
+                "friendly_name": "Curtailment Charge Below (P10 Recovery)",
                 "unit_of_measurement": "kWh",
                 "device_class": "energy",
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-up",
-                "soc_pct": round(charge_below / soc_max * 100.0, 1) if soc_max else None,
                 "p10_pv_remaining_kwh": self._p10_pv_remaining_kwh,
                 "p50_pv_remaining_kwh": self._p50_pv_remaining_kwh,
                 "load_remaining_kwh": self._load_remaining_kwh,
-                "p10_surplus_kwh": round(max(0.0, self._p10_pv_remaining_kwh - self._load_remaining_kwh), 2),
                 "overnight_target_kwh": round(self._overnight_target_kwh, 2) if self._overnight_target_kwh is not None else None,
                 "confidence": self._confidence,
-                "drives": "SOC below this -> Solar Charge (bank PV for tonight)",
             },
         )
         self.base.dashboard_item(
@@ -2152,19 +2028,11 @@ class CurtailmentPlugin(PredBatPlugin):
             "sensor.{}_curtailment_drain_above".format(prefix),
             drain_above,
             {
-                # "Headroom Floor": the SOC we must drain DOWN to so today's
-                # forecast surplus fits in the battery. Driven by P90 OVERFLOW
-                # (R7/R42/R43). Pulls against the Overnight Floor above; the gap
-                # between them is the Hold band.
-                "friendly_name": "Headroom Floor (P90 overflow)",
+                "friendly_name": "Curtailment Drain Above (Curt Floor)",
                 "unit_of_measurement": "kWh",
                 "device_class": "energy",
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-down",
-                "soc_pct": round(drain_above / soc_max * 100.0, 1) if soc_max else None,
-                "overflow_p90_kwh": self._overflow_p90,
-                "overflow_floor_kwh": round(self._overflow_floor_kwh, 2) if self._overflow_floor_kwh is not None else None,
-                "drives": "SOC above this -> Max Export (sell down to make room)",
             },
         )
         # R50 diagnostics promoted to dedicated sensors so HA recorder retains
@@ -2282,72 +2150,11 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self._log_once("ems_msc_err", "Curtailment: failed to set EMS-MSC: {}".format(e))
 
-    def _neutralise_predbat(self):
-        """Drive Predbat's OWN inputs back to neutral, so Predbat's OWN mappers undo
-        the plant registers it clamped — before we disable that chain.
-
-        Principle (Andrew, 2026-07-28): the writer that changed a register should be
-        the one to change it back. CM enumerating Predbat's registers is a losing
-        game — we already missed ess_max_discharging_limit and grid_import_limitation,
-        and a future Predbat mapper would be missed the same way.
-
-        Setting the SOURCE helpers back to neutral makes the existing mappers unwind
-        the registers for us, whatever they happen to be:
-            requested_mode  = Demand  -> EMS mode = MSC, grid_import_limitation = 100
-            discharge_rate  = rated   -> ess_max_discharging_limit = rated
-            charge_rate     = rated   -> ess_max_charging_limit    = rated
-
-        Must run BEFORE the mappers are disabled — a disabled mapper cannot relay.
-        The heartbeat's own re-open of those registers stays as a backstop for the
-        case where this silently fails (both this and _set_automation swallow errors).
-        """
-        rated_d = self._float_state(SIG_RATED_DISCHARGE_SENSOR, 6.6)
-        rated_c = self._float_state(SIG_RATED_CHARGE_SENSOR, 6.6)
-        for entity, service, kwargs in (
-            (PREDBAT_MODE_SELECT, "input_select/select_option", {"option": PREDBAT_MODE_DEMAND}),
-            (PREDBAT_DISCHARGE_RATE, "input_number/set_value", {"value": int(rated_d * 1000)}),
-            (PREDBAT_CHARGE_RATE, "input_number/set_value", {"value": int(rated_c * 1000)}),
-        ):
-            try:
-                self.base.call_service_wrapper(service, entity_id=entity, **kwargs)
-            except Exception as e:
-                self._log_once("neutralise_err", "Curtailment: failed to neutralise {}: {}".format(entity, e))
-        self.log("Curtailment: Predbat neutralised (mode=Demand, rates={:.0f}/{:.0f} W) before taking control".format(rated_d * 1000, rated_c * 1000))
-
-    def _float_state(self, entity, default):
-        """Read a numeric entity state, falling back on unknown/unavailable."""
-        try:
-            return float(self.base.get_state_wrapper(entity, default=default))
-        except (TypeError, ValueError):
-            return default
-
-    def _set_writer(self, cm_driving):
-        """Hand the register-writing role between the heartbeat and the Predbat mapper.
-
-        Exactly one is ever enabled — being disabled IS the mutex, so neither
-        automation needs a condition of its own. Always disable the outgoing writer
-        BEFORE enabling the incoming one: a brief gap with neither enabled is safe
-        (the inverter holds its last setpoint), whereas a brief overlap is two
-        writers fighting over the same registers.
-        """
-        if cm_driving:
-            # Let Predbat undo its OWN register writes before we freeze its chain.
-            self._neutralise_predbat()
-            for auto in PREDBAT_MAPPER_AUTOMATIONS:
-                self._set_automation(auto, False)
-            self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
-        else:
-            self._set_automation(SIG_HEARTBEAT_AUTOMATION, False)
-            for auto in PREDBAT_MAPPER_AUTOMATIONS:
-                self._set_automation(auto, True)
-
     def _release_to_predbat(self):
         """Window end (safe_time / off): hand the whole machine back to Predbat.
-        Order (RD2/RD6/RD10): swap the writer role (heartbeat off, mapper on), park
-        EMS-MSC, set policy Predbat, reset the sell floor, then clear read_only so
-        Predbat resumes. The mapper must be live BEFORE read_only clears, or
-        Predbat's first requested_mode change lands with nothing listening."""
-        self._set_writer(cm_driving=False)
+        Order (RD2/RD6/RD10): disable the heartbeat writer, park EMS-MSC, set policy
+        Predbat, reset the sell floor, then clear read_only so Predbat resumes."""
+        self._set_automation(SIG_HEARTBEAT_AUTOMATION, False)
         self._park_ems_msc()
         self._set_policy(POLICY_PREDBAT)
         self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
@@ -2448,8 +2255,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # low-SOC handover). On the window edge we take/release control atomically.
         # First run: adopt live state so a restart mid-window reconciles rather than
         # stranding Predbat or double-writing.
-        first_run = self._cm_controlling is None
-        if first_run:
+        if self._cm_controlling is None:
             self._read_only_set = bool(getattr(self.base, "set_read_only", False))
             self._cm_controlling = self._read_only_set
 
@@ -2462,47 +2268,25 @@ class CurtailmentPlugin(PredBatPlugin):
             self._policy_driving = False
             return
 
-        # Every deploy/restart resets plugin state, and the take/release toggles below
-        # are EDGE-triggered on _cm_controlling — so an adopted value would leave the
-        # automation enables wherever they happened to be. `first_run` forces the edge
-        # once, in whichever branch actually applies, so a drifted pair (both on, or
-        # both off) can't persist silently for the whole window. Reconciling in a
-        # separate step ahead of the branches would double-toggle and briefly enable
-        # the wrong writer.
         if manual:
-            # RD13 manual override: the user owns the POLICY SELECT — we never write it.
-            # But the WRITER ROLE must still follow whatever the policy says, whoever
-            # set it. Manual override means "you choose the policy", not "the writer
-            # role goes stale".
-            #
-            # 2026-07-28: this branch used to take CM control unconditionally. When
-            # sig_keep_floor_guard hit the reserve during a manual Max Export drain and
-            # set policy -> Predbat, the writer role stayed with CM — mappers disabled,
-            # read_only on — so Predbat could not act on the policy it had just been
-            # handed. Result: nobody driving, inverter left on its own MSC default.
-            # The guard was right; the handover was silently incomplete.
-            policy_now = self.base.get_state_wrapper(SIG_POLICY_SELECT, default=None)
-            want_cm = policy_now != POLICY_PREDBAT
-            if first_run or self._cm_controlling != want_cm:
-                self._set_writer(cm_driving=want_cm)
-                self._cm_controlling = want_cm
-            # read_only follows the DRIVE: suppress Predbat only while CM's executor
-            # holds the wheel. On a manual hand to Predbat it must be cleared, or the
-            # mappers are live but Predbat is still muzzled.
-            if want_cm and not self._read_only_set:
+            # RD13 manual override: keep the single-writer machine LIVE — enable the
+            # heartbeat and suppress Predbat — but DON'T write the policy or keep floor.
+            # The user drives input_select.sig_dispatch_policy by hand and it sticks.
+            # Grabs control regardless of plugin_active (failsafe manual drive), and
+            # never hands back while the override is on.
+            if not self._cm_controlling:
+                self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
+                self._cm_controlling = True
+            if not self._read_only_set:
                 self._set_read_only(True)
                 self._read_only_set = True
-            elif not want_cm and self._read_only_set:
-                self._set_read_only(False)
-                self._read_only_set = False
-            self._policy_driving = want_cm
+            self._policy_driving = True
             return
 
         if plugin_active:
-            # CM window. Take the writer role (window start edge): mapper off so
-            # Predbat can't write EMS modes underneath us, heartbeat on.
-            if first_run or not self._cm_controlling:
-                self._set_writer(cm_driving=True)
+            # CM window. Ensure the heartbeat writer is running (window start edge).
+            if not self._cm_controlling:
+                self._set_automation(SIG_HEARTBEAT_AUTOMATION, True)
                 self._cm_controlling = True
             if soc_pct > low_soc:
                 # CM drives: suppress Predbat, set the policy.
@@ -2521,7 +2305,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._policy_driving = True
         else:
             # Window end (safe_time / off): hand the whole machine back to Predbat.
-            if first_run or self._cm_controlling:
+            if self._cm_controlling:
                 self._release_to_predbat()
                 self._cm_controlling = False
             self._policy_driving = False
