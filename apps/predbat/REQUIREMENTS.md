@@ -237,8 +237,9 @@ the current floor formula:
 ```text
 2026-04-28   overflow_p10 1.51   overflow_p90 7.56
              pure-p90 floor -> drain_above 7.21 kWh (39.9%)
-             R59a          -> charge_below 5.49 kWh (30.4%)
-             band [30.4%, 39.9%] -> drains to 39.9%, then Holds
+             R59b          -> charge_below 4.00 kWh (22.1%, carried by soc_keep;
+                              the recovery floor is 0 with a PV runway ahead)
+             band [22.1%, 39.9%] -> drains to 39.9%, then Holds
 ```
 
 The p90 estimate floors that day at **39.9%**, not 1.9%. So the p90 overflow
@@ -272,12 +273,22 @@ R50 blend (c=0.35)   expected  0.92 -> drain_above 16.07 kWh (88.9%) -> HOLD
 pure p90 (R7/R42/R43) expected 13.03 -> drain_above  0.64 kWh ( 3.6%) -> MAX EXPORT
 ```
 
-**Over-drain protection is now R59a's job, and only R59a's.** R59a (2026-07-27) puts
-a real floor under the drain via `charge_below`. Until that fix `charge_below`
-collapsed to the 0.5 kWh deep-discharge floor and protected nothing — so for the
-whole period R50 existed, the mechanism that should have prevented a bottom-out was
-broken. With R59a working, R50's pessimism is redundant and costs headroom on
-precisely the days curtailment matters.
+**Over-drain protection does not need R50's pessimism.** It comes from two places,
+neither of which is the overflow estimate being deliberately wrong:
+
+1. **`drain_above` itself** — the p90 floor stops 2026-04-28 at 39.9%, as above.
+   This is the protection that matters, because it limits how far we drain in the
+   first place.
+2. **The R59b recovery floor rising through the day** — as remaining generation
+   shrinks the floor climbs, crossing SOC and forcing Solar Charge. Time-aware,
+   so a day that starts bright and then under-delivers pulls us back up.
+
+An earlier revision of this section claimed over-drain protection was "R59a's job,
+and only R59a's". That was overstated on both counts: R59a's static floor was not
+the only mechanism, and (per R59b) it bought its protection by blocking the morning
+drain entirely. Note also the limit of mechanism 2 — Solar Charge can only bank PV
+that actually arrives, so on a genuinely collapsed day it cannot fully recover a
+battery that was over-drained at dawn. That is mechanism 1's job.
 
 **Known consequence.** On marginal days p90 can put `charge_below` ABOVE
 `drain_above` (e.g. 2026-05-02: 29.2% vs 15.3%). That is the documented
@@ -767,6 +778,59 @@ days (P10 PV low, floor stays high) both mask it. Two existing unit tests
 encoded the defect as correct and were corrected with R59a:
 `test_p10_recovery_floor_huge_pv_runway` (20 kWh P10 PV over a day never nears
 a 3.68 kW cap) and `test_p10_recovery_floor_partial_charging`.
+
+### R59b — SUPERSEDES R59a: the recovery floor nets against GENERATION (2026-07-28)
+
+**R59a is withdrawn.** Its argument was circular: it assumed the no-charge
+policy is Hold in order to compute the threshold that *chooses* the policy.
+Under that assumption the battery never charges, so the floor can only ever
+equal `overnight_target` — and Charge fires from dawn regardless of how much
+free PV is coming.
+
+Overflow and generation are different quantities and the floor needs the second:
+
+- **Overflow** = PV above `load + export_cap`. A *curtailment* quantity — how
+  much we stand to waste.
+- **Generation** = `p10_pv_remaining - load_remaining`. What can actually be
+  used to refill the battery.
+
+Observed 2026-07-28: `overflow_p90 = 12.28` kWh but usable surplus was
+`16.77 - 5.92 = 10.85` kWh. `overflow_p10` was 0.0, so R59a drove `charge_below`
+from 0.54 to 7.20 kWh at 06:01 where it sat flat all day. That **blocked the
+morning drain on a day forecasting 12.28 kWh of overflow** — the exact inverse
+of R25 (headroom is cheap early and impossible late). It is why the policy read
+Hold when it should have read Max Export.
+
+**R59b**: `charge_below` uses the same generation-netted recovery floor as the
+R54 drain target:
+
+```text
+charge_recovery_floor = max(0, overnight_target - (p10_pv_remaining - load_remaining))
+charge_below          = max(charge_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
+```
+
+R59a's separate charge-side floor existed only to justify the overflow netting;
+with that withdrawn the two must not diverge
+(`test_charge_recovery_floor_matches_drain_side_recovery`).
+
+**The Schmitt band supplies the timing — the floor must not.** The floor starts
+near 0 on a bright morning (Hold: keep SOC low, preserve headroom for whatever
+the afternoon brings) and *rises* as remaining generation shrinks, crossing SOC
+and flipping Hold → Solar Charge by itself. Banking happens as late as it safely
+can. Measured ramp on the 2026-07-27 numbers: `0.0 → 0.57 → 4.07 → 8.07` kWh
+(`test_charge_recovery_floor_ramps_up_as_generation_runs_out`). That is the
+2026-07-27 case handled correctly, without R59a's charge-from-dawn destroying
+the afternoon headroom.
+
+Where load exceeds remaining PV (overcast), the net is negative and the floor is
+raised *above* `overnight_target` to cover the through-day deficit — so Charge
+still fires on the low-overflow days RD17 was patching around.
+
+**CM stays active for the whole curtailment window** rather than handing back
+when overflow is momentarily zero. Predbat has no curtailment awareness, and PV
+arriving in the afternoon still needs managing — only CM can do that. (This does
+not change RD6, which hands back at `safe_time`, when the day's curtailment risk
+is genuinely over.)
 
 ### R60 — effective export cap for overflow integral
 
