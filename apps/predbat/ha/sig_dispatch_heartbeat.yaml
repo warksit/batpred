@@ -76,9 +76,22 @@ trigger:
   - platform: state
     entity_id: input_boolean.sig_manual_override
     id: override_change
+  # RD14c: fire on the planned boundary. now() makes HA re-evaluate this each
+  # minute, so start and end land within a beat without waiting on the sensor.
   - platform: template
     value_template: >-
-      {% set p = states('input_select.sig_dispatch_policy') %}
+      {% set ss = state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','current_joined_event_start') or state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','next_joined_event_start') %}
+      {% set se = state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','current_joined_event_end') or state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','next_joined_event_end') %}
+      {{ ss not in [none,'','None','unknown','unavailable'] and se not in [none,'','None','unknown','unavailable']
+         and now() >= as_datetime(ss) and now() < as_datetime(se) }}
+    id: session_boundary
+  - platform: template
+    value_template: >-
+      {% set rawp = states('input_select.sig_dispatch_policy') %}
+      {% set ss = state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','current_joined_event_start') or state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','next_joined_event_start') %}
+      {% set se = state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','current_joined_event_end') or state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','next_joined_event_end') %}
+      {% set slive = ss not in [none,'','None','unknown','unavailable'] and se not in [none,'','None','unknown','unavailable'] and now() >= as_datetime(ss) and now() < as_datetime(se) %}
+      {% set p = 'Max Export' if (slive and rawp != 'Predbat') else rawp %}
       {% set cap = (states('input_number.dno_export_limit_w') | float(3680)) / 1000 %}
       {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
       {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
@@ -105,7 +118,28 @@ action:
       pv_kw: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
       soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) }}"
       hard_pct: "{{ states('input_number.sig_drain_floor_pct') | float(2.8) }}"
-      policy: "{{ states('input_select.sig_dispatch_policy') }}"
+      # RD14c (2026-07-28): drive the saving session from its PLANNED times, not
+      # from the binary sensor. Octopus publishes the sensor ~1 min late (19:00:57
+      # for a 19:00 session, observed) and the plugin only re-evaluates on its
+      # 5-min cycle, so up to ~5 min of a 30-min session was lost — ~15% of its
+      # value. The start/end times are known hours ahead, so compare the clock to
+      # them and both edges land within one beat (60 s).
+      session_start: "{{ state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','current_joined_event_start') or state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','next_joined_event_start') }}"
+      session_end: "{{ state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','current_joined_event_end') or state_attr('binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions','next_joined_event_end') }}"
+      session_live: >-
+        {{ session_start not in [none, '', 'None', 'unknown', 'unavailable']
+           and session_end not in [none, '', 'None', 'unknown', 'unavailable']
+           and now() >= as_datetime(session_start) and now() < as_datetime(session_end) }}
+      raw_policy: "{{ states('input_select.sig_dispatch_policy') }}"
+      # A live session forces Max Export, but ONLY while CM already holds the
+      # wheel. If we have handed back, Predbat owns the machine and its mappers
+      # are enabled — seizing control here would put two writers on the registers
+      # (the 2026-07-26/28 failure). Predbat handles sessions itself once RD7 lands.
+      # `| bool` is load-bearing: HA renders `variables` to strings in some
+      # contexts, and the string "False" is TRUTHY in Jinja — without it a session
+      # would start correctly and then NEVER release. Caught by
+      # test_rd14c_releases_at_the_planned_end.
+      policy: "{{ 'Max Export' if (session_live | bool and raw_policy != 'Predbat') else raw_policy }}"
       raw_kw: "{{ 6.6 if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
       # Ceiling = the most the inverter should push out.
       # - Max Export: 6.6 (inverter AC max) — command max output and let the SIG's
