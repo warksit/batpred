@@ -1,0 +1,44 @@
+alias: Predbat max charging limit action
+description: >-
+  Mapper from input_number.charge_rate to number.sigen_plant_ess_max_charging_limit.
+
+  One of the THREE Predbat mapper automations that write PLANT registers (see the
+  writer-ownership table in .claude/CLAUDE.md). Enabled only while Predbat owns the
+  writer role; CM disables all three and enables sig_dispatch_heartbeat instead.
+
+  ROBUSTNESS (2026-07-29): the condition below exists because a router/LAN event
+  took the Sigen Modbus link down (Failed to connect to 192.168.5.145:502) and left
+  sigen_inverter_ess_rated_charging_power = 'unknown'. The template then threw
+
+      float got invalid input 'unknown' ... but no default was specified
+
+  and the automation hard-failed on every trigger, so the charge limit was never
+  written at all.
+
+  We GUARD rather than supply a | float() default deliberately. A default would
+  fabricate intent: defaulting an unreadable charge_rate to "open" invents a
+  decision Predbat never made, and defaulting it to 0 would clamp the battery.
+  On an unreadable input the correct behaviour is to change nothing and let the
+  next trigger (or the heartbeat's re-open backstop) settle it.
+
+  The | float(0) calls inside the template are belt-and-braces only; the condition
+  already guarantees both are numeric, so they can never actually apply.
+id: automation_sigen_ess_max_charging_limit_input_number_action
+triggers:
+  - trigger: state
+    entity_id: input_number.charge_rate
+conditions:
+  # Act only on values we can actually read. See ROBUSTNESS above.
+  - condition: template
+    value_template: >-
+      {{ states('input_number.charge_rate') | is_number
+         and states('sensor.sigen_inverter_ess_rated_charging_power') | is_number }}
+actions:
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_ess_max_charging_limit
+    data:
+      value: >-
+        {{ [(states('input_number.charge_rate') | float(0) / 1000) | round(2),
+            states('sensor.sigen_inverter_ess_rated_charging_power') | float(0)] | min }}
+mode: single
