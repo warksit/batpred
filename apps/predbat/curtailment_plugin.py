@@ -2508,19 +2508,34 @@ class CurtailmentPlugin(PredBatPlugin):
         override_choice = str(self.base.get_state_wrapper(SIG_OVERRIDE_SELECT, default=OVERRIDE_OFF) or OVERRIDE_OFF)
         manual = override_choice not in (OVERRIDE_OFF, "unknown", "unavailable", "")
 
+        # Under manual override the sensor must report what will ACTUALLY happen —
+        # the override IS the policy the heartbeat dispatches (RD13a precedence:
+        # override > session > select). Publishing the plugin's own preference
+        # here made the sensor contradict its own reason string and disagree with
+        # the inverter (observed 2026-07-29 08:44: state "Max Export", reason
+        # "manual override", override "Hold Battery"). The plugin's preference is
+        # still worth showing — it is what resumes when the override clears — so
+        # it moves into the reason.
+        if acting and manual:
+            published_policy = override_choice
+            published_reason = "manual override: holding {} (plugin would choose {})".format(override_choice, intended_policy)
+        else:
+            published_policy = intended_policy
+            published_reason = reason
+
         # Always publish the intended decision — this is what you watch in observe-only.
         try:
             prefix = self.base.prefix
             self.base.dashboard_item(
                 "sensor.{}_curtailment_intended_policy".format(prefix),
-                intended_policy,
+                published_policy,
                 {
                     "friendly_name": "Curtailment Intended Policy",
                     "icon": "mdi:robot",
                     "keep_floor_pct": round(intended_keep, 0) if intended_keep is not None else None,
                     "low_soc_handover_pct": low_soc,
                     "soc_pct": round(soc_pct, 1),
-                    "reason": reason if not (acting and manual) else "manual override — user owns policy select",
+                    "reason": published_reason,
                     "acting": acting,
                     "manual_override": manual,
                 },
