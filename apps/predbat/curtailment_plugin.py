@@ -308,6 +308,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # what clears the breach, so the loop must stay closed).
         self._r63_engaged = False
         self._r63_needed_kwh = 0.0
+        self._was_draining = False  # R16a Schmitt state
         self._actual_pv_kw = 0.0
         # v30 policy control (RD9): split thresholds stored by publish() this cycle
         self._charge_below = 0.0
@@ -554,6 +555,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_history.clear()
         self._r63_engaged = False
         self._r63_needed_kwh = 0.0
+        self._was_draining = False  # R16a Schmitt state
         self._keep_recovered = False
         self._keep_drained_today = False
         self._r48_engaged_today = False
@@ -2463,11 +2465,15 @@ class CurtailmentPlugin(PredBatPlugin):
             elif self._policy_override == "no_drain":
                 # overflow-fits / past-safe: run the Schmitt but clamp Drain→Hold
                 # (no round-trip). Charge still fires for the evening reserve.
-                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
+                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True, was_draining=self._was_draining)
                 if schmitt == "Drain":
                     schmitt = "Hold"
             else:
-                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True)
+                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True, was_draining=self._was_draining)
+            # R16a: remember whether we are mid-drain so the deadband applies only
+            # on the way IN. Without this the drain stops at the deadband edge
+            # instead of running to target, which is the flap in mirror image.
+            self._was_draining = schmitt == "Drain"
             intended_policy = phase_to_policy(schmitt)
             # Sell floor (v32.3): the guard's "stop Max Export at this SOC" level.
             # Use the curtailment drain target (floor_kwh = overflow_floor) ONLY

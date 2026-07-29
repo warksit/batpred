@@ -26,6 +26,12 @@ R63_HYST_KWH = 0.5
 # toward 0 (charge_below).
 DEEP_DISCHARGE_FLOOR_KWH = 0.5
 
+# R16a Schmitt deadband for entering Drain (~1% of an 18 kWh battery). Sized to
+# be robust to Sigen's 0.1% SOC quantisation (0.018 kWh) so sensor noise alone
+# cannot start a drain. Entry needs drain_above + this; once draining we run all
+# the way TO drain_above, so the drain never stops short of target.
+OUTER_THRESHOLD_KWH = 0.18
+
 
 def compute_remaining_overflow(pv_forecast, load_forecast, dno_limit, start_minute=0, end_minute=1440, step_minutes=5, values_are_kwh=False):
     """
@@ -439,7 +445,7 @@ def apply_no_surplus_drain_hold(drain_target, soc_kw, pv_covering):
     return max(drain_target, soc_kw)
 
 
-def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True):
+def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_active=True, was_draining=False, outer_threshold_kwh=OUTER_THRESHOLD_KWH):
     """Split-threshold phase decision (shadow + automation logic).
 
     Charge target = min(charge_below, drain_above). On a normal day this is
@@ -454,7 +460,17 @@ def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_ac
     Drain pulls it back. Predbat handles overnight grid-charge if the
     deficit forecast holds and we end the day below overnight target.
 
-    No hysteresis here — that belongs in the HA automation Schmitt-trigger.
+    R16a hysteresis (restored 2026-07-29). Entering Drain requires SOC to exceed
+    drain_above by `outer_threshold_kwh`; once draining (`was_draining`) it runs
+    all the way TO drain_above. R16a dates from v19 but its implementation lived
+    in the 5-second HA automation that v30 retired, leaving a bare
+    `soc > drain_above` with no deadband.
+
+    Live consequence 2026-07-29 07:50-08:33: the policy flapped
+    Max Export <-> Predbat eight times in 45 minutes while SOC oscillated
+    2.8-3.1% around a drain_above of 0.54 kWh (3.0%). Sigen quantises SOC to
+    0.1% (0.018 kWh) and the RD4 low-SOC handover sits at 2.8%, so each micro
+    drain tripped the handover, MSC charged it back, and it drained again.
 
     Args:
         soc_kwh: current battery SOC in kWh
@@ -470,7 +486,9 @@ def compute_proposed_phase(soc_kwh, charge_below_kwh, drain_above_kwh, plugin_ac
     charge_target = min(charge_below_kwh, drain_above_kwh)
     if soc_kwh < charge_target:
         return "Charge"
-    if soc_kwh > drain_above_kwh:
+    # Run-to-target once engaged; a deadband only on the way IN (R16a).
+    drain_entry = drain_above_kwh if was_draining else drain_above_kwh + outer_threshold_kwh
+    if soc_kwh > drain_entry:
         return "Drain"
     return "Hold"
 
