@@ -948,6 +948,34 @@ def test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor():
     print("  test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor: PASSED")
 
 
+def test_R63_does_not_force_drain_when_nothing_is_drainable():
+    """R63 must not demand headroom the battery cannot give.
+
+    Observed live 2026-07-29 07:39: SOC 0.54 kWh sitting exactly ON drain_above
+    0.54 — nothing left to shed — yet R63 was still engaged and the policy read
+    "active Drain (override max_export)". The Schmitt band was already returning
+    Hold (SOC is not > drain_above); R63 was overriding the correct answer with
+    an instruction that could not be carried out.
+
+    Benign that morning only because PV was below the export cap so Max Export
+    had nothing to push. With PV above the cap it becomes a real instruction
+    against an empty battery, with only the 2.8% drain-floor clamp in the way.
+
+    R63 asks "can I still MAKE this headroom in time?". If there is no headroom
+    left to make, the question is moot and it must release to the band.
+    """
+    # Plenty of time, big requirement — but the battery is already at its floor.
+    # needed 6.0 > sheddable 2.0 -> a genuine deadline breach.
+    assert drain_deadline_breached(headroom_needed_kwh=6.0, max_sheddable_kwh=2.0, drainable_kwh=4.0), "with room to drain, a real shortfall must still fire"
+    assert not drain_deadline_breached(headroom_needed_kwh=6.0, max_sheddable_kwh=2.0, drainable_kwh=0.0), "nothing drainable -> must NOT force Max Export"
+    assert not drain_deadline_breached(headroom_needed_kwh=6.0, max_sheddable_kwh=2.0, drainable_kwh=-0.1), "below the floor -> must NOT force Max Export"
+    # Engaged state must also release once the battery reaches the floor.
+    assert not drain_deadline_breached(headroom_needed_kwh=6.0, max_sheddable_kwh=2.0, engaged=True, drainable_kwh=0.0), "must release when the drain is exhausted, not latch on"
+    # The live 2026-07-29 07:39 numbers: SOC exactly on the floor.
+    assert not drain_deadline_breached(headroom_needed_kwh=2.5, max_sheddable_kwh=0.0, engaged=True, drainable_kwh=0.0), "SOC on the floor must read Hold, not Drain"
+    print("  test_R63_does_not_force_drain_when_nothing_is_drainable: PASSED")
+
+
 def test_R63_shed_rate_inverts_once_pv_exceeds_the_cap():
     """R63 — the drain lever's authority is `cap − max(0, PV − load)`, which goes
     NEGATIVE once PV-load clears the export cap. Past that point we export flat
@@ -5988,6 +6016,7 @@ def run_curtailment_tests(my_predbat=None):
         test_overflow_smoothing_degrades_safely_on_short_history,
         test_R11_removed_floor_follows_the_formula_down,
         test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor,
+        test_R63_does_not_force_drain_when_nothing_is_drainable,
         test_R63_shed_rate_inverts_once_pv_exceeds_the_cap,
         test_R63_max_sheddable_integrates_a_falling_rate,
         test_R63_deadline_breach_fires_only_when_drain_is_unachievable,

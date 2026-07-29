@@ -115,6 +115,7 @@ diverter
 dlimit
 dnoregion
 docstrings
+drainable
 dstamp
 dstart
 dwindow
