@@ -697,6 +697,39 @@ def test_R50a_incident_day_still_floored_by_r59b():
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
 
 
+def test_override_keeps_cm_driving_even_when_the_select_says_predbat():
+    """RD13a: under manual override the WRITER ROLE must follow the override,
+    not the policy select.
+
+    Live failure 2026-07-29 08:56. The user held override = "Hold Battery", but:
+      - the plugin had earlier written "Predbat" to sig_dispatch_policy (RD4
+        low-SOC handover at 3% SOC),
+      - the manual branch then read that SELECT to decide the writer role,
+      - concluded CM should not drive, and DISABLED the heartbeat.
+
+    Nothing was left driving the dispatch register. It froze at 2.89 kW while PV
+    climbed to 3.46, so the battery discharged 0.775 kW to make up the
+    difference — at 3.1% SOC. That is not Hold, it is a stale setpoint.
+
+    The override select has no "Predbat" option by design (RD13a), so holding
+    ANY override means CM's executor must be driving.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_OVERRIDE_SELECT] = "Hold Battery"
+    base._sensor_overrides[SIG_POLICY_SELECT] = "Predbat"  # stale, from the low-SOC handover
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 0.54
+    plugin._policy_override = None
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.54, soc_kwh=0.56, soc_max=18.08)
+
+    svc = [(s, k.get("entity_id")) for s, k in base.services]
+    assert ("automation/turn_on", "automation.sig_dispatch_heartbeat") in svc, f"override must keep the heartbeat driving, got {svc}"
+    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") not in svc, f"must NOT disable the executor while an override is held: {svc}"
+    print("  test_override_keeps_cm_driving_even_when_the_select_says_predbat: PASSED")
+
+
 def test_intended_policy_reports_the_override_not_the_plugins_wish():
     """Under manual override the sensor must report what will ACTUALLY happen.
 
@@ -2118,18 +2151,27 @@ def test_manual_override_grabs_control_even_when_inactive():
     print("  test_manual_override_grabs_control_even_when_inactive: PASSED")
 
 
-def test_manual_override_writer_follows_policy_to_predbat():
-    """Under manual override the WRITER ROLE must still follow the policy select.
+def test_manual_override_writer_follows_the_override_not_the_select():
+    """RD13a SUPERSEDES the 2026-07-28 form of this test: the writer role follows
+    the OVERRIDE, not the policy select.
 
-    Manual override means "the user owns the policy select", NOT "the writer role
-    goes stale". Whoever sets the policy — the user, or sig_keep_floor_guard hitting
-    the reserve — the enables and read_only have to match it.
+    Originally this asserted that a `Predbat` in sig_dispatch_policy releases the
+    writer even under manual override — protecting the 2026-07-28 case where
+    sig_keep_floor_guard hit the reserve mid-drain, set policy -> Predbat, and the
+    handover was left incomplete.
 
-    2026-07-28: during a manual Max Export drain the keep-floor guard hit the reserve
-    and set policy -> Predbat. This branch took CM control unconditionally, so the
-    mappers stayed disabled and read_only stayed on: Predbat could not act on the
-    policy it had just been handed, and the inverter sat on its own MSC default with
-    nobody driving. The guard was right; the handover was silently incomplete.
+    Under RD13a the override select IS the policy (it has no Predbat option), so
+    keying the writer role off sig_dispatch_policy reads a value the plugin itself
+    may have written. Live failure 2026-07-29 08:56: override "Hold Battery",
+    select "Predbat" left by the RD4 low-SOC handover -> heartbeat disabled ->
+    nothing driving -> dispatch frozen at 2.89 kW while PV rose to 3.46, so the
+    battery discharged 0.775 kW at 3% SOC.
+
+    CONSEQUENCE, recorded deliberately: sig_keep_floor_guard can no longer hand
+    back by writing sig_dispatch_policy while an override is held. The deep
+    drain-floor clamp in the heartbeat (dispatch <= PV below sig_drain_floor_pct)
+    still applies, but the higher keep-floor stop does not. The guard should write
+    input_select.sig_override instead — tracked as follow-up.
     """
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
@@ -2143,13 +2185,13 @@ def test_manual_override_writer_follows_policy_to_predbat():
     plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
 
     calls = _automation_calls(base)
-    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") in calls, f"policy Predbat -> heartbeat must release, got {base.services}"
-    assert ("automation/turn_on", "automation.predbat_requested_mode_action") in calls, f"policy Predbat -> mappers must be enabled, got {base.services}"
-    assert base.set_read_only is False, "read_only must clear so Predbat can act on the policy it was handed"
-    assert plugin._cm_controlling is False
+    assert ("automation/turn_off", "automation.sig_dispatch_heartbeat") not in calls, f"a held override must NOT release the executor, got {base.services}"
+    assert ("automation/turn_on", "automation.predbat_requested_mode_action") not in calls, f"a held override must NOT hand the registers to Predbat, got {base.services}"
+    assert plugin._cm_controlling is True, "CM must stay the writer while an override is held"
+    assert plugin._read_only_set is True, "Predbat must stay suppressed while CM's executor drives"
     # Still must not write the policy select — that is the user's under override.
     assert not _policy_calls(base), f"manual override must never write the policy, got {base.services}"
-    print("  test_manual_override_writer_follows_policy_to_predbat: PASSED")
+    print("  test_manual_override_writer_follows_the_override_not_the_select: PASSED")
 
 
 def test_proposed_phase_charge_below_floor():
@@ -6069,6 +6111,7 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_override_keeps_cm_driving_even_when_the_select_says_predbat,
         test_intended_policy_reports_the_override_not_the_plugins_wish,
         test_override_is_the_select_alone_no_boolean,
         test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
@@ -6147,7 +6190,7 @@ def run_curtailment_tests(my_predbat=None):
         test_manual_override_keeps_machine_live_skips_policy,
         test_manual_override_off_resumes_policy,
         test_manual_override_grabs_control_even_when_inactive,
-        test_manual_override_writer_follows_policy_to_predbat,
+        test_manual_override_writer_follows_the_override_not_the_select,
         test_heartbeat_enabled_on_control,
         test_exactly_one_writer_enabled_on_control,
         test_predbat_neutralised_before_its_chain_is_frozen,
