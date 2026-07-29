@@ -697,6 +697,39 @@ def test_R50a_incident_day_still_floored_by_r59b():
     print(f"  test_R50a_incident_day_still_floored_by_r59b: PASSED (band [{charge_below / soc_max:.1%}, {drain_above / soc_max:.1%}])")
 
 
+def test_intended_policy_reports_the_override_not_the_plugins_wish():
+    """Under manual override the sensor must report what will ACTUALLY happen.
+
+    Observed live 2026-07-29 08:44:
+        intended = "Max Export"
+        reason   = "manual override — user owns policy select"
+        override = "Hold Battery"   (what the heartbeat was really dispatching)
+
+    The reason was swapped for the override message but the STATE was left as
+    the plugin's own choice, so the sensor contradicted itself and disagreed
+    with the inverter. Third time in two days that three views of one decision
+    disagreed; the Charter rule is that the card reports, it does not invent.
+
+    The plugin's preference is still useful — it says what resumes when the
+    override clears — so it moves into the reason rather than being dropped.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_OVERRIDE_SELECT] = "Hold Battery"
+    plugin = CurtailmentPlugin(base)
+    # Band that would otherwise produce Drain -> Max Export.
+    plugin._charge_below, plugin._drain_above = 0.5, 0.54
+    plugin._policy_override = None
+    plugin._publish_dispatch_policy(True, floor_kwh=0.54, soc_kwh=5.0, soc_max=18.08)
+
+    pub = base.published["sensor.predbat_curtailment_intended_policy"]
+    assert pub["value"] == "Hold Battery", f"state must be the override actually in force, got {pub['value']}"
+    assert pub["attrs"]["manual_override"] is True
+    assert "Max Export" in pub["attrs"]["reason"], f"reason must still say what the plugin would choose: {pub['attrs']['reason']}"
+    assert "override" in pub["attrs"]["reason"].lower()
+    print("  test_intended_policy_reports_the_override_not_the_plugins_wish: PASSED")
+
+
 def test_override_is_the_select_alone_no_boolean():
     """RD13a (2026-07-28): manual override is ONE entity — `input_select.sig_override`.
     Override is on iff the select is anything but "Off".
@@ -6036,6 +6069,7 @@ def run_curtailment_tests(my_predbat=None):
         test_charge_below_p10_recovery_wins,
         test_R50a_floor_uses_p90_not_the_confidence_blend,
         test_R50a_incident_day_still_floored_by_r59b,
+        test_intended_policy_reports_the_override_not_the_plugins_wish,
         test_override_is_the_select_alone_no_boolean,
         test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
         test_session_reserve_still_protects_the_drain_floor,
