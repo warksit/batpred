@@ -172,6 +172,7 @@ dlimit
 dlopen
 dnoregion
 docstrings
+drainable
 dstamp
 dstart
 dtype

@@ -883,7 +883,7 @@ def compute_max_sheddable(scale, lat_deg, lon_deg, day_of_year, from_utc_hours, 
     return total
 
 
-def drain_deadline_breached(headroom_needed_kwh, max_sheddable_kwh, engaged=False, hyst_kwh=R63_HYST_KWH):
+def drain_deadline_breached(headroom_needed_kwh, max_sheddable_kwh, engaged=False, hyst_kwh=R63_HYST_KWH, drainable_kwh=None):
     """R63 — is the drain still achievable before the lever inverts?
 
     True when we need more headroom than we can still make by T_lockout, i.e.
@@ -905,11 +905,22 @@ def drain_deadline_breached(headroom_needed_kwh, max_sheddable_kwh, engaged=Fals
         max_sheddable_kwh: from compute_max_sheddable().
         engaged: whether R63 is currently driving (previous cycle's result).
         hyst_kwh: release band, kWh.
+        drainable_kwh: how much the battery can still give (soc - the floor it
+            may drain to). <= 0 releases regardless of the deadline: there is no
+            headroom left to make, so firing achieves nothing. None skips the
+            check (pure-function callers testing the deadline alone).
 
     Returns:
         bool — True if the drain cannot be completed in the time remaining.
     """
     if headroom_needed_kwh <= 0:
+        return False
+    # Nothing left in the battery to shed -> the question is moot. Forcing Max
+    # Export here overrides the Schmitt band's correct Hold with an instruction
+    # that cannot be carried out. Observed live 2026-07-29 07:39: SOC 0.54 kWh
+    # sitting exactly on drain_above 0.54, policy reading "active Drain
+    # (override max_export)" with 0.00 kWh drainable.
+    if drainable_kwh is not None and drainable_kwh <= 0:
         return False
     if engaged:
         return headroom_needed_kwh > (max_sheddable_kwh - hyst_kwh)
