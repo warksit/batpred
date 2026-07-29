@@ -27,6 +27,7 @@ from curtailment_calc import (
     apply_no_surplus_drain_hold,
     compute_charge_below,
     compute_drain_above,
+    compute_proposed_phase,
     compute_p10_recovery_floor,
     compute_shed_rate,
     compute_overflow_fits_margin,
@@ -946,6 +947,37 @@ def test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor():
     # evening-reserve Charge is preserved on overcast days.
     assert compute_overflow_fits_margin(soc_max - 2.0, 1.5) > 0, "low-overflow day must still suppress the pointless drain"
     print("  test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor: PASSED")
+
+
+def test_R16a_schmitt_hysteresis_stops_the_drain_flap():
+    """R16a: entering Drain needs SOC above drain_above by OUTER_THRESHOLD_KWH;
+    once draining it runs all the way TO drain_above.
+
+    R16a has been in REQUIREMENTS since v19, but its implementation lived in the
+    5-second HA automation that v30 retired — so since then the plugin has done a
+    bare `soc > drain_above` every cycle with no deadband.
+
+    Observed live 2026-07-29 07:50-08:33: policy flapped Max Export <-> Predbat
+    EIGHT times in 45 minutes while SOC oscillated 2.8-3.1% around a drain_above
+    of 0.54 kWh (3.0%). Sigen quantises SOC to 0.1% (0.018 kWh), and the RD4
+    low-SOC handover sits at 2.8% — 0.2% below the drain target — so every micro
+    drain tripped the handover, MSC charged it back, and it drained again.
+    """
+    da, cb = 0.54, 0.50
+
+    # Not draining yet: sitting just above drain_above must NOT start a drain.
+    assert compute_proposed_phase(0.55, cb, da, True, was_draining=False) == "Hold", "0.01 kWh above must not trigger Drain"
+    assert compute_proposed_phase(0.71, cb, da, True, was_draining=False) == "Hold", "still inside the deadband"
+    # Clear of the deadband -> Drain.
+    assert compute_proposed_phase(0.73, cb, da, True, was_draining=False) == "Drain", "above drain_above + threshold must drain"
+
+    # Once draining, run TO the target rather than stopping at the deadband edge.
+    assert compute_proposed_phase(0.60, cb, da, True, was_draining=True) == "Drain", "must run all the way to target"
+    assert compute_proposed_phase(0.54, cb, da, True, was_draining=True) == "Hold", "reaching target exits to Hold"
+
+    # The live flap: SOC 3.0% (0.54) with drain_above 0.54 must be Hold, not Drain.
+    assert compute_proposed_phase(0.542, cb, da, True, was_draining=False) == "Hold", "the 2026-07-29 flap case must read Hold"
+    print("  test_R16a_schmitt_hysteresis_stops_the_drain_flap: PASSED")
 
 
 def test_R63_does_not_force_drain_when_nothing_is_drainable():
@@ -6016,6 +6048,7 @@ def run_curtailment_tests(my_predbat=None):
         test_overflow_smoothing_degrades_safely_on_short_history,
         test_R11_removed_floor_follows_the_formula_down,
         test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor,
+        test_R16a_schmitt_hysteresis_stops_the_drain_flap,
         test_R63_does_not_force_drain_when_nothing_is_drainable,
         test_R63_shed_rate_inverts_once_pv_exceeds_the_cap,
         test_R63_max_sheddable_integrates_a_falling_rate,
