@@ -34,6 +34,7 @@ After changing in HA, pull the updated config and commit it so the file stays in
 ## Pre-Deploy Checks
 
 - `pre-commit run --all-files`
+- `cd apps/predbat && python3 tests/test_requirements_implemented.py` — every IN FORCE requirement has code behind it (catches R16a-class drift)
 - `cd apps/predbat && python3 tests/test_curtailment.py`
 - `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the curtailment HA automation YAML
 - `cd apps/predbat && python3 tests/test_yaml_voltage_seek.py` — Jinja harness for voltage_seek_controller YAML (catches variable-order bugs under StrictUndefined)
