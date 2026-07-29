@@ -1,0 +1,38 @@
+alias: Predbat max discharging limit action
+description: >-
+  Mapper from input_number.discharge_rate to number.sigen_plant_ess_max_discharging_limit.
+
+  One of the THREE Predbat mapper automations that write PLANT registers (see the
+  writer-ownership table in .claude/CLAUDE.md). Enabled only while Predbat owns the
+  writer role; CM disables all three and enables sig_dispatch_heartbeat instead.
+
+  ROBUSTNESS (2026-07-29): same guard as the charging mapper, for the same reason —
+  a router/LAN event left the Sigen Modbus sensors 'unknown' and the undefaulted
+  | float threw, so the automation hard-failed and the limit was never written.
+  See predbat_max_charging_limit_action.yaml for the full rationale on why this
+  guards rather than defaults.
+
+  NOTE the source sensor here is the PLANT-prefixed rated power
+  (sensor.sigen_plant_ess_rated_discharging_power) whereas the charging mapper
+  reads the INVERTER-prefixed one. That asymmetry is inherited from the original
+  HA-only configs and is preserved deliberately -- do not "tidy" it without
+  checking both entities exist, they are different entities.
+id: automation_sigen_ess_max_discharging_limit_input_number_action
+triggers:
+  - trigger: state
+    entity_id: input_number.discharge_rate
+conditions:
+  # Act only on values we can actually read.
+  - condition: template
+    value_template: >-
+      {{ states('input_number.discharge_rate') | is_number
+         and states('sensor.sigen_plant_ess_rated_discharging_power') | is_number }}
+actions:
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_ess_max_discharging_limit
+    data:
+      value: >-
+        {{ [(states('input_number.discharge_rate') | float(0) / 1000) | round(2),
+            states('sensor.sigen_plant_ess_rated_discharging_power') | float(0)] | min }}
+mode: single
