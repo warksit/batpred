@@ -2582,8 +2582,20 @@ class CurtailmentPlugin(PredBatPlugin):
             # read_only on — so Predbat could not act on the policy it had just been
             # handed. Result: nobody driving, inverter left on its own MSC default.
             # The guard was right; the handover was silently incomplete.
-            policy_now = self.base.get_state_wrapper(SIG_POLICY_SELECT, default=None)
-            want_cm = policy_now != POLICY_PREDBAT
+            # RD13a: the OVERRIDE is the policy, so the writer role follows it —
+            # not sig_dispatch_policy. The select can hold a stale "Predbat" that
+            # the plugin itself wrote (e.g. the RD4 low-SOC handover) before the
+            # override was set; keying off it disables the executor while the user
+            # is still holding a policy.
+            #
+            # Live failure 2026-07-29 08:56: override "Hold Battery", select
+            # "Predbat" from a 3%-SOC handover -> heartbeat disabled -> nothing
+            # driving -> dispatch register frozen at 2.89 kW while PV rose to
+            # 3.46, so the battery discharged 0.775 kW to cover the gap at 3% SOC.
+            #
+            # The override select has no "Predbat" option by design, so holding
+            # ANY override means CM's executor must drive.
+            want_cm = override_choice != POLICY_PREDBAT
             if first_run or self._cm_controlling != want_cm:
                 self._set_writer(cm_driving=want_cm)
                 self._cm_controlling = want_cm
