@@ -53,6 +53,7 @@ from curtailment_calc import (
     drain_deadline_breached,
     compute_effective_export_cap,
     compute_charge_below,
+    DEEP_DISCHARGE_FLOOR_KWH,
     compute_drain_above,
     compute_proposed_phase,
     phase_to_policy,
@@ -1615,8 +1616,20 @@ class CurtailmentPlugin(PredBatPlugin):
             # its ceiling, so using it here can only make R63 fire slightly EARLY,
             # which is the safe direction.
             sheddable_kwh = compute_max_sheddable(floor_scale, lat, lon, doy, utc_hours, lock_utc, self._effective_dno)
+            # How much the battery can still GIVE. R63 asks "can I make this
+            # headroom in time?" — if there is none left to make, the question is
+            # moot and it must release to the Schmitt band (which already reads
+            # Hold once SOC is no longer above drain_above). Live 2026-07-29
+            # 07:39: SOC 0.54 kWh exactly on drain_above 0.54, 0.00 drainable,
+            # yet the policy read "active Drain (override max_export)".
+            try:
+                hard_floor_pct = float(self.base.get_state_wrapper(SIG_DRAIN_FLOOR_HELPER, default=DEFAULT_DRAIN_FLOOR_PCT))
+            except (TypeError, ValueError):
+                hard_floor_pct = DEFAULT_DRAIN_FLOOR_PCT
+            r63_floor = max(float(getattr(self.base, "reserve", 0) or 0), DEEP_DISCHARGE_FLOOR_KWH, soc_max * hard_floor_pct / 100.0)
+            drainable_kwh = float(soc_kw) - r63_floor
             was_engaged = self._r63_engaged
-            self._r63_engaged = drain_deadline_breached(needed_kwh, sheddable_kwh, engaged=was_engaged)
+            self._r63_engaged = drain_deadline_breached(needed_kwh, sheddable_kwh, engaged=was_engaged, drainable_kwh=drainable_kwh)
             if self._r63_engaged and not was_engaged:
                 self.log("Curtailment: R63 drain deadline — need {:.2f} kWh headroom, only {:.2f} kWh sheddable before lockout {:.2f}Z -> Max Export".format(needed_kwh, sheddable_kwh, lock_utc))
             elif was_engaged and not self._r63_engaged:
