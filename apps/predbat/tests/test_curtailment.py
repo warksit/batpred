@@ -4501,6 +4501,111 @@ def test_R55_target_soc_uses_floor_when_active():
     print(f"  test_R55_target_soc_uses_floor_when_active: PASSED (target_soc={pub['value']}% / {pub['attrs']['target_kwh']} kWh)")
 
 
+def test_numeric_sensors_carry_state_class():
+    """Every numeric curtailment sensor must carry state_class.
+
+    WHY THIS EXISTS (2026-07-29): HA keeps 5-minute recorder history for only
+    ~10 days, then retains hourly long-term statistics FOREVER — but *only*
+    for sensors with a state_class. Without it a numeric diagnostic becomes
+    unrecoverable once the recorder window passes.
+
+    That bit us: reviewing the R9 overflow safety factor, the only surviving
+    forecast-vs-actual evidence was three-month-old April fixtures captured by
+    hand. Those turned out to be measured through the AC-coupled SMA, which
+    clipped PV above the inverter ceiling and so understated actual overflow —
+    making p90 look 56% conservative when the first DC-coupled day measured
+    16%. A recommendation to trim the factor was built on that artefact.
+
+    Retention is therefore a correctness property, not housekeeping.
+
+    Categorical (string-valued) sensors cannot carry a state_class; they are
+    listed explicitly so that adding one is a deliberate act rather than an
+    accident. If you add a numeric sensor, give it a state_class — do not add
+    it to this list.
+    """
+    from datetime import datetime, timezone
+
+    categorical = {
+        "sensor.predbat_curtailment_phase",
+        "sensor.predbat_curtailment_floor_source",
+        "sensor.predbat_curtailment_intended_policy",
+        "sensor.predbat_curtailment_tomorrow",
+    }
+
+    base = MockBase(
+        pv_step={},
+        load_step={},
+        soc_kw=BATTERY_KWH * 0.5,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._overnight_target_kwh = 7.0
+    plugin.publish("active", 2.5, dno_limit_kw=4.0)
+    # These two publish outside publish() — cover them in the same sweep.
+    plugin._publish_offset(-1.5, {"reason": "state_class_audit"})
+    plugin._publish_overnight_target(7.0, {})
+
+    missing = []
+    for entity, pub in base.published.items():
+        if entity in categorical:
+            continue
+        if isinstance(pub["value"], bool) or not isinstance(pub["value"], (int, float)):
+            continue
+        if "state_class" not in (pub["attrs"] or {}):
+            missing.append(entity)
+
+    assert not missing, "numeric sensors published without state_class — HA will not keep long-term statistics for these, so they are lost after the recorder window:\n  " + "\n  ".join(sorted(missing))
+    checked = sum(1 for e, p in base.published.items() if e not in categorical and isinstance(p["value"], (int, float)) and not isinstance(p["value"], bool))
+    print(f"  test_numeric_sensors_carry_state_class: PASSED ({checked} numeric sensors all carry state_class)")
+
+
+def test_floor_component_is_winner_matches_source_label():
+    """The floor-component sensors' is_winner must match the real floor_source.
+
+    WHY: compute_floor_with_source() returns a HUMAN-READABLE winner label
+    ("Curtailment Buffer" / "P10 Recovery" / "Reserve"), not the variable name.
+    A first cut of these sensors derived is_winner from the entity suffix
+    ("overflow", "p10_recovery"), which could never match any real label — so
+    is_winner would have read False forever, silently, on every sensor. A flag
+    that is always False looks exactly like "this term never wins".
+    """
+    from datetime import datetime, timezone
+
+    base = MockBase(
+        pv_step={},
+        load_step={},
+        soc_kw=BATTERY_KWH * 0.5,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        forecast_minutes=1440,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_floor_kwh = 6.0
+    plugin._p10_recovery_floor = 2.0
+
+    for source_label, winner_entity in (
+        ("Curtailment Buffer", "sensor.predbat_curtailment_floor_overflow"),
+        ("P10 Recovery", "sensor.predbat_curtailment_floor_p10_recovery"),
+    ):
+        plugin._floor_source = source_label
+        plugin.publish("active", 6.0, dno_limit_kw=4.0)
+        flags = {e: base.published[e]["attrs"]["is_winner"] for e in ("sensor.predbat_curtailment_floor_overflow", "sensor.predbat_curtailment_floor_p10_recovery")}
+        assert flags[winner_entity] is True, f"floor_source={source_label!r} should mark {winner_entity} as winner, got {flags}"
+        assert sum(1 for v in flags.values() if v) == 1, f"exactly one component may win, got {flags}"
+
+    # And a source that is neither component (e.g. the hardware reserve) must
+    # mark neither — not silently fall through to one of them.
+    plugin._floor_source = "Reserve"
+    plugin.publish("active", 6.0, dno_limit_kw=4.0)
+    assert not base.published["sensor.predbat_curtailment_floor_overflow"]["attrs"]["is_winner"]
+    assert not base.published["sensor.predbat_curtailment_floor_p10_recovery"]["attrs"]["is_winner"]
+    print("  test_floor_component_is_winner_matches_source_label: PASSED (labels match compute_floor_with_source)")
+
+
 def test_R55_safety_pct_helper_clamps_range():
     """HA helper input_number.curtailment_overnight_safety_pct clamped to [0, 200]."""
     pv = {}
@@ -6446,6 +6551,8 @@ def run_curtailment_tests(my_predbat=None):
         test_R55_on_before_plan_does_not_clobber_calculate_overnight_target,
         test_R55_target_soc_uses_overnight_when_off,
         test_R55_target_soc_uses_floor_when_active,
+        test_numeric_sensors_carry_state_class,
+        test_floor_component_is_winner_matches_source_label,
         test_R55_safety_pct_helper_clamps_range,
         test_R55_overnight_target_raises_effective_keep_in_calculate,
     ]

@@ -737,7 +737,9 @@ class CurtailmentPlugin(PredBatPlugin):
 
     def _publish_offset(self, value, attrs):
         """Publish curtailment solar offset sensor and cache for reuse."""
-        attrs.update({"friendly_name": "Curtailment Solar SOC Keep Offset", "unit_of_measurement": "kWh", "icon": "mdi:solar-power"})
+        # state_class: HA keeps long-term statistics only for sensors that have
+        # one. Without it this is gone after the recorder window (~10 days).
+        attrs.update({"friendly_name": "Curtailment Solar SOC Keep Offset", "unit_of_measurement": "kWh", "state_class": "measurement", "icon": "mdi:solar-power"})
         self.base.dashboard_item("sensor.{}_curtailment_solar_offset".format(self.base.prefix), value, attrs)
         self._cached_offset = (value, attrs)
 
@@ -755,6 +757,8 @@ class CurtailmentPlugin(PredBatPlugin):
             {
                 "friendly_name": "Curtailment Overnight Target",
                 "unit_of_measurement": "kWh",
+                "device_class": "energy",
+                "state_class": "measurement",
                 "icon": "mdi:weather-night",
             }
         )
@@ -2129,6 +2133,7 @@ class CurtailmentPlugin(PredBatPlugin):
             {
                 "friendly_name": "Curtailment Target SOC",
                 "unit_of_measurement": "%",
+                "state_class": "measurement",
                 "icon": "mdi:battery-charging-medium",
                 "target_kwh": round(target_kwh, 2),
                 "source": self._floor_source,
@@ -2149,6 +2154,39 @@ class CurtailmentPlugin(PredBatPlugin):
                 "p10_recovery_floor_kwh": self._p10_recovery_floor,
             },
         )
+
+        # The three candidate floors, promoted from attributes on floor_source to
+        # dedicated sensors — same reasoning as the overflow_p* bands above.
+        #
+        # WHY: floor_source is categorical, so HA cannot keep long-term
+        # statistics for it, and attributes are not retained either. Publishing
+        # the components numerically means the floor's COMPOSITION survives the
+        # recorder window: which term won is reconstructable after the fact
+        # (whichever equals target_soc), and each term's trajectory is visible.
+        # Without this, "why was the floor there?" is unanswerable a fortnight
+        # later — which is exactly the position the 2026-07-29 safety-factor
+        # review found itself in.
+        # NOTE the labels must match compute_floor_with_source() exactly — it
+        # returns the human-readable winner ("Curtailment Buffer" / "P10
+        # Recovery" / "Reserve"), not the variable name. effective_keep is
+        # deliberately absent: v31 dropped it as a drain target, so it is no
+        # longer one of the terms the floor is chosen from.
+        for suffix, value, friendly, source_label, icon in (
+            ("floor_overflow", self._overflow_floor_kwh, "Curtailment Floor: Overflow (P90)", "Curtailment Buffer", "mdi:battery-arrow-down"),
+            ("floor_p10_recovery", self._p10_recovery_floor, "Curtailment Floor: P10 Recovery", "P10 Recovery", "mdi:battery-arrow-up"),
+        ):
+            self.base.dashboard_item(
+                "sensor.{}_curtailment_{}".format(prefix, suffix),
+                round(value, 2) if isinstance(value, (int, float)) else None,
+                {
+                    "friendly_name": friendly,
+                    "unit_of_measurement": "kWh",
+                    "device_class": "energy",
+                    "state_class": "measurement",
+                    "icon": icon,
+                    "is_winner": self._floor_source == source_label,
+                },
+            )
 
         # Split-threshold control: Charge only if SOC < charge_below, Drain only
         # if SOC > drain_above, Hold otherwise. The two thresholds are independent
