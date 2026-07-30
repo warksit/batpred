@@ -134,6 +134,31 @@ Checklist after a logic change:
 2. Does any new override appear in the `reason` string?
 3. Does the card still report rather than re-derive?
 
+### Working practices (A0+, 2026-07-30) — stop doing it the old way
+
+These are process rules for *how we build and operate* CM. Companion context:
+`.claude/plans/curtailment-rebuild-context.md` (why / loss function) and
+`.claude/plans/curtailment-review-recommendations.md` (roadmap). This subsection
+is normative for agents and humans editing CM.
+
+| Old way (do not) | New way (do) |
+|---|---|
+| Ship two copies of `curtailment_plugin.py` (`apps/predbat/` and `plugins/`) | **One tree only.** `plugin_system` must refuse a second load of the same `plugin_name` (hooks append; dict overwrite does not unregister). |
+| Treat missing SOC as `0.0` and keep driving | **Fail closed:** unreadable plant SOC → hold position, change nothing, say so in `reason`. |
+| Re-derive headroom / Schmitt / safety factor on the dashboard | **Report** plugin attrs (`reason`, band %, headroom_*, override label). Card may format; it must not invent a second decision. |
+| Mix % and kWh on every line of Why This Mode | **At a glance: % SOC** for band and battery; kWh only as secondary detail. |
+| Show engineer codes like `no_drain` as if they were modes | **Human labels** in `reason` / `override_label` (e.g. "surplus fits"). Keep internal codes in attrs if needed for tests. |
+| Tune from April AC-coupled fixtures | **Meters:** overflow daily + overnight import (failure modes A and B). |
+| Add another latch for the next flap | First ask: dual formula seam, or missing fail-closed? Prefer one function + args. |
+| Ship control-law changes with footgun cleanups | **Separate deploys** so the next day's A/B can be attributed. |
+| Delete a mechanism by deleting tests only | REQUIREMENTS status change + new semantic test asserting post-deletion behaviour. |
+| Grow `calculate()` past the complexity ratchet | Split; lower the pin; never raise it to pass CI. |
+
+**CM's job (one sentence):** keep battery room for PV that would otherwise be
+curtailed, then hand back to Predbat. Predbat owns price, evening export, saving
+sessions, and the overnight plan. Every constant trades under-drain (curtail)
+against over-drain (import) — measure both.
+
 ### Complexity ratchet
 
 `.flake8` has set `max-complexity = 15` for a long time, but **flake8 is not in
