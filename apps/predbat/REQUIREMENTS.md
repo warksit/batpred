@@ -261,7 +261,7 @@ forecast rather than the expected one.
 
 **Why:** an over-drain costs one battery round-trip (~10%). An under-drain costs
 the entire clipped surplus, and cannot be undone. The asymmetry is what justifies
-the 1.2 safety factor, the p90 band, the pre-PV drain (R52), and the drain
+the safety factor (R9), the p90 band, the pre-PV drain (R52), and the drain
 deadline (R63).
 
 **Removing this would:** reintroduce "wait and see" behaviour that looks correct
@@ -379,10 +379,56 @@ follow-up work, not done inline. See *Open questions*.
   overflow_floor   = max_target_soc - remaining_overflow × OVERFLOW_SAFETY_FACTOR
   ```
 
-  Safety factor = 1.2 reserves 20% extra headroom against forecast error *during*
-  overflow. The tapered cap (R45) only binds when `remaining_overflow ≥ 1.8 kWh`
-  (peak of day); near safe_time the buffer tapers toward 0, `max_target_soc`
-  approaches soc_max, and the battery fills to ~100% before handoff to MSC.
+  `OVERFLOW_SAFETY_FACTOR = 1.05` (was 1.2 until 2026-07-30). The tapered cap
+  (R45) only binds when `remaining_overflow ≥ 1.8 kWh` (peak of day); near
+  safe_time the buffer tapers toward 0, `max_target_soc` approaches soc_max, and
+  the battery fills to ~100% before handoff to MSC.
+
+  **Why 1.05 and not 1.2.** The factor multiplies an already-conservative input.
+  Overflow is fed from the **p90** band, and overflow is an integral *above a
+  threshold*, so forecast conservatism is amplified before the factor applies at
+  all. Measured across the April fixture replay: a 13% generation over-forecast
+  became a **36%** overflow over-forecast (3.36× leverage), and actual overflow
+  never once exceeded the p90-derived estimate in 11 days. 1.2 on top of that
+  reserved roughly **double** the headroom actually needed.
+
+  Over-reserving is **not free** — it is paid for as a deeper pre-PV drain (R52)
+  and the overnight import that follows. That is the cost being traded against
+  curtailment risk, and it is a real observed cost, not a theoretical one.
+
+  **Honest caveat on the evidence.** Those April fixtures were measured through
+  the AC-coupled SMA, which clipped PV above the inverter ceiling and therefore
+  *understated* actual overflow — flattering p90. The first DC-coupled day
+  measured (19 Jul) showed only **16%** margin against p90 versus **56%** mean in
+  April. 1.05 is a deliberate step toward the truth, not a settled number.
+
+  **How to refine — use the meters, do NOT re-derive from fixtures.** Since
+  2026-07-29 actual overflow is metered natively and exactly:
+
+  ```text
+  sensor.curtailment_overflow_power    template, max(0, pv - load - cap)
+  sensor.curtailment_overflow_energy   Riemann integral of the above
+  sensor.curtailment_overflow_daily    utility_meter, daily cycle
+  ```
+
+  The chain applies the clipping at native sensor resolution and only then
+  integrates, so the daily total survives HA's hourly downsampling exactly.
+  Reconstructing from 5-minute statistics instead understated a broken-cloud day
+  by **63%**, and that data expires with the ~10-day recorder window.
+
+  To retune: compare `sensor.curtailment_overflow_daily` (actual) against the
+  daily max of `sensor.predbat_curtailment_overflow_p90` (forecast) across a few
+  weeks of DC-coupled days. The factor should cover the worst observed
+  `actual/p90` ratio with a little margin — cut it further if actual never
+  approaches p90, raise it if any day exceeds p90.
+
+  **The number that ultimately matters is neither of those.** It is whether we
+  ever actually curtailed (SOC at max *and* export at cap) versus how much we
+  imported overnight. Forecast calibration is only a proxy for that trade.
+
+  **Implemented in:** `curtailment_plugin.py:OVERFLOW_SAFETY_FACTOR`,
+  `curtailment_calc.py:required_headroom_kwh`.
+  **Tested by:** `test_R9_overflow_safety_factor_is_1_05`.
 - **R9a**: `effective_load(t) = max(base_load, loadml_forecast(t))` — the overflow
   integral MUST use Predbat's LoadML per-slot forecast with `base_load` (0.5 kW) as
   a floor. LoadML already learns regular daytime loads (DHW cycle, EV charging,
