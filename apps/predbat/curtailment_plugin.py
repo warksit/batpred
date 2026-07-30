@@ -2636,15 +2636,23 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Headroom shortfall (same formula as the floor — never re-derive on the card).
         # need = safety × p90 + min(max_reserved, p90); have = soc_max − soc.
+        # Publish % for the at-a-glance card; kWh kept for diagnostics detail.
         headroom_need_kwh = None
         headroom_have_kwh = None
         headroom_short_kwh = None
+        headroom_need_pct = None
+        headroom_have_pct = None
+        headroom_short_pct = None
         try:
             ovf = float(self._overflow_p90 or 0.0)
             max_res = float(getattr(self, "_effective_max_reserved", MAX_RESERVED_KWH) or MAX_RESERVED_KWH)
             headroom_need_kwh = round(required_headroom_kwh(ovf, max_res, OVERFLOW_SAFETY_FACTOR), 2)
             headroom_have_kwh = round(max(0.0, soc_max - soc_kwh), 2)
             headroom_short_kwh = round(headroom_need_kwh - headroom_have_kwh, 2)
+            denom = max(soc_max, 0.1)
+            headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
+            headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
+            headroom_short_pct = round(headroom_short_kwh / denom * 100.0, 1)
         except (TypeError, ValueError):
             pass
 
@@ -2677,6 +2685,9 @@ class CurtailmentPlugin(PredBatPlugin):
                 "headroom_need_kwh": headroom_need_kwh,
                 "headroom_have_kwh": headroom_have_kwh,
                 "headroom_short_kwh": headroom_short_kwh,
+                "headroom_need_pct": headroom_need_pct,
+                "headroom_have_pct": headroom_have_pct,
+                "headroom_short_pct": headroom_short_pct,
             }
             self.base.dashboard_item(
                 "sensor.{}_curtailment_intended_policy".format(prefix),
