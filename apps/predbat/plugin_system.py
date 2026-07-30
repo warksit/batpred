@@ -120,8 +120,10 @@ class PluginSystem:
                     plugin_name = filename[:-3]  # Remove .py extension
 
                     try:
+                        before = plugin_name in self.plugins
                         self.load_plugin(plugin_dir, plugin_name)
-                        discovered_count += 1
+                        if plugin_name in self.plugins and not before:
+                            discovered_count += 1
                     except Exception as e:
                         self.log(f"Failed to load plugin {plugin_name}: {e}")
 
@@ -138,6 +140,18 @@ class PluginSystem:
         plugin_path = os.path.join(plugin_dir, f"{plugin_name}.py")
 
         if not os.path.exists(plugin_path):
+            return
+
+        # First-wins across the three discovery dirs. Loading a second copy of the
+        # same plugin_name would append more hooks without unregistering the first
+        # instance — two CurtailmentPlugins both writing sig_dispatch_policy
+        # (observed risk: root + plugins/ both ship curtailment_plugin.py).
+        if plugin_name in self.plugins:
+            self.log(
+                "Skipping plugin {}: already loaded (refusing second path {})".format(
+                    plugin_name, plugin_path
+                )
+            )
             return
 
         # Import the plugin module
