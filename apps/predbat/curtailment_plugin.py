@@ -183,7 +183,36 @@ SOLCAST_REMAINING = "sensor.solcast_pv_forecast_forecast_remaining_today"
 # follow the day burning off (measured lag ~+0.3 kWh on a falling series).
 OVERFLOW_SMOOTH_WINDOW_MIN = 30
 
-OVERFLOW_SAFETY_FACTOR = 1.2
+# R9 overflow safety factor. 1.2 -> 1.05 on 2026-07-30 (user decision).
+#
+# WHY 1.05 AND NOT 1.2: this multiplies an already-conservative input. Overflow
+# is fed from the p90 Solcast band, AND overflow is an integral above a
+# threshold, so forecast conservatism is amplified before the factor applies at
+# all. Measured across the April fixture replay: a 13% generation over-forecast
+# became a 36% overflow over-forecast (3.36x leverage), and actual overflow
+# never once exceeded the p90-derived estimate in 11 days. 1.2 on top reserved
+# roughly double the headroom actually needed -- and over-reserving is not free,
+# it is paid for as a deeper pre-dawn drain and the overnight import after it.
+#
+# HONEST CAVEAT: those fixtures were measured through the AC-coupled SMA, which
+# clipped PV above the inverter ceiling and so UNDERSTATED actual overflow,
+# flattering p90. The first DC-coupled day (19 Jul) showed only 16% margin vs
+# p90 against 56% mean in April. 1.05 is therefore a deliberate step, not a
+# settled number.
+#
+# TO REFINE -- use the meters, do not re-derive from fixtures. Since 2026-07-29
+# actual overflow is metered exactly by
+#     sensor.curtailment_overflow_power  -> _energy (integral) -> _daily (utility_meter)
+# which clips at native sensor resolution and only then integrates, so the daily
+# total survives HA's hourly downsampling. Reconstructing from 5-minute
+# statistics instead understated a broken-cloud day by 63%, and that data
+# expires with the ~10-day recorder window.
+#
+# Compare sensor.curtailment_overflow_daily (actual) against the daily max of
+# sensor.predbat_curtailment_overflow_p90 (forecast) over a few weeks of
+# DC-coupled days: the factor should cover the worst observed actual/p90 ratio
+# with a little margin. See test_R9_overflow_safety_factor_is_1_05.
+OVERFLOW_SAFETY_FACTOR = 1.05
 
 # v19 tapered cap (R45): reserved headroom = min(MAX_RESERVED_KWH, remaining_overflow).
 # At peak overflow the buffer clamps at 1.8 kWh (10% of 18.08 kWh = current R45 cap).
