@@ -217,6 +217,18 @@ OVERFLOW_SMOOTH_WINDOW_MIN = 30
 # with a little margin. See test_R9_overflow_safety_factor_is_1_05.
 OVERFLOW_SAFETY_FACTOR = 1.05
 
+# Human labels for _policy_override (dashboard / reason string).
+# Internal codes stay as keys for logic; never show them raw on Why This Mode.
+#   no_drain   = surplus already fits (or past safe_time): suppress Max Export only;
+#                Charge still allowed for the evening reserve. Not a user mode.
+#   hold       = force flat (e.g. pre-PV wait after drain)
+#   max_export = force drain (e.g. R63 last chance for headroom)
+OVERRIDE_LABELS = {
+    "no_drain": "surplus fits",
+    "hold": "holding flat",
+    "max_export": "must drain",
+}
+
 # v19 tapered cap (R45): reserved headroom = min(MAX_RESERVED_KWH, remaining_overflow).
 # At peak overflow the buffer clamps at 1.8 kWh (10% of 18.08 kWh = current R45 cap).
 # As overflow winds down toward safe_time, buffer tapers to 0 and max_target_soc
@@ -2583,11 +2595,13 @@ class CurtailmentPlugin(PredBatPlugin):
             else:
                 sell_floor_kwh = DEFAULT_KEEP_FLOOR_PCT / 100.0 * soc_max
             intended_keep = min(max(sell_floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
-            # At-a-glance reason: mode + SOC% + band% (never mix units).
+            # At-a-glance reason: mode + human override label + SOC% + band%
+            # (never mix units; never expose internal codes like no_drain).
             # kWh stays on attributes for detail / cards that opt in.
             charge_pct = self._charge_below / max(soc_max, 0.1) * 100.0
             drain_pct = self._drain_above / max(soc_max, 0.1) * 100.0
-            ovr = " · {}".format(self._policy_override) if self._policy_override else ""
+            ovr_label = OVERRIDE_LABELS.get(self._policy_override) if self._policy_override else None
+            ovr = " · {}".format(ovr_label) if ovr_label else ""
             reason = "{}{} · {:.0f}% · band {:.0f}–{:.0f}%".format(schmitt, ovr, soc_pct, charge_pct, drain_pct)
         elif plugin_active:
             intended_policy = POLICY_PREDBAT
@@ -2638,6 +2652,9 @@ class CurtailmentPlugin(PredBatPlugin):
         # Attributes are the single source for the Why This Mode card (report, never re-derive).
         try:
             prefix = self.base.prefix
+            overnight_target_kwh = float(self._overnight_target_kwh or 0.0) if getattr(self, "_overnight_target_kwh", None) else 0.0
+            overnight_target_pct = round(overnight_target_kwh / max(soc_max, 0.1) * 100.0, 1) if overnight_target_kwh else None
+            ovr_label = OVERRIDE_LABELS.get(self._policy_override) if self._policy_override else None
             attrs = {
                 "friendly_name": "Curtailment Intended Policy",
                 "icon": "mdi:robot",
@@ -2647,11 +2664,14 @@ class CurtailmentPlugin(PredBatPlugin):
                 "reason": published_reason,
                 "acting": acting,
                 "manual_override": manual,
-                "policy_override": self._policy_override,
+                "policy_override": self._policy_override,  # machine code for tests
+                "override_label": ovr_label,  # human: surplus fits / holding flat / must drain
                 "charge_below_pct": round(charge_pct, 1) if charge_pct is not None else None,
                 "drain_above_pct": round(drain_pct, 1) if drain_pct is not None else None,
                 "charge_below_kwh": round(self._charge_below, 2) if plugin_active else None,
                 "drain_above_kwh": round(self._drain_above, 2) if plugin_active else None,
+                "overnight_target_kwh": round(overnight_target_kwh, 2) if overnight_target_kwh else None,
+                "overnight_target_pct": overnight_target_pct,
                 "overflow_p90_kwh": round(float(self._overflow_p90 or 0.0), 2),
                 "overflow_safety_factor": OVERFLOW_SAFETY_FACTOR,
                 "headroom_need_kwh": headroom_need_kwh,
