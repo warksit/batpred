@@ -658,9 +658,35 @@ that actually arrives, so on a genuinely collapsed day it cannot fully recover a
 battery that was over-drained at dawn. That is mechanism 1's job.
 
 **Known consequence.** On marginal days p90 can put `charge_below` ABOVE
-`drain_above` (e.g. 2026-05-02: 29.2% vs 15.3%). That is the documented
-split-threshold case — Charge wins, no Drain — so it degrades safely, but it is
+`drain_above` (e.g. 2026-05-02: 29.2% vs 15.3%) — the cross-over case. This is
 more common under p90 than under the blend.
+
+**Precedence on cross-over: DRAIN WINS. Curtailment defence beats deficit
+insurance.** `compute_proposed_phase` charges to `min(charge_below,
+drain_above)`, so on a cross-over day the charge target *is* `drain_above`: we
+top up only to the headroom floor, and Drain fires above it.
+
+*Why* — R25. Headroom is cheap early and impossible late: once `PV - load > DNO`
+there are no levers left, so surrendering headroom to bank the evening reserve
+buys insurance against a deficit that may not happen, at the price of
+curtailment that then cannot be avoided. The asymmetry decides it — an
+over-drained battery is recoverable (Solar Charge banks PV as it arrives, and
+Predbat can grid-charge overnight if the deficit forecast holds), whereas
+curtailed generation is gone. Note the limit of that recovery: Solar Charge can
+only bank PV that actually arrives, so on a genuinely collapsed day it cannot
+fully refill a battery over-drained at dawn — that is the pre-PV drain target's
+job (R52/R62), not the phase logic's.
+
+**Corrected 2026-07-30.** This paragraph previously read *"Charge wins, no
+Drain — so it degrades safely"*, describing behaviour the code does not have and
+inverting the actual rule. The `min()` and its test predate the correction; only
+the prose was wrong. It caused a live misdiagnosis: the stale text was read back
+as current behaviour and a code change was nearly made to "fix" logic that was
+already correct. Doc-vs-code drift in the direction of the doc being *wrong
+about a safety rule* is the most expensive kind — see the Charter.
+
+**Implemented in:** `curtailment_calc.py:compute_proposed_phase`.
+**Tested by:** `test_proposed_phase_cross_over_charges_to_lower_threshold`.
 
 - **R52** (v22 pre-PV drain timing): activate the plugin BEFORE sunrise on
   confirmed-overflow days so we drain at full DNO rate while drain capacity

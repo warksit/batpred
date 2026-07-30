@@ -1,69 +1,132 @@
-# SIG Keep Floor Guard + Dusk Release (2026-07-18 rev, renamed policies)
+# SIG Keep Floor Guard + Dusk Release
 #
-# Two jobs, both by setting policy → Predbat (heartbeat then releases to the
-# app work mode = native MSC; interim, until the Predbat mapper is wired).
-# Sets POLICY only; heartbeat is the sole register writer.
+# Two jobs, both by stopping whatever is driving a Max Export sell:
 #
-#   1. KEEP FLOOR — SOC ≤ input_number.sig_keep_floor_pct (3 min) while policy
-#      is Max Export → Predbat. Stops a deliberate sell so the overnight reserve
-#      survives; MSC then covers the house.
+#   1. KEEP FLOOR — SOC <= input_number.sig_keep_floor_pct (3 min) while the
+#      EFFECTIVE policy is Max Export. Stops a deliberate sell so the overnight
+#      reserve survives; MSC then covers the house.
 #
-#   2. DUSK RELEASE — sun below horizon AND no active saving session → Predbat.
-#      Hands to native MSC for the night. MSC is HARDWARE self-protecting
-#      (inverter discharge cut-off), so overnight safety does not depend on the
-#      heartbeat staying alive — unlike a held PCS session.
+#   2. DUSK RELEASE — sun below horizon AND no active saving session. Hands to
+#      native MSC for the night. MSC is HARDWARE self-protecting (inverter
+#      discharge cut-off), so overnight safety does not depend on the heartbeat
+#      staying alive — unlike a held PCS session.
 #
-# NOTE: the CM's primary handover is at safe_time (RD6); this dusk trigger is
-# the BACKSTOP for a still-active manual policy the plugin didn't clear.
+# NOTE: the CM's primary handover is at safe_time (RD6); the dusk trigger is the
+# BACKSTOP for a still-active policy or override the plugin did not clear.
+#
+# RD13a FIX (2026-07-30) — WHY THIS WATCHES AND WRITES TWO ENTITIES
+# -----------------------------------------------------------------
+# The heartbeat resolves the policy it executes as:
+#
+#     effective = override      if override not in ('Off', unknown, ...)
+#                 'Max Export'  if a saving session is live and raw != Predbat
+#                 raw_policy    otherwise
+#
+# This guard originally watched and wrote input_select.sig_dispatch_policy
+# alone, which predates the override layer. With sig_override held at
+# "Max Export" it was doubly broken:
+#
+#   1. its CONDITION tested sig_dispatch_policy — not what was driving — so the
+#      keep-floor branch never fired at all; and
+#   2. its ACTION wrote sig_dispatch_policy, which the override outranks, so
+#      even had it fired the sell would have continued.
+#
+# Under a manual Max Export override the keep floor therefore did not exist, and
+# the battery would drain straight through it.
+#
+# It now tests the EFFECTIVE policy and clears BOTH layers. Clearing only the
+# override hands back to a policy select that may itself still say Max Export;
+# clearing only the policy leaves the override in charge. Writing both stops the
+# sell whichever layer was driving, and is idempotent.
+#
+# DELIBERATELY OUT OF SCOPE: the saving-session arm of `effective`. A live
+# session is a deliberate dump and the dusk branch already stands off for one;
+# the session sell is bounded at the hardware level by the heartbeat's
+# sig_drain_floor_pct clamp, not here. Widening this guard to cut a session
+# short is a separate decision — do not add it as a side effect.
 #
 # IMPORTANT: update and commit this file before changing the automation in HA.
-# Deploy via ha_config_set_automation config:, NOT python_transform.
+# Run tests/test_yaml_keep_floor_guard.py, then deploy via
+# ha_config_set_automation config:, NOT python_transform.
 
 id: "1784208297065"
 alias: "SIG Keep Floor Guard"
 description: >-
-  Keep floor (Max Export → Predbat at the reserve) and dusk backstop release
-  (→ Predbat / native MSC for the night). Sets policy only; heartbeat writes
-  registers. Repo: apps/predbat/ha/sig_keep_floor_guard.yaml.
+  Keep floor (stop a Max Export sell at the reserve) and dusk backstop release
+  (-> Predbat / native MSC for the night). Clears BOTH sig_override and
+  sig_dispatch_policy because the heartbeat lets the override outrank the
+  policy (RD13a). Sets selects only; the heartbeat writes registers.
+  Repo: apps/predbat/ha/sig_keep_floor_guard.yaml.
 mode: single
 
-trigger:
-  - platform: numeric_state
+triggers:
+  - trigger: numeric_state
     entity_id: sensor.sigen_plant_battery_state_of_charge
     below: input_number.sig_keep_floor_pct
     for: "00:03:00"
     id: floor_hit
-  - platform: state
+  - trigger: state
     entity_id: sun.sun
     to: "below_horizon"
     id: dusk
 
-action:
+actions:
   - choose:
+      # --- 1. KEEP FLOOR: SOC at the reserve while EFFECTIVELY selling --------
       - conditions:
           - condition: trigger
             id: floor_hit
-          - condition: state
-            entity_id: input_select.sig_dispatch_policy
-            state: "Max Export"
+          # "Is a Max Export sell actually happening?" — override first, since
+          # it outranks; otherwise the policy select.
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: input_select.sig_override
+                state: "Max Export"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: input_select.sig_override
+                    state: "Off"
+                  - condition: state
+                    entity_id: input_select.sig_dispatch_policy
+                    state: "Max Export"
         sequence:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_override
+            data:
+              option: "Off"
           - action: input_select.select_option
             target:
               entity_id: input_select.sig_dispatch_policy
             data:
               option: "Predbat"
+
+      # --- 2. DUSK RELEASE ---------------------------------------------------
       - conditions:
           - condition: trigger
             id: dusk
           - condition: state
             entity_id: binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions
             state: "off"
+          # Skip if already fully released on BOTH layers — keeps this a no-op.
           - condition: not
             conditions:
-              - condition: state
-                entity_id: input_select.sig_dispatch_policy
-                state: "Predbat"
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: input_select.sig_override
+                    state: "Off"
+                  - condition: state
+                    entity_id: input_select.sig_dispatch_policy
+                    state: "Predbat"
         sequence:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.sig_override
+            data:
+              option: "Off"
           - action: input_select.select_option
             target:
               entity_id: input_select.sig_dispatch_policy
