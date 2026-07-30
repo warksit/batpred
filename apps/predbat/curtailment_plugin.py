@@ -78,6 +78,9 @@ from plugin_system import PredBatPlugin
 SIG_PV_POWER = "sensor.sigen_plant_pv_power"
 SIG_LOAD_POWER = "sensor.sigen_plant_consumed_power"
 SIG_GRID_EXPORT_POWER = "sensor.sigen_plant_grid_export_power"
+# Live plant SOC — used for fail-closed (Predbat defaults missing soc to 0.0,
+# which looks like "battery empty" and drove a night re-take on 2026-07-29).
+SIG_BATTERY_SOC_PCT = "sensor.sigen_plant_battery_state_of_charge"
 
 # HA input helper entity IDs
 HA_ENABLE = "input_boolean.curtailment_manager_enable"
@@ -1260,10 +1263,11 @@ class CurtailmentPlugin(PredBatPlugin):
             self._log_once("forecast_overflow_error", "_publish_forecast_overflow failed: {} — overflow bands frozen at previous cycle (pre-PV drain gating affected)".format(exc))
 
     def calculate(self, dno_limit_kw):
-        """Compute floor using v17 solar geometry model.
+        """Compute floor and phase for this cycle.
 
-        Scale from Solcast p90 (R42). Floor = soc_max - overflow_integral × 1.25 (R9).
-        Floor ratchet: floor can only rise (R11). Deactivate at safe_time (R6).
+        Scale from Solcast p90 (R42). Floor uses required_headroom_kwh with
+        OVERFLOW_SAFETY_FACTOR (currently 1.05, R9). No floor ratchet (R11 removed).
+        Sundown deactivates; safe_time drives a Hold/no_drain override (R6 v32).
 
         Returns:
             (floor_kwh, phase) where phase is "active" or "off"
@@ -2469,6 +2473,26 @@ class CurtailmentPlugin(PredBatPlugin):
         except (TypeError, ValueError):
             return default
 
+    def _soc_readable(self):
+        """True when the plant SOC entity is a usable number.
+
+        On a failed read Predbat can leave soc_kw at 0.0 ("battery empty") — the
+        worst possible default for a controller that may charge or re-take the
+        writer chain. If the plant SOC sensor is unavailable we hold position
+        and change nothing (rebuild-context §9.4).
+        """
+        raw = self.base.get_state_wrapper(SIG_BATTERY_SOC_PCT, default="unavailable")
+        if raw is None:
+            return False
+        text = str(raw).strip().lower()
+        if text in ("", "unavailable", "unknown", "none"):
+            return False
+        try:
+            pct = float(raw)
+        except (TypeError, ValueError):
+            return False
+        return 0.0 <= pct <= 110.0
+
     def _set_writer(self, cm_driving):
         """Hand the register-writing role between the heartbeat and the Predbat mapper.
 
@@ -2559,16 +2583,22 @@ class CurtailmentPlugin(PredBatPlugin):
             else:
                 sell_floor_kwh = DEFAULT_KEEP_FLOOR_PCT / 100.0 * soc_max
             intended_keep = min(max(sell_floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
-            ovr = " (override {})".format(self._policy_override) if self._policy_override else ""
-            reason = "active {}{} | soc {:.0f}% band [{:.1f}, {:.1f}] kWh".format(schmitt, ovr, soc_pct, self._charge_below, self._drain_above)
+            # At-a-glance reason: mode + SOC% + band% (never mix units).
+            # kWh stays on attributes for detail / cards that opt in.
+            charge_pct = self._charge_below / max(soc_max, 0.1) * 100.0
+            drain_pct = self._drain_above / max(soc_max, 0.1) * 100.0
+            ovr = " · {}".format(self._policy_override) if self._policy_override else ""
+            reason = "{}{} · {:.0f}% · band {:.0f}–{:.0f}%".format(schmitt, ovr, soc_pct, charge_pct, drain_pct)
         elif plugin_active:
             intended_policy = POLICY_PREDBAT
             intended_keep = None
-            reason = "low-SOC handover ({:.0f}% <= {:.0f}%) -> MSC".format(soc_pct, low_soc)
+            charge_pct = drain_pct = None
+            reason = "low-SOC handover · {:.0f}% ≤ {:.0f}% → MSC".format(soc_pct, low_soc)
         else:
             intended_policy = POLICY_PREDBAT
             intended_keep = DEFAULT_KEEP_FLOOR_PCT
-            reason = "inactive -> hand back to Predbat"
+            charge_pct = drain_pct = None
+            reason = "inactive → Predbat"
 
         gate = str(self.base.get_state_wrapper(SIG_POLICY_CONTROL_ENABLE, default="off")).lower()
         acting = gate in ("on", "true")
@@ -2585,27 +2615,53 @@ class CurtailmentPlugin(PredBatPlugin):
         # it moves into the reason.
         if acting and manual:
             published_policy = override_choice
-            published_reason = "manual override: holding {} (plugin would choose {})".format(override_choice, intended_policy)
+            published_reason = "manual · {} (plugin would {})".format(override_choice, intended_policy)
         else:
             published_policy = intended_policy
             published_reason = reason
 
+        # Headroom shortfall (same formula as the floor — never re-derive on the card).
+        # need = safety × p90 + min(max_reserved, p90); have = soc_max − soc.
+        headroom_need_kwh = None
+        headroom_have_kwh = None
+        headroom_short_kwh = None
+        try:
+            ovf = float(self._overflow_p90 or 0.0)
+            max_res = float(getattr(self, "_effective_max_reserved", MAX_RESERVED_KWH) or MAX_RESERVED_KWH)
+            headroom_need_kwh = round(required_headroom_kwh(ovf, max_res, OVERFLOW_SAFETY_FACTOR), 2)
+            headroom_have_kwh = round(max(0.0, soc_max - soc_kwh), 2)
+            headroom_short_kwh = round(headroom_need_kwh - headroom_have_kwh, 2)
+        except (TypeError, ValueError):
+            pass
+
         # Always publish the intended decision — this is what you watch in observe-only.
+        # Attributes are the single source for the Why This Mode card (report, never re-derive).
         try:
             prefix = self.base.prefix
+            attrs = {
+                "friendly_name": "Curtailment Intended Policy",
+                "icon": "mdi:robot",
+                "keep_floor_pct": round(intended_keep, 0) if intended_keep is not None else None,
+                "low_soc_handover_pct": low_soc,
+                "soc_pct": round(soc_pct, 1),
+                "reason": published_reason,
+                "acting": acting,
+                "manual_override": manual,
+                "policy_override": self._policy_override,
+                "charge_below_pct": round(charge_pct, 1) if charge_pct is not None else None,
+                "drain_above_pct": round(drain_pct, 1) if drain_pct is not None else None,
+                "charge_below_kwh": round(self._charge_below, 2) if plugin_active else None,
+                "drain_above_kwh": round(self._drain_above, 2) if plugin_active else None,
+                "overflow_p90_kwh": round(float(self._overflow_p90 or 0.0), 2),
+                "overflow_safety_factor": OVERFLOW_SAFETY_FACTOR,
+                "headroom_need_kwh": headroom_need_kwh,
+                "headroom_have_kwh": headroom_have_kwh,
+                "headroom_short_kwh": headroom_short_kwh,
+            }
             self.base.dashboard_item(
                 "sensor.{}_curtailment_intended_policy".format(prefix),
                 published_policy,
-                {
-                    "friendly_name": "Curtailment Intended Policy",
-                    "icon": "mdi:robot",
-                    "keep_floor_pct": round(intended_keep, 0) if intended_keep is not None else None,
-                    "low_soc_handover_pct": low_soc,
-                    "soc_pct": round(soc_pct, 1),
-                    "reason": published_reason,
-                    "acting": acting,
-                    "manual_override": manual,
-                },
+                attrs,
             )
         except Exception as e:
             self._log_once("intended_policy_pub_err", "Curtailment: intended policy publish failed: {}".format(e))
@@ -2720,6 +2776,32 @@ class CurtailmentPlugin(PredBatPlugin):
                 self.publish("off", soc_max, dno_limit)
                 # Hand the policy back once if we were driving (RD10).
                 self._publish_dispatch_policy(False, soc_max, getattr(self.base, "soc_kw", 0), soc_max)
+                return
+
+            # Fail closed: unreadable plant SOC → hold position, change nothing.
+            # Never treat a missing read as 0.0 kWh (night re-take, 2026-07-29).
+            if not self._soc_readable():
+                self._last_decision = "hold: SOC unavailable"
+                self._log_once(
+                    "soc_unavailable",
+                    "Curtailment: plant SOC unreadable ({}) — holding position, no policy/writer change".format(SIG_BATTERY_SOC_PCT),
+                )
+                try:
+                    prefix = self.base.prefix
+                    self.base.dashboard_item(
+                        "sensor.{}_curtailment_intended_policy".format(prefix),
+                        self.base.get_state_wrapper(SIG_POLICY_SELECT, default=POLICY_PREDBAT) or POLICY_PREDBAT,
+                        {
+                            "friendly_name": "Curtailment Intended Policy",
+                            "icon": "mdi:alert",
+                            "reason": "hold · SOC unavailable",
+                            "acting": False,
+                            "manual_override": False,
+                            "soc_pct": None,
+                        },
+                    )
+                except Exception:
+                    pass
                 return
 
             floor, phase = self.calculate(dno_limit)

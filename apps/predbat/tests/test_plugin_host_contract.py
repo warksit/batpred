@@ -77,6 +77,53 @@ def test_before_plan_priority_and_chaining():
     return 0
 
 
+def test_load_plugin_skips_duplicate_name():
+    """Second path for the same plugin_name must not construct or register hooks.
+
+    Without this, root + plugins/ both shipping curtailment_plugin.py leaves two
+    instances live on on_update (hooks append; dict overwrite does not unregister).
+    """
+    import os
+    import tempfile
+    import textwrap
+
+    ps = PluginSystem(_mock_base())
+    with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+        body = textwrap.dedent(
+            """
+            class DemoPlugin:
+                PREDBAT_PLUGIN = True
+                instances = 0
+                def __init__(self, base):
+                    DemoPlugin.instances += 1
+                    self.base = base
+                    self.id = DemoPlugin.instances
+                def register_hooks(self, plugin_system):
+                    plugin_system.register_hook("on_update", self.on_update)
+                def on_update(self):
+                    pass
+            """
+        )
+        for d in (d1, d2):
+            path = os.path.join(d, "demo_plugin.py")
+            with open(path, "w") as f:
+                f.write(body)
+
+        ps.load_plugin(d1, "demo_plugin")
+        assert "demo_plugin" in ps.plugins
+        first = ps.plugins["demo_plugin"]
+        assert len(ps.hooks["on_update"]) == 1
+        assert first.id == 1
+
+        ps.load_plugin(d2, "demo_plugin")
+        assert ps.plugins["demo_plugin"] is first, "dict must keep first instance"
+        assert len(ps.hooks["on_update"]) == 1, "must not append a second hook"
+        assert first.id == 1
+        assert ps.base.log.called
+    print("  test_load_plugin_skips_duplicate_name: PASSED")
+    return 0
+
+
 def test_before_plan_ignores_bad_return_and_isolates_errors():
     """Non-dict returns are ignored; one raising callback must not kill the chain."""
     ps = PluginSystem(_mock_base())
@@ -128,6 +175,7 @@ def run_plugin_host_contract_tests(_my_predbat=None):
     for fn in (
         test_host_exposes_before_plan_api,
         test_before_plan_priority_and_chaining,
+        test_load_plugin_skips_duplicate_name,
         test_before_plan_ignores_bad_return_and_isolates_errors,
         test_predbat_update_path_calls_before_plan_hooks,
     ):
