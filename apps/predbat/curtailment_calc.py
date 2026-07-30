@@ -360,7 +360,7 @@ def compute_charge_below(p10_recovery_floor, soc_keep):
     return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
 
 
-def compute_pre_pv_target(soc_keep, soc_max, buffer_pct, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.2):
+def compute_pre_pv_target(soc_keep, soc_max, buffer_pct, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.05):
     """R62 (2026-07-07): forecast-driven pre-PV drain target.
 
     Replaces R52's static `soc_keep + buffer_pct% × soc_max` with a target the
@@ -764,7 +764,7 @@ def smooth_overflow_samples(samples, now_minutes, window_minutes=30):
     return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
-def required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor=1.2):
+def required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor=1.05):
     """**The** definition of "how much battery headroom does the forecast overflow
     require?". Every site that asks this question calls this function.
 
@@ -797,7 +797,7 @@ def required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor=1.2):
     return safety_factor * ov + min(max_reserved_kwh, ov)
 
 
-def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_factor=1.2, max_reserved_kwh=1.8):
+def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_factor=1.05, max_reserved_kwh=1.8):
     """Headroom margin against the SAFETY-FACTORED overflow requirement, kWh.
 
         margin = headroom - (safety_factor × overflow + min(max_reserved, overflow))

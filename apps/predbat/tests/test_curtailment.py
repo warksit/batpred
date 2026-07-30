@@ -855,14 +855,22 @@ def test_required_headroom_is_defined_once():
     Every site must now call required_headroom_kwh(). Differences between sites
     must be explicit ARGUMENTS, not separate expressions that can drift.
     """
+    # NOTE these assert the SHAPE against OVERFLOW_SAFETY_FACTOR, not a literal.
+    # The factor is expected to be retuned as the overflow meters bank real
+    # DC-coupled days (see test_R9_overflow_safety_factor_is_1_05), and a
+    # hardcoded literal here would fail on every retune while proving nothing
+    # about the invariant this test exists for -- one definition, differences
+    # expressed as arguments.
+    from curtailment_plugin import OVERFLOW_SAFETY_FACTOR as SF
+
     # Matches the Headroom Floor: safety x overflow + tapered reserve.
-    assert abs(required_headroom_kwh(6.6, 1.8) - (1.2 * 6.6 + 1.8)) < 1e-9
+    assert abs(required_headroom_kwh(6.6, 1.8) - (SF * 6.6 + 1.8)) < 1e-9
     # Tapered: reserve cannot exceed the overflow itself.
-    assert abs(required_headroom_kwh(1.0, 1.8) - (1.2 * 1.0 + 1.0)) < 1e-9
+    assert abs(required_headroom_kwh(1.0, 1.8) - (SF * 1.0 + 1.0)) < 1e-9
     # R49-reduced buffer must flow through, not be hardcoded to the constant.
     assert required_headroom_kwh(6.6, 1.26) < required_headroom_kwh(6.6, 1.8)
     # Planning sites deliberately carry no reserve — expressed as an argument.
-    assert abs(required_headroom_kwh(6.6, 0.0) - 1.2 * 6.6) < 1e-9
+    assert abs(required_headroom_kwh(6.6, 0.0) - SF * 6.6) < 1e-9
     # Degenerate inputs are safe.
     assert required_headroom_kwh(0.0, 1.8) == 0.0
     assert required_headroom_kwh(-5.0, 1.8) == 0.0
@@ -877,11 +885,15 @@ def test_no_drain_and_floor_agree_when_r49_reduces_the_buffer():
 
     Both must consume the same buffer value.
     """
+    from curtailment_plugin import OVERFLOW_SAFETY_FACTOR as SF
+
     headroom, overflow, reduced = 8.05, 6.6, 1.26
-    fits = compute_overflow_fits_margin(headroom, overflow, 1.2, reduced)
-    assert abs(fits - (headroom - required_headroom_kwh(overflow, reduced))) < 1e-9, "fits-margin must be headroom minus the shared requirement"
+    # Both sides must use the SAME factor, or this compares two different
+    # requirements and the agreement it claims to prove is accidental.
+    fits = compute_overflow_fits_margin(headroom, overflow, SF, reduced)
+    assert abs(fits - (headroom - required_headroom_kwh(overflow, reduced, SF))) < 1e-9, "fits-margin must be headroom minus the shared requirement"
     # And it must actually differ from the constant-buffer answer, or the test proves nothing.
-    assert abs(compute_overflow_fits_margin(headroom, overflow, 1.2, 1.8) - fits) > 0.5
+    assert abs(compute_overflow_fits_margin(headroom, overflow, SF, 1.8) - fits) > 0.5
     print("  test_no_drain_and_floor_agree_when_r49_reduces_the_buffer: PASSED")
 
 
@@ -4606,6 +4618,72 @@ def test_floor_component_is_winner_matches_source_label():
     print("  test_floor_component_is_winner_matches_source_label: PASSED (labels match compute_floor_with_source)")
 
 
+def test_R9_overflow_safety_factor_is_1_05():
+    """R9: OVERFLOW_SAFETY_FACTOR is 1.05, not 1.2.
+
+    WHY (2026-07-30, user decision)
+    ------------------------------
+    The factor multiplies an ALREADY-CONSERVATIVE input. Overflow is fed from
+    the p90 Solcast band, and overflow is an integral ABOVE a threshold, so
+    forecast conservatism is amplified before the factor is applied at all.
+    Measured leverage across the April fixture replay: a 13% generation
+    over-forecast became a 36% overflow over-forecast (3.36x), and actual
+    overflow never once exceeded the p90-derived estimate in 11 days.
+
+    1.2 on top of that reserved roughly double the headroom actually needed,
+    and over-reserving is NOT free -- it is paid for as a deeper pre-dawn drain
+    and the overnight import that follows.
+
+    CAVEAT ON THE EVIDENCE, recorded honestly: those April fixtures were
+    measured through the AC-coupled SMA, which clipped PV above the inverter
+    ceiling and therefore UNDERSTATED actual overflow -- flattering p90. The
+    first DC-coupled day measured (19 Jul) showed only 16% margin against p90,
+    versus 56% mean in April. So 1.05 is a deliberate step toward the truth
+    with the meter now in place to check it, not a number the data has settled.
+
+    HOW TO REFINE THIS -- do not re-derive from fixtures
+    ---------------------------------------------------
+    As of 2026-07-29 the actual overflow is metered natively and exactly:
+
+        sensor.curtailment_overflow_power    template, max(0, pv - load - cap)
+        sensor.curtailment_overflow_energy   Riemann integral of the above
+        sensor.curtailment_overflow_daily    utility_meter, daily cycle
+
+    The chain applies the clipping at native sensor resolution and only then
+    integrates, so its daily total survives HA's hourly downsampling exactly --
+    unlike reconstructing from 5-minute statistics, which understated a
+    broken-cloud day by 63% and expires after the ~10-day recorder window.
+
+    To retune: compare sensor.curtailment_overflow_daily (actual) against the
+    daily max of sensor.predbat_curtailment_overflow_p90 (forecast) over a few
+    weeks of DC-coupled days. The factor should cover the worst observed
+    actual/p90 ratio with a little margin. If actual never approaches p90, cut
+    it further; if any day exceeds p90, raise it.
+
+    The number that ultimately matters is neither of those, though: it is
+    whether we ever actually curtailed (SOC at max AND export at cap) versus
+    how much we imported overnight. Forecast calibration is a proxy for that.
+    """
+    from curtailment_plugin import OVERFLOW_SAFETY_FACTOR
+
+    assert abs(OVERFLOW_SAFETY_FACTOR - 1.05) < 1e-9, f"expected 1.05, got {OVERFLOW_SAFETY_FACTOR}"
+
+    # 10 kWh overflow, 1.8 kWh reserve -> 1.05*10 + min(1.8, 10) = 12.3
+    got = required_headroom_kwh(10.0, 1.8, OVERFLOW_SAFETY_FACTOR)
+    assert abs(got - 12.3) < 1e-6, f"expected 12.3 kWh required headroom, got {got}"
+
+    # Small-overflow day: the reserve term tapers with overflow (R45), so
+    # 1.05*1.0 + min(1.8, 1.0) = 2.05 -- NOT 1.05 + 1.8.
+    got = required_headroom_kwh(1.0, 1.8, OVERFLOW_SAFETY_FACTOR)
+    assert abs(got - 2.05) < 1e-6, f"expected 2.05 kWh on a small-overflow day, got {got}"
+
+    # The change must actually free headroom: at 10 kWh overflow, 1.5 kWh more
+    # room than the old 1.2 -- i.e. 1.5 kWh less pre-dawn drain.
+    freed = required_headroom_kwh(10.0, 1.8, 1.2) - required_headroom_kwh(10.0, 1.8, OVERFLOW_SAFETY_FACTOR)
+    assert abs(freed - 1.5) < 1e-6, f"expected 1.5 kWh freed vs the old 1.2, got {freed}"
+    print(f"  test_R9_overflow_safety_factor_is_1_05: PASSED (frees {freed:.2f} kWh of drain at 10 kWh overflow)")
+
+
 def test_R55_safety_pct_helper_clamps_range():
     """HA helper input_number.curtailment_overnight_safety_pct clamped to [0, 200]."""
     pv = {}
@@ -6552,6 +6630,7 @@ def run_curtailment_tests(my_predbat=None):
         test_R55_target_soc_uses_overnight_when_off,
         test_R55_target_soc_uses_floor_when_active,
         test_numeric_sensors_carry_state_class,
+        test_R9_overflow_safety_factor_is_1_05,
         test_floor_component_is_winner_matches_source_label,
         test_R55_safety_pct_helper_clamps_range,
         test_R55_overnight_target_raises_effective_keep_in_calculate,
