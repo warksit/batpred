@@ -38,7 +38,7 @@ MAPPERS = [
     (
         "predbat_max_charging_limit_action.yaml",
         "input_number.charge_rate",
-        "sensor.sigen_inverter_ess_rated_charging_power",
+        "sensor.sigen_plant_ess_rated_charging_power",
         "number.sigen_plant_ess_max_charging_limit",
     ),
     (
@@ -75,11 +75,34 @@ def value_template(doc, target):
 
 
 def condition_template(doc):
-    """Return the guard condition template, or None if the mapper has no guard."""
+    """Return the guard condition template, or None if the mapper has no guard.
+
+    Kept for the has-a-guard-at-all check; the guard itself is native
+    numeric_state, evaluated by guard_passes().
+    """
     for cond in _key(doc, "conditions", "condition") or []:
         if isinstance(cond, dict) and cond.get("condition") == "template":
             return cond["value_template"]
     return None
+
+
+def _numeric_state_passes(cond, states):
+    """Evaluate a native numeric_state condition the way HA does.
+
+    Key behaviour: a non-numeric state (unknown / unavailable) makes the
+    condition FALSE rather than raising. That is precisely the property being
+    relied on to skip the write instead of hard-failing.
+    """
+    raw = states.get(cond["entity_id"], "unknown")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if "above" in cond and not value > float(cond["above"]):
+        return False
+    if "below" in cond and not value < float(cond["below"]):
+        return False
+    return True
 
 
 _NO_DEFAULT = object()
@@ -125,11 +148,25 @@ def render(template, states):
 
 
 def guard_passes(doc, states):
-    """True if HA would run the actions given these states."""
-    cond = condition_template(doc)
-    if cond is None:
+    """True if HA would run the actions given these states.
+
+    Handles both native numeric_state guards (what these mappers use) and
+    template guards, so the harness keeps working either way.
+    """
+    conditions = _key(doc, "conditions", "condition") or []
+    if not conditions:
         return True
-    return render(cond, states).strip().lower() == "true"
+    for cond in conditions:
+        if not isinstance(cond, dict):
+            continue
+        kind = cond.get("condition")
+        if kind == "numeric_state":
+            if not _numeric_state_passes(cond, states):
+                return False
+        elif kind == "template":
+            if render(cond["value_template"], states).strip().lower() != "true":
+                return False
+    return True
 
 
 def run_yaml_rate_mapper_tests():

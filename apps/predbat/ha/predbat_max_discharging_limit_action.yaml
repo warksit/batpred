@@ -12,21 +12,26 @@ description: >-
   See predbat_max_charging_limit_action.yaml for the full rationale on why this
   guards rather than defaults.
 
-  NOTE the source sensor here is the PLANT-prefixed rated power
-  (sensor.sigen_plant_ess_rated_discharging_power) whereas the charging mapper
-  reads the INVERTER-prefixed one. That asymmetry is inherited from the original
-  HA-only configs and is preserved deliberately -- do not "tidy" it without
-  checking both entities exist, they are different entities.
+  NOTE this mapper was the CORRECT one. Its twin referenced
+  sensor.sigen_inverter_ess_rated_charging_power, which does not exist -- the
+  Sigen integration exposes sigen_plant_ess_rated_*_power and
+  sigen_inverter_ess_rated_*_{charge,discharge}_power, and the charging mapper
+  crossed the two families. Both now use the PLANT family. Keep them symmetric:
+  test_yaml_rate_mappers.py pins the convention so a future crossing fails a test
+  rather than silently disabling a writer for months.
 id: automation_sigen_ess_max_discharging_limit_input_number_action
 triggers:
   - trigger: state
     entity_id: input_number.discharge_rate
 conditions:
-  # Act only on values we can actually read.
-  - condition: template
-    value_template: >-
-      {{ states('input_number.discharge_rate') | is_number
-         and states('sensor.sigen_plant_ess_rated_discharging_power') | is_number }}
+  # Act only on values we can actually read -- native numeric_state, see the
+  # charging mapper for why this is not a template condition.
+  - condition: numeric_state
+    entity_id: input_number.discharge_rate
+    above: -1
+  - condition: numeric_state
+    entity_id: sensor.sigen_plant_ess_rated_discharging_power
+    above: 0
 actions:
   - action: number.set_value
     target:

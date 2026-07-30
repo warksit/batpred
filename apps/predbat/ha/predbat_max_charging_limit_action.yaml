@@ -6,9 +6,33 @@ description: >-
   writer-ownership table in .claude/CLAUDE.md). Enabled only while Predbat owns the
   writer role; CM disables all three and enables sig_dispatch_heartbeat instead.
 
+  DEAD SINCE INCEPTION (found 2026-07-29). This is the STOCK automation from
+  docs/inverter-setup.md, which references sensor.sigen_inverter_ess_rated_charging_power.
+  That is not a Predbat defect -- the same doc carries an errata note:
+
+      "Some Sigenergy Predbat users have reported that their Sigenergy modbus
+       integration has created some of the entities that Predbat requires with
+       different names ... sensor.sigen_inverter_ess_rated_charging_power is
+       sensor.sigen_inverter_ess_rated_charge_power"
+
+  The YAML is copy-pasteable but only correct once that note is applied. Here it
+  was pasted verbatim and the note was missed, so states() always returned
+  'unknown', the undefaulted | float always threw, and the automation hard-failed
+  on EVERY trigger. It had never once written ess_max_charging_limit -- so
+  whenever Predbat owned the writer role it could not limit or freeze charging.
+  Nothing caught it: no repo file, no harness. (The sibling discharge mapper WAS
+  substituted, to the plant family, which is why only this one was dead.)
+
+  This install has all four candidates with identical values
+  (plant/inverter x charging/charge = 8.8; discharging/discharge = 9.6). We use
+  the PLANT family in both mappers so the pair is self-consistent; the doc's
+  inverter naming would work equally well. Note the sig_dispatch_heartbeat uses
+  the INVERTER family -- a third convention, left alone deliberately since it
+  works and re-pointing a live writer for tidiness is not worth the risk.
+
   ROBUSTNESS (2026-07-29): the condition below exists because a router/LAN event
   took the Sigen Modbus link down (Failed to connect to 192.168.5.145:502) and left
-  sigen_inverter_ess_rated_charging_power = 'unknown'. The template then threw
+  the rated-power sensors 'unknown'. The template then threw
 
       float got invalid input 'unknown' ... but no default was specified
 
@@ -29,10 +53,16 @@ triggers:
     entity_id: input_number.charge_rate
 conditions:
   # Act only on values we can actually read. See ROBUSTNESS above.
-  - condition: template
-    value_template: >-
-      {{ states('input_number.charge_rate') | is_number
-         and states('sensor.sigen_inverter_ess_rated_charging_power') | is_number }}
+  # numeric_state is the NATIVE form of "is this readable as a number" -- it
+  # evaluates false (not an error) when the entity is unknown/unavailable,
+  # which is exactly the skip we want, and it is validated at config load
+  # rather than failing at runtime like a template condition.
+  - condition: numeric_state
+    entity_id: input_number.charge_rate
+    above: -1
+  - condition: numeric_state
+    entity_id: sensor.sigen_plant_ess_rated_charging_power
+    above: 0
 actions:
   - action: number.set_value
     target:
@@ -40,5 +70,5 @@ actions:
     data:
       value: >-
         {{ [(states('input_number.charge_rate') | float(0) / 1000) | round(2),
-            states('sensor.sigen_inverter_ess_rated_charging_power') | float(0)] | min }}
+            states('sensor.sigen_plant_ess_rated_charging_power') | float(0)] | min }}
 mode: single
