@@ -9,6 +9,10 @@ Before modifying ANY curtailment file (curtailment_plugin.py, curtailment_calc.p
 3. **If a requirement seems wrong**, discuss with the user before changing it. Update REQUIREMENTS.md if agreed.
 4. **R25 is the key design principle**: once PV-load > DNO, we have NO control levers. All management (drain/charge/hold) must happen BEFORE overflow. Never remove the drain mechanism.
 
+## Stock Predbat files (Charter — Working practices)
+
+**Do not edit upgrade-overwritten stock Predbat modules** (`config.py`, `plan.py`, `fetch.py`, `predbat.py`, etc.) for site behaviour. A Predbat update overwrites them and silently undoes the patch. Put site logic in our tree: `curtailment_*`, plugins, `ha/*.yaml`, HA entities. Prefer expert mode / existing switches over patching stock config gates.
+
 ## TDD for Curtailment
 
 When a flaw is found: **write a failing test FIRST**, then fix the code. Never deploy a fix without a test that would have caught the bug. Never break production code to make tests pass (R36/R37).
