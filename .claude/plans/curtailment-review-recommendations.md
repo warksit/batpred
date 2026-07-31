@@ -533,3 +533,36 @@ The path out:
 Recommended analysis order: gather cloudy-morning A/B from meters under current C; then choose A or B deliberately. Do not default to B without that look.
 
 **Overall sequence:** A0 → measure → A1 → B (1.1 then 1.2) → C → D only if needed.
+
+---
+
+## 10. Status snapshot (2026-07-31) — survive a context clear
+
+### Plan progress
+
+| Phase | Status |
+|-------|--------|
+| **A0** (footguns + diagnostics UX) | **Done** and pushed on `cm-on-latest-predbat` |
+| **A1** (one floor + dawn_load + ceiling) | **Deferred** — user chose measure more before A/B/C (2026-07-31) |
+| **B / C / D** | Not started |
+
+### A1 ceiling decision
+
+**Deferred — not A, B, or C yet.** Re-open only after a few day-types of meters (overflow daily vs overnight/morning import; sunny big-overflow vs cloudy). Raw plant meters are already in place; no new hardware required.
+
+### Live ops (not all in Predbat code)
+
+| Item | Live state (as of 2026-07-31) |
+|------|-------------------------------|
+| `switch.predbat_expert_mode` | **On** (stock `set_charge_freeze` is expert-gated — do not ungate in stock `config.py`) |
+| Automation `predbat_charge_freeze_off_on_drain_mornings` | **On** — 04:00 turn freeze **off** if p90>1; 07:00 restore **on**. Repo: `apps/predbat/ha/predbat_charge_freeze_drain_window.yaml` |
+| Battery loss / discharge loss | **0.014 / 0.014** (from ESS lifetime DC ratio); inverter_loss left **0.04** |
+| `apps.yaml` `rates_export: 0.0` | **Removed** on box (was dead under Octopus export sensor); use `rates_export_override` only if forcing 0p planning |
+
+### Design north star (not coded)
+
+Comfort floor until **PV covers load**; only allow deep overflow floor when cover is real **and** headroom is still needed. Today’s jump is at first ~0.1 kW PV (formula swap), not at cover — that mismatch is why 06:15 feels arbitrary.
+
+### Charter reminder
+
+**Do not edit upgrade-overwritten stock Predbat files** for site behaviour. Prefer our tree + HA entities/automations. See REQUIREMENTS Working practices + `.claude/CLAUDE.md`.

@@ -1,0 +1,68 @@
+# Predbat charge-freeze Cosy window (drain days)
+#
+# Problem this solves: on big-overflow days Predbat Freeze Charging during
+# Cosy cheap (e.g. 04:00–04:51 2026-07-31) holds SOC and imports for load,
+# fighting the need to get the battery lower before PV.
+#
+# Gate: sensor.predbat_curtailment_overflow_p90 > 1 kWh only.
+# Do NOT use drain_above here — while phase is still Off (pre-activation),
+# drain_above sits near full capacity and the comparison never passes. That
+# failed the first version on 2026-07-31 morning (p90~19 but drain_above=18.08).
+#
+# 04:00: freeze Off if expert on and p90 > 1.
+# 07:00: freeze On again (Cosy window over).
+#
+# Prerequisites:
+#   - switch.predbat_expert_mode On — stock Predbat only exposes
+#     switch.predbat_set_charge_freeze under expert mode. Do NOT ungate that
+#     switch in stock config.py (upgrade-overwritten); leave expert on.
+#   - Does NOT force-export; only removes Freeze Charging as a plan option.
+#     Big headroom drains still need CM Max Export / writer ownership.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Deploy by replacing the matching block in /homeassistant/automations.yaml
+# then reload automations.
+
+id: "1785300001001"
+alias: "Predbat charge freeze off on drain mornings"
+description: >-
+  04:00–07:00 Cosy window: disable charge freeze when overflow_p90 > 1 kWh
+  (material headroom day). Restore freeze at 07:00. Gate is p90 only — not
+  drain_above (unusable while phase Off). Requires expert mode so the stock
+  set_charge_freeze switch exists. Repo:
+  apps/predbat/ha/predbat_charge_freeze_drain_window.yaml.
+mode: single
+
+triggers:
+  - trigger: time
+    at: "04:00:00"
+    id: window_start
+  - trigger: time
+    at: "07:00:00"
+    id: window_end
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: window_start
+          - condition: state
+            entity_id: switch.predbat_expert_mode
+            state: "on"
+          - condition: numeric_state
+            entity_id: sensor.predbat_curtailment_overflow_p90
+            above: 1.0
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.predbat_set_charge_freeze
+      - conditions:
+          - condition: trigger
+            id: window_end
+          - condition: state
+            entity_id: switch.predbat_expert_mode
+            state: "on"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.predbat_set_charge_freeze
