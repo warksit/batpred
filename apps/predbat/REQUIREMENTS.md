@@ -144,6 +144,7 @@ is normative for agents and humans editing CM.
 | Old way (do not) | New way (do) |
 |---|---|
 | Ship two copies of `curtailment_plugin.py` (`apps/predbat/` and `plugins/`) | **One tree only.** `plugin_system` must refuse a second load of the same `plugin_name` (hooks append; dict overwrite does not unregister). |
+| **Edit stock Predbat files that a Predbat upgrade overwrites** (e.g. `config.py`, `plan.py`, `fetch.py`, `predbat.py`, core modules that come from upstream). Local "ungate this switch" patches die on the next pull and reintroduce silent breakage. | **Do not.** Put site behaviour in **our** tree only: `curtailment_*`, `*_plugin.py`, `ha/*.yaml`, tests, Charter. Prefer HA helpers/automations, plugin hooks (`on_before_plan` / `on_update`), or config *entities* (expert mode, switches). If stock must change, upstream a PR or re-apply via an explicit post-upgrade patch list — never a silent one-off on the live box. |
 | Treat missing SOC as `0.0` and keep driving | **Fail closed:** unreadable plant SOC → hold position, change nothing, say so in `reason`. |
 | Re-derive headroom / Schmitt / safety factor on the dashboard | **Report** plugin attrs (`reason`, band %, headroom_*, override label). Card may format; it must not invent a second decision. |
 | Mix % and kWh on every line of Why This Mode | **At a glance: % SOC** for band and battery; kWh only as secondary detail. |
