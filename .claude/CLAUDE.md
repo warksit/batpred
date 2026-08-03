@@ -27,6 +27,23 @@ When a flaw is found: **write a failing test FIRST**, then fix the code. Never d
 - **Do not arbitrarily remove features** without checking REQUIREMENTS.md. The drain mechanism was removed twice and had to be restored both times.
 - **Discuss before coding** when the approach is uncertain. Don't iterate through 10 broken deploys mid-day.
 
+## Diagnosing ownership — use `predbat.status`, NOT the read_only switch
+
+**`switch.predbat_set_read_only` lags Predbat's internal state by hours.** On
+2026-08-03 CM wrote `read_only -> False` at 20:16:06, Predbat went Read-Only →
+**Demand** by 20:20:30, and the switch entity still read `on` at 20:30 (unchanged
+since 20:05:23). Apparent "changes" at 22:56 / 14:55 on other days are the entity
+being reconciled, not the mode changing.
+
+Reading the switch instead of `predbat.status` cost a long live misdiagnosis on
+2026-08-03 — it looked like CM's write path was broken. It is not.
+
+Also: **every change to that switch forces a full inverter reset to defaults**
+(charge/discharge disabled, rates to full, reserve to default —
+`docs/customisation.md:38`, `config.py` `reset_inverter_force: True`). It is
+designed as an occasional human mode switch, not a high-frequency mutex. See
+plan §11 O3/O4.
+
 ## HA Automation Version Control
 
 The HA automation `curtailment_manager_dynamic_export_limit` is stored in:
