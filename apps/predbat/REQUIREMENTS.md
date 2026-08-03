@@ -1380,6 +1380,26 @@ with native `calendar` start/end triggers.
 session_live: "{{ is_state('calendar...octoplus_saving_sessions', 'on') }}"
 ```
 
+**RD14c-display (2026-08-03, IN FORCE) — the session dump must be REPORTED as the
+policy in force.** Because the heartbeat forces Max Export without writing
+`sig_dispatch_policy`, nothing downstream can see the dump: the select keeps the
+pre-session policy and `intended_policy` published the plugin's own Schmitt wish.
+Observed live 2026-08-03 19:13, mid-session — battery −3.84 kW, export 3.68 kW at
+the cap, card reading "→ Hold Battery / Hold · surplus fits". The publish site had
+documented the precedence `override > session > select` since RD13a but only ever
+implemented the override rung; this is the 3dca0d06 defect one layer down.
+
+`_publish_dispatch_policy` MUST mirror the heartbeat's effective-policy expression
+term for term, **including the `!= Predbat` guard** (after handback Predbat owns
+the machine and the heartbeat stands down, so the display must too), and MUST read
+the **calendar** — the same entity the heartbeat reads. A display mirror is never a
+second opinion. It publishes `session_dispatch` so the card can tell "the select
+differs from reality because the heartbeat owns it" apart from a real
+"not applied" fault.
+Implemented in: `curtailment_plugin._is_session_dispatching`, `SIG_SAVING_SESSION_CALENDAR`.
+Tests: `test_session_dump_is_published_as_the_effective_policy`,
+`test_session_dump_respects_the_heartbeat_precedence_exactly`.
+
 **Why the calendar, not the binary sensor or a hand-rolled window.** The
 calendar is *"on when a saving session that the account has joined is active"* —
 **joined-only**, so an un-joined session can never make us export for free — and
