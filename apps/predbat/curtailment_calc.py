@@ -339,6 +339,37 @@ def compute_drain_above(reserve, overflow_floor, effective_keep=None, session_pr
     return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor, session_protect_kwh)
 
 
+def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0):
+    """Which arm of `compute_drain_above` set the floor.
+
+    Returns one of: "session_protect", "overflow_floor", "deep_floor", "reserve".
+
+    The sensor is called "Headroom Floor (P90 overflow)", but on a saving-session
+    day the value comes from `session_protect` instead — observed live
+    2026-08-03, floor 10.22 kWh published next to `overflow_floor_kwh: 3.39`
+    with nothing to explain the difference. The dashboard must be able to name
+    the term that won.
+
+    Derived FROM compute_drain_above rather than re-implementing the max, so the
+    two can never disagree (the `required_headroom_kwh` drift lesson). On a tie
+    the more surprising arm is reported first: a floor held up by a session is
+    the thing a reader cannot infer from the other attributes.
+    """
+    value = compute_drain_above(reserve, overflow_floor, None, session_protect_kwh)
+    for name, term in (
+        ("session_protect", session_protect_kwh),
+        ("overflow_floor", overflow_floor),
+        ("deep_floor", DEEP_DISCHARGE_FLOOR_KWH),
+        ("reserve", reserve),
+    ):
+        try:
+            if float(term) >= value - 1e-9:
+                return name
+        except (TypeError, ValueError):
+            continue
+    return "overflow_floor"
+
+
 def compute_charge_below(p10_recovery_floor, soc_keep):
     """Charge target: SOC level below which the system must not be exporting.
 

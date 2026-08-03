@@ -55,6 +55,7 @@ from curtailment_calc import (
     compute_charge_below,
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_drain_above,
+    compute_drain_above_source,
     compute_proposed_phase,
     phase_to_policy,
     compute_pre_pv_target,
@@ -229,6 +230,16 @@ OVERRIDE_LABELS = {
     "max_export": "must drain",
 }
 
+# Human labels for the arm of compute_drain_above that set the Headroom Floor.
+# The card REPORTS these (Charter: never re-derive a second decision).
+DRAIN_SOURCE_LABELS = {
+    "session_protect": "saving session",
+    "overflow_floor": "P90 overflow",
+    "deep_floor": "deep-discharge floor",
+    "reserve": "inverter reserve",
+    "inactive": "CM inactive",
+}
+
 # v19 tapered cap (R45): reserved headroom = min(MAX_RESERVED_KWH, remaining_overflow).
 # At peak overflow the buffer clamps at 1.8 kWh (10% of 18.08 kWh = current R45 cap).
 # As overflow winds down toward safe_time, buffer tapers to 0 and max_target_soc
@@ -378,6 +389,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_fits_latched = False
         self._session_active = False
         self._session_protect_kwh = 0.0
+        # Which arm of compute_drain_above set the published Headroom Floor.
+        self._drain_above_source = "overflow_floor"
         # v32 dawn-flap latch: once the pre-PV drain fires, CM owns the day. When the
         # drain completes but PV hasn't arrived (actual_pv < 0.1) and overflow is still
         # forecast, HOLD active instead of handing back to Predbat — otherwise the
@@ -2253,9 +2266,14 @@ class CurtailmentPlugin(PredBatPlugin):
         if plugin_active:
             charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh), 2)
+            # Name the arm that won so the sensor (and the card) can explain a
+            # floor that its own P90 attributes do not account for.
+            drain_above_source = compute_drain_above_source(reserve, self._overflow_floor_kwh, self._session_protect_kwh)
         else:
             charge_below = 0.0
             drain_above = round(soc_max, 2)
+            drain_above_source = "inactive"
+        self._drain_above_source = drain_above_source
 
         # Store for _publish_dispatch_policy (RD9): the v30 policy selection reuses
         # the same split thresholds this cycle rather than recomputing them.
@@ -2323,6 +2341,15 @@ class CurtailmentPlugin(PredBatPlugin):
                 "soc_pct": round(drain_above / soc_max * 100.0, 1) if soc_max else None,
                 "overflow_p90_kwh": self._overflow_p90,
                 "overflow_floor_kwh": round(self._overflow_floor_kwh, 2) if self._overflow_floor_kwh is not None else None,
+                # Which arm of the max actually set this floor. Without it the
+                # sensor publishes only the P90 terms and cannot explain itself
+                # on a saving-session day (live 2026-08-03: 10.22 vs a published
+                # overflow_floor of 3.39).
+                "source": drain_above_source,
+                "source_label": DRAIN_SOURCE_LABELS.get(drain_above_source, drain_above_source),
+                "session_reserve_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else 0.0,
+                "session_protect_kwh": round(self._session_protect_kwh, 2) if self._session_protect_kwh else 0.0,
+                "session_start": self._get_session_start(),
                 "drives": "SOC above this -> Max Export (sell down to make room)",
             },
         )
@@ -2417,6 +2444,20 @@ class CurtailmentPlugin(PredBatPlugin):
                 mins = 0.0
             best_mins = max(best_mins, mins)
         return compute_session_reserve(best_mins, cap_kw)
+
+    def _get_session_start(self):
+        """ISO start time of the active/next joined saving session, or None.
+
+        Published alongside the reserve so the dashboard can say WHEN the floor
+        is being held for, not just how much — 'when' is half the explanation."""
+        for attr in ("current_joined_event_start", "next_joined_event_start"):
+            try:
+                value = self.base.get_state_wrapper(SIG_SAVING_SESSION, attribute=attr, default=None)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return str(value)
+        return None
 
     def _is_saving_session_active(self):
         """True while an Octopus saving session is currently running (the binary
@@ -2602,7 +2643,11 @@ class CurtailmentPlugin(PredBatPlugin):
             drain_pct = self._drain_above / max(soc_max, 0.1) * 100.0
             ovr_label = OVERRIDE_LABELS.get(self._policy_override) if self._policy_override else None
             ovr = " · {}".format(ovr_label) if ovr_label else ""
-            reason = "{}{} · {:.0f}% · band {:.0f}–{:.0f}%".format(schmitt, ovr, soc_pct, charge_pct, drain_pct)
+            # When the upper edge of the band is set by something other than P90
+            # overflow, say so — otherwise the band is unexplainable from the
+            # card's own numbers (live 2026-08-03, session floor read as P90).
+            src = " · drain floor: saving session" if self._drain_above_source == "session_protect" else ""
+            reason = "{}{} · {:.0f}% · band {:.0f}–{:.0f}%{}".format(schmitt, ovr, soc_pct, charge_pct, drain_pct, src)
         elif plugin_active:
             intended_policy = POLICY_PREDBAT
             intended_keep = None
@@ -2682,6 +2727,13 @@ class CurtailmentPlugin(PredBatPlugin):
                 "overnight_target_pct": overnight_target_pct,
                 "overflow_p90_kwh": round(float(self._overflow_p90 or 0.0), 2),
                 "overflow_safety_factor": OVERFLOW_SAFETY_FACTOR,
+                # What set the drain floor, for the Why This Mode card. % first
+                # (A0: at-a-glance is % SOC), kWh as the detail.
+                "drain_above_source": self._drain_above_source,
+                "drain_above_source_label": DRAIN_SOURCE_LABELS.get(self._drain_above_source, self._drain_above_source),
+                "session_reserve_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else 0.0,
+                "session_reserve_pct": round(self._session_reserve_kwh / max(soc_max, 0.1) * 100.0, 1) if self._session_reserve_kwh else 0.0,
+                "session_start": self._get_session_start(),
                 "headroom_need_kwh": headroom_need_kwh,
                 "headroom_have_kwh": headroom_have_kwh,
                 "headroom_short_kwh": headroom_short_kwh,

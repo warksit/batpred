@@ -1793,6 +1793,19 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
     away before the session. `compute_drain_above` is otherwise pure-curtailment (v31);
     `session_protect` is 0 on days with no session, so those days are unchanged. The
     reserve also feeds `charge_below` (recovery) as before.
+    - **(a2) Name the driver (2026-08-03, IN FORCE).** `sensor.predbat_curtailment_drain_above`
+    is titled "Headroom Floor (P90 overflow)" and publishes only P90 terms, so on a session
+    day it showed 10.22 kWh next to `overflow_floor_kwh: 3.39` with nothing to account for
+    the remaining 6.83. The floor was correct and unauditable. The sensor MUST publish
+    `source` (the winning arm of `compute_drain_above`) plus `session_reserve_kwh`,
+    `session_protect_kwh` and `session_start`; `intended_policy` MUST carry
+    `drain_above_source` + `session_reserve_pct` so the Why This Mode card can REPORT the
+    cause instead of re-deriving it, and `reason` names the session when it sets the floor.
+    `compute_drain_above_source` is derived FROM `compute_drain_above` — never a second
+    copy of the max (the `required_headroom_kwh` drift lesson).
+    Implemented in: `curtailment_calc.compute_drain_above_source`,
+    `curtailment_plugin._get_session_start`. Tests: `test_drain_above_source_mirrors_compute_drain_above`,
+    `test_drain_above_publishes_its_source`, `test_why_this_mode_reports_session_reserve`.
     - **(b) Dump during the session** — while the session is LIVE, the RD12 override forces
     `Max Export` to sell the reserve at the cap; protection drops (reserve not re-added),
     so it drains to the overnight target. Resumes the lifecycle when the session ends.

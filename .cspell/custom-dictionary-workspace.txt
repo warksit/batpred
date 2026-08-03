@@ -82,6 +82,7 @@ darkgreen
 darkred
 darray
 dasharray
+dataclass
 datacorrect
 datain
 datalist
@@ -169,6 +170,8 @@ fline
 FLOMASTA
 fontsize
 fontweight
+footgun
+footguns
 Forestfire
 foxess
 foxesscloud
@@ -505,12 +508,14 @@ tunables
 twinx
 tzfile
 tzpath
+unauditable
 unconfigured
 undeployed
 underforecast
 underpredict
 underpredicted
 underpredicts
+ungate
 unparseable
 unsmoothed
 unstaged
