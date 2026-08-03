@@ -3966,6 +3966,64 @@ def test_holds_past_safe_time_until_sundown():
     print("  test_holds_past_safe_time_until_sundown: PASSED")
 
 
+def test_sundown_defers_while_a_saving_session_is_live():
+    """Sundown must NOT hand back mid saving-session.
+
+    Live 2026-08-03: a joined session ran 19:00-20:00. PV fell through the 0.1 kW
+    sundown threshold at 19:37:40, so at 19:40:16 CM deactivated, disabled the
+    heartbeat and handed back — killing the dump with 20 minutes of the paid
+    window left. Export went 3.7 kW -> 0. (Compounded by the handback's
+    `read_only -> False` write not taking, which left NO writer at all.)
+
+    The heartbeat can only force Max Export while CM holds the wheel and the
+    select is not `Predbat` (RD14c). So deactivating during a session does not
+    merely change who reports — it stops the sell.
+
+    Deliberately NOT fixed by pinning the select to Max Export from the plugin:
+    that is exactly what RD14c removed, and it caused the 5 min 46 s over-run at
+    session end. CM just stays active; the heartbeat's calendar rule keeps
+    dispatching, and sundown lands normally on the first cycle after the session.
+    """
+    from datetime import datetime, timezone
+
+    pv, load = _make_overflow_pv(minutes_now=720)
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    sensor_overrides.update(_make_p90_sensors())
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+        sensor_overrides=sensor_overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+    assert plugin.last_phase == "active"
+
+    # Dusk arrives (PV below the 0.1 kW sundown threshold) DURING a live session.
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.03
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base.minutes_now = 19 * 60
+    base.now_utc = datetime(2025, 7, 12, 19, 0, tzinfo=timezone.utc)
+    plugin.on_update()
+    assert plugin.last_phase == "active", "must not hand back while a joined session is still dumping"
+
+    # The plugin must NOT seize the select to force the dump — that is the
+    # heartbeat's job off the calendar, and pinning it here re-creates the
+    # RD14c end-of-session over-run.
+    assert plugin._policy_override != "max_export", "dispatch stays with the heartbeat (RD14c)"
+
+    # Session ends -> the very next cycle hands back normally.
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "off"
+    base.minutes_now = 20 * 60
+    base.now_utc = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
+    plugin.on_update()
+    assert plugin.last_phase == "off", "once the session ends, sundown deactivates as before"
+    print("  test_sundown_defers_while_a_saving_session_is_live: PASSED")
+
+
 def test_defers_to_charge_window():
     """Plugin defers to Predbat during charge window when SOC < soc_keep."""
     pv, load = _make_overflow_pv(minutes_now=300)
@@ -6764,6 +6822,7 @@ def run_curtailment_tests(my_predbat=None):
         test_on_update_full_flow,
         test_on_update_stays_off_low_pv,
         test_holds_past_safe_time_until_sundown,
+        test_sundown_defers_while_a_saving_session_is_live,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
