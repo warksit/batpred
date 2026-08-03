@@ -147,11 +147,7 @@ class PluginSystem:
         # instance — two CurtailmentPlugins both writing sig_dispatch_policy
         # (observed risk: root + plugins/ both ship curtailment_plugin.py).
         if plugin_name in self.plugins:
-            self.log(
-                "Skipping plugin {}: already loaded (refusing second path {})".format(
-                    plugin_name, plugin_path
-                )
-            )
+            self.log("Skipping plugin {}: already loaded (refusing second path {})".format(plugin_name, plugin_path))
             return
 
         # Import the plugin module

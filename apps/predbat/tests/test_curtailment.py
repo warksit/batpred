@@ -27,6 +27,8 @@ from curtailment_calc import (
     apply_no_surplus_drain_hold,
     compute_charge_below,
     compute_drain_above,
+    compute_drain_above_source,
+    DEEP_DISCHARGE_FLOOR_KWH,
     compute_proposed_phase,
     compute_p10_recovery_floor,
     compute_shed_rate,
@@ -759,7 +761,11 @@ def test_intended_policy_reports_the_override_not_the_plugins_wish():
     assert pub["value"] == "Hold Battery", f"state must be the override actually in force, got {pub['value']}"
     assert pub["attrs"]["manual_override"] is True
     assert "Max Export" in pub["attrs"]["reason"], f"reason must still say what the plugin would choose: {pub['attrs']['reason']}"
-    assert "override" in pub["attrs"]["reason"].lower()
+    # The reason must flag that a HUMAN owns the policy. A0 (f9316ccc) reworded
+    # this from "manual override — …" to the at-a-glance "manual · <choice>
+    # (plugin would <x>)"; the word "override" went with it. Assert the property,
+    # not the old wording (R37: production was right, the assertion was stale).
+    assert "manual" in pub["attrs"]["reason"].lower(), f"reason must show a human is in charge: {pub['attrs']['reason']}"
     print("  test_intended_policy_reports_the_override_not_the_plugins_wish: PASSED")
 
 
@@ -3460,7 +3466,16 @@ def test_phase_managed_above_floor():
 # Plugin integration tests
 # ============================================================================
 
-from curtailment_plugin import CurtailmentPlugin, PREDICT_STEP as PLUGIN_STEP, SIG_DAILY_PV, SOLCAST_TODAY, SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY, SIG_POLICY_SELECT, SIG_OVERRIDE_SELECT
+from curtailment_plugin import (
+    CurtailmentPlugin,
+    PREDICT_STEP as PLUGIN_STEP,
+    SIG_DAILY_PV,
+    SOLCAST_TODAY,
+    SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY,
+    SIG_POLICY_SELECT,
+    SIG_OVERRIDE_SELECT,
+    SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
+)
 
 
 class MockBase:
@@ -3503,6 +3518,15 @@ class MockBase:
         self.published = {}
         self.services = []
         self._sensor_overrides = sensor_overrides or {}
+        # A0 fail-closed (2026-07-30): the plugin now HOLDS and changes nothing
+        # when plant SOC is unreadable, rather than treating it as 0.0 ("battery
+        # empty" — the 2026-07-29 night re-take). Rigs written before that guard
+        # never supplied the sensor, so every one of them takes the fallback and
+        # publishes nothing. Default it from soc_kw so the guard is exercised
+        # only by tests that deliberately remove it (R37: fix the rig, never
+        # weaken production to make a stale test pass).
+        if SIG_PLANT_SOC_ENTITY not in self._sensor_overrides:
+            self._sensor_overrides[SIG_PLANT_SOC_ENTITY] = round(soc_kw / soc_max * 100.0, 1) if soc_max else 0.0
         self.now_utc = now_utc or datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc)
 
     def log(self, msg, *args, **kwargs):
@@ -5791,14 +5815,19 @@ def test_load_state_logs_corruption():
 # ============================================================================
 
 
-def _saving_session_sensors(active=False, current_mins=0, next_mins=0):
+def _saving_session_sensors(active=False, current_mins=0, next_mins=0, current_start=None, next_start=None):
     """Octopus saving-session binary_sensor override (state + joined-event
-    duration attributes read by _get_session_reserve_kwh / _is_saving_session_active)."""
+    duration attributes read by _get_session_reserve_kwh / _is_saving_session_active).
+
+    The *_start attributes feed the published `session_start` — the dashboard
+    needs 'when', not just 'how much'."""
     return {
         SIG_SAVING_SESSION_ENTITY: {
             "state": "on" if active else "off",
             "current_joined_event_duration_in_minutes": current_mins,
             "next_joined_event_duration_in_minutes": next_mins,
+            "current_joined_event_start": current_start,
+            "next_joined_event_start": next_start,
         }
     }
 
@@ -6025,6 +6054,121 @@ def test_two_floors_are_named_and_sourced_distinctly():
     assert overnight["soc_pct"] is not None and headroom["soc_pct"] is not None
     assert "Solar Charge" in overnight["drives"] and "Max Export" in headroom["drives"]
     print(f"  test_two_floors_are_named_and_sourced_distinctly: PASSED ({overnight['soc_pct']}% / {headroom['soc_pct']}%)")
+
+
+def test_drain_above_source_mirrors_compute_drain_above():
+    """`compute_drain_above` is a 4-way max. The published `source` must name an
+    arm whose value IS the answer — for every combination.
+
+    Anti-drift guard: the source is derived FROM compute_drain_above, never
+    re-implemented beside it. This is the `required_headroom_kwh` lesson (one
+    quantity computed by three drifting expressions) applied before it can
+    happen again.
+    """
+    cases = [
+        # reserve, overflow_floor, session_protect, expected winning arm
+        (0.0, 3.39, 10.22, "session_protect"),  # live 2026-08-03
+        (0.0, 3.39, 0.0, "overflow_floor"),  # ordinary overflow day
+        (0.0, 12.0, 10.22, "overflow_floor"),  # session present but not binding
+        (0.0, 0.2, 0.0, "deep_floor"),  # nothing else above the 0.5 kWh floor
+        (5.0, 0.2, 0.0, "reserve"),  # hardware reserve dominates
+    ]
+    for reserve, overflow_floor, session_protect, expected in cases:
+        value = compute_drain_above(reserve, overflow_floor, None, session_protect)
+        source = compute_drain_above_source(reserve, overflow_floor, session_protect)
+        assert source == expected, f"reserve={reserve} overflow={overflow_floor} session={session_protect}: expected {expected}, got {source}"
+        arm = {
+            "session_protect": session_protect,
+            "overflow_floor": overflow_floor,
+            "deep_floor": DEEP_DISCHARGE_FLOOR_KWH,
+            "reserve": reserve,
+        }[source]
+        assert abs(arm - value) < 1e-6, f"source '{source}' names {arm} but compute_drain_above returned {value}"
+    print("  test_drain_above_source_mirrors_compute_drain_above: PASSED")
+
+
+def _session_publish_run(session):
+    """Shared rig: a MODERATE overflow day, with and without an upcoming session.
+
+    Overflow is deliberately sized so `overflow_floor` (~6.1 kWh) is the winning
+    arm on its own — a bigger overflow drives the floor under the 0.5 kWh deep
+    floor and the contrast under test disappears. With the session,
+    `session_protect` (overnight 6.0 + 60 min × 4.0 kW cap = 10.0) takes over.
+    This is the live 2026-08-03 shape: a real overflow floor, overridden by a
+    session the sensor never mentioned."""
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    sensor_overrides.update(_make_p90_sensors(p90_peak_kw=7.0, solcast_remaining=14.0))
+    if session:
+        sensor_overrides.update(_saving_session_sensors(active=False, next_mins=60, next_start="2026-08-03T19:00:00+01:00"))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.55,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        sensor_overrides=sensor_overrides,
+    )
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 6.0
+    plugin._overnight_target_kwh = 6.0
+    plugin.on_update()
+    return base
+
+
+def test_drain_above_publishes_its_source():
+    """The Headroom Floor sensor must name the arm that set it.
+
+    Live 2026-08-03: state 10.22 kWh, friendly_name "Headroom Floor (P90
+    overflow)", attributes `overflow_p90_kwh: 12.28, overflow_floor_kwh: 3.39`.
+    Every number on the sensor argued for 3.39 and nothing accounted for the
+    other 6.83 kWh — which was the upcoming 19:00 saving session. The floor was
+    correct; it was unauditable from the dashboard.
+    """
+    with_session = _session_publish_run(session=True).published["sensor.predbat_curtailment_drain_above"]
+    without = _session_publish_run(session=False).published["sensor.predbat_curtailment_drain_above"]
+
+    wa, wo = with_session["attrs"], without["attrs"]
+
+    assert wa["source"] == "session_protect", f"session must be named as the driver, got {wa.get('source')}"
+    assert wo["source"] == "overflow_floor", f"no session -> overflow drives the floor, got {wo.get('source')}"
+
+    # The session terms must be present as numbers, not left to be inferred.
+    assert wa["session_reserve_kwh"] > 0, "session reserve missing from the sensor that it set"
+    assert abs(wa["session_protect_kwh"] - with_session["value"]) < 0.01, f"session_protect {wa['session_protect_kwh']} should equal the published floor {with_session['value']}"
+    assert wa["session_start"], "session start time missing — 'when' is half the explanation"
+
+    # A day with no session must stay clean: zeroes, not stale values.
+    assert not wo["session_reserve_kwh"], f"no session -> reserve must be 0/None, got {wo['session_reserve_kwh']}"
+    assert wo["session_start"] is None
+    print(f"  test_drain_above_publishes_its_source: PASSED ({wo['source']} {without['value']} -> {wa['source']} {with_session['value']})")
+
+
+def test_why_this_mode_reports_session_reserve():
+    """The Why This Mode card REPORTS plugin attributes and must never re-derive
+    (Charter). So a drain floor held up by a saving session has to reach
+    `intended_policy` as attributes and be named in `reason` — otherwise the card
+    shows a band whose upper edge it cannot explain.
+    """
+    base = _session_publish_run(session=True)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+
+    assert attrs["drain_above_source"] == "session_protect", f"card needs the floor's driver, got {attrs.get('drain_above_source')}"
+    assert attrs["session_reserve_kwh"] > 0
+    assert attrs["session_reserve_pct"] > 0, "card is % SOC at a glance (A0) — kWh alone is not enough"
+    assert attrs["session_start"]
+
+    # The one-line reason must say WHY the drain floor is where it is.
+    reason = attrs["reason"].lower()
+    assert "session" in reason, f"reason must name the session when it sets the floor: {attrs['reason']}"
+
+    # And a no-session day must not mention one.
+    plain = _session_publish_run(session=False).published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert "session" not in plain["reason"].lower(), f"no session -> reason must not mention one: {plain['reason']}"
+    assert plain["drain_above_source"] == "overflow_floor"
+    print(f"  test_why_this_mode_reports_session_reserve: PASSED ({attrs['reason']})")
 
 
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
@@ -6704,6 +6848,9 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_saving_session_plugin_stays_active_but_delegates_dispatch,
         test_v32_upcoming_session_raises_drain_floor,
         test_two_floors_are_named_and_sourced_distinctly,
+        test_drain_above_source_mirrors_compute_drain_above,
+        test_drain_above_publishes_its_source,
+        test_why_this_mode_reports_session_reserve,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
         test_policy_is_reasserted_when_the_select_drifts,
         test_manual_override_does_not_reassert_the_policy,
