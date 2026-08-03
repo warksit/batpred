@@ -1638,7 +1638,19 @@ class CurtailmentPlugin(PredBatPlugin):
         # return above, so a genuine end-of-day PV≈0 is the only path here.
         peaked = self._peak_pv > 0.5
         past_safe = reached_safe_time
-        sundown = peaked and actual_pv < 0.1
+        # Sundown must NOT hand back while a joined saving session is still
+        # running. The heartbeat can only force Max Export while CM holds the
+        # wheel AND the select is not `Predbat` (RD14c), so deactivating here
+        # does not just change who reports the decision — it stops the sell.
+        # Live 2026-08-03: PV crossed 0.1 kW at 19:37:40, CM deactivated at
+        # 19:40:16 and disabled the heartbeat; export went 3.7 kW -> 0 with 20
+        # minutes of the paid 19:00-20:00 window left.
+        #
+        # We stay active and change nothing else: the select stays wherever the
+        # Schmitt put it and the heartbeat keeps dispatching off the calendar.
+        # Pinning the select to Max Export from here is what RD14c deliberately
+        # removed (it caused the 5 min 46 s over-run at session end).
+        sundown = peaked and actual_pv < 0.1 and not self._is_session_dispatching()
         if sundown:
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
             self._floor_source = "Overnight Reserve"

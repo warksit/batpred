@@ -1380,6 +1380,21 @@ with native `calendar` start/end triggers.
 session_live: "{{ is_state('calendar...octoplus_saving_sessions', 'on') }}"
 ```
 
+**RD14c-sundown (2026-08-03, IN FORCE) — sundown must not hand back mid-session.**
+`sundown = peaked and actual_pv < 0.1` also requires **no live joined session**.
+The heartbeat can only force Max Export while CM holds the wheel and the select is
+not `Predbat`, so deactivating during a session does not merely change who reports
+the decision — **it stops the sell**. Live 2026-08-03: PV crossed 0.1 kW at
+19:37:40, CM deactivated at 19:40:16 and disabled the heartbeat, and export went
+3.7 kW → 0 with 20 minutes of the paid 19:00–20:00 window left (compounded by the
+handback's `read_only -> False` write not taking, leaving no writer at all).
+CM stays active and changes nothing else — the select stays where the Schmitt put
+it and the heartbeat keeps dispatching off the calendar. **Do not fix this by
+pinning the select to Max Export from the plugin:** that is what RD14c removed and
+it caused the 5 min 46 s over-run at session end.
+Implemented in: `curtailment_plugin` sundown test. Test:
+`test_sundown_defers_while_a_saving_session_is_live`.
+
 **RD14c-display (2026-08-03, IN FORCE) — the session dump must be REPORTED as the
 policy in force.** Because the heartbeat forces Max Export without writing
 `sig_dispatch_policy`, nothing downstream can see the dump: the select keeps the
