@@ -399,6 +399,7 @@ markdownlint
 matplotlib
 maximise
 maxrss
+maxlen
 maxsoc
 mbat
 mbuhansen
