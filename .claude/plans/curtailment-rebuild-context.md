@@ -262,9 +262,22 @@ them.
    (`sigen_plant_ess_rated_charging_power`, `sigen_inverter_ess_rated_charge_power`,
    …). One mapper used a fourth combination that does not exist.
 
-7. **All state is lost on deploy.** `_peak_pv`, the R64 smoothing history, the
-   overflow deque. Every deploy perturbs live behaviour, which makes mid-day
-   debugging unreliable.
+7. **~~All state is lost on deploy.~~ CORRECTED 2026-08-03 — mostly solved.**
+   `7cdba1c0` added `curtailment_state.json` (same-day guard, atomic
+   tmp + `os.replace`), which persists and restores `peak_pv_kw`,
+   `peak_pv_time`, `pv_history` (R49), `cap_samples` / `yesterday_cap_avg`
+   (R60), `last_floor_scale`, and the day latches. Verified live across the
+   2026-08-03 19:19 deploy: `restored state from /config/curtailment_state.json
+   (peak=7.68kW, pv_history=15 entries)`.
+   **Still not persisted:** `_overflow_history`, the R64 rolling-median input
+   (`deque(maxlen=24)`), so a restart degrades the median to short-history
+   behaviour — conservatively, per
+   `test_overflow_smoothing_degrades_safely_on_short_history` — until the 30-min
+   trailing window refills.
+   *This entry was written 2026-07-30, after the fix had already shipped, and
+   was still believed on 2026-08-03 — it nearly deferred a deploy for a reason
+   that no longer existed. Exactly the §4.4 doc-drift hazard this document warns
+   about, committed by this document.*
 
 8. **Layered precedence with unaware consumers.** `override > session > policy`.
    The keep-floor guard was written against `policy` alone, so under a manual
@@ -307,3 +320,16 @@ them.
 2. **`dawn_load` not additive** (§6.2) — ~2 percentage points of overshoot.
 3. `predbat.soc_kw` was ~1.8 kWh stale after the outage; confirm it cleared.
 4. No invariant/alerting layer exists (§9.3).
+5. `_overflow_history` (R64) is the only in-memory state not in
+   `curtailment_state.json` — see §9.7 and review item 1.1.
+
+### Corrected since writing (2026-08-03)
+
+- §9.7 "all state is lost on deploy" was **already false when written** — see
+  the entry. Persistence shipped in `7cdba1c0`.
+- The **session dump was invisible** to every consumer: RD14c moved dispatch to
+  the heartbeat, which forces Max Export off the calendar without writing the
+  policy select, so `intended_policy` published the plugin's wish while the
+  battery exported at the cap. Fixed 2026-08-03 (`cbe946f7`); the publish site's
+  own `override > session > select` comment had described the missing rung for
+  weeks. Another instance of §9.8 "layered precedence with unaware consumers".

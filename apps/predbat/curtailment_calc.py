@@ -370,6 +370,31 @@ def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0)
     return "overflow_floor"
 
 
+def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining, floor_kwh=0.0):
+    """Projected battery energy (kWh) when a live saving session ends.
+
+    During the dump the heartbeat holds export at the DNO cap, so the battery
+    supplies `cap + load - pv`. Deriving it from the commanded quantities rather
+    than an instantaneous battery-power reading keeps the projection consistent
+    with the dispatch (and steady across a PV flicker).
+
+        end = max(floor, soc - (cap + load - pv) x hours_remaining)
+
+    Clamped at `floor_kwh` because the keep-floor guard stops the sell there —
+    projecting through the floor would promise a discharge that cannot happen.
+    Zero or negative time remaining returns the current SOC unchanged.
+    """
+    try:
+        mins = float(minutes_remaining)
+    except (TypeError, ValueError):
+        return soc_kwh
+    if mins <= 0:
+        return soc_kwh
+    draw_kw = max(0.0, float(cap_kw) + float(load_kw) - float(pv_kw))
+    projected = float(soc_kwh) - draw_kw * (mins / 60.0)
+    return max(float(floor_kwh), projected)
+
+
 def compute_charge_below(p10_recovery_floor, soc_keep):
     """Charge target: SOC level below which the system must not be exporting.
 

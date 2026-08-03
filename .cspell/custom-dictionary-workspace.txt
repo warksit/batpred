@@ -279,6 +279,7 @@ luxpower
 markdownlint
 matplotlib
 maximise
+maxlen
 maxsoc
 mbuhansen
 mdlrc
