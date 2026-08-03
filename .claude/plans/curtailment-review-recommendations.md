@@ -566,3 +566,81 @@ Comfort floor until **PV covers load**; only allow deep overflow floor when cove
 ### Charter reminder
 
 **Do not edit upgrade-overwritten stock Predbat files** for site behaviour. Prefer our tree + HA entities/automations. See REQUIREMENTS Working practices + `.claude/CLAUDE.md`.
+
+---
+
+## 11. Open list from the 2026-08-03 saving session (first session under CM)
+
+A joined Octopus session ran **19:00–20:00** while CM was driving. It exposed
+several defects at once. Everything below is **open unless marked DONE**.
+
+### Fixed and deployed on the night
+
+| Ref | What | Commit |
+|-----|------|--------|
+| RD14c-display | Session dump published as the policy in force — the heartbeat forces Max Export off the calendar and never writes the select, so `intended_policy` reported the plugin's wish while the battery exported at the cap | `cbe946f7` |
+| RD14c-sundown | Sundown no longer deactivates CM while a joined session is live (it was stopping the sell, not just the reporting) | `d6193fc3` |
+| — | `drain_above` publishes `source` + session terms; Why This Mode reports them | `235f3533` |
+| — | Session end-SOC projection; headroom verdict suppressed when p90 = 0; `no overflow left` label | `e6b5833b` |
+| — | Card re-derived its own manual sentence (`plugin would {{ mode }}` where mode IS the override) — now reports `reason` | `d6193fc3` |
+
+### Open — ranked
+
+**O1. Sundown has no hysteresis or end-of-day latch — HIGHEST VALUE.**
+`sundown = peaked and actual_pv < 0.1` is a single sample re-evaluated every
+cycle. On 2026-08-03 PV oscillated 0.03 → 0.22 → 0.15 kW at dusk and CM flapped
+**seven times** between 19:40 and 20:05 (previous three nights: exactly one clean
+transition each, 20:20/20:20/20:30). Each flap toggles `read_only`, and **the
+Predbat docs state every change of that switch forces a full inverter reset to
+defaults** (`config.py:947` `reset_inverter_force: True`) — so this is physically
+disruptive, not cosmetic. Once CM has deactivated after its peak it should stay
+down for the day; re-activation should need a real PV recovery, not a 50 W
+flicker. *The session gave this teeth: on previous nights CM crossed the dusk
+boundary idling in Hold, so the flapping was invisible and harmless.*
+
+**O2. Disabling the heartbeat mid-dispatch strands the registers.**
+At 19:40 CM disabled the heartbeat while it held `active_power_fixed_adjustment`
+at 6.6. Disabling a writer does not unwind what it wrote, so the plant kept
+exporting at the cap with **no writer at all** until something else moved it.
+Same class as the Charter's "the writer that changed a register changes it back",
+one level down: the *disable* path needs to neutralise first.
+
+**O3. `switch.predbat_set_read_only` is NOT a reliable state indicator.**
+It lags Predbat's internal state by **hours** — 2026-08-03 20:16:06 CM wrote
+`read_only -> False`, Predbat went Read-Only → **Demand** by 20:20:30, and the
+switch entity still read `on` at 20:30 (unchanged since 20:05:23). Earlier
+"changes" at 22:56 (1 + 2 Aug) and 14:55 are the entity being reconciled, not the
+mode changing. **Diagnose ownership from `predbat.status`, never from this
+switch.** This misled a live diagnosis on the night into concluding the write path
+was broken — it is not. Worth a Charter line.
+
+**O4. read_only is the wrong instrument for a high-frequency mutex — feeds RD7.**
+Docs (`customisation.md:38`) do sanction it for "your own automation", but every
+change resets the inverter to defaults, and the Manual Control section explicitly
+offers the alternative: *"A better alternative in some cases is to tell Predbat
+what you want it to do in a particular time slot using the Manual Control
+feature."* (`select.predbat_manual_charge` / `manual_export` /
+`manual_freeze_charge`, which accept `HH:MM` from an automation.) That would keep
+**Predbat as sole writer** while CM expresses intent — removing the mutex, the
+reset thrash, and the whole ownership-handoff failure class. This is what RD7 has
+been circling. Design decision, not a drive-by.
+
+**O5. `session_end_soc_pct` is gated on the wrong condition.**
+Gated on `session_dispatch` (CM driving), so the projection vanishes the moment CM
+hands back — which is exactly when you still want to know where the session leaves
+you. Should be gated on "a session is live" and keep projecting at whatever rate is
+actually flowing.
+
+**O6. `_overflow_history` still not persisted** — the only in-memory state missing
+from `curtailment_state.json` (review item **1.1**, now a one-line addition).
+
+**O7. `last_phase` not persisted** — after a deploy the transition log reads
+`PHASE none -> off` instead of `active -> off`. Cosmetic, but it cost real time on
+the night working out whether a deploy had caused a handback.
+
+**O8. Unexercised fixes to verify.** The p90 = 0 suppression and the
+`no overflow left` label deployed but never fired (CM went inactive first). Verify
+on the next evening where CM is still active with p90 at zero. Likewise the
+session end-SOC projection has never rendered.
+
+**O9. Predbat v8.47.4 update pending** on the box; auto-update off.
