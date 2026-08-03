@@ -28,6 +28,7 @@ from curtailment_calc import (
     compute_charge_below,
     compute_drain_above,
     compute_drain_above_source,
+    estimate_session_end_kwh,
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_proposed_phase,
     compute_p10_recovery_floor,
@@ -5816,7 +5817,7 @@ def test_load_state_logs_corruption():
 # ============================================================================
 
 
-def _saving_session_sensors(active=False, current_mins=0, next_mins=0, current_start=None, next_start=None):
+def _saving_session_sensors(active=False, current_mins=0, next_mins=0, current_start=None, next_start=None, current_end=None):
     """Octopus saving-session binary_sensor override (state + joined-event
     duration attributes read by _get_session_reserve_kwh / _is_saving_session_active).
 
@@ -5828,6 +5829,7 @@ def _saving_session_sensors(active=False, current_mins=0, next_mins=0, current_s
             "current_joined_event_duration_in_minutes": current_mins,
             "next_joined_event_duration_in_minutes": next_mins,
             "current_joined_event_start": current_start,
+            "current_joined_event_end": current_end,
             "next_joined_event_start": next_start,
         }
     }
@@ -6244,6 +6246,98 @@ def test_session_dump_respects_the_heartbeat_precedence_exactly():
     assert pub2["value"] == "Predbat", f"after handback the session must not force Max Export, got {pub2['value']}"
     assert not pub2["attrs"]["session_dispatch"]
     print("  test_session_dump_respects_the_heartbeat_precedence_exactly: PASSED")
+
+
+def test_session_end_soc_projection():
+    """Projected SOC when the saving session ends.
+
+    During the dump the battery supplies the export cap plus house load, less
+    whatever PV is still coming in — the same quantity the heartbeat commands,
+    so the projection matches the dispatch rather than a noisy instantaneous
+    battery reading. Clamped at the sell floor because the keep-floor guard
+    stops the discharge there.
+    """
+    # 30 min left, 3.68 kW cap + 0.5 kW load, no PV -> 2.09 kWh out of 9.0.
+    end = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=30, floor_kwh=0.0)
+    assert abs(end - (9.0 - (4.18 * 0.5))) < 0.01, end
+
+    # PV offsets the draw.
+    end_pv = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=1.0, minutes_remaining=30, floor_kwh=0.0)
+    assert end_pv > end, "PV during the session must reduce the battery draw"
+
+    # The guard stops the sell at the floor — never project through it.
+    clamped = estimate_session_end_kwh(soc_kwh=7.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=120, floor_kwh=6.46)
+    assert abs(clamped - 6.46) < 1e-6, f"must clamp at the sell floor, got {clamped}"
+
+    # No time left -> no change. Degenerate inputs must not explode.
+    assert abs(estimate_session_end_kwh(9.0, 3.68, 0.5, 0.0, 0, 0.0) - 9.0) < 1e-6
+    assert abs(estimate_session_end_kwh(9.0, 3.68, 0.5, 0.0, -5, 0.0) - 9.0) < 1e-6
+    print("  test_session_end_soc_projection: PASSED")
+
+
+def test_session_end_soc_is_published_during_the_dump():
+    """The card should answer "where will this leave me?" while it is dumping —
+    that is the number you actually want mid-session, and it is not derivable
+    from anything else on the card."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=60, current_end="2026-08-03T20:00:00+01:00"))
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 6.2, 18.08
+    plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.0, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["session_end_soc_pct"] is not None, "mid-dump the card must project where the session leaves us"
+    assert 0 <= attrs["session_end_soc_pct"] <= 100
+    assert attrs["session_end_soc_pct"] < round(9.0 / 18.08 * 100, 1), "exporting at the cap must project DOWN"
+
+    # No session -> nothing to project, and no stale number left lying around.
+    plain = MockBase()
+    plain._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    p2 = CurtailmentPlugin(plain)
+    p2._charge_below, p2._drain_above = 6.2, 18.08
+    p2._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.0, soc_max=18.08)
+    assert plain.published["sensor.predbat_curtailment_intended_policy"]["attrs"]["session_end_soc_pct"] is None
+    print("  test_session_end_soc_is_published_during_the_dump: PASSED")
+
+
+def test_no_overflow_left_is_not_reported_as_surplus_fits():
+    """ "surplus fits" is a non-statement when the p90 forecast is zero — there is
+    no surplus to fit. Observed on the card 2026-08-03 19:29 with
+    overflow_p90 = 0.0: "↑ fits · 53% spare" and "· surplus fits", both of which
+    describe a comparison against nothing.
+
+    `no_drain` covers two different situations and they deserve different words:
+    the surplus genuinely fits in the remaining headroom, or there is no surplus
+    forecast left at all.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 6.2, 18.08
+    plugin._policy_override = "no_drain"
+    plugin._overflow_p90 = 0.0
+    plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=8.1, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["override_label"] != "surplus fits", "with p90=0 there is no surplus to fit"
+    assert "no overflow" in attrs["override_label"].lower(), attrs["override_label"]
+    assert "surplus fits" not in attrs["reason"], attrs["reason"]
+    # And the headroom comparison must be suppressed, not published as a number
+    # the card will dutifully render.
+    assert attrs["headroom_short_pct"] is None, "no forecast overflow -> no headroom verdict to show"
+
+    # With a real forecast overflow the original wording stands.
+    base2 = MockBase()
+    base2._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    p2 = CurtailmentPlugin(base2)
+    p2._charge_below, p2._drain_above = 6.2, 18.08
+    p2._policy_override = "no_drain"
+    p2._overflow_p90 = 4.0
+    p2._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=8.1, soc_max=18.08)
+    a2 = base2.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert a2["override_label"] == "surplus fits", a2["override_label"]
+    assert a2["headroom_short_pct"] is not None
+    print("  test_no_overflow_left_is_not_reported_as_surplus_fits: PASSED")
 
 
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
@@ -6927,6 +7021,9 @@ def run_curtailment_tests(my_predbat=None):
         test_drain_above_publishes_its_source,
         test_session_dump_is_published_as_the_effective_policy,
         test_session_dump_respects_the_heartbeat_precedence_exactly,
+        test_session_end_soc_projection,
+        test_session_end_soc_is_published_during_the_dump,
+        test_no_overflow_left_is_not_reported_as_surplus_fits,
         test_why_this_mode_reports_session_reserve,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
         test_policy_is_reasserted_when_the_select_drifts,

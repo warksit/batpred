@@ -56,6 +56,7 @@ from curtailment_calc import (
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_drain_above,
     compute_drain_above_source,
+    estimate_session_end_kwh,
     compute_proposed_phase,
     phase_to_policy,
     POLICY_MAX_EXPORT,
@@ -236,6 +237,11 @@ OVERRIDE_LABELS = {
     "hold": "holding flat",
     "max_export": "must drain",
 }
+# `no_drain` covers two different situations. "surplus fits" is a comparison
+# against the forecast overflow — a non-statement once that forecast is zero
+# (observed on the card 2026-08-03 19:29: "surplus fits · fits · 53% spare"
+# with overflow_p90 = 0.0, i.e. nothing to fit and nothing to spare it against).
+NO_OVERFLOW_LABEL = "no overflow left"
 
 # Human labels for the arm of compute_drain_above that set the Headroom Floor.
 # The card REPORTS these (Charter: never re-derive a second decision).
@@ -2452,6 +2458,49 @@ class CurtailmentPlugin(PredBatPlugin):
             best_mins = max(best_mins, mins)
         return compute_session_reserve(best_mins, cap_kw)
 
+    def _override_label(self):
+        """Human label for the active policy override, or None.
+
+        `no_drain` splits: "surplus fits" is a verdict about the forecast
+        overflow, so once that forecast is zero the honest words are "no
+        overflow left" — there is nothing to fit."""
+        if not self._policy_override:
+            return None
+        if self._policy_override == "no_drain" and not float(self._overflow_p90 or 0.0):
+            return NO_OVERFLOW_LABEL
+        return OVERRIDE_LABELS.get(self._policy_override)
+
+    def _get_session_end(self):
+        """Datetime the active joined saving session ends, or None.
+
+        Uses the binary sensor's tz-aware `current_joined_event_end`. Unlike the
+        dispatch decision (which must read the calendar — RD14c), an end TIME is
+        not a control decision, and this attribute carries an explicit UTC
+        offset where the calendar's `end_time` string does not."""
+        try:
+            raw = self.base.get_state_wrapper(SIG_SAVING_SESSION, attribute="current_joined_event_end", default=None)
+        except (TypeError, ValueError):
+            return None
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            return None
+
+    def _session_minutes_remaining(self):
+        """Minutes until the live session ends (0 if unknown/finished)."""
+        end = self._get_session_end()
+        if end is None:
+            return 0.0
+        try:
+            now = self.base.now_utc if getattr(self.base, "now_utc", None) else datetime.now(end.tzinfo)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=end.tzinfo)
+            return max(0.0, (end - now).total_seconds() / 60.0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
     def _is_session_dispatching(self):
         """True while the heartbeat is forcing Max Export for a live saving session.
 
@@ -2612,6 +2661,10 @@ class CurtailmentPlugin(PredBatPlugin):
             low_soc = DEFAULT_DRAIN_FLOOR_PCT
         soc_pct = soc_kwh / max(soc_max, 0.1) * 100
 
+        # The level the guard stops a session dump at. Bound here so the
+        # projection below is safe on every branch, not just the active one.
+        session_sell_floor_kwh = 0.0
+
         # Decide the intended policy + keep floor (pure decision, no side effects yet)
         if plugin_active and soc_pct > low_soc:
             # v32 evening lifecycle override (set in calculate()): "max_export" =
@@ -2655,12 +2708,15 @@ class CurtailmentPlugin(PredBatPlugin):
             else:
                 sell_floor_kwh = DEFAULT_KEEP_FLOOR_PCT / 100.0 * soc_max
             intended_keep = min(max(sell_floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
+            # The level the guard will actually stop a session dump at — the
+            # projection must not run through it.
+            session_sell_floor_kwh = sell_floor_kwh
             # At-a-glance reason: mode + human override label + SOC% + band%
             # (never mix units; never expose internal codes like no_drain).
             # kWh stays on attributes for detail / cards that opt in.
             charge_pct = self._charge_below / max(soc_max, 0.1) * 100.0
             drain_pct = self._drain_above / max(soc_max, 0.1) * 100.0
-            ovr_label = OVERRIDE_LABELS.get(self._policy_override) if self._policy_override else None
+            ovr_label = self._override_label()
             ovr = " · {}".format(ovr_label) if ovr_label else ""
             # When the upper edge of the band is set by something other than P90
             # overflow, say so — otherwise the band is unexplainable from the
@@ -2728,16 +2784,38 @@ class CurtailmentPlugin(PredBatPlugin):
         headroom_short_pct = None
         try:
             ovf = float(self._overflow_p90 or 0.0)
-            max_res = float(getattr(self, "_effective_max_reserved", MAX_RESERVED_KWH) or MAX_RESERVED_KWH)
-            headroom_need_kwh = round(required_headroom_kwh(ovf, max_res, OVERFLOW_SAFETY_FACTOR), 2)
-            headroom_have_kwh = round(max(0.0, soc_max - soc_kwh), 2)
-            headroom_short_kwh = round(headroom_need_kwh - headroom_have_kwh, 2)
-            denom = max(soc_max, 0.1)
-            headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
-            headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
-            headroom_short_pct = round(headroom_short_kwh / denom * 100.0, 1)
+            # With no forecast overflow there is no headroom question to answer.
+            # Publishing "fits · 53% spare" against zero is noise the card then
+            # dutifully renders (observed 2026-08-03 19:29). None means "no
+            # verdict" and the card omits the line; 0 would read as a real answer.
+            if ovf > 0:
+                max_res = float(getattr(self, "_effective_max_reserved", MAX_RESERVED_KWH) or MAX_RESERVED_KWH)
+                headroom_need_kwh = round(required_headroom_kwh(ovf, max_res, OVERFLOW_SAFETY_FACTOR), 2)
+                headroom_have_kwh = round(max(0.0, soc_max - soc_kwh), 2)
+                headroom_short_kwh = round(headroom_need_kwh - headroom_have_kwh, 2)
+                denom = max(soc_max, 0.1)
+                headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
+                headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
+                headroom_short_pct = round(headroom_short_kwh / denom * 100.0, 1)
         except (TypeError, ValueError):
             pass
+
+        # Where the dump leaves us: the number you actually want mid-session,
+        # and one the card cannot derive from anything else it shows.
+        session_end_soc_pct = None
+        if session_dispatch:
+            try:
+                end_kwh = estimate_session_end_kwh(
+                    soc_kwh=soc_kwh,
+                    cap_kw=float(getattr(self, "_effective_dno", 3.68) or 3.68),
+                    load_kw=float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0.5) or 0.5),
+                    pv_kw=float(self.base.get_state_wrapper(SIG_PV_POWER, default=0.0) or 0.0),
+                    minutes_remaining=self._session_minutes_remaining(),
+                    floor_kwh=session_sell_floor_kwh,
+                )
+                session_end_soc_pct = round(end_kwh / max(soc_max, 0.1) * 100.0, 1)
+            except (TypeError, ValueError, AttributeError):
+                session_end_soc_pct = None
 
         # Always publish the intended decision — this is what you watch in observe-only.
         # Attributes are the single source for the Why This Mode card (report, never re-derive).
@@ -2745,7 +2823,7 @@ class CurtailmentPlugin(PredBatPlugin):
             prefix = self.base.prefix
             overnight_target_kwh = float(self._overnight_target_kwh or 0.0) if getattr(self, "_overnight_target_kwh", None) else 0.0
             overnight_target_pct = round(overnight_target_kwh / max(soc_max, 0.1) * 100.0, 1) if overnight_target_kwh else None
-            ovr_label = OVERRIDE_LABELS.get(self._policy_override) if self._policy_override else None
+            ovr_label = self._override_label()
             attrs = {
                 "friendly_name": "Curtailment Intended Policy",
                 "icon": "mdi:robot",
@@ -2776,6 +2854,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 # The card must not warn "not applied" when the select and the
                 # policy in force legitimately differ for this one reason.
                 "session_dispatch": session_dispatch,
+                "session_end_soc_pct": session_end_soc_pct,
                 "headroom_need_kwh": headroom_need_kwh,
                 "headroom_have_kwh": headroom_have_kwh,
                 "headroom_short_kwh": headroom_short_kwh,

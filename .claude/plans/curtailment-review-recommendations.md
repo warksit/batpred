@@ -322,7 +322,7 @@ Goal: replace “latched override soup” with an **explicit small state machine
 
 | # | Action | Why |
 |---|--------|-----|
-| **1.1** | **State survival across deploy.** Reconstruct `_peak_pv` (and peak time if possible) from HA history on startup when state file is empty/stale for today. Persist overflow smooth window if cheap. Prefer reconstruct over ever-growing latch sets. | Kills mid-day deploy confusion; belongs **before** ownership state-machine work |
+| **1.1** | **State survival across deploy — LARGELY DONE (corrected 2026-08-03).** `curtailment_state.json` (`7cdba1c0`) already persists `peak_pv_kw`/`peak_pv_time`, `pv_history` (R49), `cap_samples`/`yesterday_cap_avg` (R60), `last_floor_scale` and the day latches, same-day guarded and atomically written; verified restoring live across the 2026-08-03 deploy. **Remaining scope is one line:** add `_overflow_history` (R64 rolling-median deque) to the saved dict + a restore loop. No HA-history reconstruction needed. | Was sized as "build persistence"; it is now a small addition. Mid-day deploys are already safe for everything except ~30 min of R64 smoothing |
 | **1.2** | Ownership state machine: `acquire_cm()` / `release_predbat()` / `apply_manual(policy)` — full mapper chain, neutralise Predbat, park EMS, policy, `read_only`, **then verify** key entities. | Repeated 07-26…07-30 |
 | **1.3** | Decision state machine (Idle / PreDrain / Manage / HoldOnly / Released) mapping today’s overrides. | Opacity of override soup |
 | **1.4** | Split `calculate()` along phase boundaries (one extraction per commit); lower ruff pin from 49 toward 15; optionally enable flake8 C901 on CM files only. | Edit risk |
