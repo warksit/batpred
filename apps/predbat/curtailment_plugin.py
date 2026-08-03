@@ -58,6 +58,7 @@ from curtailment_calc import (
     compute_drain_above_source,
     compute_proposed_phase,
     phase_to_policy,
+    POLICY_MAX_EXPORT,
     compute_pre_pv_target,
     compute_floor_with_source,
     compute_session_reserve,
@@ -162,6 +163,12 @@ POLICY_PREDBAT = "Predbat"
 # v31 floor/handback (2026-07-19): saving-session reserve (Octopus sensor CM can
 # read directly) + early-handback buffer (fit p90 overflow with this to spare).
 SIG_SAVING_SESSION = "binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
+# RD14c: DISPATCH is driven off the Octoplus CALENDAR, not the binary sensor —
+# Octopus publishes the sensor ~1 min late at each edge, which cost 5 min 46 s
+# of selling past the paid window on 2026-07-28. The heartbeat reads this entity;
+# the display layer MUST read the same one, or the card can disagree with the
+# dispatcher at exactly the moments that matter.
+SIG_SAVING_SESSION_CALENDAR = "calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
 HA_EARLY_HANDBACK_BUFFER = "input_number.curtailment_early_handback_buffer_kwh"
 EARLY_HANDBACK_BUFFER_DEFAULT = 1.5
 # v32: the "overflow fits headroom" buffer is now a Hold gate (not a deactivate
@@ -2445,6 +2452,18 @@ class CurtailmentPlugin(PredBatPlugin):
             best_mins = max(best_mins, mins)
         return compute_session_reserve(best_mins, cap_kw)
 
+    def _is_session_dispatching(self):
+        """True while the heartbeat is forcing Max Export for a live saving session.
+
+        Reads the CALENDAR — the same entity, with the same semantics, that
+        `sig_dispatch_heartbeat.yaml` uses to compute its effective policy. This
+        is a display mirror of a decision made elsewhere, so it must never be a
+        second opinion."""
+        try:
+            return str(self.base.get_state_wrapper(SIG_SAVING_SESSION_CALENDAR, default="off")).lower() in ("on", "true")
+        except (TypeError, ValueError):
+            return False
+
     def _get_session_start(self):
         """ISO start time of the active/next joined saving session, or None.
 
@@ -2672,9 +2691,28 @@ class CurtailmentPlugin(PredBatPlugin):
         # "manual override", override "Hold Battery"). The plugin's preference is
         # still worth showing — it is what resumes when the override clears — so
         # it moves into the reason.
+        #
+        # The session layer was documented here from the start and never
+        # implemented, so the middle rung of the precedence was invisible:
+        # RD14c moved session DISPATCH to the heartbeat, which forces Max Export
+        # off the calendar WITHOUT writing the select — so nothing downstream
+        # could see it. Live 2026-08-03 19:13, mid-session: battery -3.84 kW,
+        # export 3.68 kW at the cap, card reading "Hold Battery · surplus fits".
+        #
+        # Mirrors sig_dispatch_heartbeat.yaml term for term:
+        #   policy = override        if override active
+        #            else 'Max Export' if (session_live and raw != 'Predbat')
+        #            else raw
+        # The `!= Predbat` guard matters: once we have handed back, Predbat owns
+        # the machine and the heartbeat stands down rather than making a second
+        # writer — the display must stand down with it.
+        session_dispatch = bool(acting and self._is_session_dispatching() and intended_policy != POLICY_PREDBAT and not manual)
         if acting and manual:
             published_policy = override_choice
             published_reason = "manual · {} (plugin would {})".format(override_choice, intended_policy)
+        elif session_dispatch:
+            published_policy = POLICY_MAX_EXPORT
+            published_reason = "saving session · exporting at cap (plugin would {})".format(intended_policy)
         else:
             published_policy = intended_policy
             published_reason = reason
@@ -2734,6 +2772,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 "session_reserve_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else 0.0,
                 "session_reserve_pct": round(self._session_reserve_kwh / max(soc_max, 0.1) * 100.0, 1) if self._session_reserve_kwh else 0.0,
                 "session_start": self._get_session_start(),
+                # True while the HEARTBEAT (not the select) is driving the dump.
+                # The card must not warn "not applied" when the select and the
+                # policy in force legitimately differ for this one reason.
+                "session_dispatch": session_dispatch,
                 "headroom_need_kwh": headroom_need_kwh,
                 "headroom_have_kwh": headroom_have_kwh,
                 "headroom_short_kwh": headroom_short_kwh,
