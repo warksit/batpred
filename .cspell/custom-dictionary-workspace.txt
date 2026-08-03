@@ -126,6 +126,7 @@ darkred
 darray
 dasharray
 Dashlane
+dataclass
 datacorrect
 datain
 datalist
@@ -242,6 +243,7 @@ FLOMASTA
 fontsize
 fontweight
 footgun
+footguns
 Forestfire
 formaction
 formmethod
@@ -725,6 +727,7 @@ tzpath
 unasserted
 uncalibrated
 uncompilable
+unauditable
 unconfigured
 underivable
 undiscounted
@@ -739,6 +742,7 @@ underforecast
 underpredict
 underpredicted
 underpredicts
+ungate
 unparseable
 unpickled
 unpickles
