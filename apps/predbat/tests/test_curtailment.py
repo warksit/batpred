@@ -3475,6 +3475,7 @@ from curtailment_plugin import (
     SIG_POLICY_SELECT,
     SIG_OVERRIDE_SELECT,
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
+    SIG_SAVING_SESSION_CALENDAR,
 )
 
 
@@ -6171,6 +6172,80 @@ def test_why_this_mode_reports_session_reserve():
     print(f"  test_why_this_mode_reports_session_reserve: PASSED ({attrs['reason']})")
 
 
+def test_session_dump_is_published_as_the_effective_policy():
+    """During a LIVE saving session the card must show what the heartbeat is
+    actually dispatching, not the plugin's own Schmitt wish.
+
+    Observed live 2026-08-03 19:13, mid-session: battery -3.84 kW, export
+    3.68 kW at the cap (dispatching correctly), while Why This Mode read
+    "→ Hold Battery / Hold · surplus fits". RD14c moved session DISPATCH to the
+    heartbeat, which forces Max Export off the CALENDAR and never writes
+    `sig_dispatch_policy` — so the select, and every consumer of it, keeps
+    showing the pre-session policy.
+
+    `curtailment_plugin.py` already documents the precedence as
+    `override > session > select` (the RD13a comment) but only ever implemented
+    the override layer. This is the same defect as 2026-07-29 08:44 / 3dca0d06:
+    the sensor reporting the plugin's preference instead of the policy in force.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    plugin = CurtailmentPlugin(base)
+    # A band that makes the plugin want Hold — exactly the live 19:13 shape.
+    plugin._charge_below, plugin._drain_above = 6.2, 18.08
+    plugin._policy_override = "no_drain"
+    plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.4, soc_max=18.08)
+
+    pub = base.published["sensor.predbat_curtailment_intended_policy"]
+    assert pub["value"] == "Max Export", f"session dump is the policy in force, got {pub['value']}"
+    assert pub["attrs"]["session_dispatch"] is True, "card needs to know the heartbeat (not the select) is driving"
+    reason = pub["attrs"]["reason"].lower()
+    assert "session" in reason, f"reason must name the session: {pub['attrs']['reason']}"
+    assert "hold" in reason, f"the plugin's own wish must survive into the reason: {pub['attrs']['reason']}"
+    print(f"  test_session_dump_is_published_as_the_effective_policy: PASSED ({pub['attrs']['reason']})")
+
+
+def test_session_dump_respects_the_heartbeat_precedence_exactly():
+    """The plugin's display must mirror the heartbeat's effective-policy rule,
+    term for term — a display that disagrees with the dispatcher is worse than
+    no display. The heartbeat (sig_dispatch_heartbeat.yaml) computes:
+
+        policy = override        if override active
+                 else 'Max Export' if (session_live and raw_policy != 'Predbat')
+                 else raw_policy
+
+    Two consequences pinned here:
+      - a MANUAL override still outranks the session dump (a human can see
+        something we cannot);
+      - after handback (policy Predbat) a live session must NOT claim Max
+        Export — Predbat owns the machine and the heartbeat deliberately stands
+        down rather than putting two writers on the registers.
+    """
+    # 1. Manual override outranks the session.
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_OVERRIDE_SELECT] = "Hold Battery"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 6.2, 18.08
+    plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.4, soc_max=18.08)
+    pub = base.published["sensor.predbat_curtailment_intended_policy"]
+    assert pub["value"] == "Hold Battery", f"manual override outranks the session, got {pub['value']}"
+    assert "manual" in pub["attrs"]["reason"].lower()
+
+    # 2. Handed back to Predbat -> the session must not claim the wheel.
+    base2 = MockBase()
+    base2._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base2._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    plugin2 = CurtailmentPlugin(base2)
+    plugin2._publish_dispatch_policy(False, floor_kwh=0.0, soc_kwh=9.4, soc_max=18.08)
+    pub2 = base2.published["sensor.predbat_curtailment_intended_policy"]
+    assert pub2["value"] == "Predbat", f"after handback the session must not force Max Export, got {pub2['value']}"
+    assert not pub2["attrs"]["session_dispatch"]
+    print("  test_session_dump_respects_the_heartbeat_precedence_exactly: PASSED")
+
+
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
     """v32: with the single drain floor (2.8%), the plugin keeps driving Max Export
     between 2.8% and the old 5% — SOC 0.7 kWh (3.9%) drives, SOC 0.4 kWh (2.2%)
@@ -6850,6 +6925,8 @@ def run_curtailment_tests(my_predbat=None):
         test_two_floors_are_named_and_sourced_distinctly,
         test_drain_above_source_mirrors_compute_drain_above,
         test_drain_above_publishes_its_source,
+        test_session_dump_is_published_as_the_effective_policy,
+        test_session_dump_respects_the_heartbeat_precedence_exactly,
         test_why_this_mode_reports_session_reserve,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
         test_policy_is_reasserted_when_the_select_drifts,
