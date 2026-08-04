@@ -32,12 +32,31 @@
 #        180 W pump phase (~60 s before the compressor) comfortably does.
 #     2. `done_today` — only the FIRST cycle after 13:00 is recorded.
 #   If those 46.7 W blips ever creep up, raise the threshold to ~100 W: the real
-#   cycle starts at ~180 W, so 100 W keeps a wide margin on BOTH sides.
+#   cycle starts at ~180 W, so 100 W keeps a wide margin on BOTH sides. Note the
+#   winter change below wants it raised much further, above CH's peak draw —
+#   at that point the ~180 W pump phase is deliberately excluded and the meter
+#   starts on the compressor ramp instead, losing ~0.01 kWh of pump energy.
 #
-# WINTER: once CH runs, a 13:00 window no longer isolates DHW on its own. Expect
-# to revisit — either a tighter discriminator or a DHW mode signal if the GSHP
-# ever exposes one. The failsafe below stops a CH-driven cycle running to
-# midnight, but it will not stop CH energy being counted.
+# WINTER (Andrew, 2026-08-04) — better than a time window alone:
+#   1. The DHW block is SCHEDULED ON THE GSHP itself, so the 13:00 timing is a
+#      programmed fact, not an observed habit. It should hold through winter.
+#   2. DHW has a distinct power signature, and CH never draws as much: space
+#      heating runs to a LOWER flow temperature than a ~50 C cylinder reheat, and
+#      compressor draw scales with lift. Summer DHW peaks 3108-3170 W across 10
+#      consecutive days — a tight, repeatable band.
+#
+# So the winter discriminator is POWER, not time: raise the start threshold above
+# CH's maximum draw so the meter only ever arms on the DHW ramp. The number is not
+# guessable from summer data, but it does not need to be guessed — HA keeps HOURLY
+# `max` statistics for sensor.heat_pump_energy_meter_power FOREVER (state_class
+# measurement), so once CH has run for a few weeks the two populations can be read
+# straight off and the threshold set from data. That is the same method that
+# separated the dusk-flap nights on elevation.
+#
+# Until then the risk is bounded but real: if CH is running at 13:00, the meter
+# arms on CH, and power may not fall below 50 W for hours — the 23:55 failsafe
+# closes it, but the recorded figure would be DHW + CH. Do not trust this sensor
+# through the heating season until the threshold is re-derived.
 #
 # IMPORTANT: update and commit this file before changing the automation in HA.
 # Apply via ha_config_set_automation with `config:` (full replacement), never
