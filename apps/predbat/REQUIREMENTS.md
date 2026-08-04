@@ -1399,6 +1399,22 @@ Tests: `test_sundown_gated_on_solar_elevation`, `test_sundown_latches_for_the_da
 `test_sundown_latch_cannot_arm_while_the_sun_is_high`,
 `test_sundown_latch_still_defers_to_a_live_session`.
 
+**RD14-own (2026-08-04, IN FORCE) — CM OWNS a live joined session end to end.**
+No **discretionary** handback while the session calendar is on. The heartbeat can
+only force Max Export while CM holds the wheel AND the select is not `Predbat`
+(RD14c), so *any* handback stops the sell — not just sundown. Guarded paths:
+sundown (RD14c-sundown), **"no PV yet"** (peak never cleared 0.1 kW — a
+winter-evening session), **`p90_scale < 0.5`** (Solcast missing/stale), and the
+**R4 charge-window defer** (GSHP-gated, and winter is exactly when sessions run).
+On the two forecast-less paths CM returns `active` with a **`hold`** override —
+it must own the plant so the heartbeat can dispatch, but must not drive the
+Schmitt off a forecast it has just declared unusable.
+**Genuine fail-closed paths are NOT guarded** and must still refuse to act: no
+`soc_max`, no location, no clock, unreadable plant SOC (A0).
+Tests: `test_cm_owns_a_session_through_every_discretionary_handback`,
+`test_r4_defer_does_not_release_the_wheel_mid_session`,
+`test_sundown_defers_while_a_saving_session_is_live`.
+
 **RD14c-sundown (2026-08-03, IN FORCE) — sundown must not hand back mid-session.**
 `sundown = peaked and actual_pv < 0.1` also requires **no live joined session**.
 The heartbeat can only force Max Export while CM holds the wheel and the select is
