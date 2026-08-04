@@ -6225,14 +6225,17 @@ def test_why_this_mode_reports_session_reserve():
     assert attrs["session_reserve_pct"] > 0, "card is % SOC at a glance (A0) — kWh alone is not enough"
     assert attrs["session_start"]
 
-    # The one-line reason must say WHY the drain floor is where it is.
-    reason = attrs["reason"].lower()
-    assert "session" in reason, f"reason must name the session when it sets the floor: {attrs['reason']}"
+    # The card must be able to name WHY the drain floor is where it is. That now
+    # rides on the source label (rendered as "drain if above N% (saving session)")
+    # rather than being restated in `reason` — see
+    # test_reason_does_not_repeat_the_structured_attributes.
+    assert attrs["drain_above_source_label"] == "saving session", attrs["drain_above_source_label"]
 
     # And a no-session day must not mention one.
     plain = _session_publish_run(session=False).published["sensor.predbat_curtailment_intended_policy"]["attrs"]
     assert "session" not in plain["reason"].lower(), f"no session -> reason must not mention one: {plain['reason']}"
     assert plain["drain_above_source"] == "overflow_floor"
+    assert "session" not in plain["drain_above_source_label"]
     print(f"  test_why_this_mode_reports_session_reserve: PASSED ({attrs['reason']})")
 
 
@@ -6601,6 +6604,42 @@ def test_r4_defer_does_not_release_the_wheel_mid_session():
     p2.on_update()
     assert p2.last_phase == "off", f"no session -> R4 defer still hands back, got {p2.last_phase}"
     print("  test_r4_defer_does_not_release_the_wheel_mid_session: PASSED")
+
+
+def test_reason_does_not_repeat_the_structured_attributes():
+    """`reason` is the one-line WHY. The numbers belong to the attributes, which
+    the card renders as its own lines — so reason must not restate them.
+
+    Observed on the card 2026-08-04, every fact printed twice:
+
+        Hold · surplus fits · 9% · band 3-19%     <- reason
+        9% · band 3-19%                           <- from soc_pct / *_pct attrs
+        drain if above 19% (P90 overflow)         <- from drain_above_source_label
+        fits · 10% spare                          <- from headroom_short_pct
+        · surplus fits                            <- from override_label
+
+    SOC, the band, the drain-floor source and the override label each appeared
+    twice. Keep them in the attributes (where the card can format them and other
+    consumers can read them as numbers), out of the prose.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 3.5
+    plugin._policy_override = "no_drain"
+    plugin._overflow_p90 = 4.0
+    plugin._publish_dispatch_policy(True, floor_kwh=3.5, soc_kwh=1.6, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    reason = attrs["reason"]
+
+    assert "band" not in reason, f"band is published as charge_below_pct/drain_above_pct: {reason}"
+    assert "%" not in reason, f"percentages belong in the attributes, not the prose: {reason}"
+    # The WHY must survive.
+    assert "Hold" in reason and attrs["override_label"] in reason, reason
+    # And the attributes must still carry everything the card needs.
+    for key in ("soc_pct", "charge_below_pct", "drain_above_pct", "override_label", "drain_above_source_label", "headroom_short_pct"):
+        assert attrs[key] is not None, f"card needs {key}"
+    print(f"  test_reason_does_not_repeat_the_structured_attributes: PASSED ({reason})")
 
 
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
@@ -7034,6 +7073,7 @@ def run_curtailment_tests(my_predbat=None):
         test_sundown_latch_still_defers_to_a_live_session,
         test_cm_owns_a_session_through_every_discretionary_handback,
         test_r4_defer_does_not_release_the_wheel_mid_session,
+        test_reason_does_not_repeat_the_structured_attributes,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
