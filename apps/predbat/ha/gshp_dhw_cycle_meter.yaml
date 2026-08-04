@@ -1,0 +1,174 @@
+# GSHP DHW cycle meter (2026-08-04)
+#
+# Records the daily domestic-hot-water reheat as an ENERGY DELTA on the lifetime
+# heat-pump meter, not by integrating power. The delta is exact regardless of
+# sampling rate; integrating a 34-minute, 3 kW block sampled every ~15 s would
+# carry avoidable error at both edges.
+#
+# Why a cycle meter and not the plain daily utility_meter:
+#   sensor.gshp_daily is the WHOLE heat pump. Today that is ~all DHW because
+#   central heating is off, but the moment CH returns it becomes DHW + CH and the
+#   DHW series is lost. This isolates the reheat so the series survives winter.
+#
+# Cycle definition (Andrew, 2026-08-04):
+#   START  first sustained reading above 50 W at/after 13:00
+#   END    from that point, when it falls back below 50 W
+#
+# Measured over 25 Jul - 4 Aug (10 days, sensor.heat_pump_energy_meter_power):
+#   - EVERY day has exactly one reheat and it is ALWAYS in the 13:00 hour
+#   - peak 3108-3170 W, remarkably repeatable
+#   - standby floor ~9 W (0.216 kWh/day, ~12% of the daily total)
+#   - 4 Aug in detail: 13:10:50 pump 180 W -> 13:11:51 compressor 2200 W ->
+#     ramp to 3163 W -> 13:44:19 compressor off -> ~186 W run-on ->
+#     13:45:19 back to 9 W standby.  34.5 minutes, no mid-cycle dip.
+#   - 8 and 10 Jul read exactly 0.22 kWh: standby only, no reheat ran at all.
+#
+# THE TRAP, and why the guards below exist:
+#   Two excursions above standby were NOT reheats — Sat 25 Jul 12:00 and
+#   Fri 31 Jul 18:00, both peaking at 46.7 W. That is only 3.3 W under the 50 W
+#   threshold, and the 18:00 one is AFTER 13:00. A slightly larger blip would
+#   start a spurious cycle and overwrite the day's real figure. Two defences:
+#     1. `for: 1 min` on the start trigger — a blip cannot arm it, but the real
+#        180 W pump phase (~60 s before the compressor) comfortably does.
+#     2. `done_today` — only the FIRST cycle after 13:00 is recorded.
+#   If those 46.7 W blips ever creep up, raise the threshold to ~100 W: the real
+#   cycle starts at ~180 W, so 100 W keeps a wide margin on BOTH sides.
+#
+# WINTER: once CH runs, a 13:00 window no longer isolates DHW on its own. Expect
+# to revisit — either a tighter discriminator or a DHW mode signal if the GSHP
+# ever exposes one. The failsafe below stops a CH-driven cycle running to
+# midnight, but it will not stop CH energy being counted.
+#
+# IMPORTANT: update and commit this file before changing the automation in HA.
+# Apply via ha_config_set_automation with `config:` (full replacement), never
+# python_transform — it reorders keys and HA evaluates variables top-down.
+
+id: "1785400000001"
+alias: "GSHP DHW cycle meter"
+description: >-
+  Records the daily DHW reheat as a delta on the lifetime heat-pump meter.
+  Starts on a sustained reading above 50 W from 13:00, ends when it drops back
+  below 50 W. Repo: apps/predbat/ha/gshp_dhw_cycle_meter.yaml.
+mode: single
+
+triggers:
+  # Sustained, not instantaneous — see THE TRAP above.
+  - trigger: numeric_state
+    entity_id: sensor.heat_pump_energy_meter_power
+    above: 50
+    for: "00:01:00"
+    id: cycle_start
+  # A numeric_state trigger only fires on CROSSING, so if the reheat is already
+  # under way at 13:00 it would never arm. This catches that.
+  - trigger: time
+    at: "13:00:00"
+    id: window_open
+  - trigger: numeric_state
+    entity_id: sensor.heat_pump_energy_meter_power
+    below: 50
+    for: "00:02:00"
+    id: cycle_end
+  - trigger: time
+    at: "23:55:00"
+    id: failsafe_close
+  - trigger: time
+    at: "00:00:00"
+    id: day_reset
+
+conditions: []
+
+actions:
+  - choose:
+      # ---- START: first sustained >50 W at/after 13:00, once per day --------
+      - conditions:
+          - condition: trigger
+            id:
+              - cycle_start
+              - window_open
+          - condition: time
+            after: "13:00:00"
+          - condition: state
+            entity_id: input_boolean.gshp_dhw_running
+            state: "off"
+          - condition: state
+            entity_id: input_boolean.gshp_dhw_done_today
+            state: "off"
+          - condition: numeric_state
+            entity_id: sensor.heat_pump_energy_meter_power
+            above: 50
+        sequence:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.gshp_dhw_cycle_start_kwh
+            data:
+              value: "{{ states('sensor.heat_pump_energy_meter_energy') | float(0) | round(5) }}"
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.gshp_dhw_running
+
+      # ---- END: dropped back below 50 W --------------------------------
+      - conditions:
+          - condition: trigger
+            id: cycle_end
+          - condition: state
+            entity_id: input_boolean.gshp_dhw_running
+            state: "on"
+        sequence:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.gshp_dhw_today_kwh
+            data:
+              # Clamped at 0: a meter reset, or a start reading restored stale
+              # across a HA restart, would otherwise write a negative "energy".
+              value: >-
+                {{ [ ((states('sensor.heat_pump_energy_meter_energy') | float(0))
+                      - (states('input_number.gshp_dhw_cycle_start_kwh') | float(0)))
+                     | round(3), 0 ] | max }}
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.gshp_dhw_running
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.gshp_dhw_done_today
+
+      # ---- FAILSAFE: never leave a cycle open across midnight -----------
+      - conditions:
+          - condition: trigger
+            id: failsafe_close
+          - condition: state
+            entity_id: input_boolean.gshp_dhw_running
+            state: "on"
+        sequence:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.gshp_dhw_today_kwh
+            data:
+              value: >-
+                {{ [ ((states('sensor.heat_pump_energy_meter_energy') | float(0))
+                      - (states('input_number.gshp_dhw_cycle_start_kwh') | float(0)))
+                     | round(3), 0 ] | max }}
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.gshp_dhw_running
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.gshp_dhw_done_today
+
+      # ---- MIDNIGHT: re-arm for the new day ------------------------------
+      # Zeroing matters: a day with NO reheat (8 and 10 Jul) must read 0.0, not
+      # yesterday's figure. The history keeps the series.
+      - conditions:
+          - condition: trigger
+            id: day_reset
+        sequence:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.gshp_dhw_today_kwh
+            data:
+              value: 0
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.gshp_dhw_done_today
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.gshp_dhw_running
