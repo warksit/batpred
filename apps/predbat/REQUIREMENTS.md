@@ -1380,6 +1380,25 @@ with native `calendar` start/end triggers.
 session_live: "{{ is_state('calendar...octoplus_saving_sessions', 'on') }}"
 ```
 
+**O1 / sundown gate + latch (2026-08-04, IN FORCE).** Sundown requires the SUN to
+be down, not merely PV to be low: `elevation < SUNDOWN_ELEV_DEG (8.0)`. Ten nights
+of live transitions separate perfectly at the first handback — flap nights
+**12.6 / 14.5 / 11.4 deg**, clean nights **7.8 / 6.3 / 5.5 / 5.7 / 6.7 / 6.5 / 5.0 deg**;
+no overlap, 3.6 deg of margin, 8.0 sits just above the highest clean night so a
+genuine handback is never delayed. At 11-15 deg the sun is still well up, so PV
+under 100 W is a cloud — CM handed back, PV recovered, CM re-took the wheel, and
+**every toggle of `read_only` forces a full inverter reset**
+(`docs/customisation.md:38`). Elevation is monotonic through dusk, so this cannot
+flap by construction; a dwell timer would only make it slower.
+A same-day `_sundown_latched` (persisted in `curtailment_state.json`, cleared by
+`_reset_for_new_day`) covers what the gate cannot: residual PV noise below the
+gate, and midwinter where peak elevation here (~10.7 deg) never clears the gate.
+**The latch may only ARM below the gate** — otherwise one heavy afternoon storm
+would latch CM off for the rest of a big-overflow day.
+Tests: `test_sundown_gated_on_solar_elevation`, `test_sundown_latches_for_the_day`,
+`test_sundown_latch_cannot_arm_while_the_sun_is_high`,
+`test_sundown_latch_still_defers_to_a_live_session`.
+
 **RD14c-sundown (2026-08-03, IN FORCE) — sundown must not hand back mid-session.**
 `sundown = peaked and actual_pv < 0.1` also requires **no live joined session**.
 The heartbeat can only force Max Export while CM holds the wheel and the select is
