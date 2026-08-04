@@ -586,7 +586,7 @@ several defects at once. Everything below is **open unless marked DONE**.
 
 ### Open — ranked
 
-**O1. Sundown has no hysteresis or end-of-day latch — HIGHEST VALUE.**
+**O1. Sundown has no hysteresis or end-of-day latch — FIXED 2026-08-04 (`68afdd14`).**
 `sundown = peaked and actual_pv < 0.1` is a single sample re-evaluated every
 cycle. On 2026-08-03 PV oscillated 0.03 → 0.22 → 0.15 kW at dusk and CM flapped
 **seven times** between 19:40 and 20:05 (previous three nights: exactly one clean
@@ -597,6 +597,12 @@ disruptive, not cosmetic. Once CM has deactivated after its peak it should stay
 down for the day; re-activation should need a real PV recovery, not a 50 W
 flicker. *The session gave this teeth: on previous nights CM crossed the dusk
 boundary idling in Hold, so the flapping was invisible and harmless.*
+
+**Fix shipped:** sundown now also requires `solar_elevation < 8.0 deg`, plus a
+same-day `_sundown_latched` (persisted; may only ARM below the gate). Ten nights
+of data separate perfectly — flap nights 11.4-14.5 deg, clean nights 5.0-7.8 deg.
+Elevation is monotonic through dusk so this cannot flap by construction. Verify
+at dusk on the next few evenings: expect exactly ONE Active->Off transition.
 
 **O2. Disabling the heartbeat mid-dispatch strands the registers.**
 At 19:40 CM disabled the heartbeat while it held `active_power_fixed_adjustment`
