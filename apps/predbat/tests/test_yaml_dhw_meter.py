@@ -85,9 +85,9 @@ def test_start_is_sustained_and_once_per_day():
     assert trig["cycle_start"].get("for") == "00:01:00", "an instantaneous blip must not arm the meter"
 
     start = branch(doc, "gshp_dhw_cycle_start_kwh")
-    conds = yaml.safe_dump(start["conditions"])
-    assert "gshp_dhw_done_today" in conds, "only the FIRST cycle after 13:00 may be recorded"
-    assert "13:00:00" in conds, "start must be gated to at/after 13:00"
+    guards = yaml.safe_dump(start["conditions"])
+    assert "gshp_dhw_done_today" in guards, "only the FIRST cycle after 13:00 may be recorded"
+    assert "13:00:00" in guards, "start must be gated to at/after 13:00"
     # A numeric_state trigger only fires on crossing, so a reheat already running
     # at 13:00 needs the time trigger to arm it.
     assert "window_open" in yaml.safe_dump(start["conditions"]), "13:00 trigger must also be able to start the cycle"
