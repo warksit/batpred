@@ -1313,6 +1313,75 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as exc:
             self._log_once("forecast_overflow_error", "_publish_forecast_overflow failed: {} — overflow bands frozen at previous cycle (pre-PV drain gating affected)".format(exc))
 
+    def _pre_pv_phase(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw, soc_kw, soc_max):
+        """Pre-dawn / winter-morning branch: no PV observed yet today.
+
+        Extracted from calculate() to stay under the C901 ratchet (the hook's own
+        note: split calculate along its phase boundaries, never raise the pin).
+        Returns a (floor, phase) tuple; the caller returns it verbatim.
+        """
+        # Compute forecast integrals from current Solcast so dashboard
+        # shows expected overflow before activation.
+        self._publish_forecast_overflow(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
+
+        # R52: pre-PV drain — if forecast says big overflow + CH off + we
+        # have time to drain at DNO before PV starts, activate now.
+        pre_pv = self._pre_pv_drain_decision(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
+        if pre_pv is not None:
+            target_kwh, decision_str = pre_pv
+            self._last_decision = "active (pre-PV): " + decision_str
+            self._last_floor_scale = 0.0
+            self._floor_source = "Pre-PV Drain"
+            # R62: stamp the published-threshold inputs with the pre-PV
+            # target. Without this, publish() derives drain_above from
+            # YESTERDAY EVENING'S _effective_keep_kwh/_overflow_floor_kwh
+            # (e.g. 14.95 after an R61 dusk hold) and the HA automation
+            # never drains below yesterday's level — pre-PV drain would
+            # silently do nothing. p10_recovery is likewise stale from
+            # dusk; pre-dawn recovery is meaningless (whole PV day ahead),
+            # so clear it — charge_below then rests on soc_keep/deep floor.
+            self._effective_keep_kwh = round(target_kwh, 2)
+            self._overflow_floor_kwh = round(target_kwh, 2)
+            self._p10_recovery_floor = 0.0
+            self._pre_pv_engaged_today = True
+            self._save_state()
+            return target_kwh, "active"
+
+        # v32 dawn-flap fix: the pre-PV drain has finished (pre_pv is None) but PV
+        # hasn't arrived yet. If it fired today and overflow is still forecast,
+        # HOLD active (battery flat at the drained level) rather than handing back
+        # to Predbat/MSC — otherwise actual PV flickering across the 0.1kW boundary
+        # at dawn flaps off↔active and churns the policy/heartbeat (2026-07-21).
+        # This block only runs pre-dawn (peak not yet observed), so it can't affect
+        # the evening; Hold at PV≈0 = cover load from battery, no sell, no absorb.
+        if self._pre_pv_engaged_today and self._overflow_p90 > PRE_PV_OVERFLOW_THRESHOLD_KWH:
+            self._policy_override = "hold"
+            self._floor_source = "Pre-PV Hold"
+            self._effective_keep_kwh = round(soc_kw, 2)
+            self._overflow_floor_kwh = round(soc_kw, 2)
+            self._p10_recovery_floor = 0.0
+            self._last_decision = "active (pre-PV hold): drain done, awaiting PV"
+            self._save_state()
+            return soc_kw, "active"
+
+        if self._is_session_dispatching():
+            # RD14-own: a joined session is live and CM owns it. The heartbeat
+            # can only force Max Export while CM holds the wheel and the select
+            # is not `Predbat`, so handing back here would stop the sell.
+            # Hold is the right posture — no usable PV to manage, but we must
+            # still own the plant so the heartbeat can dispatch.
+            self._policy_override = "hold"
+            self._floor_source = "Saving Session"
+            self._effective_keep_kwh = round(soc_kw, 2)
+            self._overflow_floor_kwh = round(soc_kw, 2)
+            self._p10_recovery_floor = 0.0
+            self._last_decision = "active (session): no PV, holding the wheel for the session"
+            return soc_kw, "active"
+
+        self._last_decision = "off: no PV yet"
+        self._floor_source = "Overnight Reserve"
+        return soc_max, "off"
+
     def calculate(self, dno_limit_kw):
         """Compute floor and phase for this cycle.
 
@@ -1432,53 +1501,7 @@ class CurtailmentPlugin(PredBatPlugin):
 
         # Guard: no PV yet (pre-dawn / winter morning)
         if self._peak_pv < 0.1 and actual_pv < 0.1:
-            # Compute forecast integrals from current Solcast so dashboard
-            # shows expected overflow before activation.
-            self._publish_forecast_overflow(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
-
-            # R52: pre-PV drain — if forecast says big overflow + CH off + we
-            # have time to drain at DNO before PV starts, activate now.
-            pre_pv = self._pre_pv_drain_decision(lat, lon, doy, local_offset, utc_hours, dno_limit_kw)
-            if pre_pv is not None:
-                target_kwh, decision_str = pre_pv
-                self._last_decision = "active (pre-PV): " + decision_str
-                self._last_floor_scale = 0.0
-                self._floor_source = "Pre-PV Drain"
-                # R62: stamp the published-threshold inputs with the pre-PV
-                # target. Without this, publish() derives drain_above from
-                # YESTERDAY EVENING'S _effective_keep_kwh/_overflow_floor_kwh
-                # (e.g. 14.95 after an R61 dusk hold) and the HA automation
-                # never drains below yesterday's level — pre-PV drain would
-                # silently do nothing. p10_recovery is likewise stale from
-                # dusk; pre-dawn recovery is meaningless (whole PV day ahead),
-                # so clear it — charge_below then rests on soc_keep/deep floor.
-                self._effective_keep_kwh = round(target_kwh, 2)
-                self._overflow_floor_kwh = round(target_kwh, 2)
-                self._p10_recovery_floor = 0.0
-                self._pre_pv_engaged_today = True
-                self._save_state()
-                return target_kwh, "active"
-
-            # v32 dawn-flap fix: the pre-PV drain has finished (pre_pv is None) but PV
-            # hasn't arrived yet. If it fired today and overflow is still forecast,
-            # HOLD active (battery flat at the drained level) rather than handing back
-            # to Predbat/MSC — otherwise actual PV flickering across the 0.1kW boundary
-            # at dawn flaps off↔active and churns the policy/heartbeat (2026-07-21).
-            # This block only runs pre-dawn (peak not yet observed), so it can't affect
-            # the evening; Hold at PV≈0 = cover load from battery, no sell, no absorb.
-            if self._pre_pv_engaged_today and self._overflow_p90 > PRE_PV_OVERFLOW_THRESHOLD_KWH:
-                self._policy_override = "hold"
-                self._floor_source = "Pre-PV Hold"
-                self._effective_keep_kwh = round(soc_kw, 2)
-                self._overflow_floor_kwh = round(soc_kw, 2)
-                self._p10_recovery_floor = 0.0
-                self._last_decision = "active (pre-PV hold): drain done, awaiting PV"
-                self._save_state()
-                return soc_kw, "active"
-
-            self._last_decision = "off: no PV yet"
-            self._floor_source = "Overnight Reserve"
-            return soc_max, "off"
+            return self._pre_pv_phase(lat, lon, doy, local_offset, utc_hours, dno_limit_kw, soc_kw, soc_max)
 
         # Track actual peak for scale calibration (R43)
         if actual_pv > self._peak_pv:
@@ -1494,6 +1517,17 @@ class CurtailmentPlugin(PredBatPlugin):
 
         if p90_scale < 0.5:
             # No Solcast data and no yesterday's scale — cannot compute safely
+            if self._is_session_dispatching():
+                # RD14-own: keep the wheel so the heartbeat can dispatch, but do
+                # NOT drive the Schmitt off a forecast we have just declared
+                # unusable — hold position instead.
+                self._policy_override = "hold"
+                self._floor_source = "Saving Session"
+                self._effective_keep_kwh = round(soc_kw, 2)
+                self._overflow_floor_kwh = round(soc_kw, 2)
+                self._p10_recovery_floor = 0.0
+                self._last_decision = "active (session): no Solcast, holding the wheel for the session"
+                return soc_kw, "active"
             self._last_decision = "off: p90_scale<0.5 (no Solcast)"
             self._floor_source = "No Forecast"
             return soc_max, "off"
@@ -1663,28 +1697,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # Schmitt put it and the heartbeat keeps dispatching off the calendar.
         # Pinning the select to Max Export from here is what RD14c deliberately
         # removed (it caused the 5 min 46 s over-run at session end).
-        #
-        # O1 (2026-08-04): PV alone is too noisy to detect sunset. Ten nights of
-        # live transitions separate PERFECTLY on solar elevation at the first
-        # "Off":
-        #     flapped:  12.6, 14.5, 11.4 deg   (3 nights, 2-6 extra transitions)
-        #     clean:     7.8, 6.3, 5.5, 5.7, 6.7, 6.5, 5.0 deg   (7 nights)
-        # No overlap, 3.6 deg of margin. At 11-15 deg the sun is still well up, so
-        # PV under 100 W is a CLOUD — CM hands back, PV recovers, CM re-takes the
-        # wheel, and every toggle of read_only forces a full inverter reset
-        # (docs/customisation.md:38). Elevation is monotonic through dusk, so this
-        # cannot flap by construction — unlike a dwell timer, which would only
-        # make the flapping slower.
-        #
-        # The latch covers what the gate cannot: residual PV noise BELOW the gate,
-        # and midwinter, where peak elevation at this latitude (~10.7 deg) never
-        # clears the gate so it is permissive all day. It can only ARM below the
-        # gate — otherwise one heavy afternoon storm would latch CM off for the
-        # rest of a big-overflow day, turning a display annoyance into lost
-        # generation.
-        sun_elevation = solar_elevation(lat, lon, utc_hours, doy)
-        sun_low = sun_elevation < SUNDOWN_ELEV_DEG
-        sundown = (not self._is_session_dispatching()) and sun_low and (self._sundown_latched or (peaked and actual_pv < 0.1))
+        sundown = self._is_sundown(peaked, actual_pv, lat, lon, utc_hours, doy)
         if sundown:
             self._sundown_latched = True
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
@@ -2548,6 +2561,36 @@ class CurtailmentPlugin(PredBatPlugin):
         except (TypeError, ValueError, AttributeError):
             return 0.0
 
+    def _is_sundown(self, peaked, actual_pv, lat, lon, utc_hours, doy):
+        """O1 (2026-08-04): has the sun actually gone down?
+
+        PV alone is too noisy. Ten nights of live transitions separate PERFECTLY
+        on solar elevation at the first handback:
+
+            flapped:  12.6, 14.5, 11.4 deg   (3 nights, 2-6 extra transitions)
+            clean:     7.8, 6.3, 5.5, 5.7, 6.7, 6.5, 5.0 deg   (7 nights)
+
+        No overlap, 3.6 deg of margin. At 11-15 deg the sun is still well up, so PV
+        under 100 W is a CLOUD — CM hands back, PV recovers, CM re-takes the wheel,
+        and every toggle of read_only forces a full inverter reset
+        (docs/customisation.md:38). Elevation is monotonic through dusk, so this
+        cannot flap by construction — unlike a dwell timer, which would only make
+        the flapping slower and would need state a deploy would wipe.
+
+        The latch covers what the gate cannot: residual PV noise BELOW the gate,
+        and midwinter, where peak elevation at this latitude (~10.7 deg) never
+        clears the gate so it is permissive all day. It may only ARM below the gate
+        (the caller sets it only when this returns True) — otherwise one heavy
+        afternoon storm would latch CM off for the rest of a big-overflow day.
+
+        A live joined session outranks both: handing back would stop the sell.
+        """
+        if self._is_session_dispatching():
+            return False
+        if solar_elevation(lat, lon, utc_hours, doy) >= SUNDOWN_ELEV_DEG:
+            return False
+        return self._sundown_latched or (peaked and actual_pv < 0.1)
+
     def _is_session_dispatching(self):
         """True while the heartbeat is forcing Max Export for a live saving session.
 
@@ -3076,6 +3119,14 @@ class CurtailmentPlugin(PredBatPlugin):
                     soc_keep=effective_keep,
                     was_deferring=self._r4_deferring,
                 )
+                # RD14-own: a live joined session outranks the R4 charge-window
+                # defer. Handing the select to Predbat mid-session stops the
+                # heartbeat dispatching (it requires select != Predbat), so the
+                # sell would end early. Winter-only path (R4 is GSHP-gated), but
+                # winter is exactly when sessions run.
+                if should_defer and self._is_session_dispatching():
+                    should_defer = False
+                    self._r4_deferring = False
 
                 if should_defer:
                     minutes_now = getattr(self.base, "minutes_now", 0)

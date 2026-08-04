@@ -6515,6 +6515,94 @@ def test_sundown_latch_still_defers_to_a_live_session():
     print("  test_sundown_latch_still_defers_to_a_live_session: PASSED")
 
 
+def test_cm_owns_a_session_through_every_discretionary_handback():
+    """While a joined session is live, CM OWNS it — no discretionary handback.
+
+    The heartbeat can only force Max Export while CM holds the wheel AND the
+    select is not `Predbat` (RD14c). So *any* path that hands back mid-session
+    stops the sell, not just sundown. Guarding sundown alone left three other
+    routes open:
+
+      - "no PV yet" (peak never cleared 0.1 kW — a winter-evening session)
+      - "p90_scale<0.5" (Solcast missing or stale)
+      - R4 defer to a Predbat charge window (GSHP heating active)
+
+    Each now holds position and keeps the wheel instead of handing back. Hold is
+    the right neutral posture: the forecast machinery is unusable on these paths,
+    so CM should not drive the Schmitt off it — but it must still own the plant so
+    the heartbeat can dispatch.
+
+    Genuine fail-closed paths (no soc_max, no location, no clock, unreadable SOC)
+    are deliberately NOT guarded — those must still refuse to act.
+    """
+    from datetime import datetime, timezone
+
+    def _run(session, pv_kw, solcast_ok=True):
+        pv = {m: 0.0 for m in range(0, 480, PLUGIN_STEP)}
+        load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
+        overrides = {"sensor.sigen_plant_pv_power": pv_kw, "sensor.sigen_plant_consumed_power": 0.5}
+        if solcast_ok:
+            overrides.update(_make_p90_sensors())
+        if session:
+            overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+        base = MockBase(
+            pv_step=pv,
+            load_step=load,
+            soc_kw=BATTERY_KWH * 0.50,
+            minutes_now=20 * 60,
+            best_soc_keep=4.0,
+            now_utc=datetime(2025, 7, 12, 19, 0, tzinfo=timezone.utc),
+            sensor_overrides=overrides,
+        )
+        plugin = CurtailmentPlugin(base)
+        _floor, phase = plugin.calculate(dno_limit_kw=4.0)
+        return plugin, phase
+
+    # "no PV yet" — peak never cleared 0.1 kW (winter evening session).
+    _p, off_phase = _run(session=False, pv_kw=0.0)
+    assert off_phase == "off", f"baseline: no PV and no session -> off, got {off_phase}"
+    plugin, phase = _run(session=True, pv_kw=0.0)
+    assert phase == "active", f"session live -> CM must own the plant even with no PV, got {phase}"
+    assert plugin._policy_override == "hold", f"neutral posture, not a Schmitt drive: {plugin._policy_override}"
+
+    # Solcast missing — cannot compute floors, but must not release the wheel.
+    _p2, off2 = _run(session=False, pv_kw=3.0, solcast_ok=False)
+    assert off2 == "off", f"baseline: no Solcast and no session -> off, got {off2}"
+    p3, phase3 = _run(session=True, pv_kw=3.0, solcast_ok=False)
+    assert phase3 == "active", f"session live -> keep the wheel despite no Solcast, got {phase3}"
+    assert p3._policy_override == "hold"
+    print("  test_cm_owns_a_session_through_every_discretionary_handback: PASSED")
+
+
+def test_r4_defer_does_not_release_the_wheel_mid_session():
+    """R4 hands the machine to a Predbat charge window when GSHP heating is on and
+    SOC is below keep. Mid-session that would stop the dump, so the session wins."""
+    pv = {m: 0.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 3.0, "sensor.sigen_plant_consumed_power": 0.5}
+    overrides.update(_make_p90_sensors())
+    overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=1.0, minutes_now=20 * 60, best_soc_keep=8.0, sensor_overrides=overrides)
+    # Make the defer branch genuinely reachable: GSHP heating on (its default),
+    # SOC well below keep, and a live Predbat charge window that is not a freeze.
+    base.charge_window_best = [{"start": 0, "end": 1440, "average": 10.0}]
+    base.charge_limit_best = [BATTERY_KWH]
+    plugin = CurtailmentPlugin(base)
+    plugin._r4_deferring = False
+    assert plugin._is_gshp_ch_active(), "rig must have GSHP active or the branch is unreachable"
+    plugin.on_update()
+    assert plugin.last_phase != "off", "a live session outranks the R4 charge-window defer"
+    assert not plugin._r4_deferring, "and must not leave the defer latch armed"
+
+    # Without the session the defer stands.
+    del base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR]
+    p2 = CurtailmentPlugin(base)
+    p2._r4_deferring = False
+    p2.on_update()
+    assert p2.last_phase == "off", f"no session -> R4 defer still hands back, got {p2.last_phase}"
+    print("  test_r4_defer_does_not_release_the_wheel_mid_session: PASSED")
+
+
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
     """v32: with the single drain floor (2.8%), the plugin keeps driving Max Export
     between 2.8% and the old 5% — SOC 0.7 kWh (3.9%) drives, SOC 0.4 kWh (2.2%)
@@ -6944,6 +7032,8 @@ def run_curtailment_tests(my_predbat=None):
         test_sundown_latches_for_the_day,
         test_sundown_latch_cannot_arm_while_the_sun_is_high,
         test_sundown_latch_still_defers_to_a_live_session,
+        test_cm_owns_a_session_through_every_discretionary_handback,
+        test_r4_defer_does_not_release_the_wheel_mid_session,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
