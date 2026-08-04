@@ -243,6 +243,12 @@ OVERRIDE_LABELS = {
 # with overflow_p90 = 0.0, i.e. nothing to fit and nothing to spare it against).
 NO_OVERFLOW_LABEL = "no overflow left"
 
+# O1 (2026-08-04): sundown requires the sun to actually be down. Ten nights of
+# live data separate perfectly at the first handback — flap nights 11.4-14.5 deg,
+# clean nights 5.0-7.8 deg. 8.0 sits in the 3.6 deg gap, just above the highest
+# clean night, so a genuine handback is never delayed.
+SUNDOWN_ELEV_DEG = 8.0
+
 # Human labels for the arm of compute_drain_above that set the Headroom Floor.
 # The card REPORTS these (Charter: never re-derive a second decision).
 DRAIN_SOURCE_LABELS = {
@@ -404,6 +410,10 @@ class CurtailmentPlugin(PredBatPlugin):
         self._session_protect_kwh = 0.0
         # Which arm of compute_drain_above set the published Headroom Floor.
         self._drain_above_source = "overflow_floor"
+        # O1: once sundown is declared below the elevation gate, stay down for the
+        # day. Persisted — an evening restart otherwise re-takes the wheel (live
+        # 2026-08-03, "PHASE none -> active" at 20:05 after a deploy).
+        self._sundown_latched = False
         # v32 dawn-flap latch: once the pre-PV drain fires, CM owns the day. When the
         # drain completes but PV hasn't arrived (actual_pv < 0.1) and overflow is still
         # forecast, HOLD active instead of handing back to Predbat — otherwise the
@@ -528,6 +538,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_recovered = bool(data.get("keep_recovered", False))
         self._keep_drained_today = bool(data.get("keep_drained_today", False))
         self._r48_engaged_today = bool(data.get("r48_engaged_today", False))
+        self._sundown_latched = bool(data.get("sundown_latched", False))
         # Restore _pv_history (R49) — without this, every restart kills v20
         # buffer-reduction for the rest of the day until 60 min of fresh
         # samples accumulate.
@@ -591,6 +602,7 @@ class CurtailmentPlugin(PredBatPlugin):
             "keep_recovered": self._keep_recovered,
             "keep_drained_today": self._keep_drained_today,
             "r48_engaged_today": self._r48_engaged_today,
+            "sundown_latched": self._sundown_latched,
             "pv_history": [list(entry) for entry in self._pv_history],
             "yesterday_cap_avg": self._yesterday_cap_avg,
             "cap_samples": list(self._cap_samples),
@@ -630,6 +642,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_drained_today = False
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
+        self._sundown_latched = False  # O1 dusk-flap latch
         self._pre_pv_engaged_today = False  # v32 dawn-flap latch
         self._pre_pv_drain_started = False  # v32.2 pre-PV drain start-latch
         self._policy_override = None
@@ -1650,8 +1663,30 @@ class CurtailmentPlugin(PredBatPlugin):
         # Schmitt put it and the heartbeat keeps dispatching off the calendar.
         # Pinning the select to Max Export from here is what RD14c deliberately
         # removed (it caused the 5 min 46 s over-run at session end).
-        sundown = peaked and actual_pv < 0.1 and not self._is_session_dispatching()
+        #
+        # O1 (2026-08-04): PV alone is too noisy to detect sunset. Ten nights of
+        # live transitions separate PERFECTLY on solar elevation at the first
+        # "Off":
+        #     flapped:  12.6, 14.5, 11.4 deg   (3 nights, 2-6 extra transitions)
+        #     clean:     7.8, 6.3, 5.5, 5.7, 6.7, 6.5, 5.0 deg   (7 nights)
+        # No overlap, 3.6 deg of margin. At 11-15 deg the sun is still well up, so
+        # PV under 100 W is a CLOUD — CM hands back, PV recovers, CM re-takes the
+        # wheel, and every toggle of read_only forces a full inverter reset
+        # (docs/customisation.md:38). Elevation is monotonic through dusk, so this
+        # cannot flap by construction — unlike a dwell timer, which would only
+        # make the flapping slower.
+        #
+        # The latch covers what the gate cannot: residual PV noise BELOW the gate,
+        # and midwinter, where peak elevation at this latitude (~10.7 deg) never
+        # clears the gate so it is permissive all day. It can only ARM below the
+        # gate — otherwise one heavy afternoon storm would latch CM off for the
+        # rest of a big-overflow day, turning a display annoyance into lost
+        # generation.
+        sun_elevation = solar_elevation(lat, lon, utc_hours, doy)
+        sun_low = sun_elevation < SUNDOWN_ELEV_DEG
+        sundown = (not self._is_session_dispatching()) and sun_low and (self._sundown_latched or (peaked and actual_pv < 0.1))
         if sundown:
+            self._sundown_latched = True
             self._last_decision = "off: sundown (peak={:.1f}, actual_pv={:.2f})".format(self._peak_pv, actual_pv)
             self._floor_source = "Overnight Reserve"
             self._policy_override = None

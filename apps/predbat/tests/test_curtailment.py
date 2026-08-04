@@ -3957,12 +3957,14 @@ def test_holds_past_safe_time_until_sundown():
     assert plugin.last_phase == "active", "v32: stay active past safe_time while PV flows"
     assert plugin._policy_override == "no_drain", f"v32.1: no_drain past safe_time, got {plugin._policy_override}"
 
-    # Now PV falls to ≈0 → sundown → deactivate.
+    # Now PV falls to ≈0 AND the sun is genuinely down → deactivate.
+    # 20:00 UTC on doy 193 = 4.9 deg elevation. (Was 19:00 UTC = 12.4 deg, which
+    # O1 now correctly refuses to call sundown — at that height PV≈0 is a cloud.)
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.05
-    base.minutes_now = 19 * 60
-    base.now_utc = datetime(2025, 7, 12, 19, 0, tzinfo=timezone.utc)
+    base.minutes_now = 21 * 60
+    base.now_utc = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
     plugin.on_update()
-    assert plugin.last_phase == "off", "v32: deactivate at sundown (PV≈0)"
+    assert plugin.last_phase == "off", "v32: deactivate at sundown (PV≈0, sun down)"
     print("  test_holds_past_safe_time_until_sundown: PASSED")
 
 
@@ -4002,11 +4004,13 @@ def test_sundown_defers_while_a_saving_session_is_live():
     plugin.on_update()
     assert plugin.last_phase == "active"
 
-    # Dusk arrives (PV below the 0.1 kW sundown threshold) DURING a live session.
+    # Genuine dusk DURING a live session: PV below 0.1 kW *and* the sun below the
+    # O1 elevation gate (20:00 UTC on doy 193 = 4.9 deg), so the session is the
+    # only thing keeping CM active — not the gate.
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.03
     base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
-    base.minutes_now = 19 * 60
-    base.now_utc = datetime(2025, 7, 12, 19, 0, tzinfo=timezone.utc)
+    base.minutes_now = 21 * 60
+    base.now_utc = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
     plugin.on_update()
     assert plugin.last_phase == "active", "must not hand back while a joined session is still dumping"
 
@@ -4017,8 +4021,8 @@ def test_sundown_defers_while_a_saving_session_is_live():
 
     # Session ends -> the very next cycle hands back normally.
     base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "off"
-    base.minutes_now = 20 * 60
-    base.now_utc = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
+    base.minutes_now = 21 * 60 + 10
+    base.now_utc = datetime(2025, 7, 12, 20, 10, tzinfo=timezone.utc)
     plugin.on_update()
     assert plugin.last_phase == "off", "once the session ends, sundown deactivates as before"
     print("  test_sundown_defers_while_a_saving_session_is_live: PASSED")
@@ -6398,6 +6402,119 @@ def test_no_overflow_left_is_not_reported_as_surplus_fits():
     print("  test_no_overflow_left_is_not_reported_as_surplus_fits: PASSED")
 
 
+def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False):
+    """Plugin already through its PV day, now at dusk with `pv_kw` on the array."""
+    from datetime import datetime, timezone
+
+    pv, load = _make_overflow_pv(minutes_now=720)
+    overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    overrides.update(_make_p90_sensors())
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,
+        minutes_now=720,
+        best_soc_keep=4.0,
+        now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
+        sensor_overrides=overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin.on_update()
+    assert plugin.last_phase == "active", "rig must start active (mid-overflow)"
+
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = pv_kw
+    if session:
+        base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base.minutes_now = minutes_now
+    base.now_utc = now_local
+    plugin._sundown_latched = latched
+    plugin.on_update()
+    return plugin
+
+
+def test_sundown_gated_on_solar_elevation():
+    """PV alone is too noisy to detect sunset — gate it on where the sun actually is.
+
+    Ten nights of live phase transitions (2026-07-25 .. 2026-08-03) separate
+    perfectly on solar elevation at the first "Off":
+
+        flapped:  12.6 deg, 14.5 deg, 11.4 deg   (3 nights, 2-6 extra transitions each)
+        clean:     7.8, 6.3, 5.5, 5.7, 6.7, 6.5, 5.0 deg   (7 nights, one clean handback)
+
+    No overlap, 3.6 deg of margin. The physics: at 11-15 deg the sun is still
+    meaningfully up, so PV below 100 W is a CLOUD, not sunset — CM hands back,
+    PV recovers, CM re-takes the wheel, and each toggle of read_only forces a
+    full inverter reset (docs/customisation.md:38).
+
+    Elevation is monotonic through dusk, so this cannot flap by construction —
+    unlike a dwell timer, which only makes flapping slower.
+    """
+    from datetime import datetime, timezone
+
+    # 11.1 deg — reproduces 2026-08-03's 11.4 deg false sundown.
+    high = _dusk_rig(datetime(2025, 7, 12, 19, 10, tzinfo=timezone.utc), 20 * 60 + 10, pv_kw=0.03)
+    assert high.last_phase == "active", "sun still 11.1 deg up — PV≈0 is a cloud, not sunset"
+
+    # 4.9 deg — reproduces 2026-08-02's 5.0 deg clean handback.
+    low = _dusk_rig(datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc), 21 * 60, pv_kw=0.03)
+    assert low.last_phase == "off", "sun down to 4.9 deg with PV≈0 — genuine sundown"
+    print("  test_sundown_gated_on_solar_elevation: PASSED (11.1 deg stays active, 4.9 deg hands back)")
+
+
+def test_sundown_latches_for_the_day():
+    """Below the gate, a PV blip must not re-take the wheel.
+
+    2026-08-03: CM handed back at 19:40 then re-activated at 19:41:49, 19:50:30
+    and 20:05:09 as PV bounced 0.03 -> 0.22 -> 0.15 kW. The elevation gate stops
+    the early false sundown; the latch covers residual noise BELOW the gate, and
+    covers midwinter where peak elevation at this latitude (~10.7 deg) never
+    clears the gate at all so it is permissive all day.
+    """
+    from datetime import datetime, timezone
+
+    # Latched, sun low, and PV has bounced well above the 0.1 threshold.
+    p = _dusk_rig(datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc), 21 * 60, pv_kw=0.9, latched=True)
+    assert p.last_phase == "off", "latched below the gate — a PV blip must not re-activate"
+
+    assert p._sundown_latched, "latch must stay armed"
+
+    # It must survive a deploy, or an evening restart re-takes the wheel — which
+    # is exactly what happened on 2026-08-03 (PHASE none -> active at 20:05).
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p.base.config_root = tmp
+        p._save_state()
+        revived = CurtailmentPlugin(p.base)
+        assert revived._sundown_latched, "sundown latch must persist across a restart"
+    print("  test_sundown_latches_for_the_day: PASSED (latched + persisted)")
+
+
+def test_sundown_latch_cannot_arm_while_the_sun_is_high():
+    """The latch is only safe because the gate guards it.
+
+    Without that, one heavy afternoon storm (PV -> 0 at high sun) would latch CM
+    off for the rest of a big-overflow day — turning a display-level annoyance
+    into lost generation. Arming is only permitted below the elevation gate.
+    """
+    from datetime import datetime, timezone
+
+    # 14:00 BST, sun ~45 deg up, PV crushed to zero by a storm.
+    p = _dusk_rig(datetime(2025, 7, 12, 13, 0, tzinfo=timezone.utc), 14 * 60, pv_kw=0.0)
+    assert p.last_phase == "active", "a mid-afternoon PV collapse is not sundown"
+    assert not p._sundown_latched, "the latch must not arm while the sun is high"
+    print("  test_sundown_latch_cannot_arm_while_the_sun_is_high: PASSED")
+
+
+def test_sundown_latch_still_defers_to_a_live_session():
+    """RD14c-sundown must survive the latch: a joined session outranks both."""
+    from datetime import datetime, timezone
+
+    p = _dusk_rig(datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc), 21 * 60, pv_kw=0.03, latched=True, session=True)
+    assert p.last_phase == "active", "a live session must keep CM driving even when latched"
+    print("  test_sundown_latch_still_defers_to_a_live_session: PASSED")
+
+
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
     """v32: with the single drain floor (2.8%), the plugin keeps driving Max Export
     between 2.8% and the old 5% — SOC 0.7 kWh (3.9%) drives, SOC 0.4 kWh (2.2%)
@@ -6823,6 +6940,10 @@ def run_curtailment_tests(my_predbat=None):
         test_on_update_stays_off_low_pv,
         test_holds_past_safe_time_until_sundown,
         test_sundown_defers_while_a_saving_session_is_live,
+        test_sundown_gated_on_solar_elevation,
+        test_sundown_latches_for_the_day,
+        test_sundown_latch_cannot_arm_while_the_sun_is_high,
+        test_sundown_latch_still_defers_to_a_live_session,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
