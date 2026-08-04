@@ -644,3 +644,24 @@ on the next evening where CM is still active with p90 at zero. Likewise the
 session end-SOC projection has never rendered.
 
 **O9. Predbat v8.47.4 update pending** on the box; auto-update off.
+
+### Fixed 2026-08-04
+
+**Stale-check used the wrong timestamp (FIXED).** The card measured liveness with
+`last_updated`, which HA only advances when the state or an attribute actually
+*changes* — not on every republish (`last_reported`). With the battery held flat
+and nothing moving, no attribute changed for four cycles and `last_updated` froze,
+so the card showed **"stale 20 min"** at 07:53 while the plugin had published at
+07:51:01. It warned precisely when the system was most stable. Now uses
+`last_reported`.
+
+**General lesson:** for any liveness/staleness check on an HA entity, use
+`last_reported`. `last_updated` answers "when did something change", which is the
+opposite of what a heartbeat check wants.
+
+### Overnight 2026-08-03 → 04 (result of the night's fixes)
+
+Clean handback at 20:16:06, Predbat in Demand all night, **0.01 kWh import**,
+battery carried the house 34.8% → 9.2%. CM re-activated in the morning for a
+12.19 kWh p90 overflow day, band 2.8–19.2%, holding at 9.2%. No flapping (PV rose
+monotonically through the dawn threshold).
