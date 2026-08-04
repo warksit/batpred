@@ -2808,11 +2808,11 @@ class CurtailmentPlugin(PredBatPlugin):
             drain_pct = self._drain_above / max(soc_max, 0.1) * 100.0
             ovr_label = self._override_label()
             ovr = " · {}".format(ovr_label) if ovr_label else ""
-            # When the upper edge of the band is set by something other than P90
-            # overflow, say so — otherwise the band is unexplainable from the
-            # card's own numbers (live 2026-08-03, session floor read as P90).
-            src = " · drain floor: saving session" if self._drain_above_source == "session_protect" else ""
-            reason = "{}{} · {:.0f}% · band {:.0f}–{:.0f}%{}".format(schmitt, ovr, soc_pct, charge_pct, drain_pct, src)
+            # reason is the one-line WHY only. SOC, the band, the drain-floor
+            # source and the override label are all published as attributes and
+            # rendered by the card as their own lines — restating them here
+            # printed every fact twice (observed 2026-08-04).
+            reason = "{}{}".format(schmitt, ovr)
         elif plugin_active:
             intended_policy = POLICY_PREDBAT
             intended_keep = None
