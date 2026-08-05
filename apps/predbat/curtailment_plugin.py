@@ -56,6 +56,7 @@ from curtailment_calc import (
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_drain_above,
     compute_drain_above_source,
+    classify_forecast_tracking,
     estimate_session_end_kwh,
     compute_proposed_phase,
     phase_to_policy,
@@ -357,6 +358,11 @@ class CurtailmentPlugin(PredBatPlugin):
         self._peak_pv_time = 0
         # p90 scale from Solcast (set at activation, stable through day, R42)
         self._p90_scale = 0.0
+        # Retained so the phase sensor can report which band today's sky is
+        # tracking — the plugin blends three overflow integrals and never said
+        # which one the day actually resembled.
+        self._p10_scale = 0.0
+        self._p50_scale = 0.0
         self._p90_peak_kw = 0.0
         # Diagnostics published to sensors
         self._remaining_overflow = 0.0
@@ -1194,6 +1200,7 @@ class CurtailmentPlugin(PredBatPlugin):
             return None
 
         p10_scale, p50_scale, p90_scale = self._get_p_scales(lat, lon, doy, local_offset)
+        self._p10_scale, self._p50_scale = p10_scale, p50_scale
         if p90_scale < 0.5:
             return None
 
@@ -1279,6 +1286,7 @@ class CurtailmentPlugin(PredBatPlugin):
         """
         try:
             p10_scale, p50_scale, p90_scale = self._get_p_scales(lat, lon, doy, local_offset)
+            self._p10_scale, self._p50_scale = p10_scale, p50_scale
             if p90_scale < 0.5:
                 return
             threshold_kw = dno_limit_kw + MIN_BASE_LOAD_KW
@@ -2226,6 +2234,8 @@ class CurtailmentPlugin(PredBatPlugin):
         floor_pct = round(target_kwh / soc_max * 100, 1) if soc_max > 0 else 100
         state = "Active" if phase == "active" else "Off"
 
+        tracking_band, tracking_pct = classify_forecast_tracking(self._actual_scale, self._p10_scale, self._p50_scale, self._p90_scale)
+
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
             state,
@@ -2236,7 +2246,14 @@ class CurtailmentPlugin(PredBatPlugin):
                 "floor_scale": round(self._floor_scale, 2),
                 "safe_scale": round(self._safe_scale, 2),
                 "p90_scale": round(self._p90_scale, 2),
+                "p50_scale": round(self._p50_scale, 2),
+                "p10_scale": round(self._p10_scale, 2),
                 "actual_scale": round(self._actual_scale, 2),
+                # Which Solcast band today's sky is actually tracking. Without it,
+                # "was the forecast wrong or was the control wrong?" cannot be
+                # answered after the fact.
+                "tracking_band": tracking_band,
+                "tracking_pct": tracking_pct,
                 "peak_pv_kw": round(self._peak_pv, 2),
                 "peak_pv_time": self._peak_pv_time,
                 "overflow_kwh": round(self._remaining_overflow, 2),
