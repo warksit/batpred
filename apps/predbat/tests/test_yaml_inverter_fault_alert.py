@@ -30,6 +30,10 @@ RATED_DISCH = "sensor.sigen_plant_ess_rated_discharging_power"
 IMPORT_LIMIT = "number.sigen_plant_grid_import_limitation"
 
 
+POLICY = "input_select.sig_dispatch_policy"
+REQUESTED_MODE = "input_select.predbat_requested_mode"
+
+
 def _load():
     with open(YAML_PATH) as f:
         return yaml.safe_load(f)
@@ -56,12 +60,14 @@ def _render_fault_type(auto, states):
     return ctx["fault_type"]
 
 
-def _mock(running="Running", disch=9.6, rated=9.6, imp=100):
+def _mock(running="Running", disch=9.6, rated=9.6, imp=100, policy="Max Export", requested_mode="Demand"):
     return {
         RUNNING_STATE: running,
         DISCH_LIMIT: str(disch),
         RATED_DISCH: str(rated),
         IMPORT_LIMIT: str(imp),
+        POLICY: policy,
+        REQUESTED_MODE: requested_mode,
         "sensor.sigen_inverter_phase_a_voltage": "242",
         "sensor.sigen_inverter_grid_frequency": "50.0",
         "sensor.sigen_plant_battery_state_of_charge": "44.6",
@@ -117,9 +123,44 @@ def test_critical_sound_only_for_genuine_faults():
     print("PASS  sound: critical gated on is_protective")
 
 
+def test_predbat_freeze_is_not_a_fault():
+    """2026-08-05 05:43. Predbat held SOC at its 6% target overnight, which locks
+    the battery via discharge_rate=0 -> ess_max_discharging_limit=0. The alert
+    fired, correctly describing the state — but told the user to check that the
+    heartbeat was enabled and discharge_rate was not 0, both of which were CORRECT
+    at the time (CM had handed back; the zero was Predbat's intent). CM took the
+    wheel at 05:55 and the limits re-opened 4 s later.
+
+    An alert that fires on intended behaviour and gives advice that does not apply
+    is worse than no alert: it is how the REAL 2026-07-28 lockout got dismissed.
+    """
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, imp=0, policy="Predbat", requested_mode="Freeze Charging"))
+    assert "CLAMPED" not in msg, f"Predbat deliberately freezing is not a clamp fault: {msg}"
+
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Freeze Discharging"))
+    assert "CLAMPED" not in msg, f"export freeze is equally intended: {msg}"
+    print("PASS  intended: Predbat owns the wheel and is freezing -> no clamp alert")
+
+
+def test_clamp_still_fires_when_cm_owns_the_wheel():
+    """The case that MUST still alert: CM is driving and the limits are shut, so
+    nobody intends the clamp. This is 2026-07-26 / 07-28 — SOC flat for hours with
+    Max Export commanding into a locked battery."""
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Max Export", requested_mode="Demand"))
+    assert "CLAMPED" in msg, f"CM driving into shut limits must still alert: {msg}"
+    assert "discharge_rate" in msg
+
+    # And a shut limit while Predbat owns it but is NOT freezing is still a fault.
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Demand"))
+    assert "CLAMPED" in msg, f"Predbat idle with shut limits is nobody's intent: {msg}"
+    print("PASS  fault: shut limits with no freeze intent -> still alerts")
+
+
 def main():
     for t in (
         test_clamped_battery_is_not_reported_as_a_meter_fault,
+        test_predbat_freeze_is_not_a_fault,
+        test_clamp_still_fires_when_cm_owns_the_wheel,
         test_blocked_import_also_reads_as_clamped,
         test_open_limits_still_report_meter_fault,
         test_protective_states_unchanged,

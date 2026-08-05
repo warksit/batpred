@@ -60,10 +60,24 @@ action:
       disch_limit: "{{ states('number.sigen_plant_ess_max_discharging_limit') | float(0) }}"
       rated_disch: "{{ states('sensor.sigen_plant_ess_rated_discharging_power') | float(9.6) }}"
       import_limit: "{{ states('number.sigen_plant_grid_import_limitation') | float(100) }}"
-      is_clamped: "{{ disch_limit < (rated_disch * 0.5) or import_limit < 1 }}"
+      # 2026-08-05: a shut limit is only a FAULT when it is nobody's intent.
+      # Predbat's Hold/Freeze charging deliberately locks the battery via
+      # discharge_rate=0 -> ess_max_discharging_limit=0 and import_limit=0, and it
+      # does so every night it holds SOC at its target. Fired 05:43 on a
+      # "Hold charging target 6%-6%"; CM took the wheel at 05:55 and the heartbeat
+      # re-opened the limits 4 s later. Correct detection, but the ACTION text sent
+      # you after a disabled heartbeat and a zero discharge_rate that were both
+      # CORRECT at the time — i.e. it trains you to ignore it, which is exactly how
+      # the real 2026-07-28 lockout got dismissed.
+      # Ownership is the discriminator: CM driving + limits shut = fault;
+      # Predbat driving + Predbat in a freeze = intended, and self-clearing.
+      predbat_owns: "{{ states('input_select.sig_dispatch_policy') == 'Predbat' }}"
+      predbat_freezing: "{{ states('input_select.predbat_requested_mode') in ['Freeze Charging', 'Freeze Discharging'] }}"
+      intended_freeze: "{{ predbat_owns and predbat_freezing }}"
+      is_clamped: "{{ (disch_limit < (rated_disch * 0.5) or import_limit < 1) and not intended_freeze }}"
       fault_type: >-
         {% set s = states('sensor.sigen_plant_plant_running_state') %}
-        {% if s == 'Running' and is_clamped %}Battery CLAMPED - inverter running but idle because the ESS limits are shut, not a meter fault. discharge_limit={{ disch_limit }}kW (rated {{ rated_disch }}), import_limit={{ import_limit }}. Usually a stale Predbat freeze the heartbeat has not re-opened. ACTION: check sig_dispatch_heartbeat is enabled and input_number.discharge_rate is not 0.
+        {% if s == 'Running' and is_clamped %}Battery CLAMPED - inverter running but idle because the ESS limits are shut, not a meter fault. discharge_limit={{ disch_limit }}kW (rated {{ rated_disch }}), import_limit={{ import_limit }}. Predbat is NOT deliberately freezing (policy={{ states('input_select.sig_dispatch_policy') }}, requested_mode={{ states('input_select.predbat_requested_mode') }}), so this is a stale clamp nobody owns. ACTION: check sig_dispatch_heartbeat is enabled and input_number.discharge_rate is not 0.
         {% elif s == 'Running' %}Meter Communication Fault - inverter running but idle, limits are open so likely lost meter connection. ACTION: Check mySigen app for alert 4001_2. May need meter power cycle.
         {% elif s == 'Shutdown' %}SIG Protective Disconnect (Shutdown) - G99 grid protection. Auto-recovers in 3-5 min. No action needed.
         {% elif s == 'Environmental Abnormality' %}SIG Environmental Abnormality - grid voltage/frequency excursion. Auto-recovers in 1-2 min. No action needed.
