@@ -17,6 +17,32 @@ Before modifying ANY curtailment file (curtailment_plugin.py, curtailment_calc.p
 
 When a flaw is found: **write a failing test FIRST**, then fix the code. Never deploy a fix without a test that would have caught the bug. Never break production code to make tests pass (R36/R37).
 
+**Watch it FAIL, and fail for the right reason.** A test that has never failed has
+proved nothing. If it passes the moment you write it, you have not pinned the
+behaviour — you have written a description.
+
+**Never let the failure mode into the allowed set.** Assert the SPECIFIC expected
+value, not a set of acceptable ones. Broken twice on 2026-08-05: the new
+forecast-tracking metric was shipped with
+
+```python
+assert attrs["tracking_band"] in ("below p10", "p10-p50", "p50-p90", "above p90", "unknown")
+```
+
+`"unknown"` IS the failure mode, so the test passed on the exact defect it existed
+to catch, twice, through two deploys. It was only found by reading the live value.
+**If you cannot name the value it should be, you do not understand it well enough
+to ship it.**
+
+**The rig is not production — check the shapes.** Four rig-fidelity gaps surfaced in
+one day (2026-08-05), each hiding a real defect: MockBase's lat/lon is 55.86N when
+`zone.home` is 52.31N; plant SOC was absent so every rig hit the A0 fail-closed
+hold; `_peak_pv` was set without `_peak_pv_time`, so `actual_scale` computed as 0;
+and `_make_p90_sensors` supplied only `pv_estimate90`, so the other two bands were
+always 0. A green test on an unfaithful rig is not evidence. When adding a
+diagnostic, **read the live value after deploying** — that is the only check that
+caught any of these.
+
 ## Key Curtailment Lessons (2026-04-05)
 
 - **Activation = "is there a problem?"** (excess > headroom). **Floor = "what's the solution?"** (how much to drain). Keep them separate.
