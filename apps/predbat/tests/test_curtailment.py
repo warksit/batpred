@@ -6441,10 +6441,13 @@ def test_sundown_gated_on_solar_elevation():
     Ten nights of live phase transitions (2026-07-25 .. 2026-08-03) separate
     perfectly on solar elevation at the first "Off":
 
-        flapped:  12.6 deg, 14.5 deg, 11.4 deg   (3 nights, 2-6 extra transitions each)
-        clean:     7.8, 6.3, 5.5, 5.7, 6.7, 6.5, 5.0 deg   (7 nights, one clean handback)
+        flapped:  10.5, 12.7, 9.4 deg    (3 nights, 2-6 extra transitions each)
+        clean:     5.4, 3.8, 2.9, 3.2, 4.4, 4.2, 2.5 deg   (7 nights, one handback each)
 
-    No overlap, 3.6 deg of margin. The physics: at 11-15 deg the sun is still
+    No overlap, 4.0 deg of margin, at the REAL site latitude (52.31N). NOTE the
+    rig below runs at MockBase's hardcoded 55.86N, so the elevations asserted here
+    are the rig's, not the site's — what the test pins is the BEHAVIOUR either side
+    of the gate, which is latitude-independent. The physics: at 11-15 deg the sun is still
     meaningfully up, so PV below 100 W is a CLOUD, not sunset — CM hands back,
     PV recovers, CM re-takes the wheel, and each toggle of read_only forces a
     full inverter reset (docs/customisation.md:38).
@@ -6454,11 +6457,11 @@ def test_sundown_gated_on_solar_elevation():
     """
     from datetime import datetime, timezone
 
-    # 11.1 deg — reproduces 2026-08-03's 11.4 deg false sundown.
+    # 11.1 deg — above the gate, reproducing a false sundown.
     high = _dusk_rig(datetime(2025, 7, 12, 19, 10, tzinfo=timezone.utc), 20 * 60 + 10, pv_kw=0.03)
     assert high.last_phase == "active", "sun still 11.1 deg up — PV≈0 is a cloud, not sunset"
 
-    # 4.9 deg — reproduces 2026-08-02's 5.0 deg clean handback.
+    # 4.9 deg — below the gate, reproducing a genuine handback.
     low = _dusk_rig(datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc), 21 * 60, pv_kw=0.03)
     assert low.last_phase == "off", "sun down to 4.9 deg with PV≈0 — genuine sundown"
     print("  test_sundown_gated_on_solar_elevation: PASSED (11.1 deg stays active, 4.9 deg hands back)")
@@ -6470,8 +6473,8 @@ def test_sundown_latches_for_the_day():
     2026-08-03: CM handed back at 19:40 then re-activated at 19:41:49, 19:50:30
     and 20:05:09 as PV bounced 0.03 -> 0.22 -> 0.15 kW. The elevation gate stops
     the early false sundown; the latch covers residual noise BELOW the gate, and
-    covers midwinter where peak elevation at this latitude (~10.7 deg) never
-    clears the gate at all so it is permissive all day.
+    covers midwinter, when peak elevation at the real site (~14 deg at 52.31N)
+    still clears 8.0 only briefly.
     """
     from datetime import datetime, timezone
 
