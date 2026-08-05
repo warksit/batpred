@@ -296,13 +296,24 @@ def compute_p10_recovery_floor(overnight_target_kwh, p10_pv_remaining_kwh, load_
     return max(0.0, overnight_target_kwh - net_charging)
 
 
-def compute_session_reserve(duration_minutes, cap_kw):
+def compute_session_reserve(duration_minutes, cap_kw, discharge_efficiency=1.0):
     """Battery energy (kWh) to reserve for a saving-session export: run at the
     export cap for the session duration. Feeds the recovery-floor target on top
     of the overnight LOAD need (they don't overlap — load is consumption, the
     session is discretionary export). Zero if no session.
 
-        session_reserve = (duration_minutes / 60) * cap_kw
+        session_reserve = (duration_minutes / 60) * cap_kw / discharge_efficiency
+
+    The efficiency term is what makes this the BATTERY drawdown rather than the
+    energy delivered. To push cap x duration through the meter the battery must
+    give up more, and reserving only the delivered figure runs the dump short at
+    the end of the paid window (2026-08-05: 3.68 kWh reserved for a 60 min
+    session at 3.68 kW would deliver ~3.49 kWh at 0.947). Same factor Predbat
+    applies in its own predict trajectory, and the same one the R55 morning_gap
+    uses — battery_loss_discharge x inverter_loss.
+
+    Clamped at 0.5 like the R55 path: a bad or missing efficiency must not
+    inflate the reserve without bound.
     """
     try:
         mins = float(duration_minutes)
@@ -310,7 +321,14 @@ def compute_session_reserve(duration_minutes, cap_kw):
         return 0.0
     if mins <= 0:
         return 0.0
-    return (mins / 60.0) * cap_kw
+    try:
+        eff = float(discharge_efficiency)
+    except (TypeError, ValueError):
+        eff = 1.0
+    if eff <= 0:
+        eff = 1.0
+    eff = max(0.5, min(1.0, eff))
+    return (mins / 60.0) * cap_kw / eff
 
 
 def compute_drain_above(reserve, overflow_floor, effective_keep=None, session_protect_kwh=0.0):
