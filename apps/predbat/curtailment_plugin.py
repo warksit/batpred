@@ -244,9 +244,9 @@ OVERRIDE_LABELS = {
 NO_OVERFLOW_LABEL = "no overflow left"
 
 # O1 (2026-08-04): sundown requires the sun to actually be down. Ten nights of
-# live data separate perfectly at the first handback — flap nights 11.4-14.5 deg,
-# clean nights 5.0-7.8 deg. 8.0 sits in the 3.6 deg gap, just above the highest
-# clean night, so a genuine handback is never delayed.
+# live data separate perfectly at the first handback — flap nights 9.4-12.7 deg,
+# clean nights 2.5-5.4 deg (real site, lat 52.31N). 8.0 sits inside the 4.0 deg
+# gap: it blocks every flap-triggering moment and permits every clean one.
 SUNDOWN_ELEV_DEG = 8.0
 
 # Human labels for the arm of compute_drain_above that set the Headroom Floor.
@@ -2567,10 +2567,17 @@ class CurtailmentPlugin(PredBatPlugin):
         PV alone is too noisy. Ten nights of live transitions separate PERFECTLY
         on solar elevation at the first handback:
 
-            flapped:  12.6, 14.5, 11.4 deg   (3 nights, 2-6 extra transitions)
-            clean:     7.8, 6.3, 5.5, 5.7, 6.7, 6.5, 5.0 deg   (7 nights)
+            flapped:  10.5, 12.7, 9.4 deg    (3 nights, 2-6 extra transitions)
+            clean:     5.4, 3.8, 2.9, 3.2, 4.4, 4.2, 2.5 deg   (7 nights)
 
-        No overlap, 3.6 deg of margin. At 11-15 deg the sun is still well up, so PV
+        No overlap, 4.0 deg of margin (real site, lat 52.31N). Verified
+        2026-08-04, the first night on the gate: ONE transition, 20:00:53 at
+        6.3 deg, no flapping.
+
+        These figures were FIRST derived at 55.86N — the hardcoded MockBase
+        location, not zone.home — which read every elevation ~3 deg high. 8.0
+        falls inside the gap at both latitudes, so the deployed behaviour was
+        right by luck. Re-tune from zone.home, never from the test rig. At 11-15 deg the sun is still well up, so PV
         under 100 W is a CLOUD — CM hands back, PV recovers, CM re-takes the wheel,
         and every toggle of read_only forces a full inverter reset
         (docs/customisation.md:38). Elevation is monotonic through dusk, so this
