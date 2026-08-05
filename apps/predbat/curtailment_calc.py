@@ -395,6 +395,61 @@ def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining,
     return max(float(floor_kwh), projected)
 
 
+def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale):
+    """Which Solcast band is today's observed sky actually tracking?
+
+    The plugin derives THREE overflow integrals from three clear-sky scales
+    (p_scales_from_forecast) and blends them. When the day goes wrong it matters
+    which of the three was right — but nothing said so, which left "was the
+    forecast bad, or was the control bad?" unanswerable after the fact.
+
+    Compares the OBSERVED clear-sky scale (from today's peak, R43) against the
+    three forecast scales and returns:
+
+        (label, percentile)
+
+    label      "below p10" | "p10-p50" | "p50-p90" | "above p90" | "unknown"
+    percentile piecewise-linear position on the 10/50/90 anchors, or None when
+               the bands are unusable. Extrapolated beyond the anchors and
+               clamped to 0-100, so "above p90" reads 90-100 rather than
+               pretending to precision the bands cannot support.
+
+    Peak-based, like every other scale in the system — it answers "which band is
+    today's SKY tracking", not "which band is today's ENERGY tracking". Cloud
+    timing can put those two apart.
+    """
+    try:
+        a = float(actual_scale)
+        p10 = float(p10_scale)
+        p50 = float(p50_scale)
+        p90 = float(p90_scale)
+    except (TypeError, ValueError):
+        return "unknown", None
+    # Bands must be present and correctly ordered to interpolate on.
+    if a <= 0 or p10 <= 0 or p50 <= 0 or p90 <= 0:
+        return "unknown", None
+    if not (p10 <= p50 <= p90):
+        return "unknown", None
+
+    if a < p10:
+        label = "below p10"
+        span = p50 - p10
+        pct = 10.0 - 40.0 * ((p10 - a) / span) if span > 0 else 0.0
+    elif a <= p50:
+        label = "p10-p50"
+        span = p50 - p10
+        pct = 10.0 + 40.0 * ((a - p10) / span) if span > 0 else 30.0
+    elif a <= p90:
+        label = "p50-p90"
+        span = p90 - p50
+        pct = 50.0 + 40.0 * ((a - p50) / span) if span > 0 else 70.0
+    else:
+        label = "above p90"
+        span = p90 - p50
+        pct = 90.0 + 40.0 * ((a - p90) / span) if span > 0 else 100.0
+    return label, round(max(0.0, min(100.0, pct)), 1)
+
+
 def compute_charge_below(p10_recovery_floor, soc_keep):
     """Charge target: SOC level below which the system must not be exporting.
 

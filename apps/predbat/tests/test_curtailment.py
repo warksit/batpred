@@ -28,6 +28,7 @@ from curtailment_calc import (
     compute_charge_below,
     compute_drain_above,
     compute_drain_above_source,
+    classify_forecast_tracking,
     estimate_session_end_kwh,
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_proposed_phase,
@@ -6645,6 +6646,55 @@ def test_reason_does_not_repeat_the_structured_attributes():
     print(f"  test_reason_does_not_repeat_the_structured_attributes: PASSED ({reason})")
 
 
+def test_forecast_tracking_band():
+    """Which Solcast band is today's sky actually tracking?
+
+    Without this, "was the forecast wrong or was the control wrong?" is
+    unanswerable after the fact — the plugin computes three overflow integrals
+    and blends them, but never said which one the day resembled.
+
+    Real observations: 2026-08-04 ran actual_scale 11.78 against p90_scale 9.22,
+    i.e. the day BEAT its own p90 — precisely the case that should read
+    "above p90" rather than being silently clipped to it.
+    """
+    # Ordered bands, actual sitting in each region.
+    assert classify_forecast_tracking(5.0, 7.0, 9.0, 11.0)[0] == "below p10"
+    assert classify_forecast_tracking(8.0, 7.0, 9.0, 11.0)[0] == "p10-p50"
+    assert classify_forecast_tracking(10.0, 7.0, 9.0, 11.0)[0] == "p50-p90"
+    assert classify_forecast_tracking(11.78, 7.0, 9.22, 9.22)[0] == "above p90", "2026-08-04 beat its p90 — must not clip to it"
+
+    # Percentile lands on the anchors.
+    assert classify_forecast_tracking(7.0, 7.0, 9.0, 11.0)[1] == 10.0
+    assert classify_forecast_tracking(9.0, 7.0, 9.0, 11.0)[1] == 50.0
+    assert classify_forecast_tracking(11.0, 7.0, 9.0, 11.0)[1] == 90.0
+    # Monotonic between them.
+    assert classify_forecast_tracking(8.0, 7.0, 9.0, 11.0)[1] == 30.0
+
+    # Degenerate inputs must say "unknown", never invent a band. A missing
+    # Solcast band reads 0.0 (p_scales_from_forecast), which would otherwise
+    # make every day look like it was beating the forecast.
+    for bad in ((0, 7, 9, 11), (9, 0, 0, 0), ("x", 7, 9, 11), (9, 11, 9, 7)):
+        assert classify_forecast_tracking(*bad) == ("unknown", None), bad
+    print("  test_forecast_tracking_band: PASSED")
+
+
+def test_tracking_band_published_for_debugging():
+    """It has to reach the phase sensor or it is not a debug metric."""
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.55, minutes_now=720, best_soc_keep=4.0, sensor_overrides=overrides)
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 9.0
+    plugin.on_update()
+    attrs = base.published["sensor.predbat_curtailment_phase"]["attrs"]
+    for key in ("p10_scale", "p50_scale", "p90_scale", "actual_scale", "tracking_band", "tracking_pct"):
+        assert key in attrs, f"phase sensor missing {key}"
+    assert attrs["tracking_band"] in ("below p10", "p10-p50", "p50-p90", "above p90", "unknown"), attrs["tracking_band"]
+    print(f"  test_tracking_band_published_for_debugging: PASSED ({attrs['tracking_band']})")
+
+
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
     """v32: with the single drain floor (2.8%), the plugin keeps driving Max Export
     between 2.8% and the old 5% — SOC 0.7 kWh (3.9%) drives, SOC 0.4 kWh (2.2%)
@@ -7077,6 +7127,8 @@ def run_curtailment_tests(my_predbat=None):
         test_cm_owns_a_session_through_every_discretionary_handback,
         test_r4_defer_does_not_release_the_wheel_mid_session,
         test_reason_does_not_repeat_the_structured_attributes,
+        test_forecast_tracking_band,
+        test_tracking_band_published_for_debugging,
     ]
     print("  --- apply / on_update tests ---")
     for test_fn in apply_tests:
