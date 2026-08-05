@@ -1615,6 +1615,11 @@ class CurtailmentPlugin(PredBatPlugin):
         # replaces R43's global max(p_scale, actual_scale) collapse that broke
         # band spread on sunny mornings.
         p10_scale, p50_scale, _p90_check = self._get_p_scales(lat, lon, doy, local_offset)
+        # Retain for the tracking-band debug metric. This is the MAIN active path —
+        # the other two call sites are the pre-PV/forecast-publish paths, so
+        # instrumenting only those left the published scales at their init 0.0 all
+        # day and the band read "unknown" (observed live 2026-08-05 13:02).
+        self._p10_scale, self._p50_scale = p10_scale, p50_scale
         p10_fb = max(p10_scale, actual_scale)
         p50_fb = max(p50_scale, actual_scale)
         # p90_fb is floor_scale (already max(p90, actual) from R43 above)
