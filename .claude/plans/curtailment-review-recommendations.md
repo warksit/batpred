@@ -631,6 +631,33 @@ feature."* (`select.predbat_manual_charge` / `manual_export` /
 reset thrash, and the whole ownership-handoff failure class. This is what RD7 has
 been circling. Design decision, not a drive-by.
 
+**O4a. The same gap, from the other end: CM cannot stop Predbat holding SOC.**
+Logged 2026-08-05. Predbat spent the small hours in `Hold charging target 6%-6%`
+on a **20.47 kWh p90 overflow day**, i.e. importing to hold a battery CM needs
+empty — pointless when the energy is going to be exported anyway.
+
+Three things are now established and none of them fix it:
+- The 04:00 charge-freeze automation **worked** (`set_charge_freeze` off from
+  04:00), and made no difference. `inverter.py:2778` calls `charge_freeze_service`
+  whenever `target_soc == soc_percent`, independent of that switch — the same
+  finding as 2026-08-01 04:30. **That switch cannot reach this.**
+- The 6% is not a keep floor: `best_soc_keep` is **0.0**. It is Predbat's own
+  optimiser output. So this is not a misconfiguration, it is two objectives
+  disagreeing — Predbat is £-optimising, CM needs headroom (R25).
+- It also produced the spurious CLAMPED alert (fixed separately, `31fb5123`),
+  because holding SOC locks the battery via `discharge_rate=0`.
+
+Cost on the day was small (0.34 kWh), and a third lever aimed at the symptom
+would be the fourth patch on the same seam. The only levers that actually reach
+it are O4-shaped: either CM takes the wheel before Predbat's overnight hold
+matters, or **CM constrains Predbat's plan via `on_before_plan`** so Predbat's own
+optimiser produces the drain. The second is the same answer the control-
+infrastructure question reached independently — CM's real output is a headroom
+constraint ("SOC <= X by T"), not a dispatch policy, and R25 says that management
+is anticipatory, i.e. planning-shaped rather than real-time-shaped.
+
+**Do not add another freeze-suppression lever.** Resolve it in O4.
+
 **O5. `session_end_soc_pct` is gated on the wrong condition.**
 Gated on `session_dispatch` (CM driving), so the projection vanishes the moment CM
 hands back — which is exactly when you still want to know where the session leaves
