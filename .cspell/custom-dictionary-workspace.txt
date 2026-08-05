@@ -153,6 +153,7 @@ derating
 desync
 desynced
 deque
+derate
 derating
 dess
 devcontainer
