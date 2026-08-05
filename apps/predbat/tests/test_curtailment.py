@@ -3589,17 +3589,26 @@ def _make_overflow_pv(minutes_now=720):
     return pv, load
 
 
-def _make_p90_sensors(p90_peak_kw=8.58, solcast_remaining=25.0):
+def _make_p90_sensors(p90_peak_kw=8.58, solcast_remaining=25.0, all_bands=False):
     """Build sensor_overrides with Solcast p90 detailedForecast.
 
     MockBase default: now_utc=2025-07-12 12:00 UTC, minutes_now=720 → local_offset=0.
     Period_start at 12:00 local = 12:00 UTC. p90_scale_from_forecast will compute
     scale = p90_peak_kw / sin(elevation at 12:25 UTC) ≈ p90_peak_kw / 0.829.
 
+    `all_bands` adds pv_estimate10 / pv_estimate so p_scales_from_forecast returns
+    three real scales. Off by default: the p90-only shape is what production
+    degrades to when Solcast is short, and most tests depend on that. Opt in when
+    the test needs the band SPREAD rather than just the p90 floor.
+
     Returns a dict to merge into sensor_overrides.
     """
+    slot = {"period_start": "2025-07-12T12:00:00+00:00", "pv_estimate90": p90_peak_kw}
+    if all_bands:
+        slot["pv_estimate"] = round(p90_peak_kw * 0.80, 3)
+        slot["pv_estimate10"] = round(p90_peak_kw * 0.55, 3)
     return {
-        "sensor.solcast_pv_forecast_forecast_today": {"detailedForecast": [{"period_start": "2025-07-12T12:00:00+00:00", "pv_estimate90": p90_peak_kw}]},
+        "sensor.solcast_pv_forecast_forecast_today": {"detailedForecast": [slot]},
         "sensor.solcast_pv_forecast_forecast_remaining_today": solcast_remaining,
     }
 
@@ -6683,16 +6692,28 @@ def test_tracking_band_published_for_debugging():
     pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
     load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
     overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
-    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0, all_bands=True))
     base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.55, minutes_now=720, best_soc_keep=4.0, sensor_overrides=overrides)
     plugin = CurtailmentPlugin(base)
     plugin._peak_pv = 9.0
+    # actual_scale is peak / sin(elevation AT THE PEAK), so the peak TIME matters —
+    # leaving it at 0 puts the peak at midnight, sin <= 0, and actual_scale stays
+    # 0.0 no matter how big the peak was.
+    plugin._peak_pv_time = 720
     plugin.on_update()
     attrs = base.published["sensor.predbat_curtailment_phase"]["attrs"]
     for key in ("p10_scale", "p50_scale", "p90_scale", "actual_scale", "tracking_band", "tracking_pct"):
         assert key in attrs, f"phase sensor missing {key}"
     assert attrs["tracking_band"] in ("below p10", "p10-p50", "p50-p90", "above p90", "unknown"), attrs["tracking_band"]
-    print(f"  test_tracking_band_published_for_debugging: PASSED ({attrs['tracking_band']})")
+
+    # The band scales must be populated by the ACTIVE path, not just the pre-PV
+    # ones. Instrumenting only the forecast-publish call sites left both at their
+    # init 0.0 every cycle, so the band read "unknown" all day — correct-looking
+    # code, no value (observed live 2026-08-05 13:02).
+    assert attrs["p50_scale"] > 0, f"active path must populate p50_scale, got {attrs['p50_scale']}"
+    assert attrs["p10_scale"] > 0, f"active path must populate p10_scale, got {attrs['p10_scale']}"
+    assert attrs["tracking_band"] != "unknown", "populated scales must yield a real band"
+    print(f"  test_tracking_band_published_for_debugging: PASSED ({attrs['tracking_band']} @ {attrs['tracking_pct']}%)")
 
 
 def test_v32_drain_floor_drives_between_2_8_and_5pct():
