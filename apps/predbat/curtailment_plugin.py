@@ -250,6 +250,11 @@ NO_OVERFLOW_LABEL = "no overflow left"
 # gap: it blocks every flap-triggering moment and permits every clean one.
 SUNDOWN_ELEV_DEG = 8.0
 
+# Do not hand back in the run-up to a joined saving session — see _session_imminent.
+# 30 min comfortably covers the 5-minute plugin cycle plus the ownership handover,
+# without pinning CM active for a session hours away.
+SESSION_IMMINENT_MINS = 30.0
+
 # Human labels for the arm of compute_drain_above that set the Headroom Floor.
 # The card REPORTS these (Charter: never re-derive a second decision).
 DRAIN_SOURCE_LABELS = {
@@ -901,9 +906,7 @@ class CurtailmentPlugin(PredBatPlugin):
             # the same factor our morning_gap underestimates by the same %
             # (e.g. 5.29 kWh load → 6.20 kWh battery drawdown for SIG with
             # 12% inverter loss + 3% battery discharge loss).
-            battery_loss_discharge = float(getattr(self.base, "battery_loss_discharge", 1.0) or 1.0)
-            inverter_loss = float(getattr(self.base, "inverter_loss", 1.0) or 1.0)
-            discharge_efficiency = max(0.5, battery_loss_discharge * inverter_loss)
+            discharge_efficiency = self._discharge_efficiency()
             morning_gap_battery = morning_gap_load / discharge_efficiency
 
             safety_pct = self._get_overnight_safety_pct()
@@ -2538,7 +2541,7 @@ class CurtailmentPlugin(PredBatPlugin):
             except (TypeError, ValueError):
                 mins = 0.0
             best_mins = max(best_mins, mins)
-        return compute_session_reserve(best_mins, cap_kw)
+        return compute_session_reserve(best_mins, cap_kw, discharge_efficiency=self._discharge_efficiency())
 
     def _override_label(self):
         """Human label for the active policy override, or None.
@@ -2614,11 +2617,49 @@ class CurtailmentPlugin(PredBatPlugin):
 
         A live joined session outranks both: handing back would stop the sell.
         """
-        if self._is_session_dispatching():
+        if self._is_session_dispatching() or self._session_imminent():
             return False
         if solar_elevation(lat, lon, utc_hours, doy) >= SUNDOWN_ELEV_DEG:
             return False
         return self._sundown_latched or (peaked and actual_pv < 0.1)
+
+    def _session_imminent(self, within_minutes=SESSION_IMMINENT_MINS):
+        """True when a joined session starts within `within_minutes`.
+
+        A session starting minutes AFTER sundown is the worst case: handing back
+        sets the select to `Predbat` and disables the heartbeat, and the heartbeat
+        only forces Max Export while the select is NOT Predbat — so the dump never
+        starts. CM would re-take on its next cycle (RD14-own) but lose up to 5
+        minutes of a paid window. 2026-08-05 had a 20:00 session against a 20:00:53
+        sundown the night before, i.e. a coin flip on a ~1 minute margin.
+
+        Deliberately NOT open-ended: a session six hours out must not pin CM active
+        all evening burning the battery on house load.
+        """
+        start = self._get_session_start()
+        if not start:
+            return False
+        try:
+            start_dt = datetime.fromisoformat(str(start))
+            now = self.base.now_utc if getattr(self.base, "now_utc", None) else datetime.now(start_dt.tzinfo)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=start_dt.tzinfo)
+            delta_min = (start_dt - now).total_seconds() / 60.0
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return 0 <= delta_min <= within_minutes
+
+    def _discharge_efficiency(self):
+        """Battery-to-meter efficiency: battery_loss_discharge x inverter_loss.
+
+        ONE definition, used by the R55 morning gap and the saving-session
+        reserve. Both need the same thing — "how much must the battery give up
+        to deliver X at the meter" — and they were previously only computed in
+        the R55 path, so the session reserve under-reserved by the loss.
+        """
+        battery_loss_discharge = float(getattr(self.base, "battery_loss_discharge", 1.0) or 1.0)
+        inverter_loss = float(getattr(self.base, "inverter_loss", 1.0) or 1.0)
+        return max(0.5, battery_loss_discharge * inverter_loss)
 
     def _is_session_dispatching(self):
         """True while the heartbeat is forcing Max Export for a live saving session.
