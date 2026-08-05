@@ -598,11 +598,20 @@ down for the day; re-activation should need a real PV recovery, not a 50 W
 flicker. *The session gave this teeth: on previous nights CM crossed the dusk
 boundary idling in Hold, so the flapping was invisible and harmless.*
 
-**Fix shipped:** sundown now also requires `solar_elevation < 8.0 deg`, plus a
-same-day `_sundown_latched` (persisted; may only ARM below the gate). Ten nights
-of data separate perfectly — flap nights 11.4-14.5 deg, clean nights 5.0-7.8 deg.
-Elevation is monotonic through dusk so this cannot flap by construction. Verify
-at dusk on the next few evenings: expect exactly ONE Active->Off transition.
+**Fix shipped and VERIFIED:** sundown now also requires `solar_elevation < 8.0 deg`,
+plus a same-day `_sundown_latched` (persisted; may only ARM below the gate). Ten
+nights separate perfectly at the real site (lat 52.31N) — flap nights
+**9.4-12.7 deg**, clean nights **2.5-5.4 deg**, a 4.0 deg gap with 8.0 inside it.
+Elevation is monotonic through dusk so this cannot flap by construction.
+
+**2026-08-04, first night on the gate: ONE transition, 20:00:53 at 6.3 deg.**
+
+*Correction:* the figures were first derived at **55.86N**, the hardcoded MockBase
+location rather than `zone.home` (52.31N, -1.41), reading every elevation ~3 deg
+high. 8.0 falls inside the gap at both latitudes, so the deployed threshold was
+right **by luck**. Two lessons: re-tune from `zone.home`, never the test rig; and
+**MockBase's lat/lon do not match production** — worth aligning, since any future
+solar-geometry work will inherit the same error.
 
 **O2. Disabling the heartbeat mid-dispatch strands the registers.**
 At 19:40 CM disabled the heartbeat while it held `active_power_fixed_adjustment`
