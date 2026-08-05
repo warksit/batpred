@@ -29,6 +29,8 @@ from curtailment_calc import (
     compute_drain_above,
     compute_drain_above_source,
     classify_forecast_tracking,
+    p_scales_from_forecast,
+    p90_scale_from_forecast,
     estimate_session_end_kwh,
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_proposed_phase,
@@ -6655,6 +6657,50 @@ def test_reason_does_not_repeat_the_structured_attributes():
     print(f"  test_reason_does_not_repeat_the_structured_attributes: PASSED ({reason})")
 
 
+def test_forecast_bands_survive_a_datetime_period_start():
+    """HA stores Solcast `period_start` as a datetime, not an ISO string.
+
+    Both scale parsers slice it as a string (`ps[11:16]`), which raises
+    TypeError on a datetime — and TypeError was NOT in the caught tuple
+    (ValueError, IndexError, KeyError), so it escaped to the caller's broad
+    `except Exception` and silently degraded to the (0, 0, cached_p90) fallback.
+
+    Live 2026-08-05: p10_scale=0.0, p50_scale=0.0, p90_scale=10.16 — exactly the
+    fallback signature, while the real forecast (p10 4.42 / p50 7.28 / p90 8.27
+    kW peaks) should have given roughly 5.96 / 9.01 / 10.16. So R50's band spread
+    has been collapsing to the p90 fallback in production, unnoticed, because the
+    caller treats a missing band as "unusual but not fatal".
+
+    str() first: "2026-08-05T11:00" and "2026-08-05 11:00" both slice to "11:00"
+    at [11:16], so one normalisation covers both shapes.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    lat, lon, doy, off = 52.31, -1.41, 217, 1.0
+    raw = [
+        {"period_start": "2026-08-05T11:00:00+01:00", "pv_estimate10": 4.417, "pv_estimate": 6.801, "pv_estimate90": 7.4458},
+        {"period_start": "2026-08-05T13:30:00+01:00", "pv_estimate10": 4.0927, "pv_estimate": 7.2777, "pv_estimate90": 8.2564},
+    ]
+    bst = timezone(timedelta(hours=1))
+    as_dt = [dict(r, period_start=datetime.fromisoformat(r["period_start"]).astimezone(bst)) for r in raw]
+
+    str_bands = p_scales_from_forecast(raw, lat, lon, doy, off)
+    dt_bands = p_scales_from_forecast(as_dt, lat, lon, doy, off)
+    assert all(b > 0 for b in str_bands), f"ISO strings must parse: {str_bands}"
+    assert all(b > 0 for b in dt_bands), f"datetime period_start must parse too: {dt_bands}"
+    for a, b in zip(str_bands, dt_bands):
+        assert abs(a - b) < 0.01, f"both shapes must give the same scale: {str_bands} vs {dt_bands}"
+
+    # And the p90-only parser, which has the identical slice.
+    assert p90_scale_from_forecast(as_dt, lat, lon, doy, off)[0] > 0, "p90 parser must accept a datetime too"
+
+    # The bands must stay ORDERED — a collapsed spread is what the fallback gives,
+    # and it is indistinguishable from a genuinely narrow forecast unless checked.
+    p10, p50, p90 = dt_bands
+    assert p10 < p50 < p90, f"bands must remain ordered and distinct: {dt_bands}"
+    print(f"  test_forecast_bands_survive_a_datetime_period_start: PASSED ({[round(x, 2) for x in dt_bands]})")
+
+
 def test_forecast_tracking_band():
     """Which Solcast band is today's sky actually tracking?
 
@@ -7148,6 +7194,7 @@ def run_curtailment_tests(my_predbat=None):
         test_cm_owns_a_session_through_every_discretionary_handback,
         test_r4_defer_does_not_release_the_wheel_mid_session,
         test_reason_does_not_repeat_the_structured_attributes,
+        test_forecast_bands_survive_a_datetime_period_start,
         test_forecast_tracking_band,
         test_tracking_band_published_for_debugging,
     ]

@@ -1260,13 +1260,16 @@ def p90_scale_from_forecast(detailed_forecast, lat_deg, lon_deg, day_of_year, lo
             continue
         # Parse period_start hour — assume local time, convert to UTC
         try:
-            ps = slot["period_start"]
-            # Format: "2026-04-19T13:00:00+01:00" or similar
+            # str() first: HA hands this back as a DATETIME, not the ISO string
+            # the slice assumes, and a datetime is not subscriptable. Both
+            # "2026-08-05T11:00..." and "2026-08-05 11:00..." slice to "11:00"
+            # at [11:16], so one normalisation covers both shapes.
+            ps = str(slot["period_start"])
             time_part = ps[11:16]  # "HH:MM"
             h, m = int(time_part[:2]), int(time_part[3:5])
             local_h = h + m / 60.0 + 0.25  # mid-point of 30-min slot
             utc_h = local_h - local_offset_hours
-        except (ValueError, IndexError, KeyError):
+        except (TypeError, ValueError, IndexError, KeyError):
             continue
         best_kw = kw
         best_utc = utc_h
@@ -1311,12 +1314,15 @@ def p_scales_from_forecast(detailed_forecast, lat_deg, lon_deg, day_of_year, loc
             if kw <= best_kw:
                 continue
             try:
-                ps = slot["period_start"]
+                # See p90_scale_from_forecast: period_start arrives as a datetime
+                # from HA, and TypeError was not caught, so this silently
+                # degraded every band to the (0, 0, cached_p90) fallback.
+                ps = str(slot["period_start"])
                 time_part = ps[11:16]
                 h, m = int(time_part[:2]), int(time_part[3:5])
                 local_h = h + m / 60.0 + 0.25
                 utc_h = local_h - local_offset_hours
-            except (ValueError, IndexError, KeyError):
+            except (TypeError, ValueError, IndexError, KeyError):
                 continue
             best_kw = kw
             best_utc = utc_h
