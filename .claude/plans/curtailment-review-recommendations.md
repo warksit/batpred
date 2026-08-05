@@ -687,6 +687,57 @@ session end-SOC projection has never rendered.
 
 **O9. Predbat v8.47.4 update pending** on the box; auto-update off.
 
+**O10. Discharge efficiency CANNOT be measured with current instrumentation.**
+Logged 2026-08-05. Do not re-derive it from the plant meters — you will get ~0.998
+and it will be wrong.
+
+`sensor.sigen_plant_daily_load_consumption` is a **derived residual**, not a
+measurement: the SIG computes it as `PV + battery + import - export`. Proof from
+the 2026-08-03 session hour, battery dumping to grid at the cap:
+
+```
+PV 0.41 + discharge 3.77 - export 3.20 = 0.98  ==  the published load figure
+SOC 56.9 -> 36.0%  = 3.779 kWh DC (18.08 nominal)
+battery AC out = export + load - PV = 3.770 kWh      ->  AC/DC = 0.998
+```
+
+The energy balance closes to three decimals **by construction** and would do so
+whatever the real losses were. Same artefact overnight: `load_consumption` and
+`daily_battery_discharge_energy` were identical to 2 dp in all three hours
+(0.53 / 0.50 / 0.48) — one number printed twice, not two agreeing measurements.
+
+The only genuinely independent instruments are the **grid import/export meter**
+and **SOC**; everything between them is inferred, and there is no whole-house
+clamp. (`sensor.heat_pump_energy_meter_power` is independent but covers only the
+GSHP.)
+
+What we actually know about the deployed 0.947:
+- `battery_loss_discharge` **1.4%** — has a basis, derived from the ESS lifetime
+  DC ratio.
+- `inverter_loss` **4%** — a Predbat DEFAULT, never calibrated for this site. For a
+  6.6 kW hybrid at 3.68 kW, real-world figures are typically 96-98%, so 4% sits at
+  the pessimistic end.
+
+Consequence: the session reserve holds ~0.1 kWh more than needed (3.886 vs ~3.79
+at 0.97). Safe direction for the paid session, but it is headroom given up on an
+overflow day. **Kept at 0.947 deliberately** — tuning it from a residual is fitting
+to an identity. Calibrating properly needs a whole-house AC clamp, or an
+export-only test with PV genuinely at zero and load separately metered.
+
+**O11. Failure mode A is now measurable (2026-08-05) — but only as TIME.**
+`binary_sensor.curtailment_condition` (SOC >= 99 AND export >= cap - 0.05 AND
+battery not charging) plus `sensor.curtailment_condition_active` (0/1,
+`state_class: measurement`, so HA's hourly mean x 60 = minutes in condition,
+retained FOREVER). Both created as template helpers, verified live.
+
+**Magnitude stays unobservable** and this does not change that: when the battery
+is full the MPPTs derate, so measured PV already reflects the curtailment and the
+counterfactual is unknown. `curtailment_overflow_daily` measures PRESSURE (energy
+that had to go somewhere), not LOSS — on 2026-08-05 it read 12.1 kWh, all of which
+the battery absorbed, and nothing was curtailed. Minutes-in-condition is the
+honest A signal; pair it with the overflow meter and the tracking band to judge a
+day.
+
 ### Fixed 2026-08-04
 
 **Stale-check used the wrong timestamp (FIXED).** The card measured liveness with
