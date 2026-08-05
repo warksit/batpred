@@ -6657,6 +6657,80 @@ def test_reason_does_not_repeat_the_structured_attributes():
     print(f"  test_reason_does_not_repeat_the_structured_attributes: PASSED ({reason})")
 
 
+def test_session_reserve_accounts_for_discharge_losses():
+    """To DELIVER cap x duration through the meter, the battery must give up more.
+
+    compute_session_reserve returned raw energy at the cap, so a 60 min session at
+    3.68 kW reserved 3.68 kWh — but at Predbat's own discharge_efficiency of 0.947
+    that only delivers ~3.49 kWh, and the dump runs short near the end of the paid
+    hour. Spotted by Andrew 2026-08-05: published 20.4% of an 18.08 kWh battery
+    where it should be ~21.5%.
+
+    Same factor Predbat applies in its own predict trajectory, and the same one
+    the R55 morning_gap already uses — battery_loss_discharge x inverter_loss.
+    """
+    # No efficiency given -> unchanged, so existing callers keep their behaviour.
+    assert abs(compute_session_reserve(60, 3.68) - 3.68) < 1e-6
+
+    # 60 min at the 3.68 kW cap, 0.947 efficiency.
+    out = compute_session_reserve(60, 3.68, discharge_efficiency=0.947)
+    assert abs(out - 3.68 / 0.947) < 1e-6, out
+    assert out > 3.68, "reserving less than the deliverable energy under-sells the session"
+    assert abs(out - 3.885) < 0.002, out
+
+    # Half an hour scales linearly.
+    assert abs(compute_session_reserve(30, 3.68, discharge_efficiency=0.947) - (3.68 / 0.947) / 2) < 1e-6
+
+    # Degenerate efficiencies must not divide by zero or inflate absurdly.
+    for bad in (0, -1, None, "x"):
+        got = compute_session_reserve(60, 3.68, discharge_efficiency=bad)
+        assert 3.68 <= got <= 3.68 / 0.5, f"efficiency {bad} must clamp, got {got}"
+    print(f"  test_session_reserve_accounts_for_discharge_losses: PASSED (3.68 -> {out:.3f} kWh)")
+
+
+def test_sundown_defers_for_an_IMMINENT_session_not_just_a_live_one():
+    """A session starting minutes after sundown is the worst case.
+
+    2026-08-05: session at 20:00, and the night before sundown fired at 20:00:53.
+    If sundown lands first CM hands back, sets the select to Predbat and disables
+    the heartbeat — and the heartbeat only forces Max Export while the select is
+    NOT Predbat, so the dump never starts. CM would re-take on its next cycle
+    (RD14-own), losing up to 5 minutes of a 60 minute paid window, and only if
+    nothing else has grabbed the wheel meanwhile.
+
+    Deferring for an imminent session removes the race entirely: CM simply does
+    not hand back in the half hour before one.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    def _dusk(next_start_offset_min):
+        pv, load = _make_overflow_pv(minutes_now=720)
+        ov = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+        ov.update(_make_p90_sensors())
+        base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.40, minutes_now=720, best_soc_keep=4.0, now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc), sensor_overrides=ov)
+        plugin = CurtailmentPlugin(base)
+        plugin.on_update()
+        assert plugin.last_phase == "active"
+        # Genuine dusk: PV below 0.1 kW and sun below the gate (20:00 UTC, doy 193).
+        now = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
+        base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.03
+        base.minutes_now = 21 * 60
+        base.now_utc = now
+        if next_start_offset_min is not None:
+            start = (now + timedelta(minutes=next_start_offset_min)).isoformat()
+            base._sensor_overrides.update(_saving_session_sensors(active=False, next_mins=60, next_start=start))
+        plugin.on_update()
+        return plugin
+
+    # No session -> normal sundown handback.
+    assert _dusk(None).last_phase == "off", "without a session, dusk must still hand back"
+    # Session 15 min away -> hold the wheel.
+    assert _dusk(15).last_phase == "active", "must not hand back minutes before a session"
+    # Session 6 hours away -> irrelevant, hand back normally.
+    assert _dusk(360).last_phase == "off", "a distant session must not pin CM active all evening"
+    print("  test_sundown_defers_for_an_IMMINENT_session_not_just_a_live_one: PASSED")
+
+
 def test_forecast_bands_survive_a_datetime_period_start():
     """HA stores Solcast `period_start` as a datetime, not an ISO string.
 
@@ -7194,6 +7268,8 @@ def run_curtailment_tests(my_predbat=None):
         test_cm_owns_a_session_through_every_discretionary_handback,
         test_r4_defer_does_not_release_the_wheel_mid_session,
         test_reason_does_not_repeat_the_structured_attributes,
+        test_session_reserve_accounts_for_discharge_losses,
+        test_sundown_defers_for_an_IMMINENT_session_not_just_a_live_one,
         test_forecast_bands_survive_a_datetime_period_start,
         test_forecast_tracking_band,
         test_tracking_band_published_for_debugging,
