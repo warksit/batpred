@@ -261,7 +261,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
-| RD21–RD23 | IN FORCE | v33 dawn gap (2026-08-06): reserve survives PV start; drain floor stops selling, not load-covering; one floor helper. |
+| RD21–RD24 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control. |
 | RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
@@ -2007,6 +2007,26 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
 
   Therefore the clamp is gated on `policy == 'Max Export'`. `policy` is the EFFECTIVE
   policy, so a session-forced Max Export is still clamped.
+
+- **RD24 — Entering the Predbat branch must unwind PCS Remote Control, however it
+  was entered.** The MSC handback was gated on the `policy_change` trigger alone,
+  which assumes the only way into the branch is the policy select moving. It is not:
+  the **override** also changes the EFFECTIVE policy. Live 2026-08-06 07:38 — select
+  read `Predbat`, override set to `Hold Battery`, so the effective policy was Hold
+  and the ACTIVE branch wrote PCS Remote Control + a 1.08 kW setpoint. Clearing the
+  override returned the effective policy to Predbat without touching the select, so
+  only `override_change` fired, the MSC write was skipped, and the plant was left
+  exporting against a setpoint nobody owned — heartbeat inert, all three mappers
+  disabled, Predbat read-only, battery at 1.4% discharging into it.
+
+  Fix: `policy_change` **OR** live EMS mode == `PCS Remote Control`, on any trigger.
+  Keying the self-heal on the MODE is what makes it safe and complete:
+  `predbat_requested_mode_action` selects only `Maximum Self Consumption`,
+  `Command Charging (Grid First)`, `Command Discharging (PV First)` — **never** PCS
+  Remote Control, which only the heartbeat's active branch writes. So reverting it
+  cannot stomp Predbat (the 2026-07-27 regression), and unlike simply adding
+  `override_change` it also recovers after an HA restart, where no trigger fires at
+  all. The `not MSC` guard stays — it is what prevents a write every minute.
 
 - **RD23 — One drain floor, one owner.** The released floor is read from
   `input_number.sig_drain_floor_pct` (via `_drain_floor_kwh`), never a plugin-side
