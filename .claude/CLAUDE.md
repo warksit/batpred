@@ -168,6 +168,21 @@ Before any HA automation edit (`ha_config_set_automation`):
    expected value for a known input — never just check that the
    automation is "on" or "running"
 
+## SIG / CM maintenance posture (from 2026-08)
+
+**Architecture is frozen while CM is stable.** Edge fine-tuning only. Do not start
+a structural rewrite (Python PCS executor, delete heartbeat, wholesale
+`sig-control-v2` merge) unless multi-writer defects burn multiple days again —
+and not as an autumn project when Predbat owns most hours.
+
+- **Ownership table + deploy + golden checks:** `apps/predbat/ha/README.md`
+- **Freeze / what not to do / seasonal focus:** `.claude/memory/sig-control-maintenance.md`
+- **Deferred proposal (not current path):** `.claude/plans/sig-control-python-migration.md`
+- **Historical Predbat EMS driver (reference only):** `origin/sig-control-v2`
+
+Prefer plan-side CM off (tighter activation) over clever handback. Prefer golden
+tests and the ownership table over new writers.
+
 ## Writer Ownership (SIG control) — learned the hard way 2026-07-28
 
 **Exactly one writer enabled is NOT sufficient.** Predbat writes PLANT registers
