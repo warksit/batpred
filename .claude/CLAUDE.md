@@ -86,6 +86,7 @@ After changing in HA, pull the updated config and commit it so the file stays in
 - `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the curtailment HA automation YAML
 - `cd apps/predbat && python3 tests/test_yaml_voltage_seek.py` — Jinja harness for voltage_seek_controller YAML (catches variable-order bugs under StrictUndefined)
 - `cd apps/predbat && python3 tests/test_yaml_heartbeat.py` — heartbeat dispatch + the ESS/import limit re-open (regressed twice; see below)
+- `cd apps/predbat && python3 tests/test_yaml_dispatch_intent.py` — RD26 single point of truth: the dispatch maths lives ONLY in `ha/sig_dispatch_intent_helpers.yaml`; fails if the automation re-inlines it
 - `cd apps/predbat && python3 tests/test_yaml_inverter_fault_alert.py` — fault-alert diagnosis (clamped battery vs meter fault)
 - `cd apps/predbat && python3 tests/test_yaml_requested_mode.py` — Predbat→SIG mode mapper
 - `cd apps/predbat && python3 tests/test_yaml_dhw_meter.py` — GSHP DHW cycle meter (delta template + the once-per-day / sustain guards)
