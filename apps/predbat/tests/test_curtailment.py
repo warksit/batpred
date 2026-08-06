@@ -57,7 +57,16 @@ STEP_MINUTES = 5
 START_SOC_PCT = 0.40
 
 # v18 constants (match curtailment_plugin.py)
-OVERFLOW_SAFETY_FACTOR = 1.2
+# The v10 SIMULATOR's safety factor, deliberately frozen at the historical 1.2.
+# This is NOT the production constant — that is curtailment_plugin.
+# OVERFLOW_SAFETY_FACTOR = 1.05, pinned by test_r9_safety_factor_is_1_05.
+#
+# It was called OVERFLOW_SAFETY_FACTOR here and shadowed the real one at module
+# scope, so a test that computed an expected value with it silently disagreed
+# with the function under test (2026-08-06, RD28). Renamed so that can't recur.
+# The scenario tests below model the OLD activation/floor behaviour, so they keep
+# 1.2 on purpose — do not "fix" the value.
+V10_SIM_SAFETY_FACTOR = 1.2
 MAX_RESERVED_KWH = 1.8  # v19: ceiling on tapered buffer (= 10% of soc_max)
 SOC_CAP_FACTOR = 0.95
 SOC_MARGIN_KWH = 0.2  # HA automation hysteresis for Charge/Hold/Drain split
@@ -206,11 +215,11 @@ def _simulate_day_v10(
 
         # --- v10 activation ---
         headroom = battery_kwh * SOC_CAP_FACTOR - soc
-        active = remaining_overflow * OVERFLOW_SAFETY_FACTOR > max(headroom, 0)
+        active = remaining_overflow * V10_SIM_SAFETY_FACTOR > max(headroom, 0)
 
         # --- v10 floor ---
         if active:
-            floor = battery_kwh - remaining_overflow * OVERFLOW_SAFETY_FACTOR
+            floor = battery_kwh - remaining_overflow * V10_SIM_SAFETY_FACTOR
             floor = max(floor, soc_floor_kwh)
             floor = min(floor, battery_kwh * SOC_CAP_FACTOR)
         else:
@@ -485,7 +494,7 @@ def test_activation_overflow_exceeds_headroom():
     soc = BATTERY_KWH * 0.50
     headroom = BATTERY_KWH * SOC_CAP_FACTOR - soc
     overflow = 10.0
-    assert overflow * OVERFLOW_SAFETY_FACTOR > headroom, f"Should activate: {overflow * OVERFLOW_SAFETY_FACTOR:.1f} > {headroom:.1f}"
+    assert overflow * V10_SIM_SAFETY_FACTOR > headroom, f"Should activate: {overflow * V10_SIM_SAFETY_FACTOR:.1f} > {headroom:.1f}"
     print("  test_activation_overflow_exceeds_headroom: PASSED")
 
 
@@ -496,7 +505,7 @@ def test_activation_overflow_within_headroom():
     soc = BATTERY_KWH * 0.50
     headroom = BATTERY_KWH * SOC_CAP_FACTOR - soc
     overflow = 3.0
-    assert overflow * OVERFLOW_SAFETY_FACTOR <= headroom, f"Should stay off: {overflow * OVERFLOW_SAFETY_FACTOR:.1f} <= {headroom:.1f}"
+    assert overflow * V10_SIM_SAFETY_FACTOR <= headroom, f"Should stay off: {overflow * V10_SIM_SAFETY_FACTOR:.1f} <= {headroom:.1f}"
     print("  test_activation_overflow_within_headroom: PASSED")
 
 
@@ -507,7 +516,7 @@ def test_activation_high_soc_low_overflow():
     soc = BATTERY_KWH * 0.90
     headroom = BATTERY_KWH * SOC_CAP_FACTOR - soc
     overflow = 2.0
-    assert overflow * OVERFLOW_SAFETY_FACTOR > headroom, f"Should activate: {overflow * OVERFLOW_SAFETY_FACTOR:.1f} > {headroom:.1f}"
+    assert overflow * V10_SIM_SAFETY_FACTOR > headroom, f"Should activate: {overflow * V10_SIM_SAFETY_FACTOR:.1f} > {headroom:.1f}"
     print("  test_activation_high_soc_low_overflow: PASSED")
 
 
@@ -661,7 +670,7 @@ def test_R50a_floor_uses_p90_not_the_confidence_blend():
     p10, p50, p90 = 0.0, 1.57, 13.03
 
     def floor_from(overflow):
-        return max(0.0, (soc_max - min(MAX_RESERVED_KWH, overflow)) - overflow * OVERFLOW_SAFETY_FACTOR)
+        return max(0.0, (soc_max - min(MAX_RESERVED_KWH, overflow)) - overflow * V10_SIM_SAFETY_FACTOR)
 
     # The blend is what we are moving AWAY from — assert it would have held.
     blended = compute_expected_overflow(p10, p50, p90, 0.35, 0.60, 0.85)
@@ -690,7 +699,7 @@ def test_R50a_incident_day_still_floored_by_r59b():
     soc_max, reserve = 18.08, 0.542
     p90_2804 = 7.56  # overflow from solcast_2026_04_28.json, DNO 4.0 (pre-swap)
 
-    floor = max(0.0, (soc_max - min(MAX_RESERVED_KWH, p90_2804)) - p90_2804 * OVERFLOW_SAFETY_FACTOR)
+    floor = max(0.0, (soc_max - min(MAX_RESERVED_KWH, p90_2804)) - p90_2804 * V10_SIM_SAFETY_FACTOR)
     drain_above = compute_drain_above(reserve, floor)
 
     # Bright late-April morning: generation still to come comfortably exceeds
@@ -866,7 +875,7 @@ def test_required_headroom_is_defined_once():
     Every site must now call required_headroom_kwh(). Differences between sites
     must be explicit ARGUMENTS, not separate expressions that can drift.
     """
-    # NOTE these assert the SHAPE against OVERFLOW_SAFETY_FACTOR, not a literal.
+    # NOTE these assert the SHAPE against V10_SIM_SAFETY_FACTOR, not a literal.
     # The factor is expected to be retuned as the overflow meters bank real
     # DC-coupled days (see test_R9_overflow_safety_factor_is_1_05), and a
     # hardcoded literal here would fail on every retune while proving nothing
@@ -1026,7 +1035,7 @@ def test_no_drain_uses_the_same_safety_margin_as_the_headroom_floor():
     soc_max, p90 = 18.08, 6.60
     headroom = soc_max - 10.03  # 8.05
 
-    required = OVERFLOW_SAFETY_FACTOR * p90 + min(MAX_RESERVED_KWH, p90)
+    required = V10_SIM_SAFETY_FACTOR * p90 + min(MAX_RESERVED_KWH, p90)
     assert required > headroom, "fixture must be a day that does NOT genuinely fit"
 
     # The safety-factored margin is what no_drain must key off.
@@ -1834,9 +1843,7 @@ def test_no_overflow_charge_target_never_eats_the_headroom():
     definition of required headroom, never a second expression (Charter).
     """
     # Pass the safety factor EXPLICITLY to both, so the test cannot disagree with
-    # the function about which constant applies. NB this file defines its own
-    # OVERFLOW_SAFETY_FACTOR = 1.2 at module scope, which is STALE — production
-    # moved to 1.05 — and silently produced a wrong expected value here first time.
+    # the function about which constant applies.
     sf = 1.05
     ovf = 6.0
     need = required_headroom_kwh(ovf, 1.8, sf)
@@ -2493,10 +2500,10 @@ def test_proposed_phase_thresholds_collapse_at_sunset():
 
 
 def test_floor_computation():
-    """Floor = (soc_max * 0.9) - overflow * OVERFLOW_SAFETY_FACTOR (R9 + R45)."""
+    """Floor = (soc_max * 0.9) - overflow * V10_SIM_SAFETY_FACTOR (R9 + R45)."""
     overflow = 10.0
-    floor = BATTERY_KWH * 0.9 - overflow * OVERFLOW_SAFETY_FACTOR
-    expected = 18.08 * 0.9 - 10.0 * OVERFLOW_SAFETY_FACTOR
+    floor = BATTERY_KWH * 0.9 - overflow * V10_SIM_SAFETY_FACTOR
+    expected = 18.08 * 0.9 - 10.0 * V10_SIM_SAFETY_FACTOR
     assert abs(floor - expected) < 0.01, f"Expected {expected}, got {floor}"
     print(f"  test_floor_computation: PASSED (floor={floor:.2f}kWh = {floor/BATTERY_KWH*100:.0f}%)")
 
@@ -2505,7 +2512,7 @@ def test_floor_above_soc_keep():
     """Floor never goes below soc_keep."""
     overflow = 20.0  # huge overflow → floor = 18.08 - 25 = -6.92
     soc_keep = 4.0
-    floor = BATTERY_KWH - overflow * OVERFLOW_SAFETY_FACTOR
+    floor = BATTERY_KWH - overflow * V10_SIM_SAFETY_FACTOR
     floor = max(floor, soc_keep)
     assert floor >= soc_keep, f"Floor should be >= soc_keep ({soc_keep}), got {floor}"
     print(f"  test_floor_above_soc_keep: PASSED (floor={floor:.2f}kWh)")
@@ -2589,7 +2596,7 @@ def test_cap_taper_ratchet_noise_immune():
     ratchet = None
     for remaining in [1.0, 1.5, 1.0]:
         max_target, _ = _taper_cap_formula(remaining)
-        overflow_floor = max(0.0, max_target - remaining * OVERFLOW_SAFETY_FACTOR)
+        overflow_floor = max(0.0, max_target - remaining * V10_SIM_SAFETY_FACTOR)
         if ratchet is not None:
             overflow_floor = max(overflow_floor, ratchet)
         ratchet = overflow_floor
@@ -2704,7 +2711,7 @@ def test_buffer_unchanged_before_14_00():
     if remaining > 1.3:
         # Buffer should be the full MAX_RESERVED_KWH — no morning reduction
         expected_max_target = BATTERY_KWH - MAX_RESERVED_KWH
-        expected_floor = max(0.0, expected_max_target - remaining * OVERFLOW_SAFETY_FACTOR)
+        expected_floor = max(0.0, expected_max_target - remaining * V10_SIM_SAFETY_FACTOR)
         assert abs(floor - expected_floor) < 0.05, f"Pre-14:00 floor should match un-reduced taper {expected_floor:.2f}, got {floor:.2f}"
     print(f"  test_buffer_unchanged_before_14_00: PASSED (remaining={remaining:.2f}, floor={floor:.2f})")
 
@@ -2773,7 +2780,7 @@ def test_R50_compute_expected_overflow_apr_28_incident():
     # expected = 0.64*5 + 0.36*14 = 3.2 + 5.04 = 8.24
     assert 7.5 < expected < 9.0, f"Apr 28 case: expected ~8.2, got {expected}"
     # Verify floor calculation would produce reasonable target
-    floor_kwh = BATTERY_KWH - MAX_RESERVED_KWH - expected * OVERFLOW_SAFETY_FACTOR
+    floor_kwh = BATTERY_KWH - MAX_RESERVED_KWH - expected * V10_SIM_SAFETY_FACTOR
     floor_pct = floor_kwh / BATTERY_KWH * 100
     assert floor_pct > 30, f"Apr 28 case: floor should be >30%, got {floor_pct:.1f}%"
     assert floor_pct < 50, f"Apr 28 case: floor should be <50% (still meaningful drain), got {floor_pct:.1f}%"
