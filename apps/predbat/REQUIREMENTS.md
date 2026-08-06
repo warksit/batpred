@@ -261,7 +261,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
-| RD21–RD26 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test; **RD26 single point of truth** — dispatch intent defined once in `ha/sig_dispatch_intent_helpers.yaml`. |
+| RD21–RD27 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test; **RD26 single point of truth** — dispatch intent defined once in `ha/sig_dispatch_intent_helpers.yaml`; **RD27 no mid-window handback** (RD4 'A' retired). |
 | RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
@@ -2007,6 +2007,32 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
 
   Therefore the clamp is gated on `policy == 'Max Export'`. `policy` is the EFFECTIVE
   policy, so a session-forced Max Export is still clamped.
+
+- **RD27 — No mid-window handback. RD4 "A" (low-SOC → MSC) is RETIRED.** While the
+  plugin is ACTIVE, CM keeps the wheel at any SOC. Handing back is a window-END
+  decision (RD6 safe_time / sundown) and nothing else.
+
+  The old rule handed the policy select to Predbat below the drain floor — and
+  handed it to **nobody**. `_release_to_predbat()` is not on that path, so it cleared
+  `read_only` while leaving the three Predbat mappers **disabled** (`_set_writer(
+  cm_driving=True)` runs a few lines earlier and stays). Predbat was un-muzzled with
+  no write path, the heartbeat went inert in its Predbat branch, and the plant fell
+  through to the SIG's own Maximum Self Consumption default.
+
+  Live 2026-08-06: handed back at 04:50, still handed back at 09:00 — charging at
+  3.5 kW with **zero export** against a 19.89 kWh overflow forecast, while surplus
+  (3.54 kW) was still *under* the 3.68 kW cap and therefore fully exportable. ~2% of
+  pack spent on headroom the peak then had to curtail. Unrecoverable.
+
+  Nothing is lost by removing it: below the floor the Schmitt gives Charge (under
+  `charge_below`) or Max Export, and RD22's **sell-only** clamp already stops the
+  battery being sold. The handover existed solely to escape CM's own clamp, which is
+  no longer something to escape. Safety lives in the executor, not in a second rule
+  in the planner.
+
+  **It was written in two places** — the decision side (which only shaped the
+  published reason) and the acting side (which did the actual write). Removing only
+  the first changed nothing; the failing test is what found the second.
 
 - **RD26 — Single point of truth for dispatch intent.** RD25 made the two copies
   provably agree; this removes the second copy. `ha/sig_dispatch_intent_helpers.yaml`
