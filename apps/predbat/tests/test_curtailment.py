@@ -39,6 +39,7 @@ from curtailment_calc import (
     compute_overflow_fits_margin,
     smooth_overflow_samples,
     required_headroom_kwh,
+    compute_no_overflow_charge_target,
     compute_session_reserve,
     compute_max_sheddable,
     drain_deadline_breached,
@@ -1801,6 +1802,103 @@ def test_dispatch_policy_max_export_high_soc():
     plugin._publish_dispatch_policy(True, floor_kwh=14.0, soc_kwh=16.0, soc_max=18.08)
     assert _policy_calls(base) == ["Max Export"], base.services
     print("  test_dispatch_policy_max_export_high_soc: PASSED")
+
+
+def test_no_overflow_charge_target_is_the_overnight_need():
+    """RD28: once no overflow is left, bank to TONIGHT'S NEED, then hold.
+
+    While curtailment competes for the same kWh, `charge_below` (the P10 recovery
+    floor) is the right threshold: it is a DEADLINE — "be at least this high now,
+    or a P10 afternoon will not get you there" — and deferring preserves headroom.
+
+    Once overflow_p90 is 0 nothing competes, so deferring only earns an export
+    credit and risks buying the same energy back overnight at import rates.
+
+    Live 2026-08-06 18:02: overflow_p90 0.0, SOC 5.66 kWh, overnight_target
+    6.62 kWh, charge_below 5.15 kWh. SOC was ABOVE charge_below, so the Schmitt
+    said Hold and CM exported the surplus while 0.96 kWh short of tonight's need.
+    P10 margin was 0.51 kWh — about eight minutes of surplus. Andrew had to set a
+    manual Solar Charge override to bank it.
+    """
+    t = compute_no_overflow_charge_target(overnight_target_kwh=6.62, soc_max=18.08, overflow_p90_kwh=0.0, max_reserved_kwh=1.8)
+    assert abs(t - 6.62) < 0.01, "with no overflow the target is the overnight need, got {}".format(t)
+    assert t > 5.15, "must be ABOVE the P10 recovery floor — that floor is a deadline, not a target"
+    print("  test_no_overflow_charge_target_is_the_overnight_need: PASSED ({:.2f} kWh)".format(t))
+
+
+def test_no_overflow_charge_target_never_eats_the_headroom():
+    """The safeguard: never bank so much that a remaining overflow stops fitting.
+
+    "No overflow left" is a forecast that can move. While p90 overflow is still
+    non-zero the target is clamped to whatever leaves room for it — using the ONE
+    definition of required headroom, never a second expression (Charter).
+    """
+    # Pass the safety factor EXPLICITLY to both, so the test cannot disagree with
+    # the function about which constant applies. NB this file defines its own
+    # OVERFLOW_SAFETY_FACTOR = 1.2 at module scope, which is STALE — production
+    # moved to 1.05 — and silently produced a wrong expected value here first time.
+    sf = 1.05
+    ovf = 6.0
+    need = required_headroom_kwh(ovf, 1.8, sf)
+    t = compute_no_overflow_charge_target(overnight_target_kwh=16.0, soc_max=18.08, overflow_p90_kwh=ovf, max_reserved_kwh=1.8, safety_factor=sf)
+    assert abs(t - (18.08 - need)) < 0.01, "target must clamp to soc_max - required_headroom ({:.2f}), got {:.2f}".format(18.08 - need, t)
+    assert t < 16.0, "the clamp must actually bite when the overnight need would eat the headroom"
+    assert compute_no_overflow_charge_target(6.62, 18.08, 40.0, 1.8) == 0.0, "must never go negative on a huge-overflow day"
+    print("  test_no_overflow_charge_target_never_eats_the_headroom: PASSED (clamped to {:.2f})".format(t))
+
+
+def test_no_drain_branch_charges_to_the_overnight_need():
+    """RD28 end to end: in the no_drain state, the plugin must Charge whenever SOC
+    is below tonight's need — NOT merely below the P10 recovery floor.
+
+    Reproduces live 2026-08-06 18:02 exactly: SOC 5.66 kWh sits ABOVE charge_below
+    5.15, so the old code said Hold and exported the surplus while 0.96 kWh short
+    of the 6.62 kWh overnight target.
+    """
+    base = MockBase(soc_kw=5.66)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._policy_override = "no_drain"
+    plugin._charge_below, plugin._drain_above = 5.15, 17.83
+    plugin._overnight_target_kwh = 6.62
+    plugin._overflow_p90 = 0.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=17.83, soc_kwh=5.66, soc_max=18.08)
+    written = _policy_calls(base)
+    assert written and written[-1] == "Solar Charge Battery", "SOC 5.66 < overnight need 6.62 with no overflow left must CHARGE, got {}".format(written)
+    print("  test_no_drain_branch_charges_to_the_overnight_need: PASSED")
+
+
+def test_no_drain_branch_holds_once_the_need_is_met():
+    """...and stops there. Charge to the target, then Hold — not Charge to full."""
+    base = MockBase(soc_kw=7.0)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._policy_override = "no_drain"
+    plugin._charge_below, plugin._drain_above = 5.15, 17.83
+    plugin._overnight_target_kwh = 6.62
+    plugin._overflow_p90 = 0.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=17.83, soc_kwh=7.0, soc_max=18.08)
+    written = _policy_calls(base)
+    assert written and written[-1] == "Hold Battery", "SOC 7.0 above the 6.62 need must HOLD, not keep charging, got {}".format(written)
+    print("  test_no_drain_branch_holds_once_the_need_is_met: PASSED")
+
+
+def test_no_drain_still_never_drains():
+    """RD17 unchanged: the no_drain override still clamps Drain to Hold."""
+    base = MockBase(soc_kw=17.0)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._policy_override = "no_drain"
+    plugin._charge_below, plugin._drain_above = 5.15, 2.0
+    plugin._overnight_target_kwh = 6.62
+    plugin._overflow_p90 = 0.0
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=2.0, soc_kwh=17.0, soc_max=18.08)
+    written = _policy_calls(base)
+    assert written and written[-1] == "Hold Battery", "no_drain must clamp Drain->Hold, got {}".format(written)
+    print("  test_no_drain_still_never_drains: PASSED")
 
 
 def test_card_publishes_the_threshold_actually_in_force():
@@ -7414,6 +7512,11 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
+        test_no_overflow_charge_target_is_the_overnight_need,
+        test_no_overflow_charge_target_never_eats_the_headroom,
+        test_no_drain_branch_charges_to_the_overnight_need,
+        test_no_drain_branch_holds_once_the_need_is_met,
+        test_no_drain_still_never_drains,
         test_card_publishes_the_threshold_actually_in_force,
         test_low_soc_never_hands_back_mid_window,
         test_low_soc_drain_stays_max_export_not_handback,
