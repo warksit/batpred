@@ -49,6 +49,7 @@ from curtailment_calc import (
     compute_max_sheddable,
     compute_overflow_fits_margin,
     required_headroom_kwh,
+    compute_no_overflow_charge_target,
     smooth_overflow_samples,
     drain_deadline_breached,
     compute_effective_export_cap,
@@ -2960,11 +2961,39 @@ class CurtailmentPlugin(PredBatPlugin):
                 # Pure hold (pre-PV dawn wait): battery flat, never charge/drain.
                 schmitt = "Hold"
             elif self._policy_override == "no_drain":
-                # overflow-fits / past-safe: run the Schmitt but clamp Drain→Hold
-                # (no round-trip). Charge still fires for the evening reserve.
-                schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True, was_draining=self._was_draining)
-                if schmitt == "Drain":
-                    schmitt = "Hold"
+                # overflow-fits / past-safe: never drain (no round-trip), and RD28 —
+                # bank to TONIGHT'S NEED, then Hold.
+                #
+                # This used to run the ordinary Schmitt, whose charge threshold is
+                # `charge_below` — the P10 recovery floor. That floor is a DEADLINE
+                # ("be at least this high now, or a P10 afternoon will not get you
+                # there"), and deferring to it is right while curtailment wants the
+                # same kWh: every kWh banked early is headroom lost at the peak.
+                #
+                # Once overflow_p90 is 0 nothing competes. Deferring then earns only
+                # an export credit and risks buying the same energy back overnight
+                # at import rates — the worse side of that trade.
+                #
+                # Live 2026-08-06 18:02: overflow_p90 0.0, SOC 5.66 kWh, overnight
+                # target 6.62, charge_below 5.15. SOC sat ABOVE charge_below, so this
+                # branch said Hold and exported the surplus while 0.96 kWh short, on
+                # a P10 margin of 0.51 kWh — about eight minutes of surplus. It took
+                # a manual Solar Charge override to bank it.
+                #
+                # Deliberately NOT compute_proposed_phase: that takes
+                # min(charge_below, drain_above), which would clamp the target back
+                # down whenever drain_above is low. Charge-then-Hold is the whole
+                # rule here, so it is written plainly. No hysteresis is lost — the
+                # Schmitt deadband only ever applied to entering Drain, which this
+                # branch forbids anyway.
+                charge_target = compute_no_overflow_charge_target(
+                    overnight_target_kwh=self._overnight_target_kwh if self._overnight_target_kwh is not None else self._charge_below,
+                    soc_max=soc_max,
+                    overflow_p90_kwh=float(self._overflow_p90 or 0.0),
+                    max_reserved_kwh=float(getattr(self, "_effective_max_reserved", MAX_RESERVED_KWH) or MAX_RESERVED_KWH),
+                    safety_factor=OVERFLOW_SAFETY_FACTOR,
+                )
+                schmitt = "Charge" if soc_kwh < charge_target else "Hold"
             else:
                 schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True, was_draining=self._was_draining)
             # R16a: remember whether we are mid-drain so the deadband applies only

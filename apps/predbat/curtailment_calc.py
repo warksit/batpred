@@ -948,6 +948,47 @@ def required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor=1.05):
     return safety_factor * ov + min(max_reserved_kwh, ov)
 
 
+def compute_no_overflow_charge_target(overnight_target_kwh, soc_max, overflow_p90_kwh, max_reserved_kwh, safety_factor=1.05):
+    """RD28: the charge target once curtailment no longer competes for the same kWh.
+
+        target = min(overnight_target, soc_max - required_headroom(overflow_p90))
+
+    **Why a different target from `charge_below`.** `charge_below` is the P10
+    recovery floor — a DEADLINE, not a target: "be at least this high now, or a P10
+    afternoon will not get you there". Deferring to it is correct while curtailment
+    wants the same kWh, because every kWh banked early is headroom lost at the peak.
+
+    Once `overflow_p90` reaches 0 nothing competes. Deferring then earns only an
+    export credit and risks buying the same energy back overnight at import rates,
+    which is the worse side of that trade. So bank to tonight's actual need and
+    then hold.
+
+    Live 2026-08-06 18:02 — the case this exists for: overflow_p90 0.0, SOC 5.66
+    kWh, overnight_target 6.62, charge_below 5.15. SOC sat ABOVE charge_below, so
+    the Schmitt said Hold and CM exported the surplus while 0.96 kWh short of
+    tonight's need, on a P10 margin of 0.51 kWh — about eight minutes of surplus.
+
+    **The min() is the safeguard.** "No overflow left" is a forecast and forecasts
+    move, so while p90 is still non-zero the target is clamped to whatever leaves
+    room for it. It uses `required_headroom_kwh` rather than a second expression —
+    the 2026-07-28 lesson that five spellings of this question let the weakest one
+    veto the strongest.
+
+    Args:
+        overnight_target_kwh: tonight's need (R55 morning-gap target).
+        soc_max: usable battery capacity, kWh.
+        overflow_p90_kwh: remaining forecast overflow.
+        max_reserved_kwh: the R45 reserve ceiling for this caller.
+        safety_factor: mirrors OVERFLOW_SAFETY_FACTOR (which lives in the plugin,
+            so the default is the literal here, as in required_headroom_kwh).
+
+    Returns:
+        float kWh — charge to this, then Hold. Never negative.
+    """
+    headroom = required_headroom_kwh(overflow_p90_kwh, max_reserved_kwh, safety_factor)
+    return max(0.0, min(overnight_target_kwh, soc_max - headroom))
+
+
 def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_factor=1.05, max_reserved_kwh=1.8):
     """Headroom margin against the SAFETY-FACTORED overflow requirement, kWh.
 

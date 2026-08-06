@@ -303,6 +303,7 @@ Mixergy
 mkdocs
 mlugg
 Modbus
+modbusregisterdefinitions
 mogons
 monokai
 Mosquitto
