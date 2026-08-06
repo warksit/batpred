@@ -18,6 +18,8 @@ import datetime as _dt
 import jinja2
 import yaml
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 HERE = os.path.dirname(__file__)
 YAML_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_heartbeat.yaml")
 REMOTE_EMS_SWITCH = "switch.sigen_plant_remote_ems_controlled_by_home_assistant"
@@ -39,8 +41,30 @@ def _iter_actions(node):
             yield from _iter_actions(v)
 
 
+def _with_intent(states):
+    """Add the RD26 intent sensors, rendered from the SINGLE source of truth.
+
+    The heartbeat no longer computes the policy or the setpoint — it reads
+    sensor.sig_effective_policy / sensor.sig_dispatch_kw. Rendering them here from
+    ha/sig_dispatch_intent_helpers.yaml keeps every dispatch assertion below
+    meaningful end-to-end, and means a change to the helpers is exercised by the
+    whole heartbeat suite rather than only by its own file.
+
+    Done at render time, not in _mock, because some tests mutate the states dict
+    after building it (e.g. deleting the drain-floor helper to test its default).
+    """
+    import test_yaml_dispatch_intent as intent
+
+    st = dict(states)
+    policy, kw = intent.render_sensors(st)
+    st.setdefault("sensor.sig_effective_policy", policy)
+    st.setdefault("sensor.sig_dispatch_kw", str(kw))
+    return st
+
+
 def _render_dispatch(auto, states):
     """Render the action `variables` block in order with a mock states()."""
+    states = _with_intent(states)
     variables = auto["action"][0]["variables"]
     env = jinja2.Environment()
     # HA provides a `bool` filter; plain Jinja does not. Mirror it so the harness
@@ -329,6 +353,7 @@ def _trigger_vars(auto, states):
     trigger is deciding on, instead of only its boolean — which is what let three
     divergences ship today.
     """
+    states = _with_intent(states)
     trig = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
     tmpl = trig["value_template"]
     cut = tmpl.rindex("{{")
@@ -448,6 +473,7 @@ def test_self_heal_cannot_stomp_predbat_own_modes():
 
 def _render_stale_trigger(auto, states):
     """Render the `stale_setpoint` template trigger to its boolean."""
+    states = _with_intent(states)
     trig = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
     env = jinja2.Environment()
     env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes", "on")
@@ -505,9 +531,12 @@ def test_drain_floor_does_not_strand_hold_below_the_floor():
     violated by the mechanism meant to protect a battery that needs no protection:
     the SIG simply imports at 0%, there is no cliff (Andrew, 2026-08-06).
     """
+    # RD26: the value now arrives via sensor.sig_dispatch_kw, which rounds to the
+    # 2 dp the register takes anyway (0.359 -> 0.36). The register write is
+    # unchanged — it was always `| round(2)`.
     d = _render_dispatch(_load(), _mock("Hold Battery", pv=0.311, load=0.359, soc=1.3, hard=2.8))
-    assert abs(d - 0.359) < 0.001, "Hold below the drain floor must still cover load (0.359), got {} — battery stranded, load imported".format(d)
-    print("PASS  drain floor: Hold @SOC1.3% covers load {:.3f} (not clamped to PV)".format(d))
+    assert abs(d - 0.36) < 0.001, "Hold below the drain floor must still cover load (0.36), got {} — battery stranded, load imported".format(d)
+    print("PASS  drain floor: Hold @SOC1.3% covers load {:.2f} (not clamped to PV)".format(d))
 
 
 def test_drain_floor_still_blocks_selling_below_the_floor():
@@ -519,8 +548,8 @@ def test_drain_floor_still_blocks_selling_below_the_floor():
     accident.
     """
     d = _render_dispatch(_load(), _mock("Max Export", pv=0.311, load=0.359, soc=1.3, hard=2.8))
-    assert abs(d - 0.311) < 0.001, "Max Export below the drain floor must clamp to PV (0.311), got {}".format(d)
-    print("PASS  drain floor: Max Export @SOC1.3% still clamped to PV {:.3f}".format(d))
+    assert abs(d - 0.31) < 0.001, "Max Export below the drain floor must clamp to PV (0.31), got {}".format(d)
+    print("PASS  drain floor: Max Export @SOC1.3% still clamped to PV {:.2f}".format(d))
 
 
 def test_drain_floor_solar_charge_not_stranded():
@@ -529,8 +558,8 @@ def test_drain_floor_solar_charge_not_stranded():
     battery bridge it — the same defect, on the policy least able to justify it.
     """
     d = _render_dispatch(_load(), _mock("Solar Charge Battery", pv=0.311, load=0.359, soc=1.3, hard=2.8))
-    assert abs(d - 0.359) < 0.001, "Solar Charge below the floor must still cover load (0.359), got {}".format(d)
-    print("PASS  drain floor: Solar Charge @SOC1.3% covers load {:.3f}".format(d))
+    assert abs(d - 0.36) < 0.001, "Solar Charge below the floor must still cover load (0.36), got {}".format(d)
+    print("PASS  drain floor: Solar Charge @SOC1.3% covers load {:.2f}".format(d))
 
 
 def test_rd14c_live_session_forces_max_export():
@@ -542,7 +571,10 @@ def test_rd14c_live_session_forces_max_export():
     _render_dispatch(_load(), _session_mock("Hold Battery", session_on=True))
     ctx = _render_dispatch.ctx
     assert ctx["policy"] == "Max Export", f"live session must force Max Export, got {ctx['policy']}"
-    assert ctx["raw_policy"] == "Hold Battery", "the select itself must be untouched"
+    # RD26: `raw_policy` is no longer an action variable — the select is read
+    # inside sensor.sig_effective_policy. Assert against the select itself, which
+    # is the actual claim: the session must not have written to it.
+    assert _session_mock("Hold Battery", session_on=True)["input_select.sig_dispatch_policy"] == "Hold Battery", "the select itself must be untouched"
     print("PASS  RD14c: live session -> Max Export")
 
 

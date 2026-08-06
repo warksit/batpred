@@ -91,35 +91,25 @@ trigger:
     id: session_end
   - platform: template
     value_template: >-
-      {# Policy precedence MUST be byte-for-byte the same decision as `policy` in
-         the action variables: override > session > select. It previously read the
-         select alone, so under a manual override while the select still said
-         handback, the trigger failed its own active-policy gate and disarmed —
-         while the ACTION was driving Hold every beat. Result: no fast corrector,
-         only the 60 s beat, and the battery absorbed every PV sag in between
-         (live 2026-08-06 08:17: commanded 1.45, PV 1.329, battery -0.135 kW).
-         test_trigger_and_action_can_never_diverge renders both copies over a
-         200-case matrix and fails on any disagreement. #}
-      {% set ovr = states('input_select.sig_override') %}
-      {% set rawp = states('input_select.sig_dispatch_policy') %}
-      {% set p = ovr if ovr not in ['Off', 'unknown', 'unavailable', ''] else ('Max Export' if (is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') and rawp != 'Predbat') else rawp) %}
-      {% set cap = (states('input_number.dno_export_limit_w') | float(3680)) / 1000 %}
-      {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
-      {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
-      {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
-      {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
-      {% set raw = 6.6 if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
-      {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
-      {# RD22: sell-only clamp. MUST stay identical to `dispatch_kw` in the action
-         variables — this trigger re-implements the dispatch maths to decide whether
-         the live setpoint has drifted, so if the two copies disagree it demands a
-         setpoint the action will never write and re-fires forever (mode: restart). #}
-      {% set pre = ([raw, pv] | min if (soc <= hard and p == 'Max Export') else raw) %}
-      {% set want = [[pre, ceil] | min, 0] | max %}
+      {# RD26: this trigger is a READER. The effective policy and the setpoint are
+         defined ONCE, in ha/sig_dispatch_intent_helpers.yaml, and both this trigger
+         and the action below read them. HA gives a template trigger no access to the
+         action's `variables`, so the maths used to be written here a second time —
+         and the two copies diverged three times on 2026-08-06 (the RD22 clamp landed
+         in one copy only; a regression test passed anyway because the disagreement
+         was under this trigger's own 0.1 kW tolerance; and the policy here ignored
+         sig_override, disarming the fast corrector exactly when a human was driving).
+         Do not re-inline the arithmetic — test_heartbeat_defers_to_intent_sensors
+         fails on it. #}
+      {% set p = states('sensor.sig_effective_policy') %}
+      {% set want = states('sensor.sig_dispatch_kw') | float(-1) %}
       {% set rated_d = states('sensor.sigen_inverter_ess_rated_discharge_power') | float(6.6) %}
       {% set disc = states('number.sigen_plant_ess_max_discharging_limit') | float(0) %}
       {% set imp = states('number.sigen_plant_grid_import_limitation') | float(100) %}
-      {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and
+      {# want < 0 means the intent sensor is unavailable — say nothing rather than
+         drive the plant off a missing value. 0 is a REAL setpoint, so -1 is the
+         sentinel. #}
+      {{ p in ['Max Export', 'Hold Battery', 'Solar Charge Battery'] and want >= 0 and
          is_state('switch.sigen_plant_remote_ems_controlled_by_home_assistant', 'on') and
          ((states('number.sigen_plant_active_power_fixed_adjustment') | float(0) - want) | abs > 0.1
           or disc < (rated_d * 0.5)
@@ -128,68 +118,22 @@ trigger:
 
 action:
   - variables:
+      # RD26: the effective policy and the setpoint are defined ONCE, in
+      # ha/sig_dispatch_intent_helpers.yaml. This block READS them — it does not
+      # recompute them. The `stale_setpoint` trigger reads the same two sensors, so
+      # the two can no longer disagree; before, HA's inability to share `variables`
+      # with a trigger forced a second copy and it diverged three times in one day
+      # (2026-08-06). test_heartbeat_defers_to_intent_sensors fails if the
+      # arithmetic reappears here.
+      policy: "{{ states('sensor.sig_effective_policy') }}"
+      # -1 sentinel: the intent sensor is unavailable (HA restart, missing source).
+      # 0 is a LEGITIMATE setpoint, so it cannot double as the error value. The
+      # dispatch write below is skipped while this is negative — better to leave the
+      # register where it is than to drive the plant off a missing reading.
+      dispatch_kw: "{{ states('sensor.sig_dispatch_kw') | float(-1) }}"
+      # Not part of the dispatch computation: this is the DNO export-limit register
+      # value, written straight through so the SIG clamps export in hardware.
       cap_kw: "{{ (states('input_number.dno_export_limit_w') | float(3680)) / 1000 }}"
-      load_kw: "{{ [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max }}"
-      pv_kw: "{{ states('sensor.sigen_plant_pv_power') | float(0) }}"
-      soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(50) }}"
-      hard_pct: "{{ states('input_number.sig_drain_floor_pct') | float(2.8) }}"
-      # RD14c (2026-07-28): saving sessions come from the Octoplus CALENDAR.
-      # It is "on when a saving session that the account has joined is active",
-      # and HA schedules calendar triggers at the exact event boundary.
-      #
-      # Why not the binary sensor: Octopus publishes it ~1 min late (19:00:57 for
-      # a 19:00:00 session, observed), and the plugin only re-evaluates on its
-      # 5-min cycle — the end edge measured 5 min 46 s late, dumping the battery
-      # at the cap past the paid window. ~15% of a 30-min session at each edge.
-      session_live: "{{ is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') }}"
-      # RD13a: manual override is the select alone — active iff not "Off", and
-      # its value IS the policy. No boolean; there is no second entity to diverge.
-      override_choice: "{{ states('input_select.sig_override') }}"
-      raw_policy: "{{ states('input_select.sig_dispatch_policy') }}"
-      # `| bool` is load-bearing: HA renders `variables` to strings in some
-      # contexts and the string "False" is TRUTHY in Jinja — without it a session
-      # would start correctly and NEVER release. Caught by
-      # test_rd14c_releases_at_the_planned_end, not by review.
-      #
-      # A live session forces Max Export, but ONLY while CM already holds the
-      # wheel. If we have handed back, Predbat owns the machine and its mappers
-      # are enabled — seizing control here would put two writers on the registers
-      # (the 2026-07-26 / 2026-07-28 failures).
-      # Precedence: manual override > live saving session > the plugin's select.
-      # A human holding a policy outranks the session dump — they can see something
-      # we cannot.
-      # ONE expression, not a folded block: a `>-` block leaves trailing whitespace,
-      # so "Max Export " would fail every `policy in [...]` comparison below.
-      policy: "{{ override_choice if override_choice not in ['Off', 'unknown', 'unavailable', ''] else ('Max Export' if (session_live | bool and raw_policy != 'Predbat') else raw_policy) }}"
-      raw_kw: "{{ 6.6 if policy == 'Max Export' else ([pv_kw, load_kw] | max if policy == 'Hold Battery' else load_kw) }}"
-      # Ceiling = the most the inverter should push out.
-      # - Max Export: 6.6 (inverter AC max) — command max output and let the SIG's
-      #   grid_export_limitation clamp export to the DNO cap in HARDWARE. Draining
-      #   the battery to hold the cap IS Max Export's intent, so no load-tracking is
-      #   needed; the firmware tracks load at hardware speed (no heartbeat lag). The
-      #   drain-floor clamp (pre) still bites below sig_drain_floor_pct.
-      # - Hold / Solar Charge: load+cap (export-limited), never above 6.6. The
-      #   load+cap ceiling is what keeps Hold FLAT (tracks PV); a flat 6.6 would turn
-      #   Hold into a battery-draining Max Export on any PV dip.
-      ceiling_kw: "{{ 6.6 if policy == 'Max Export' else [load_kw + cap_kw, 6.6] | min }}"
-      # Drain-floor clamp — applies to SELLING ONLY (policy == 'Max Export').
-      #
-      # It used to apply to every policy, which stranded the battery and imported
-      # the shortfall. Live 2026-08-06 06:48 under a manual Hold at SOC 1.3%:
-      #   pv 0.311, load 0.359 -> raw 0.359 -> clamped to min(raw,pv) = 0.311
-      #   battery -0.003 kW (idle), import 0.027 kW
-      # The plant was told to output exactly PV, so house load took the difference
-      # from the grid while the battery held 0.235 kWh. Because the clamp is applied
-      # AFTER policy selection it also overrode the human override — no policy could
-      # use the battery below the floor.
-      #
-      # Stopping the battery SELLING at the floor (R5) and letting it COVER LOAD
-      # below it (RD4) are not in conflict; the old form just blocked both at once.
-      # Safe to relax because the SIG simply imports at 0% — there is no protection
-      # cliff, so the floor is a curtailment-economics choice (Andrew, 2026-08-06).
-      # `policy` here is the EFFECTIVE policy, so a session-forced Max Export is
-      # still clamped.
-      dispatch_kw: "{{ [[ ([raw_kw, pv_kw] | min if (soc_pct <= hard_pct and policy == 'Max Export') else raw_kw), ceiling_kw] | min, 0] | max }}"
       rated_discharge_kw: "{{ states('sensor.sigen_inverter_ess_rated_discharge_power') | float(6.6) }}"
       rated_charge_kw: "{{ states('sensor.sigen_inverter_ess_rated_charge_power') | float(6.6) }}"
       max_discharge_kw: "{{ rated_discharge_kw | float(6.6) | round(2) }}"
@@ -346,8 +290,15 @@ action:
             data:
               value: "{{ (rated_charge_kw | float(6.6) * 1000) | int }}"
             alias: "Mirror charge_rate helper"
-          - action: number.set_value
-            target:
-              entity_id: number.sigen_plant_active_power_fixed_adjustment
-            data:
-              value: "{{ dispatch_kw | float | round(2) }}"
+          # Skip the write entirely when the intent sensor has no opinion (-1).
+          # The ESS/import re-opens above are unconditional — they are permissive
+          # and safe with or without a setpoint — but commanding the plant off a
+          # missing value is not.
+          - if:
+              - "{{ dispatch_kw | float(-1) >= 0 }}"
+            then:
+              - action: number.set_value
+                target:
+                  entity_id: number.sigen_plant_active_power_fixed_adjustment
+                data:
+                  value: "{{ dispatch_kw | float | round(2) }}"
