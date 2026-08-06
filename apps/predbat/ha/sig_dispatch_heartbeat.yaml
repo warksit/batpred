@@ -66,16 +66,34 @@ trigger:
   - platform: time_pattern
     minutes: "/1"
     id: beat
+  # RD26 corollary: trigger on the DERIVED sensor, never on its inputs.
+  #
+  # This used to be two state triggers, on input_select.sig_dispatch_policy and
+  # input_select.sig_override. That was correct while the policy was computed
+  # inline — trigger and value could not disagree. Once RD26 moved the value into
+  # a template sensor it became a RACE: HA fires the state trigger on the input
+  # immediately, and the derived sensor recomputes a moment later, so the run reads
+  # the OLD policy. Live 2026-08-06 11:42:13, trace of the override_change run:
+  #
+  #     trigger:   input_select.sig_override "Off" -> "Max Export"
+  #     variables: policy = "Predbat", dispatch_kw = 0.68   (both stale)
+  #     -> Predbat branch, wrote nothing, finished in 12 ms
+  #
+  # The override is the human's immediate lever and it did nothing for 47 s, until
+  # the next :00 beat, while the plant self-consumed 4.4 kW into the battery on an
+  # overflow day. A derived sensor cannot change before it has been computed, so
+  # triggering on it makes the ordering correct by construction.
+  #
+  # `stale_setpoint` below references sensor.sig_dispatch_kw and is safe for the
+  # same reason. Enforced by test_triggers_fire_on_the_derived_sensor_not_its_inputs.
+  #
+  # One trigger now covers both: a policy select change and an override change are
+  # only interesting when they move the EFFECTIVE policy, which is exactly what this
+  # sensor reports. The id stays `policy_change` — the one-shot MSC handback wants
+  # the effective-policy transition, which is a better gate than the raw select.
   - platform: state
-    entity_id: input_select.sig_dispatch_policy
+    entity_id: sensor.sig_effective_policy
     id: policy_change
-  # Manual override flips who is driving (RD13), so re-evaluate dispatch at once
-  # rather than waiting up to a minute for the beat. Deliberately its OWN id: the
-  # one-shot MSC handback below is gated on policy_change only, so toggling the
-  # override while already handed back must not re-park the unit.
-  - platform: state
-    entity_id: input_select.sig_override
-    id: override_change
   # RD14c: NATIVE calendar triggers. The Octoplus saving-sessions calendar is
   # "on when a saving session that the account has joined is active", and HA
   # schedules calendar triggers to fire at the exact event boundary — no polling,
