@@ -1,6 +1,10 @@
 # SIG control — move actuation into Python, delete the HA automation layer
 
-**Status:** proposal, not yet started. Written 2026-08-06.
+**Status:** proposal, **deferred**. Written 2026-08-06. Not the current path —
+CM is stable with edge fine-tuning only; autumn is Predbat-dominant. See
+`.claude/memory/sig-control-maintenance.md` and `apps/predbat/ha/README.md`.
+Revisit only if multi-writer pain returns (earliest: next high-overflow season).
+`sig-control-v2` was recovered on origin (Predbat EMS half only — not Hold/PCS).
 
 **For reviewers:** this document is self-contained. §1–§5a are background and evidence,
 §6 is the proposal, §7 separates verified fact from assumption, §8 records what was tried
