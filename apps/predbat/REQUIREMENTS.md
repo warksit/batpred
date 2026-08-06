@@ -261,7 +261,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
-| RD21–RD25 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test. |
+| RD21–RD26 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test; **RD26 single point of truth** — dispatch intent defined once in `ha/sig_dispatch_intent_helpers.yaml`. |
 | RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
@@ -2007,6 +2007,39 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
 
   Therefore the clamp is gated on `policy == 'Max Export'`. `policy` is the EFFECTIVE
   policy, so a session-forced Max Export is still clamped.
+
+- **RD26 — Single point of truth for dispatch intent.** RD25 made the two copies
+  provably agree; this removes the second copy. `ha/sig_dispatch_intent_helpers.yaml`
+  defines the effective policy and the setpoint **once**, as two template sensors:
+
+  | sensor | is |
+  |---|---|
+  | `sensor.sig_effective_policy` | override > session > select |
+  | `sensor.sig_dispatch_kw` | the inverter AC OUTPUT setpoint, incl. the RD22 sell-only clamp |
+
+  Both the `stale_setpoint` trigger and the action variables now **read** them.
+  Two sensors rather than one with attributes because the config-flow template
+  helper exposes a state template only.
+
+  **Fail-safe.** Consumers read the setpoint as `| float(-1)` and treat negative as
+  "no opinion": the trigger will not fire and the dispatch write is skipped, so an
+  unavailable sensor freezes the register rather than commanding the plant off a
+  missing value. `-1` and not `0`, because **0 is a legitimate setpoint** (a Max
+  Export clamped to zero PV asks for exactly that), so 0 cannot double as the error
+  value. The ESS/import re-opens stay unconditional — they are permissive.
+
+  **Deploy order matters:** helpers first, then the heartbeat. The reverse leaves the
+  heartbeat reading `unknown` and holding the last setpoint until the helpers land.
+
+  Guarded by `tests/test_yaml_dispatch_intent.py`:
+  `test_heartbeat_defers_to_intent_sensors` fails if the arithmetic reappears in the
+  automation, and `test_intent_sensors_match_reference` pins the values against an
+  oracle verified equal to the pre-refactor formulas over the full matrix (0/240
+  differ) on the day it landed. The heartbeat harness renders the helpers to supply
+  the sensors, so the whole heartbeat suite exercises them end-to-end.
+
+  Note the refactor rounds the setpoint to 2 dp one step earlier than before. The
+  register write is unchanged — it was always `| round(2)`.
 
 - **RD25 — The `stale_setpoint` trigger and the action variables are ONE decision
   written twice, and must be tested as one.** HA gives a template trigger no access
