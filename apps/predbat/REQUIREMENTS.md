@@ -241,6 +241,42 @@ precedence it must mirror.
 `curtailment_manager_dynamic_export_limit`, `curtailment_stale_phase_watchdog`,
 `voltage_seek_controller`. They are not writers today; re-check before assuming.
 
+## Register ownership audit (2026-08-06)
+
+Every SIG control register: who writes it, and what unwinds it on each transition.
+Built by enumeration, not recall, after four stranded-state defects in one day.
+
+| Register | Written by | On CM → Predbat | On Predbat → CM |
+|---|---|---|---|
+| `remote_ems_controlled_by_home_assistant` | heartbeat (ON only, **never** off — RD2) | left ON ✓ | left ON ✓ |
+| `remote_ems_control_mode` | heartbeat (PCS Remote Control) · `predbat_requested_mode_action` (MSC / Command Charging / Command Discharging) | `_park_ems_msc()` → MSC ✓ **plus** RD24 self-heal on any beat | heartbeat → PCS ✓ |
+| `active_power_fixed_adjustment` | heartbeat only | **not unwound** — left at last dispatch. Inert under MSC, and Predbat never selects PCS, so benign | overwritten each beat ✓ |
+| `grid_export_limitation` | heartbeat (= DNO cap) | left at cap — always correct, benign | re-asserted ✓ |
+| `grid_import_limitation` | heartbeat (→100) · `predbat_requested_mode_action` (→0 on Freeze Charging) | left open; Predbat owns it again | heartbeat re-opens ✓ (5bbdedeb) |
+| `ess_max_discharging_limit` | heartbeat (→rated) · `predbat_max_discharging_limit_action` | left open; Predbat owns it again | heartbeat re-opens ✓ |
+| `ess_max_charging_limit` | heartbeat (→rated) · `predbat_max_charging_limit_action` | left open; Predbat owns it again | heartbeat re-opens ✓ |
+| `ess_discharge_cut_off_state_of_charge` | **nobody** — 0% by design | — | — |
+| `input_number.discharge_rate` / `charge_rate` | heartbeat mirrors to rated · Predbat plans them | `_neutralise_predbat()` **not** called this way ⚠ | `_neutralise_predbat()` ✓ |
+
+**The asymmetry is deliberate and correct.** `_neutralise_predbat()` runs only on
+Predbat → CM: Predbat's own mappers unwind Predbat's own registers *before* that
+chain is disabled ("the writer that changed a register changes it back"). Going the
+other way there is nothing to unwind — every CM register is either re-owned by
+Predbat's mappers or inert under MSC.
+
+### Known gap — the guard writes selects but cannot swap the writer role
+
+`sig_keep_floor_guard` writes `sig_dispatch_policy` / `sig_override` directly. It
+cannot call `_set_writer()`, so on its DUSK branch the select says `Predbat` while
+the heartbeat is still ENABLED and the mappers still DISABLED, until the plugin's
+next cycle runs `_release_to_predbat()`. In that window the heartbeat is inert (its
+Predbat branch) and the mappers cannot write: **nobody drives, for up to 5 minutes.**
+
+Same shape as the 2026-08-06 04:50→09:00 dead zone, just bounded. Not fixed. Options:
+have the guard fire the plugin instead of writing selects, or give the writer-role
+swap its own automation triggered by `sensor.sig_effective_policy`. Decide before
+next winter — the dusk branch runs every night.
+
 ## Status index — what is actually in force
 
 **Check this table before citing any requirement.** It was built on 2026-07-28 by
