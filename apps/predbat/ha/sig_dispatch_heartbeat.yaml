@@ -91,8 +91,18 @@ trigger:
     id: session_end
   - platform: template
     value_template: >-
+      {# Policy precedence MUST be byte-for-byte the same decision as `policy` in
+         the action variables: override > session > select. It previously read the
+         select alone, so under a manual override while the select still said
+         handback, the trigger failed its own active-policy gate and disarmed —
+         while the ACTION was driving Hold every beat. Result: no fast corrector,
+         only the 60 s beat, and the battery absorbed every PV sag in between
+         (live 2026-08-06 08:17: commanded 1.45, PV 1.329, battery -0.135 kW).
+         test_trigger_and_action_can_never_diverge renders both copies over a
+         200-case matrix and fails on any disagreement. #}
+      {% set ovr = states('input_select.sig_override') %}
       {% set rawp = states('input_select.sig_dispatch_policy') %}
-      {% set p = 'Max Export' if (is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') and rawp != 'Predbat') else rawp %}
+      {% set p = ovr if ovr not in ['Off', 'unknown', 'unavailable', ''] else ('Max Export' if (is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') and rawp != 'Predbat') else rawp) %}
       {% set cap = (states('input_number.dno_export_limit_w') | float(3680)) / 1000 %}
       {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
       {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
