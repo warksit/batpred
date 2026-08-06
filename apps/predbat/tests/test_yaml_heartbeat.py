@@ -321,6 +321,88 @@ def _msc_write_fires(trigger_id, ems_mode):
     return all(_eval_condition(c, trigger_id, states) for c in step["if"])
 
 
+def _trigger_vars(auto, states):
+    """Render the stale_setpoint trigger's INTERNAL working (`p`, `want`).
+
+    The trigger is a run of `{% set %}` statements followed by exactly one output
+    expression. Swapping that final expression lets the harness see the values the
+    trigger is deciding on, instead of only its boolean — which is what let three
+    divergences ship today.
+    """
+    trig = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
+    tmpl = trig["value_template"]
+    cut = tmpl.rindex("{{")
+    assert "want" in tmpl[:cut], "trigger no longer computes `want` — rewrite this harness with it"
+    env = jinja2.Environment()
+    env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes", "on")
+    ctx = {"states": lambda e: states.get(e, "unknown"), "is_state": lambda e, v: states.get(e) == v}
+    out = env.from_string(tmpl[:cut] + "{{ p }}|{{ want }}").render(**ctx).strip()
+    p, want = out.split("|")
+    return p, float(want)
+
+
+ACTIVE_POLICIES = ("Max Export", "Hold Battery", "Solar Charge Battery")
+
+
+def test_trigger_and_action_can_never_diverge():
+    """THE anti-divergence guard.
+
+    HA gives a template trigger no access to the action's `variables`, so the
+    dispatch logic is necessarily written TWICE — once to decide "has the live
+    setpoint drifted?", once to compute what to write. Three divergences shipped
+    on 2026-08-06 alone:
+
+      1. the RD22 sell-only clamp landed in the action copy only
+      2. ...and the first test for it passed anyway, because at the live numbers
+         the two copies differed by less than the trigger's own 0.1 kW tolerance
+      3. the trigger's policy ignores `sig_override` entirely, so under a manual
+         override with the select on Predbat the trigger is disarmed and the fast
+         corrector is dead — only the 60 s beat writes, and the battery absorbs
+         every PV sag in between (live: commanded 1.45, PV 1.329, battery -0.135)
+
+    So do not test the copies separately. Render BOTH over a matrix and assert
+    they agree — on the value AND on whether they consider the policy active.
+    A future edit to one copy alone cannot pass this.
+    """
+    auto = _load()
+    cases = []
+    for select in ("Predbat", "Max Export", "Hold Battery", "Solar Charge Battery"):
+        for override in ("Off", "Hold Battery", "Max Export", "Solar Charge Battery", "Predbat"):
+            for session in (False, True):
+                for pv, load, soc in ((0.1, 1.5, 1.3), (1.329, 0.364, 1.7), (8.0, 0.5, 50), (0.0, 0.4, 90), (3.0, 3.0, 2.8)):
+                    st = _mock(select, pv, load, soc, hard=2.8)
+                    st["input_select.sig_override"] = override
+                    st["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"] = "on" if session else "off"
+                    cases.append(st)
+
+    mismatches = []
+    for st in cases:
+        trig_p, want = _trigger_vars(auto, st)
+        dispatch = _render_dispatch(auto, st)
+        act_p = _render_dispatch.ctx["policy"]
+        tag = "select={} override={} session={} pv={} load={} soc={}".format(
+            st["input_select.sig_dispatch_policy"],
+            st["input_select.sig_override"],
+            st["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"],
+            st["sensor.sigen_plant_pv_power"],
+            st["sensor.sigen_plant_total_load_power"],
+            st["sensor.sigen_plant_battery_state_of_charge"],
+        )
+        if trig_p != act_p:
+            mismatches.append("POLICY {}: trigger says {!r}, action says {!r}".format(tag, trig_p, act_p))
+        elif abs(want - dispatch) > 1e-6:
+            mismatches.append("SETPOINT {}: trigger wants {:.3f}, action writes {:.3f}".format(tag, want, dispatch))
+        # Armed exactly when the action would drive. Disarmed-but-driving is the
+        # live 2026-08-06 fault: no fast correction under a manual override.
+        armed = trig_p in ACTIVE_POLICIES
+        drives = act_p in ACTIVE_POLICIES
+        if armed != drives:
+            mismatches.append("ARMING {}: trigger armed={}, action drives={}".format(tag, armed, drives))
+
+    assert not mismatches, "trigger and action have diverged in {} of {} cases:\n  {}".format(len(mismatches), len(cases), "\n  ".join(mismatches[:8]))
+    print("PASS  trigger/action equivalence over {} state combinations".format(len(cases)))
+
+
 def test_predbat_branch_self_heals_pcs_remote_control():
     """Entering the Predbat branch must unwind PCS Remote Control HOWEVER it was
     entered — not only via the policy_change trigger.
@@ -585,6 +667,7 @@ def main():
         test_dispatch_hard_floor_clamp,
         test_dispatch_drives_between_2_8_and_5,
         test_dispatch_drain_floor_default_2_8,
+        test_trigger_and_action_can_never_diverge,
         test_predbat_branch_self_heals_pcs_remote_control,
         test_self_heal_cannot_stomp_predbat_own_modes,
         test_stale_trigger_agrees_with_dispatch,
