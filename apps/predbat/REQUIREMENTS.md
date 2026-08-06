@@ -325,7 +325,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
-| RD21–RD27 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test; **RD26 single point of truth** — dispatch intent defined once in `ha/sig_dispatch_intent_helpers.yaml`; **RD27 no mid-window handback** (RD4 'A' retired). |
+| RD21–RD28 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test; **RD26 single point of truth** — dispatch intent defined once in `ha/sig_dispatch_intent_helpers.yaml`; **RD27 no mid-window handback** (RD4 'A' retired); **RD28 bank to tonight's need once no overflow is left**. |
 | RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
@@ -2071,6 +2071,36 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
 
   Therefore the clamp is gated on `policy == 'Max Export'`. `policy` is the EFFECTIVE
   policy, so a session-forced Max Export is still clamped.
+
+- **RD28 — Once no overflow is left, bank to tonight's need, then hold.** In the
+  `no_drain` state the charge threshold is **not** `charge_below`. That is the P10
+  recovery floor — a DEADLINE ("be at least this high now, or a P10 afternoon will not
+  get you there") — and deferring to it is correct only while curtailment competes for
+  the same kWh, because every kWh banked early is headroom lost at the peak.
+
+  Once `overflow_p90` reaches 0 nothing competes. Deferring then earns an export credit
+  and risks buying the same energy back overnight at import rates, which is the worse
+  side of that trade.
+
+  Live 2026-08-06 18:02 — `overflow_p90` 0.0, SOC 5.66 kWh, `overnight_target` 6.62,
+  `charge_below` 5.15. SOC sat **above** `charge_below`, so the Schmitt said Hold and CM
+  exported the surplus while 0.96 kWh short of tonight's need, on a P10 margin of 0.51
+  kWh — about eight minutes of surplus. It took a manual Solar Charge override to bank it.
+
+  `compute_no_overflow_charge_target` = `min(overnight_target, soc_max −
+  required_headroom(overflow_p90))`. The `min` is the safeguard: "no overflow left" is a
+  forecast and forecasts move, so while p90 is non-zero the target is clamped to leave
+  room for it — via `required_headroom_kwh`, never a second expression (the 2026-07-28
+  lesson where five spellings of that question let the weakest veto the strongest).
+
+  **Gated on the measured condition, not on `safe_time`.** On 2026-08-06 overflow reached
+  zero ~28 min before the predicted `safe_time`; gating on the time would have wasted
+  that banking window. `safe_time` only ever predicted when this condition would arrive.
+
+  Deliberately not `compute_proposed_phase` — that takes `min(charge_below, drain_above)`
+  and would clamp the target back down when `drain_above` is low. Charge-then-Hold is the
+  whole rule, so it is written plainly. No hysteresis is lost: the Schmitt deadband only
+  applied to entering Drain, which this branch forbids (RD17, unchanged).
 
 - **RD27 — No mid-window handback. RD4 "A" (low-SOC → MSC) is RETIRED.** While the
   plugin is ACTIVE, CM keeps the wheel at any SOC. **Three sites, not one** — the
