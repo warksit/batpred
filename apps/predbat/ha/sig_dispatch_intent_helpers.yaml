@@ -1,0 +1,93 @@
+# SIG dispatch intent — THE single point of truth (RD26, 2026-08-06)
+#
+# WHY THIS EXISTS
+#
+# HA gives a template trigger no access to an automation's `variables` block, so
+# `sig_dispatch_heartbeat` was forced to write the dispatch logic TWICE: once in
+# the `stale_setpoint` trigger to decide "has the live setpoint drifted?", once in
+# the action variables to compute what to write. Three divergences shipped on
+# 2026-08-06 alone:
+#
+#   1. the RD22 sell-only clamp landed in the action copy only
+#   2. ...and its first regression test passed anyway, because at the live numbers
+#      the copies differed by less than the trigger's own 0.1 kW tolerance
+#   3. the trigger's policy ignored `sig_override` entirely, so under a manual
+#      override the trigger disarmed while the action drove — killing the fast
+#      corrector exactly when a human was at the wheel
+#
+# `test_trigger_and_action_can_never_diverge` closes the hole by rendering both
+# copies over a 200-case matrix. This file removes the hole: there is now ONE
+# definition of the effective policy and ONE of the setpoint, and both the trigger
+# and the action READ them. Nothing to keep in step.
+#
+# Two sensors rather than one sensor with attributes: the config-flow template
+# helper exposes a state template only, no custom attributes. Chaining is fine —
+# HA tracks the dependency and updates `sig_dispatch_kw` when `sig_effective_
+# policy` changes.
+#
+# FAIL-SAFE. A template sensor can go `unknown` (HA restart, a source entity
+# missing). `sig_dispatch_kw` therefore never emits a bare `unknown` that a
+# consumer might read as 0 and write to the inverter: consumers take
+# `| float(-1)` and treat any negative value as "no opinion, write nothing".
+# -1 is used rather than 0 because 0 is a LEGITIMATE setpoint (it is what a
+# clamped-to-zero-PV Max Export asks for), so 0 cannot double as the error value.
+#
+# DEPLOY: via ha_config_set_helper (helper_type: template). This file is the
+# source of truth — edit here, run tests/test_yaml_dispatch_intent.py, then push.
+# Never edit the helper in the HA UI without updating this file.
+
+sensors:
+  # ---------------------------------------------------------------------------
+  # Effective policy: override > session > select.
+  #
+  # Precedence rationale (RD13a/RD14c): a human holding an override outranks the
+  # session dump — they can see something the automation cannot. The session only
+  # forces Max Export when the select is not already parked on handback, so a
+  # session can never drag us out of Predbat's hands.
+  # ---------------------------------------------------------------------------
+  - name: SIG Effective Policy
+    unique_id: sig_effective_policy
+    state: >-
+      {% set ovr = states('input_select.sig_override') %}
+      {% set rawp = states('input_select.sig_dispatch_policy') %}
+      {{ ovr if ovr not in ['Off', 'unknown', 'unavailable', ''] else
+         ('Max Export' if (is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') and rawp != 'Predbat') else rawp) }}
+
+  # ---------------------------------------------------------------------------
+  # Dispatch setpoint (kW) — the INVERTER AC OUTPUT the plant should produce.
+  #
+  # Confirmed empirically 2026-08-06 08:17: commanded 1.45 against a measured
+  # inverter_ac of 1.449, with export = inverter_ac - house load. It is NOT a grid
+  # setpoint; house load comes out of it first.
+  #
+  #   Max Export     6.6 (inverter AC max) and let the SIG's grid_export_limitation
+  #                  clamp export to the DNO cap in HARDWARE — firmware tracks load
+  #                  at hardware speed, with no heartbeat lag.
+  #   Hold Battery   max(pv, load), ceiling load+cap: tracks PV so the battery stays
+  #                  flat. A flat 6.6 would turn Hold into a drain on any PV dip.
+  #   Solar Charge   load, so all PV surplus goes to the battery.
+  #
+  # RD22 sell-only clamp: below the drain floor, Max Export is held to PV so an
+  # empty battery is never sold. It does NOT apply to Hold/Solar Charge — those
+  # dispatch load-covering power, and clamping them strands the battery and imports
+  # the shortfall (live 2026-08-06 06:48, SOC 1.3%: battery idle, importing 27 W
+  # while holding 0.235 kWh). Stopping the battery SELLING at the floor (R5) and
+  # letting it COVER LOAD below it (RD4) are not in conflict.
+  #
+  # `hard` defaults to 2.8 — deliberately HIGHER than the live 1.0% helper, so an
+  # unreadable helper under-drains rather than over-drains (RD23).
+  # ---------------------------------------------------------------------------
+  - name: SIG Dispatch kW
+    unique_id: sig_dispatch_kw
+    unit_of_measurement: kW
+    state: >-
+      {% set p = states('sensor.sig_effective_policy') %}
+      {% set cap = (states('input_number.dno_export_limit_w') | float(3680)) / 1000 %}
+      {% set load = [states('sensor.sigen_plant_total_load_power') | float(0.5), 0.2] | max %}
+      {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
+      {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
+      {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
+      {% set raw = 6.6 if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
+      {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
+      {% set pre = ([raw, pv] | min if (soc <= hard and p == 'Max Export') else raw) %}
+      {{ ([[pre, ceil] | min, 0] | max) | round(2) }}
