@@ -219,9 +219,38 @@ action:
                 target:
                   entity_id: switch.sigen_plant_remote_ems_controlled_by_home_assistant
               - delay: "00:00:02"
+          # Park in EMS-MSC (RD2). TWO ways in, deliberately:
+          #
+          #   policy_change      the one-shot handback. Fires once on the
+          #                      transition, from whatever mode Predbat was in.
+          #   PCS Remote Control self-heal, on ANY trigger. This mode is written
+          #                      ONLY by this automation's active branch —
+          #                      predbat_requested_mode_action selects only
+          #                      Maximum Self Consumption / Command Charging
+          #                      (Grid First) / Command Discharging (PV First).
+          #                      So reverting it can never stomp Predbat, and the
+          #                      1-min beat is safe to act on it.
+          #
+          # The self-heal exists because policy_change is not the only way into
+          # this branch. Live 2026-08-06 07:38: the select read Predbat while the
+          # OVERRIDE was set to Hold Battery, so the effective policy was Hold and
+          # the active branch wrote PCS Remote Control + a 1.08 kW setpoint.
+          # Clearing the override returned the effective policy to Predbat without
+          # touching the select, so only `override_change` fired, the MSC write was
+          # skipped, and the plant was left exporting against a setpoint nobody
+          # owned while the battery sat at 1.4%. Keying on the MODE rather than on
+          # which trigger fired also recovers this after an HA restart.
+          #
+          # The `not MSC` guard stays: it is what stops a pointless write every
+          # minute, and it is load-bearing for the policy_change arm.
           - if:
-              - condition: trigger
-                id: policy_change
+              - condition: or
+                conditions:
+                  - condition: trigger
+                    id: policy_change
+                  - condition: state
+                    entity_id: select.sigen_plant_remote_ems_control_mode
+                    state: "PCS Remote Control"
               - condition: not
                 conditions:
                   - condition: state
