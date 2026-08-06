@@ -100,7 +100,11 @@ trigger:
       {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
       {% set raw = 6.6 if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
       {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
-      {% set pre = ([raw, pv] | min if soc <= hard else raw) %}
+      {# RD22: sell-only clamp. MUST stay identical to `dispatch_kw` in the action
+         variables — this trigger re-implements the dispatch maths to decide whether
+         the live setpoint has drifted, so if the two copies disagree it demands a
+         setpoint the action will never write and re-fires forever (mode: restart). #}
+      {% set pre = ([raw, pv] | min if (soc <= hard and p == 'Max Export') else raw) %}
       {% set want = [[pre, ceil] | min, 0] | max %}
       {% set rated_d = states('sensor.sigen_inverter_ess_rated_discharge_power') | float(6.6) %}
       {% set disc = states('number.sigen_plant_ess_max_discharging_limit') | float(0) %}

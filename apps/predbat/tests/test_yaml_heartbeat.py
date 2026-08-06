@@ -285,6 +285,46 @@ def test_dispatch_drain_floor_default_2_8():
     print(f"PASS  drain floor default 2.8%: SOC2% → {d:.2f}")
 
 
+def _render_stale_trigger(auto, states):
+    """Render the `stale_setpoint` template trigger to its boolean."""
+    trig = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
+    env = jinja2.Environment()
+    env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes", "on")
+    ctx = {
+        "states": lambda e: states.get(e, "unknown"),
+        "is_state": lambda e, v: states.get(e) == v,
+    }
+    return env.from_string(trig["value_template"]).render(**ctx).strip().lower() == "true"
+
+
+def test_stale_trigger_agrees_with_dispatch():
+    """The stale_setpoint trigger RE-IMPLEMENTS the dispatch maths to decide
+    whether the live setpoint has drifted. If the two copies disagree, the
+    trigger fires on every state change forever (mode: restart), because the
+    setpoint it demands is one the action will never write.
+
+    This is the `required_headroom_kwh` lesson in YAML: one quantity, two
+    expressions. The harness rendered only the ACTION variables, so the RD22
+    clamp gate landed in one copy and not the other — caught by reading the
+    deployed JSON, not by the green test.
+    """
+    # The gap between the two copies must EXCEED the trigger's own 0.1 kW
+    # tolerance, or the test passes on the drift it exists to catch. At the live
+    # 06:48 numbers (pv 0.311, load 0.359) the disagreement is only 0.048 and is
+    # invisible; a normal evening load makes it 1.4 kW.
+    st = _mock("Hold Battery", pv=0.1, load=1.5, soc=1.3, hard=2.8)
+    st["switch.sigen_plant_remote_ems_controlled_by_home_assistant"] = "on"
+    st["sensor.sigen_inverter_ess_rated_discharge_power"] = "6.6"
+    st["number.sigen_plant_ess_max_discharging_limit"] = "6.6"
+    st["number.sigen_plant_grid_import_limitation"] = "100"
+
+    dispatch = _render_dispatch(_load(), st)
+    # The register already holds exactly what the action would write.
+    st["number.sigen_plant_active_power_fixed_adjustment"] = str(dispatch)
+    assert _render_stale_trigger(_load(), st) is False, "trigger demands a setpoint the action will never write ({:.3f}) — permanent re-fire loop".format(dispatch)
+    print("PASS  stale trigger agrees with dispatch {:.3f} (no re-fire loop)".format(dispatch))
+
+
 def test_drain_floor_does_not_strand_hold_below_the_floor():
     """The drain floor stops CM SELLING an empty battery. It must NOT stop the
     battery covering house load.
@@ -466,6 +506,7 @@ def main():
         test_dispatch_hard_floor_clamp,
         test_dispatch_drives_between_2_8_and_5,
         test_dispatch_drain_floor_default_2_8,
+        test_stale_trigger_agrees_with_dispatch,
         test_drain_floor_does_not_strand_hold_below_the_floor,
         test_drain_floor_still_blocks_selling_below_the_floor,
         test_drain_floor_solar_charge_not_stranded,
