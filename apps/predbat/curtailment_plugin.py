@@ -2918,7 +2918,25 @@ class CurtailmentPlugin(PredBatPlugin):
         session_sell_floor_kwh = 0.0
 
         # Decide the intended policy + keep floor (pure decision, no side effects yet)
-        if plugin_active and soc_pct > low_soc:
+        #
+        # RD27 (2026-08-06): there is NO low-SOC handover. While active, CM keeps the
+        # wheel at any SOC. The old rule handed the policy select to Predbat below
+        # the drain floor — and handed it to NOBODY: `_release_to_predbat` is not on
+        # that path, so read_only stayed on and the three Predbat mappers stayed
+        # disabled. Predbat could not act, the heartbeat went inert in its Predbat
+        # branch, and the plant fell through to the SIG's own Maximum Self
+        # Consumption default, quietly filling the battery through the pre-overflow
+        # window. Live 2026-08-06: handed back 04:50, still handed back at 09:00,
+        # charging 3.5 kW with ZERO export against a 19.89 kWh overflow forecast and
+        # a surplus (3.54 kW) still under the 3.68 kW cap — i.e. exportable energy
+        # spent on headroom the peak then had to curtail. ~2% of pack, unrecoverable.
+        #
+        # The handover existed only to escape CM's own drain-floor clamp. RD22 made
+        # that clamp sell-only, so there is nothing left to escape: below the floor
+        # the Schmitt picks Charge (under charge_below) or Hold, both of which keep
+        # the battery off the grid and keep exporting surplus. Handing back is a
+        # window-END decision (RD6 safe_time / sundown), never a mid-window one.
+        if plugin_active:
             # v32 evening lifecycle override (set in calculate()): "max_export" =
             # dump the saving-session reserve at the cap; "hold" = overflow already
             # fits headroom or past safe_time → battery flat, sell surplus, no
@@ -3196,20 +3214,27 @@ class CurtailmentPlugin(PredBatPlugin):
             if first_run or not self._cm_controlling:
                 self._set_writer(cm_driving=True)
                 self._cm_controlling = True
-            if soc_pct > low_soc:
-                # CM drives: suppress Predbat, set the policy.
-                if not self._read_only_set:
-                    self._set_read_only(True)
-                    self._read_only_set = True
-                self._set_policy(intended_policy)
-                self._set_keep_floor(intended_keep)
-            else:
-                # RD4 low-SOC handover: let EMS-MSC cover load; drop drive suppression
-                # but STAY in the window (heartbeat on) so we re-drive when SOC recovers.
-                if self._read_only_set:
-                    self._set_read_only(False)
-                    self._read_only_set = False
-                self._set_policy(POLICY_PREDBAT)
+            # RD27: CM drives at ANY SOC inside the window. The old low-SOC branch
+            # here was the one that actually WROTE the handover (the decision-side
+            # copy above only shaped the published reason) — and it handed to nobody:
+            # it cleared read_only but left the mappers OFF, because _set_writer(
+            # cm_driving=True) runs a few lines up and stays. So Predbat was
+            # un-muzzled with no write path, the heartbeat went inert in its Predbat
+            # branch, and the plant fell through to the SIG's Maximum Self
+            # Consumption default — filling the battery through the pre-overflow
+            # window. Live 2026-08-06: 04:50 to 09:00, charging 3.5 kW with ZERO
+            # export against a 19.89 kWh overflow forecast, surplus still under the
+            # cap. ~2% of pack spent on headroom the peak then had to curtail.
+            #
+            # Handing back is a window-END decision (RD6 safe_time / sundown) and
+            # nothing else. Below the drain floor the Schmitt gives Charge or Hold,
+            # and RD22's sell-only clamp already stops the battery being sold — so
+            # there is nothing the handover was protecting.
+            if not self._read_only_set:
+                self._set_read_only(True)
+                self._read_only_set = True
+            self._set_policy(intended_policy)
+            self._set_keep_floor(intended_keep)
             self._policy_driving = True
         else:
             # Window end (safe_time / off): hand the whole machine back to Predbat.

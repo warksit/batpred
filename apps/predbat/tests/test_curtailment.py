@@ -1803,18 +1803,62 @@ def test_dispatch_policy_max_export_high_soc():
     print("  test_dispatch_policy_max_export_high_soc: PASSED")
 
 
-def test_dispatch_policy_low_soc_hands_to_msc():
-    """RD4 'A': active but SOC below the low-SOC handover → Predbat (MSC), no PCS."""
+def test_low_soc_never_hands_back_mid_window():
+    """RD27: while ACTIVE, CM never hands the wheel back on low SOC.
+
+    The old RD4 'A' handover set the policy select to Predbat whenever SOC fell
+    below the drain floor. It handed to NOBODY: `_release_to_predbat` is not
+    called on this path, so `read_only` stayed on and the three Predbat mappers
+    stayed disabled. Predbat therefore could not act, the heartbeat went inert in
+    its Predbat branch, and the plant fell through to the SIG's own Maximum Self
+    Consumption default.
+
+    Live 2026-08-06: handed back at 04:50 and still handed back at 09:00 with the
+    plant charging at 3.5 kW and ZERO export, on a day forecasting 19.89 kWh of
+    overflow. Surplus was 3.54 kW against a 3.68 kW cap — every kWh of that could
+    have been exported at full value; instead it filled the battery and consumed
+    headroom that the overflow peak then had to curtail. ~2% of pack, unrecoverable.
+
+    The handover only ever existed to escape CM's own drain-floor clamp. RD22 made
+    that clamp sell-only, so there is nothing left to escape: at low SOC the Schmitt
+    simply picks Charge (below charge_below) or Hold, both of which keep the battery
+    off the grid and keep exporting surplus.
+    """
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     base.services.clear()
-    # 0.4 kWh of 18.08 = 2.2% < 2.8% drain floor → hand to MSC
+    # 0.4 kWh of 18.08 = 2.2%, below the 2.8% drain floor.
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=0.4, soc_max=18.08)
-    assert _policy_calls(base) == ["Predbat"], base.services
-    assert plugin._policy_driving is True  # still our day; resumes when SOC recovers
-    print("  test_dispatch_policy_low_soc_hands_to_msc: PASSED")
+    written = _policy_calls(base)
+    assert written and written[-1] != "Predbat", "low SOC must NOT hand back mid-window, got {}".format(written)
+    # 0.4 kWh < charge_below 2.0 kWh, so the Schmitt wants to refill.
+    assert written[-1] == "Solar Charge Battery", "below charge_below the Schmitt must Charge, got {}".format(written[-1])
+    assert base.set_read_only is True, "CM still owns the wheel, so read_only must stay set"
+    assert plugin._policy_driving is True
+    print("  test_low_soc_never_hands_back_mid_window: PASSED ({})".format(written[-1]))
+
+
+def test_low_soc_drain_stays_max_export_not_handback():
+    """Above charge_below but below the drain floor: still Max Export, never a handback.
+
+    Named for what it actually does. The plugin does NOT clamp Drain to Hold here,
+    and it does not need to: the heartbeat's RD22 sell-clamp holds Max Export at PV
+    below the floor, so the battery is not sold and the two are physically identical.
+    The safety lives in the executor, not in a second rule up here.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    # charge_below below the SOC so the Schmitt does not want to charge.
+    plugin._charge_below, plugin._drain_above = 0.1, 0.18
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.18, soc_kwh=0.4, soc_max=18.08)
+    written = _policy_calls(base)
+    assert written[-1] == "Max Export", "SOC above drain_above must stay Max Export (the sell-clamp makes it safe), got {}".format(written)
+    assert base.set_read_only is True, "read_only must stay set — CM still owns the wheel"
+    print("  test_low_soc_drain_stays_max_export_not_handback: PASSED")
 
 
 def test_dispatch_policy_handback_once_on_deactivate():
@@ -2053,7 +2097,7 @@ def test_heartbeat_untouched_observe_only():
 
 def test_heartbeat_stays_on_through_low_soc():
     """The window spans low-SOC dips: heartbeat stays enabled (only turned on once,
-    never off) when SOC drops below the handover mid-window."""
+    never off) AND CM keeps driving (RD27) when SOC drops below the drain floor."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
@@ -2061,11 +2105,12 @@ def test_heartbeat_stays_on_through_low_soc():
     # Enter control (SOC in band)
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
     base.services.clear()
-    # SOC drops below the 12% handover — still in the window
+    # SOC drops below the drain floor — RD27: still in the window AND still driving
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=0.4, soc_max=18.08)
     assert not any(s == "automation/turn_off" for s, _ in _automation_calls(base)), f"must NOT disable heartbeat on low-SOC, got {base.services}"
     assert plugin._cm_controlling is True
-    assert _policy_calls(base) == ["Predbat"], base.services
+    written = _policy_calls(base)
+    assert written and written[-1] != "Predbat", f"RD27: low SOC must not hand back mid-window, got {base.services}"
     print("  test_heartbeat_stays_on_through_low_soc: PASSED")
 
 
@@ -2096,19 +2141,23 @@ def test_read_only_released_on_handback():
     print("  test_read_only_released_on_handback: PASSED")
 
 
-def test_read_only_released_on_low_soc_handover():
-    """RD4: active but SOC below the low-SOC handover → CM hands to Predbat (MSC),
-    so read_only clears even though the plugin is still active."""
+def test_read_only_held_through_low_soc():
+    """RD27 (was RD4, retired 2026-08-06): low SOC must NOT release read_only.
+
+    The old rule cleared read_only mid-window while leaving the three Predbat
+    mappers DISABLED — un-muzzling Predbat with no write path. Nothing drove, and
+    the plant fell through to the SIG's own self-consumption default. CM keeps both
+    the wheel and read_only until the window ends."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 2.0, 14.0
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
     assert base.set_read_only is True
-    # 0.4 kWh of 18.08 = 2.2% < 2.8% drain floor → hand to Predbat
+    # 0.4 kWh of 18.08 = 2.2%, below the 2.8% drain floor — CM keeps driving.
     plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=0.4, soc_max=18.08)
-    assert base.set_read_only is False, "low-SOC handover must release read_only"
-    print("  test_read_only_released_on_low_soc_handover: PASSED")
+    assert base.set_read_only is True, "read_only must be HELD through low SOC — releasing it without enabling the mappers hands to nobody"
+    print("  test_read_only_held_through_low_soc: PASSED")
 
 
 def test_read_only_untouched_observe_only():
@@ -7005,8 +7054,10 @@ def test_v32_drain_floor_drives_between_2_8_and_5pct():
     plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.7, soc_max=18.08)
     assert _policy_calls(base) and _policy_calls(base)[-1] != "Predbat", f"3.9% > 2.8% floor must drive, not MSC: {base.services}"
     base.services.clear()
+    # RD27: below the floor CM still drives — the drain floor governs SELLING (the
+    # heartbeat clamp), never who holds the wheel.
     plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.4, soc_max=18.08)
-    assert _policy_calls(base) == ["Predbat"], f"2.2% < 2.8% floor → MSC handover: {base.services}"
+    assert _policy_calls(base) and _policy_calls(base)[-1] != "Predbat", f"2.2% < floor must still DRIVE (RD27), got {base.services}"
     print("  test_v32_drain_floor_drives_between_2_8_and_5pct: PASSED")
 
 
@@ -7093,7 +7144,11 @@ def test_v32_keep_floor_min_is_drain_floor_not_5():
 
 
 def test_v32_drain_floor_helper_override():
-    """v32: sig_drain_floor_pct helper is honoured — set to 6%, SOC 5% hands to MSC."""
+    """v32/RD27: sig_drain_floor_pct is honoured as the SELL floor, not a handover.
+
+    Set to 6% with SOC at 5%: the plugin keeps the wheel (RD27) and the published
+    keep-floor is clamped to the helper — it is the heartbeat's sell-clamp that
+    stops the battery being sold, not a change of driver."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     base._sensor_overrides["input_number.sig_drain_floor_pct"] = "6"
@@ -7102,7 +7157,9 @@ def test_v32_drain_floor_helper_override():
     base.services.clear()
     # 0.9 kWh / 18.08 = 5.0% < 6% → MSC
     plugin._publish_dispatch_policy(True, floor_kwh=0.9, soc_kwh=0.9, soc_max=18.08)
-    assert _policy_calls(base) == ["Predbat"], f"5% < 6% helper floor → MSC: {base.services}"
+    assert _policy_calls(base) and _policy_calls(base)[-1] != "Predbat", f"5% < 6% helper floor must still DRIVE (RD27), got {base.services}"
+    keep = [v["value"] for svc_name, v in base.services if svc_name == "input_number/set_value" and v.get("entity_id") == "input_number.sig_keep_floor_pct"]
+    assert keep and keep[-1] >= 6.0, f"keep floor must be clamped up to the 6% helper, got {keep}"
     print("  test_v32_drain_floor_helper_override: PASSED")
 
 
@@ -7324,14 +7381,15 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
-        test_dispatch_policy_low_soc_hands_to_msc,
+        test_low_soc_never_hands_back_mid_window,
+        test_low_soc_drain_stays_max_export_not_handback,
         test_dispatch_policy_handback_once_on_deactivate,
         test_sell_floor_overnight_reserve_when_not_draining,
         test_sell_floor_overflow_floor_during_curtailment_drain,
         test_sell_floor_session_dumps_to_overnight_reserve,
         test_read_only_set_when_cm_driving,
         test_read_only_released_on_handback,
-        test_read_only_released_on_low_soc_handover,
+        test_read_only_held_through_low_soc,
         test_read_only_untouched_observe_only,
         test_manual_override_keeps_machine_live_skips_policy,
         test_manual_override_off_resumes_policy,
