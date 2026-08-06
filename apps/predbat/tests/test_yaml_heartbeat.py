@@ -285,6 +285,53 @@ def test_dispatch_drain_floor_default_2_8():
     print(f"PASS  drain floor default 2.8%: SOC2% → {d:.2f}")
 
 
+def test_drain_floor_does_not_strand_hold_below_the_floor():
+    """The drain floor stops CM SELLING an empty battery. It must NOT stop the
+    battery covering house load.
+
+    Live 2026-08-06 06:48, SOC 1.3% under a manual Hold override:
+
+        pv 0.311  load 0.359  ->  raw = max(pv,load) = 0.359
+        soc 1.3 <= hard 2.8   ->  clamped to min(raw, pv) = 0.311
+        battery -0.003 kW (idle), import 0.027 kW
+
+    The plant was commanded to output exactly PV, so the 0.048 kW shortfall came
+    off the grid while the battery sat holding 0.235 kWh. The clamp overrode the
+    policy AND the human override — it is applied after policy selection, so under
+    the old form no policy could use the battery below the floor.
+
+    That is RD4's prohibition ("never forced to import while it holds charge")
+    violated by the mechanism meant to protect a battery that needs no protection:
+    the SIG simply imports at 0%, there is no cliff (Andrew, 2026-08-06).
+    """
+    d = _render_dispatch(_load(), _mock("Hold Battery", pv=0.311, load=0.359, soc=1.3, hard=2.8))
+    assert abs(d - 0.359) < 0.001, "Hold below the drain floor must still cover load (0.359), got {} — battery stranded, load imported".format(d)
+    print("PASS  drain floor: Hold @SOC1.3% covers load {:.3f} (not clamped to PV)".format(d))
+
+
+def test_drain_floor_still_blocks_selling_below_the_floor():
+    """The other half: Max Export below the floor must STILL clamp to PV.
+
+    Both halves in one commit deliberately — the change is "the clamp applies to
+    SELLING, not to load-covering", and a test that only pins the new behaviour
+    would let the old requirement (R5, stop selling at the floor) be deleted by
+    accident.
+    """
+    d = _render_dispatch(_load(), _mock("Max Export", pv=0.311, load=0.359, soc=1.3, hard=2.8))
+    assert abs(d - 0.311) < 0.001, "Max Export below the drain floor must clamp to PV (0.311), got {}".format(d)
+    print("PASS  drain floor: Max Export @SOC1.3% still clamped to PV {:.3f}".format(d))
+
+
+def test_drain_floor_solar_charge_not_stranded():
+    """Solar Charge dispatches `load`. Below the floor the old clamp cut that to
+    PV as well, so a charging policy imported the shortfall instead of letting the
+    battery bridge it — the same defect, on the policy least able to justify it.
+    """
+    d = _render_dispatch(_load(), _mock("Solar Charge Battery", pv=0.311, load=0.359, soc=1.3, hard=2.8))
+    assert abs(d - 0.359) < 0.001, "Solar Charge below the floor must still cover load (0.359), got {}".format(d)
+    print("PASS  drain floor: Solar Charge @SOC1.3% covers load {:.3f}".format(d))
+
+
 def test_rd14c_live_session_forces_max_export():
     """RD14c: a live saving session forces Max Export even though the policy
     select still says Hold. Source is the Octoplus CALENDAR, which is "on when a
@@ -419,6 +466,9 @@ def main():
         test_dispatch_hard_floor_clamp,
         test_dispatch_drives_between_2_8_and_5,
         test_dispatch_drain_floor_default_2_8,
+        test_drain_floor_does_not_strand_hold_below_the_floor,
+        test_drain_floor_still_blocks_selling_below_the_floor,
+        test_drain_floor_solar_charge_not_stranded,
     ):
         t()
     print("test_yaml_heartbeat: ALL PASSED")

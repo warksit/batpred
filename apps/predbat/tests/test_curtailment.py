@@ -3480,6 +3480,7 @@ from curtailment_plugin import (
     SIG_OVERRIDE_SELECT,
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
     SIG_SAVING_SESSION_CALENDAR,
+    DAWN_RESERVE_FRACTION,
 )
 
 
@@ -6143,25 +6144,178 @@ def test_drain_above_source_mirrors_compute_drain_above():
     happen again.
     """
     cases = [
-        # reserve, overflow_floor, session_protect, expected winning arm
-        (0.0, 3.39, 10.22, "session_protect"),  # live 2026-08-03
-        (0.0, 3.39, 0.0, "overflow_floor"),  # ordinary overflow day
-        (0.0, 12.0, 10.22, "overflow_floor"),  # session present but not binding
-        (0.0, 0.2, 0.0, "deep_floor"),  # nothing else above the 0.5 kWh floor
-        (5.0, 0.2, 0.0, "reserve"),  # hardware reserve dominates
+        # reserve, overflow_floor, session_protect, floor_kwh, expected winning arm
+        (0.0, 3.39, 10.22, None, "session_protect"),  # live 2026-08-03
+        (0.0, 3.39, 0.0, None, "overflow_floor"),  # ordinary overflow day
+        (0.0, 12.0, 10.22, None, "overflow_floor"),  # session present but not binding
+        (0.0, 0.2, 0.0, None, "deep_floor"),  # nothing else above the 0.5 kWh floor
+        (5.0, 0.2, 0.0, None, "reserve"),  # hardware reserve dominates
+        # The dawn arm must be nameable: a reader seeing a 1.81 kWh floor next to
+        # overflow_floor 0.0 cannot otherwise tell what is holding it up.
+        (0.0, 0.0, 0.0, 1.81, "dawn_reserve"),  # dawn gap, PV not yet covering load
+        (0.0, 4.0, 0.0, 1.81, "overflow_floor"),  # dawn reserve present but not binding
+        (0.0, 0.1, 0.0, DAWN_TEST_FLOOR_KWH, "deep_floor"),  # released: the 1% helper floor is the deep arm
     ]
-    for reserve, overflow_floor, session_protect, expected in cases:
-        value = compute_drain_above(reserve, overflow_floor, None, session_protect)
-        source = compute_drain_above_source(reserve, overflow_floor, session_protect)
-        assert source == expected, f"reserve={reserve} overflow={overflow_floor} session={session_protect}: expected {expected}, got {source}"
+    for reserve, overflow_floor, session_protect, floor_kwh, expected in cases:
+        value = compute_drain_above(reserve, overflow_floor, None, session_protect, floor_kwh)
+        source = compute_drain_above_source(reserve, overflow_floor, session_protect, floor_kwh)
+        assert source == expected, f"reserve={reserve} overflow={overflow_floor} session={session_protect} floor={floor_kwh}: expected {expected}, got {source}"
         arm = {
             "session_protect": session_protect,
             "overflow_floor": overflow_floor,
-            "deep_floor": DEEP_DISCHARGE_FLOOR_KWH,
+            "dawn_reserve": floor_kwh,
+            "deep_floor": DEEP_DISCHARGE_FLOOR_KWH if floor_kwh is None else floor_kwh,
             "reserve": reserve,
         }[source]
         assert abs(arm - value) < 1e-6, f"source '{source}' names {arm} but compute_drain_above returned {value}"
     print("  test_drain_above_source_mirrors_compute_drain_above: PASSED")
+
+
+# The live drain-floor helper, deliberately NOT the rig default (2.8). At 2.8% the
+# released floor is 0.506 kWh — within 0.006 of DEEP_DISCHARGE_FLOOR_KWH, so a test
+# asserting it would pass just as well against the OLD behaviour. Charter: never let
+# the failure mode into the allowed set.
+DAWN_TEST_FLOOR_PCT = 1.0
+DAWN_TEST_FLOOR_KWH = DAWN_TEST_FLOOR_PCT / 100.0 * BATTERY_KWH
+
+
+def _make_dawn_base(pv_kw, load_kw, soc_pct=0.30, hour=6, floor_pct=DAWN_TEST_FLOOR_PCT):
+    """MockBase for the dawn gap: PV has STARTED but does not yet cover load."""
+    from datetime import datetime, timezone
+
+    minutes_now = int(hour * 60)
+    overrides = {
+        "sensor.sigen_plant_pv_power": pv_kw,
+        "sensor.sigen_plant_consumed_power": load_kw,
+        "input_number.sig_drain_floor_pct": floor_pct,
+    }
+    return MockBase(
+        soc_kw=BATTERY_KWH * soc_pct,
+        minutes_now=minutes_now,
+        now_utc=datetime(2025, 7, 12, hour, 0, tzinfo=timezone.utc),
+        sensor_overrides=overrides,
+    )
+
+
+def _dawn_drain_above(plugin):
+    """Publish on a maximum-overflow day (every other arm zero) and return the floor."""
+    plugin._overflow_floor_kwh = 0.0
+    plugin._effective_keep_kwh = 0.0
+    plugin._p10_recovery_floor = 0.0
+    plugin._session_protect_kwh = 0.0
+    plugin.publish("active", 0.0, dno_limit_kw=4.0)
+    return plugin._drain_above
+
+
+def test_dawn_reserve_survives_pv_start():
+    """The dawn reserve must hold until PV MEETS LOAD, not until PV starts.
+
+    Live 2026-08-06, the defect this pins. `compute_pre_pv_target` reserves
+    `DEEP_DISCHARGE_FLOOR_KWH + dawn_load_kwh` to carry the house to dawn, but
+    that term lives ONLY in the pre-PV path. At PV start the phase ends, the
+    normal Schmitt takes over with `compute_drain_above`, which had no dawn arm
+    at all — so the reserve was spent 85 minutes before it was needed:
+
+        04:00-05:30  pre-PV drain -> 5.5%   (reserve honoured)
+        ~05:30       PV start -> reserve term vanishes
+        05:30-06:00  Schmitt drains on to drain_above=2.8%, bottoms 2.5%
+        06:00-06:55  coasts 2.5% -> 1.3% on house load, importing
+        ~06:55       PV finally meets load
+
+    PV start and PV-meets-load are ~85 min apart in August and hours apart in
+    winter. Draining into that gap buys headroom hours before overflow needs it
+    and pays for it with import.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.31, load_kw=0.42))
+    floor = _dawn_drain_above(plugin)
+    expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
+    assert abs(floor - expected) < 0.01, "PV 0.31 < load 0.42 is still the dawn gap: floor must be the {:.2f} kWh dawn reserve, got {:.2f}".format(expected, floor)
+    print("  test_dawn_reserve_survives_pv_start: PASSED ({:.2f} kWh held)".format(floor))
+
+
+def test_dawn_reserve_released_by_measured_crossover():
+    """Once measured PV >= load the battery has no load duty left, so the whole
+    reserve is released to headroom — down to POST_DAWN_FLOOR_KWH, not the old
+    deep floor.
+
+    Gated on MEASUREMENT, not forecast: over-reserving is then self-correcting,
+    which is why 10% can be chosen without agonising over it. Releasing 10% ->
+    1% is 1.63 kWh, ~27 min at the 3.68 kW cap, against ~3 h of slack before
+    overflow starts — the headroom cost is nil.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.59, load_kw=0.42))
+    floor = _dawn_drain_above(plugin)
+    assert abs(floor - DAWN_TEST_FLOOR_KWH) < 0.01, "PV 0.59 >= load 0.42: reserve must release to the {:.2f} kWh helper floor, got {:.2f}".format(DAWN_TEST_FLOOR_KWH, floor)
+    assert plugin._dawn_released is True, "crossover must set the latch"
+    print("  test_dawn_reserve_released_by_measured_crossover: PASSED ({:.2f} kWh)".format(floor))
+
+
+def test_released_floor_comes_from_the_live_helper():
+    """The released floor is the ONE drain-floor helper (RD15), not a second
+    plugin constant beside it. Three coincident 5% floors were consolidated into
+    that helper once already; a hardcoded twin would undo it silently — and a CM
+    target below the helper is unreachable anyway, because the heartbeat's
+    sell-clamp reads the same entity.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.59, load_kw=0.42, floor_pct=4.0))
+    floor = _dawn_drain_above(plugin)
+    assert abs(floor - 4.0 / 100.0 * BATTERY_KWH) < 0.01, "helper at 4% must set the released floor to {:.2f}, got {:.2f}".format(4.0 / 100.0 * BATTERY_KWH, floor)
+    print("  test_released_floor_comes_from_the_live_helper: PASSED ({:.2f} kWh)".format(floor))
+
+
+def test_dawn_release_latches_against_midday_cloud():
+    """Release is a ONE-WAY daily latch.
+
+    Without it, a cloud at 11:00 drops PV under load, the floor jumps back to
+    10% and the drain stops in the middle of the overflow window — the exact
+    failure the elevation gate was built to avoid at dusk, arriving at dawn
+    instead.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.59, load_kw=0.42))
+    _dawn_drain_above(plugin)
+    assert plugin._dawn_released is True
+
+    plugin.base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.10
+    floor = _dawn_drain_above(plugin)
+    assert abs(floor - DAWN_TEST_FLOOR_KWH) < 0.01, "a cloud after crossover must NOT re-arm the dawn reserve, got {:.2f}".format(floor)
+    print("  test_dawn_release_latches_against_midday_cloud: PASSED")
+
+
+def test_dawn_reserve_uses_forecast_dawn_load_when_larger():
+    """10% is an August number. In winter the dawn gap is hours, so the
+    forecast term must be able to win — `max(10%, DEEP + dawn_load)`.
+
+    Keeps `compute_pre_pv_target`'s existing dawn_load computation load-bearing
+    across the phase boundary instead of discarding it at PV start.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.10, load_kw=0.80))
+    plugin._dawn_load_kwh = 3.0  # a long, dark winter gap
+    floor = _dawn_drain_above(plugin)
+    assert abs(floor - (DEEP_DISCHARGE_FLOOR_KWH + 3.0)) < 0.01, "forecast dawn_load must win over the 10% floor when larger, got {:.2f}".format(floor)
+    print("  test_dawn_reserve_uses_forecast_dawn_load_when_larger: PASSED ({:.2f} kWh)".format(floor))
+
+
+def test_dawn_release_latch_persists_and_resets_daily():
+    """The latch must survive a deploy (state is reloaded, not rebuilt) and must
+    NOT survive midnight — a stale release would strand tomorrow's dawn."""
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.59, load_kw=0.42))
+    _dawn_drain_above(plugin)
+    assert plugin._dawn_released is True
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        plugin.base.config_root = tmpdir
+        plugin._save_state()
+        reloaded = CurtailmentPlugin(_make_dawn_base(pv_kw=0.10, load_kw=0.80))
+        reloaded.base.config_root = tmpdir
+        reloaded._load_state()
+        assert reloaded._dawn_released is True, "latch must survive a deploy via curtailment_state.json"
+        assert abs(_dawn_drain_above(reloaded) - DAWN_TEST_FLOOR_KWH) < 0.01, "a restored latch must keep the reserve released even though PV < load"
+
+    plugin._reset_for_new_day()
+    assert plugin._dawn_released is False, "midnight must re-arm the dawn reserve"
+    print("  test_dawn_release_latch_persists_and_resets_daily: PASSED")
 
 
 def _session_publish_run(session):
@@ -7527,6 +7681,12 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_upcoming_session_raises_drain_floor,
         test_two_floors_are_named_and_sourced_distinctly,
         test_drain_above_source_mirrors_compute_drain_above,
+        test_dawn_reserve_survives_pv_start,
+        test_dawn_reserve_released_by_measured_crossover,
+        test_released_floor_comes_from_the_live_helper,
+        test_dawn_release_latches_against_midday_cloud,
+        test_dawn_reserve_uses_forecast_dawn_load_when_larger,
+        test_dawn_release_latch_persists_and_resets_daily,
         test_drain_above_publishes_its_source,
         test_session_dump_is_published_as_the_effective_policy,
         test_session_dump_respects_the_heartbeat_precedence_exactly,
