@@ -285,6 +285,85 @@ def test_dispatch_drain_floor_default_2_8():
     print(f"PASS  drain floor default 2.8%: SOC2% → {d:.2f}")
 
 
+def _eval_condition(cond, trigger_id, states):
+    """Evaluate the subset of HA condition types the heartbeat uses."""
+    if isinstance(cond, str):
+        raise AssertionError("template condition not supported by this evaluator: {}".format(cond))
+    kind = cond.get("condition")
+    if kind == "trigger":
+        ids = cond["id"]
+        return trigger_id in (ids if isinstance(ids, list) else [ids])
+    if kind == "state":
+        want = cond["state"]
+        actual = states.get(cond["entity_id"])
+        return actual in (want if isinstance(want, list) else [want])
+    if kind == "not":
+        return not all(_eval_condition(c, trigger_id, states) for c in cond["conditions"])
+    if kind == "or":
+        return any(_eval_condition(c, trigger_id, states) for c in cond["conditions"])
+    if kind == "and":
+        return all(_eval_condition(c, trigger_id, states) for c in cond["conditions"])
+    raise AssertionError("unhandled condition type {!r}".format(kind))
+
+
+def _msc_write_fires(trigger_id, ems_mode):
+    """Would the Predbat branch write Maximum Self Consumption, given this
+    trigger and this live EMS mode?"""
+    auto = _load()
+    predbat = next(b for b in auto["action"][1]["choose"] if "Predbat" in " ".join(str(c) for c in b["conditions"]))
+    step = None
+    for s in predbat["sequence"]:
+        if isinstance(s, dict) and "if" in s:
+            if any((a.get("action") or a.get("service")) == "select.select_option" and a.get("data", {}).get("option") == "Maximum Self Consumption" for a in _iter_actions(s.get("then", []))):
+                step = s
+    assert step is not None, "no guarded MSC write in the Predbat branch"
+    states = {"select.sigen_plant_remote_ems_control_mode": ems_mode}
+    return all(_eval_condition(c, trigger_id, states) for c in step["if"])
+
+
+def test_predbat_branch_self_heals_pcs_remote_control():
+    """Entering the Predbat branch must unwind PCS Remote Control HOWEVER it was
+    entered — not only via the policy_change trigger.
+
+    Live 2026-08-06 07:38. The policy select read Predbat; the override was set
+    to Hold Battery, which makes the EFFECTIVE policy Hold, so the heartbeat took
+    the ACTIVE branch and wrote PCS Remote Control + a 1.08 kW setpoint. Setting
+    the override back to Off returned the effective policy to Predbat — but the
+    select never changed, so only `override_change` fired and the MSC handback,
+    gated on `policy_change`, was skipped. Result: heartbeat inert, mappers
+    disabled, Predbat read-only, and the plant left exporting against a 1.08 kW
+    setpoint nobody owned, discharging a 1.4% battery.
+
+    Keying the self-heal on the MODE rather than on which trigger fired also
+    covers an HA restart, which `override_change` alone would not.
+    """
+    assert _msc_write_fires("override_change", "PCS Remote Control") is True, "override-driven entry into the Predbat branch must unwind PCS Remote Control"
+    assert _msc_write_fires("beat", "PCS Remote Control") is True, "the 1-min beat must self-heal a stranded PCS Remote Control (covers an HA restart)"
+    print("PASS  Predbat branch self-heals PCS Remote Control on any trigger")
+
+
+def test_self_heal_cannot_stomp_predbat_own_modes():
+    """The other half, and the reason this is safe.
+
+    `predbat_requested_mode_action` only ever selects Maximum Self Consumption,
+    Command Charging (Grid First), or Command Discharging (PV First) — it never
+    selects PCS Remote Control, which is the heartbeat's own mode. So keying the
+    self-heal on that value cannot fight Predbat.
+
+    The regression this protects (2026-07-27): the Predbat branch used to
+    re-assert MSC on EVERY run when the mode was not MSC — i.e. exactly when
+    Predbat had just commanded Charging/Discharging — so Predbat's mode was
+    reverted within a minute and enabling the mapper achieved nothing.
+    """
+    for mode in ("Command Charging (Grid First)", "Command Discharging (PV First)"):
+        assert _msc_write_fires("beat", mode) is False, "the beat must NOT revert Predbat's own {!r}".format(mode)
+        assert _msc_write_fires("override_change", mode) is False, "an override change must NOT revert Predbat's own {!r}".format(mode)
+        # The deliberate handback is still allowed to park in MSC (RD2).
+        assert _msc_write_fires("policy_change", mode) is True, "policy_change handback must still park in MSC from {!r}".format(mode)
+    assert _msc_write_fires("beat", "Maximum Self Consumption") is False, "already MSC — no pointless write every minute"
+    print("PASS  self-heal cannot stomp Command Charging/Discharging; RD2 park intact")
+
+
 def _render_stale_trigger(auto, states):
     """Render the `stale_setpoint` template trigger to its boolean."""
     trig = next(t for t in auto["trigger"] if t.get("id") == "stale_setpoint")
@@ -506,6 +585,8 @@ def main():
         test_dispatch_hard_floor_clamp,
         test_dispatch_drives_between_2_8_and_5,
         test_dispatch_drain_floor_default_2_8,
+        test_predbat_branch_self_heals_pcs_remote_control,
+        test_self_heal_cannot_stomp_predbat_own_modes,
         test_stale_trigger_agrees_with_dispatch,
         test_drain_floor_does_not_strand_hold_below_the_floor,
         test_drain_floor_still_blocks_selling_below_the_floor,
