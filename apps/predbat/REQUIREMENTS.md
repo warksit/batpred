@@ -261,7 +261,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
-| RD21–RD24 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control. |
+| RD21–RD25 | IN FORCE | v33 (2026-08-06): dawn reserve survives PV start; drain floor stops selling, not load-covering; one floor helper; Predbat branch self-heals PCS Remote Control; trigger/action equivalence enforced by test. |
 | RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
@@ -2007,6 +2007,32 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
 
   Therefore the clamp is gated on `policy == 'Max Export'`. `policy` is the EFFECTIVE
   policy, so a session-forced Max Export is still clamped.
+
+- **RD25 — The `stale_setpoint` trigger and the action variables are ONE decision
+  written twice, and must be tested as one.** HA gives a template trigger no access
+  to the action's `variables`, so the dispatch logic is necessarily duplicated: once
+  to decide "has the live setpoint drifted?", once to compute what to write. Three
+  divergences shipped on 2026-08-06 alone — the RD22 clamp landing in the action copy
+  only; a first regression test that passed anyway because at the live numbers the
+  copies differed by less than the trigger's own 0.1 kW tolerance; and the trigger's
+  policy ignoring `sig_override` entirely.
+
+  That last one disarmed the fast corrector exactly when a human was driving: under a
+  manual override with the select on handback, the ACTION drove Hold every beat while
+  the TRIGGER computed the handback policy, failed its active-policy gate, and never
+  fired. Only the 60 s beat wrote, so the open-loop setpoint trailed PV and the battery
+  absorbed every sag (live 08:17 — commanded 1.45, PV 1.329, battery −0.135 kW; ±0.14
+  kW oscillation about a mean of ~0).
+
+  Two rules follow:
+
+  1. **Policy precedence in the trigger MUST be the same decision as `policy` in the
+     action:** override > session > select.
+  2. **Never test the copies separately.** `test_trigger_and_action_can_never_diverge`
+     renders BOTH over a 200-case matrix (select × override × session × PV/load/SOC)
+     and asserts they agree on the policy, on the setpoint, and on whether the policy
+     counts as active. An edit to one copy alone cannot pass it. This is the guard;
+     the individual assertions are only documentation.
 
 - **RD24 — Entering the Predbat branch must unwind PCS Remote Control, however it
   was entered.** The MSC handback was gated on the `policy_change` trigger alone,
