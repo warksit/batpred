@@ -76,21 +76,21 @@ actions:
       - conditions:
           - condition: trigger
             id: floor_hit
-          # "Is a Max Export sell actually happening?" — override first, since
-          # it outranks; otherwise the policy select.
-          - condition: or
-            conditions:
-              - condition: state
-                entity_id: input_select.sig_override
-                state: "Max Export"
-              - condition: and
-                conditions:
-                  - condition: state
-                    entity_id: input_select.sig_override
-                    state: "Off"
-                  - condition: state
-                    entity_id: input_select.sig_dispatch_policy
-                    state: "Max Export"
+          # "Is a Max Export sell actually happening?" — ask the SINGLE SOURCE OF
+          # TRUTH (RD26). This used to rebuild the override > session > select
+          # precedence out of HA conditions, which is a fourth copy of that rule.
+          # A copy that drifts here silently disables the keep floor — precisely
+          # the 2026-07-30 RD13a bug this guard was rewritten to fix, and it could
+          # return the same way. Reading the sensor makes that impossible.
+          #
+          # NB this now also covers the SESSION arm, which the hand-rolled version
+          # deliberately excluded. That is safe: a live session only reaches
+          # "Max Export" here if the select is not on handback, and the sell is
+          # still bounded by the heartbeat's sig_drain_floor_pct clamp. The DUSK
+          # branch keeps its own explicit session hold-off below.
+          - condition: state
+            entity_id: sensor.sig_effective_policy
+            state: "Max Export"
         sequence:
           # RD27: stop the SELL, not the ownership. Both layers must stop saying
           # Max Export — clearing only the override hands back to a select that
