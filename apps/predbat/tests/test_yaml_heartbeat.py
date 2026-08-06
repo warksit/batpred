@@ -226,21 +226,31 @@ def test_active_policy_reopens_ess_and_import_limits():
     print("PASS  re-open: active policy clears ESS + import clamps and resets the rate helpers")
 
 
-def test_manual_override_is_a_trigger():
-    """Flipping the override select must re-evaluate dispatch immediately.
+def test_manual_override_acts_immediately():
+    """Flipping the override select must re-evaluate dispatch immediately (RD13).
 
-    It changes who is driving (RD13); without this trigger the heartbeat waits up
-    to a minute for the beat. It carries its OWN id so the one-shot MSC handback —
-    gated on policy_change — does not re-park the unit when the override is
-    toggled while already handed back.
+    The GUARANTEE is unchanged; the mechanism moved. It used to be a state trigger
+    on input_select.sig_override. Once RD26 put the policy in a template sensor that
+    became a race — HA fires on the input at once, the sensor recomputes a moment
+    later, and the run reads the OLD policy. Live 2026-08-06 11:42:13: the override
+    run saw policy="Predbat", took the Predbat branch, wrote nothing in 12 ms, and
+    the override did nothing for 47 s until the next beat.
+
+    So the override now reaches the heartbeat through sensor.sig_effective_policy,
+    which changes whenever the override does. Same immediacy, no stale read.
+
+    The old worry — that an override toggle while handed back would re-park the
+    unit via the policy_change-gated MSC write — is resolved by construction:
+    Off -> Hold moves the EFFECTIVE policy to Hold, so the run takes the ACTIVE
+    branch, not the Predbat one. And Hold -> Off SHOULD park in MSC; that is RD24,
+    the fix for the stranded PCS Remote Control.
     """
     auto = _load()
-    ids = {t.get("id") for t in auto["trigger"]}
-    assert "override_change" in ids, f"manual override trigger missing, got ids {ids}"
-    ov = next(t for t in auto["trigger"] if t.get("id") == "override_change")
-    assert ov.get("entity_id") == "input_select.sig_override", ov
-    assert ov.get("id") != "policy_change", "override must not share the policy_change id — it would re-park on every toggle"
-    print("PASS  trigger: manual override re-evaluates dispatch (own id, not policy_change)")
+    state_triggers = {t.get("entity_id"): t for t in auto["trigger"] if t.get("platform") == "state"}
+    assert "sensor.sig_effective_policy" in state_triggers, f"override must reach the heartbeat via the derived policy sensor, got {list(state_triggers)}"
+    assert state_triggers["sensor.sig_effective_policy"].get("id") == "policy_change"
+    assert "input_select.sig_override" not in state_triggers, "triggering on the raw override races the derived sensor (47 s of nothing, live 2026-08-06)"
+    print("PASS  trigger: override acts immediately via sensor.sig_effective_policy")
 
 
 def test_live_trigger():
@@ -690,7 +700,7 @@ def main():
         test_structural,
         test_heartbeat_and_predbat_never_drive_together,
         test_active_policy_reopens_ess_and_import_limits,
-        test_manual_override_is_a_trigger,
+        test_manual_override_acts_immediately,
         test_live_trigger,
         test_dispatch_ceiling_overflow,
         test_dispatch_tracks_pv_on_dip,

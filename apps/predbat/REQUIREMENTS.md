@@ -2067,6 +2067,20 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   Note the refactor rounds the setpoint to 2 dp one step earlier than before. The
   register write is unchanged — it was always `| round(2)`.
 
+  **RD26a — trigger on the DERIVED sensor, never on its inputs.** Moving the value
+  into a template sensor while leaving the triggers on `input_select.sig_override` /
+  `input_select.sig_dispatch_policy` created a race: HA fires the state trigger on
+  the input immediately, the sensor recomputes a moment later, and the run reads the
+  OLD policy. Live 2026-08-06 11:42:13, from the trace — trigger
+  `input_select.sig_override` "Off" → "Max Export", variables `policy: "Predbat"`,
+  `dispatch_kw: 0.68`, took the Predbat branch, wrote nothing, finished in 12 ms.
+  The override is the human's immediate lever and it did nothing for 47 s until the
+  next `:00` beat, while the plant self-consumed 4.4 kW into the battery on an
+  overflow day. Both state triggers are replaced by one on
+  `sensor.sig_effective_policy`: a derived sensor cannot change before it has been
+  computed, so ordering is correct by construction. `stale_setpoint` already
+  references `sensor.sig_dispatch_kw` and is safe for the same reason.
+
 - **RD25 — The `stale_setpoint` trigger and the action variables are ONE decision
   written twice, and must be tested as one.** HA gives a template trigger no access
   to the action's `variables`, so the dispatch logic is necessarily duplicated: once

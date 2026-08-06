@@ -171,6 +171,37 @@ def test_heartbeat_defers_to_intent_sensors():
     print("PASS  heartbeat defers to the intent sensors (no second copy)")
 
 
+def test_triggers_fire_on_the_derived_sensor_not_its_inputs():
+    """RD26 corollary — the race this cost us live on 2026-08-06 11:42.
+
+    The heartbeat used to trigger on `input_select.sig_override` /
+    `input_select.sig_dispatch_policy` and compute the policy inline, so trigger
+    and value were always consistent. RD26 moved the value into a template sensor
+    but LEFT the triggers on the inputs. HA fires the state trigger on the input
+    immediately; the derived sensor recomputes a moment later. Trace of the run:
+
+        trigger:   state of input_select.sig_override, "Off" -> "Max Export"
+        variables: policy = "Predbat"   dispatch_kw = 0.68      <- stale
+        -> took the Predbat branch, wrote nothing, finished in 12 ms
+
+    The override is the human's immediate lever; it did nothing for 47 s until the
+    next :00 beat, with the plant self-consuming at 4.4 kW into the battery on an
+    overflow day.
+
+    Fix: trigger on `sensor.sig_effective_policy`. A derived sensor cannot change
+    before it has been computed, so the ordering is correct by construction rather
+    than by luck. `stale_setpoint` already references `sensor.sig_dispatch_kw` and
+    is safe for the same reason.
+    """
+    doc = _load(HEARTBEAT_PATH)
+    state_triggers = [t for t in doc["trigger"] if t.get("platform") == "state" or t.get("trigger") == "state"]
+    entities = {t.get("entity_id") for t in state_triggers}
+    assert "sensor.sig_effective_policy" in entities, "policy changes must be triggered from the DERIVED sensor, or the action reads a stale value"
+    for raw in ("input_select.sig_override", "input_select.sig_dispatch_policy"):
+        assert raw not in entities, "{} must NOT be a trigger — it fires before sensor.sig_effective_policy has recomputed (live 2026-08-06 11:42, 47 s of nothing)".format(raw)
+    print("PASS  triggers fire on the derived sensor, not its inputs")
+
+
 def run():
     """Run the dispatch-intent harness."""
     print("**** SIG dispatch intent (single point of truth) ****")
@@ -180,6 +211,7 @@ def run():
         test_sell_clamp_is_sell_only,
         test_dispatch_never_emits_a_bare_unknown,
         test_heartbeat_defers_to_intent_sensors,
+        test_triggers_fire_on_the_derived_sensor_not_its_inputs,
     ):
         try:
             fn()
