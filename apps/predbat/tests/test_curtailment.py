@@ -1803,6 +1803,39 @@ def test_dispatch_policy_max_export_high_soc():
     print("  test_dispatch_policy_max_export_high_soc: PASSED")
 
 
+def test_card_publishes_the_threshold_actually_in_force():
+    """The card must state the threshold the code USES, not a raw input.
+
+    `compute_proposed_phase` charges below `min(charge_below, drain_above)` — on a
+    cross-over day (deficit forecast, so charge_below > drain_above) the effective
+    charge target is drain_above, because charging to the LOWER of the two
+    preserves curtailment headroom.
+
+    The sensor published `charge_below` raw. Live 2026-08-06 10:56 the card read
+    "charge if below 2.8% (P10 recovery floor)" while the threshold in force was
+    1.0% — a stated number that was not the one being used. Andrew spotted the
+    inversion from the card and asked whether charge was being ignored; it was,
+    correctly, but nothing on the card said so.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    # The live drain floor, so the dawn arm cannot hold drain_above above
+    # charge_below and quietly un-cross the very case under test.
+    base._sensor_overrides["input_number.sig_drain_floor_pct"] = "1.0"
+    plugin = CurtailmentPlugin(base)
+    # Cross-over day: charge_below (2.8%) ABOVE drain_above (1.0%).
+    plugin._p10_recovery_floor, plugin._overflow_floor_kwh = 0.5, 0.18
+    plugin._effective_keep_kwh = 0.0
+    plugin._dawn_released = True
+    plugin.publish("active", 0.18, dno_limit_kw=4.0)
+    attrs = base.published.get("sensor.predbat_curtailment_charge_below", {}).get("attrs", {})
+    assert attrs.get("effective_charge_pct") is not None, "card needs the threshold in force, not just charge_below"
+    expect = min(plugin._charge_below, plugin._drain_above) / 18.08 * 100.0
+    assert abs(attrs["effective_charge_pct"] - round(expect, 1)) < 0.05, "effective target must be min(charge_below, drain_above) = {:.2f}%, got {}".format(expect, attrs["effective_charge_pct"])
+    assert attrs["effective_charge_pct"] < attrs["soc_pct"], "on a cross-over day the effective target must be BELOW charge_below — that is the whole point"
+    print("  test_card_publishes_the_threshold_actually_in_force: PASSED ({}% in force vs {}% charge_below)".format(attrs["effective_charge_pct"], attrs["soc_pct"]))
+
+
 def test_low_soc_never_hands_back_mid_window():
     """RD27: while ACTIVE, CM never hands the wheel back on low SOC.
 
@@ -7381,6 +7414,7 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
+        test_card_publishes_the_threshold_actually_in_force,
         test_low_soc_never_hands_back_mid_window,
         test_low_soc_drain_stays_max_export_not_handback,
         test_dispatch_policy_handback_once_on_deactivate,

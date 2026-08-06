@@ -222,7 +222,7 @@ memory — the grep found two sites that memory had not.
 
 | Quantity | Canonical site | Other sites that MUST agree | Guard |
 |---|---|---|---|
-| **Effective policy** (override > session > select) | `ha/sig_dispatch_intent_helpers.yaml` → `sensor.sig_effective_policy` (RD26) | `sig_dispatch_heartbeat.yaml` **reads** it ✓ · `sig_keep_floor_guard.yaml` **re-derives** it as HA conditions ⚠ · `curtailment_plugin.py` **re-derives** it for the published policy ⚠ | `test_trigger_and_action_can_never_diverge`, `test_heartbeat_defers_to_intent_sensors` |
+| **Effective policy** (override > session > select) | `ha/sig_dispatch_intent_helpers.yaml` → `sensor.sig_effective_policy` (RD26) | `sig_dispatch_heartbeat.yaml` **reads** it ✓ · `sig_keep_floor_guard.yaml` **reads** it ✓ (2026-08-06) · `curtailment_plugin.py` **re-derives** it for the published policy ⚠ | `test_trigger_and_action_can_never_diverge`, `test_heartbeat_defers_to_intent_sensors` |
 | **Dispatch setpoint** (incl. RD22 sell-clamp) | `sig_dispatch_intent_helpers.yaml` → `sensor.sig_dispatch_kw` (RD26) | `sig_dispatch_heartbeat.yaml` action **and** `stale_setpoint` trigger — both **read** it ✓ | `test_intent_sensors_match_reference` |
 | **Who may write `input_select.sig_dispatch_policy`** | `curtailment_plugin._set_policy()` | `sig_keep_floor_guard.yaml` (keep-floor → Hold Battery; dusk → Predbat) | `test_yaml_keep_floor_guard` |
 | **Who may write `input_select.sig_override`** | the human | `sig_keep_floor_guard.yaml` (clears to Off) · `sig_manual_override_failsafe_off.yaml` | — ⚠ no test |
@@ -230,10 +230,12 @@ memory — the grep found two sites that memory had not.
 | **`sig_drain_floor_pct`** (sell floor) | the helper itself (RD23) | `sig_dispatch_heartbeat.yaml` clamp · `sig_dispatch_intent_helpers.yaml` · `curtailment_plugin._drain_floor_kwh` · `sig_keep_floor_guard.yaml` | `test_released_floor_comes_from_the_live_helper` |
 | **Predbat→SIG register writes** | three mapper automations, not one | `predbat_requested_mode_action` · `predbat_max_discharging_limit_action` · `predbat_max_charging_limit_action` (2026-07-28) | `test_exactly_one_writer_enabled_on_handback` |
 
-⚠ = known duplicate, no single source yet. Collapsing the two remaining
-effective-policy re-derivations onto `sensor.sig_effective_policy` is the next
-RD26 step; it is a refactor of the live control path, so it lands in a low-stakes
-window, not mid-day.
+⚠ = known duplicate, no single source yet. One remains: `curtailment_plugin.py`
+re-derives the effective policy for the PUBLISHED reason string. It cannot read the
+sensor without a round-trip through HA on every cycle, so it stays a duplicate for
+now — but it only affects display, never dispatch, and
+`test_v32_saving_session_plugin_stays_active_but_delegates_dispatch` pins the
+precedence it must mirror.
 
 **Not deployed** (in repo, no HA entity — confirmed 2026-08-06): `sig_saving_session`,
 `curtailment_manager_dynamic_export_limit`, `curtailment_stale_phase_watchdog`,
