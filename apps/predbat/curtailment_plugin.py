@@ -2425,6 +2425,17 @@ class CurtailmentPlugin(PredBatPlugin):
                 "state_class": "measurement",
                 "icon": "mdi:battery-arrow-up",
                 "soc_pct": round(charge_below / soc_max * 100.0, 1) if soc_max else None,
+                # The threshold actually IN FORCE. compute_proposed_phase charges
+                # below min(charge_below, drain_above): on a cross-over day (deficit
+                # forecast, charge_below > drain_above) the lower one wins, because
+                # charging to the lower of the two preserves curtailment headroom.
+                # Publishing charge_below alone made the card state a number the
+                # code was not using — live 2026-08-06 10:56 it read "charge if
+                # below 2.8%" while 1.0% was in force. The card must explain what
+                # is going on, so it renders THIS.
+                "effective_charge_kwh": round(min(charge_below, drain_above), 2),
+                "effective_charge_pct": round(min(charge_below, drain_above) / soc_max * 100.0, 1) if soc_max else None,
+                "crossed_over": bool(charge_below > drain_above),
                 "p10_pv_remaining_kwh": self._p10_pv_remaining_kwh,
                 "p50_pv_remaining_kwh": self._p50_pv_remaining_kwh,
                 "load_remaining_kwh": self._load_remaining_kwh,

@@ -81,8 +81,32 @@ def _cond_matches(cond, states, trigger_id):
     raise RuntimeError("unhandled condition kind: {}".format(kind))
 
 
+def _with_effective_policy(states):
+    """Derive sensor.sig_effective_policy from the SINGLE SOURCE OF TRUTH.
+
+    The guard now reads that sensor rather than rebuilding override > session >
+    select itself (RD26). Rendering it here from ha/sig_dispatch_intent_helpers.yaml
+    keeps every assertion below an end-to-end check: a change to the canonical
+    precedence is exercised by this harness too, instead of the guard being tested
+    against a hand-written stand-in that could drift the same way the conditions did.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import test_yaml_dispatch_intent as intent
+
+    st = dict(states)
+    # The intent sensor reads the CALENDAR; this harness speaks binary_sensor.
+    st.setdefault(intent.CALENDAR, st.get(SESSION, "off"))
+    st.setdefault("sensor.sigen_plant_pv_power", "1.0")
+    st.setdefault("sensor.sigen_plant_total_load_power", "0.5")
+    st.setdefault("sensor.sigen_plant_battery_state_of_charge", "50")
+    policy, _kw = intent.render_sensors(st)
+    st["sensor.sig_effective_policy"] = policy
+    return st
+
+
 def writes_for(doc, states, trigger_id):
     """Return {entity_id: option} that the guard would write, walking `choose`."""
+    states = _with_effective_policy(states)
     for step in _key(doc, "actions", "action"):
         if not (isinstance(step, dict) and "choose" in step):
             continue
@@ -125,11 +149,32 @@ def _released_to_predbat(writes):
     return writes.get(OVERRIDE) == "Off" and writes.get(POLICY) == "Predbat"
 
 
+def _guard_reads_effective_policy(doc):
+    """RD26 step 2: the guard must READ sensor.sig_effective_policy, not rebuild
+    the override > session > select precedence out of HA conditions.
+
+    Duplicate-logic index, 2026-08-06: four sites compute the effective policy.
+    sig_dispatch_intent_helpers.yaml is canonical, the heartbeat reads it, and
+    this guard and curtailment_plugin.py still re-derive it. A re-derivation that
+    drifts here silently disables the keep floor — which is exactly the 2026-07-30
+    RD13a bug this guard was rewritten to fix, and it can come back the same way.
+
+    Its own comment already documents the precedence verbatim; that is the tell.
+    """
+    blob = yaml.safe_dump(doc)
+    return "sensor.sig_effective_policy" in blob
+
+
 def run_yaml_keep_floor_guard_tests():
     """Run the keep-floor-guard harness."""
     print("**** Running keep floor guard YAML tests ****")
     failed = False
     doc = load_doc()
+
+    # --- 0. Single source of truth for the effective policy ----------------
+    if not _guard_reads_effective_policy(doc):
+        print("  FAILED — guard re-derives the effective policy instead of reading " "sensor.sig_effective_policy (duplicate-logic index)")
+        failed = True
 
     # --- 1. THE REGRESSION: sell driven by a manual OVERRIDE ---------------
     st = {POLICY: "Hold Battery", OVERRIDE: "Max Export", SESSION: "off"}
