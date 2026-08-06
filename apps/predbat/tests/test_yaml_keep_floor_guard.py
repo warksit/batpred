@@ -97,7 +97,31 @@ def writes_for(doc, states, trigger_id):
 
 
 def _sell_stopped(writes):
-    """The sell is only genuinely stopped if NEITHER layer still says Max Export."""
+    """KEEP FLOOR (RD27): stop the SELL, not the ownership.
+
+    Both layers must stop saying Max Export — clearing only the override hands
+    back to a policy select that may still say Max Export, and clearing only the
+    policy leaves the override in charge. But the policy must land on
+    **Hold Battery**, NOT Predbat.
+
+    Writing Predbat here was a mid-window HANDBACK, the same rule RD27 removed
+    from two places in the plugin — this guard was the third. Live 2026-08-06:
+    keep floor 2.0%, SOC ~1.3%, override "Max Export". The guard fired at
+    11:38:25.79 and 60 ms later the select read Predbat. Predbat was read-only
+    with all three mappers disabled, so the plant fell through to the SIG's own
+    Maximum Self Consumption default and charged the battery through the
+    pre-overflow window. It also silently cancelled the user's override ~3 min
+    after they set it, twice.
+
+    Hold Battery stops the sell (battery flat, PV surplus still exports) while CM
+    keeps the wheel. Handing back is a window-END decision — which is the DUSK
+    branch's job, and that one still writes Predbat, correctly.
+    """
+    return writes.get(OVERRIDE) == "Off" and writes.get(POLICY) == "Hold Battery"
+
+
+def _released_to_predbat(writes):
+    """Dusk release: the window is over, so handing back IS correct."""
     return writes.get(OVERRIDE) == "Off" and writes.get(POLICY) == "Predbat"
 
 
@@ -136,8 +160,8 @@ def run_yaml_keep_floor_guard_tests():
     # --- 4. Dusk release must also clear the override ----------------------
     st = {POLICY: "Hold Battery", OVERRIDE: "Max Export", SESSION: "off"}
     w = writes_for(doc, st, "dusk")
-    if not _sell_stopped(w):
-        print("  FAILED — dusk must release BOTH layers, got {}".format(w))
+    if not _released_to_predbat(w):
+        print("  FAILED — dusk must release BOTH layers to Predbat, got {}".format(w))
         failed = True
 
     # --- 5. Dusk must NOT release during a live saving session -------------
