@@ -213,6 +213,32 @@ Concrete failures caused by not doing the above, all confirmed live:
 
 ## PART 1 — CURRENT SPEC (NORMATIVE)
 
+## Duplicate-logic index — every quantity with more than one site
+
+**Read this before editing any control rule.** Charter: enumerate the sites first.
+Four defects on 2026-08-06 were all "this logic exists in N places and I changed
+N−1". Built by grepping the *concept* (entity / threshold / policy name), not by
+memory — the grep found two sites that memory had not.
+
+| Quantity | Canonical site | Other sites that MUST agree | Guard |
+|---|---|---|---|
+| **Effective policy** (override > session > select) | `ha/sig_dispatch_intent_helpers.yaml` → `sensor.sig_effective_policy` (RD26) | `sig_dispatch_heartbeat.yaml` **reads** it ✓ · `sig_keep_floor_guard.yaml` **re-derives** it as HA conditions ⚠ · `curtailment_plugin.py` **re-derives** it for the published policy ⚠ | `test_trigger_and_action_can_never_diverge`, `test_heartbeat_defers_to_intent_sensors` |
+| **Dispatch setpoint** (incl. RD22 sell-clamp) | `sig_dispatch_intent_helpers.yaml` → `sensor.sig_dispatch_kw` (RD26) | `sig_dispatch_heartbeat.yaml` action **and** `stale_setpoint` trigger — both **read** it ✓ | `test_intent_sensors_match_reference` |
+| **Who may write `input_select.sig_dispatch_policy`** | `curtailment_plugin._set_policy()` | `sig_keep_floor_guard.yaml` (keep-floor → Hold Battery; dusk → Predbat) | `test_yaml_keep_floor_guard` |
+| **Who may write `input_select.sig_override`** | the human | `sig_keep_floor_guard.yaml` (clears to Off) · `sig_manual_override_failsafe_off.yaml` | — ⚠ no test |
+| **Mid-window handback ban (RD27)** | `curtailment_plugin._publish_dispatch_policy` | acting path in the same function · `sig_keep_floor_guard.yaml` keep-floor branch | `test_low_soc_never_hands_back_mid_window`, `test_yaml_keep_floor_guard` |
+| **`sig_drain_floor_pct`** (sell floor) | the helper itself (RD23) | `sig_dispatch_heartbeat.yaml` clamp · `sig_dispatch_intent_helpers.yaml` · `curtailment_plugin._drain_floor_kwh` · `sig_keep_floor_guard.yaml` | `test_released_floor_comes_from_the_live_helper` |
+| **Predbat→SIG register writes** | three mapper automations, not one | `predbat_requested_mode_action` · `predbat_max_discharging_limit_action` · `predbat_max_charging_limit_action` (2026-07-28) | `test_exactly_one_writer_enabled_on_handback` |
+
+⚠ = known duplicate, no single source yet. Collapsing the two remaining
+effective-policy re-derivations onto `sensor.sig_effective_policy` is the next
+RD26 step; it is a refactor of the live control path, so it lands in a low-stakes
+window, not mid-day.
+
+**Not deployed** (in repo, no HA entity — confirmed 2026-08-06): `sig_saving_session`,
+`curtailment_manager_dynamic_export_limit`, `curtailment_stale_phase_watchdog`,
+`voltage_seek_controller`. They are not writers today; re-check before assuming.
+
 ## Status index — what is actually in force
 
 **Check this table before citing any requirement.** It was built on 2026-07-28 by
@@ -2009,7 +2035,11 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   policy, so a session-forced Max Export is still clamped.
 
 - **RD27 — No mid-window handback. RD4 "A" (low-SOC → MSC) is RETIRED.** While the
-  plugin is ACTIVE, CM keeps the wheel at any SOC. Handing back is a window-END
+  plugin is ACTIVE, CM keeps the wheel at any SOC. **Three sites, not one** — the
+  plugin's decision path, the plugin's acting path, and `sig_keep_floor_guard.yaml`.
+  The guard was the last one live: its keep-floor branch wrote `Predbat`, which is a
+  handback. It now writes **Hold Battery** — stop the SELL, not the ownership. The
+  guard's DUSK branch still writes Predbat, correctly: that is a window-END release. Handing back is a window-END
   decision (RD6 safe_time / sundown) and nothing else.
 
   The old rule handed the policy select to Predbat below the drain floor — and

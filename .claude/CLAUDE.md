@@ -78,6 +78,61 @@ The HA automation `curtailment_manager_dynamic_export_limit` is stored in:
 **Never change the automation in HA without first updating and committing this file.**
 After changing in HA, pull the updated config and commit it so the file stays in sync.
 
+## Before editing control logic — ENUMERATE THE SITES
+
+Never edit a control rule until you have listed every place that implements it
+and can say why the list is complete. grep the **concept** — the entity, the
+threshold, the policy name — not the code in front of you.
+
+2026-08-06, four instances in one day:
+
+- the RD22 sell-clamp existed in the action variables **and** the
+  `stale_setpoint` trigger; the first fix changed one
+- the MSC handback had two entry paths (`policy_change`, override); one covered
+- the low-SOC handover had a decision-side copy **and** an acting-side WRITER —
+  the first edit changed only the published reason and nothing real
+- three Predbat mapper automations, not one (2026-07-28, same lesson)
+
+If a quantity legitimately lives in two places (HA gives template triggers no
+access to `variables`), it goes in the **Duplicate-logic index** in
+`REQUIREMENTS.md` with all its sites, and a test must render every copy and
+assert they agree.
+
+## "Deployed" is not "verified"
+
+Verification requires a **discriminating** observation: conditions under which
+the old and new behaviour differ. If current conditions cannot tell them apart,
+the correct report is "deployed, not yet verified — needs X to confirm".
+
+Prefer an automation **trace** over a state read. Three defects on 2026-08-06
+were invisible in state and obvious in the trace: `policy="Predbat"` with stale
+variables; a 12 ms run that took no branch; the self-heal firing on the beat.
+
+Never call work done before **pre-commit + full test suite + deploy +
+a discriminating check**. Until all four, say what is actually true —
+"committed, not deployed", "deployed, unverified".
+
+## Blocked sub-goals are headlines, not footnotes
+
+If part of an agreed change cannot land, say so as the FIRST line, not as a
+caveat inside a success report. 2026-08-06: the 1% drain floor was agreed,
+blocked by three separate things, mentioned in passing, and was still not in
+force hours later while the user believed it was.
+
+## Two surprises = stop patching, start auditing
+
+Two unexpected findings in the same subsystem in one session means the mental
+model is wrong, not that there are two bugs. Stop shipping fixes and enumerate
+the subsystem instead. On 2026-08-06 this threshold was passed by ~09:00 and
+five more deploys followed, three of which introduced new faults.
+
+## No structural refactor of the live control path on a high-stakes day
+
+Build it, test it, commit it — land it in a low-stakes window (after the
+curtailment window closes, or pre-dawn). RD26 was correct and still cost a
+47-second dead zone on the human override because it shipped at 11:00 on a
+20 kWh overflow day.
+
 ## Pre-Deploy Checks
 
 - `pre-commit run --all-files`
