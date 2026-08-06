@@ -331,7 +331,7 @@ def compute_session_reserve(duration_minutes, cap_kw, discharge_efficiency=1.0):
     return (mins / 60.0) * cap_kw / eff
 
 
-def compute_drain_above(reserve, overflow_floor, effective_keep=None, session_protect_kwh=0.0):
+def compute_drain_above(reserve, overflow_floor, effective_keep=None, session_protect_kwh=0.0, floor_kwh=None):
     """Drain target: the SOC above which CM drains (Max Export) — PURE
     CURTAILMENT (v31, 2026-07-19). Drain only to make room for forecast
     overflow; NEVER to an overnight/evening reserve (that's Predbat's job, and
@@ -353,14 +353,34 @@ def compute_drain_above(reserve, overflow_floor, effective_keep=None, session_pr
     before it. 0 when no session is scheduled, so days without a session keep the
     pure-curtailment drain target unchanged. The session is dumped live via a
     Max Export override, not via this floor.
+
+    v33 (2026-08-06): `floor_kwh` replaces the fixed DEEP_DISCHARGE_FLOOR_KWH arm
+    so the caller can raise it to the DAWN RESERVE (carry the house until PV meets
+    load) or lower it to POST_DAWN_FLOOR_KWH once that duty is discharged. Defaults
+    to DEEP_DISCHARGE_FLOOR_KWH, so callers that do not care are unchanged.
+
+    Why it has to live HERE and not only in compute_pre_pv_target: the pre-PV path
+    ends at PV START, but the battery is not free of load duty until PV MEETS LOAD
+    — ~85 min later in August, hours in winter. The reserve used to evaporate at
+    that phase boundary and the Schmitt drained straight through the gap (live
+    2026-08-06: 5.5% -> 2.5% -> coasted to 1.3% importing).
     """
-    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH, overflow_floor, session_protect_kwh)
+    if floor_kwh is None:
+        floor_kwh = DEEP_DISCHARGE_FLOOR_KWH
+    return max(reserve, floor_kwh, overflow_floor, session_protect_kwh)
 
 
-def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0):
+def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0, floor_kwh=None):
     """Which arm of `compute_drain_above` set the floor.
 
-    Returns one of: "session_protect", "overflow_floor", "deep_floor", "reserve".
+    Returns one of: "session_protect", "overflow_floor", "dawn_reserve",
+    "deep_floor", "reserve".
+
+    "dawn_reserve" is reported when the caller-supplied `floor_kwh` is ABOVE the
+    deep floor, i.e. we are holding charge back to carry the house until PV meets
+    load. Without a distinct label a reader sees a 1.81 kWh floor sitting next to
+    `overflow_floor_kwh: 0.0` with nothing to explain it — the same complaint that
+    produced this function for `session_protect`.
 
     The sensor is called "Headroom Floor (P90 overflow)", but on a saving-session
     day the value comes from `session_protect` instead — observed live
@@ -373,11 +393,13 @@ def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0)
     the more surprising arm is reported first: a floor held up by a session is
     the thing a reader cannot infer from the other attributes.
     """
-    value = compute_drain_above(reserve, overflow_floor, None, session_protect_kwh)
+    value = compute_drain_above(reserve, overflow_floor, None, session_protect_kwh, floor_kwh)
+    hard_floor = DEEP_DISCHARGE_FLOOR_KWH if floor_kwh is None else floor_kwh
+    hard_name = "dawn_reserve" if hard_floor > DEEP_DISCHARGE_FLOOR_KWH else "deep_floor"
     for name, term in (
         ("session_protect", session_protect_kwh),
         ("overflow_floor", overflow_floor),
-        ("deep_floor", DEEP_DISCHARGE_FLOOR_KWH),
+        (hard_name, hard_floor),
         ("reserve", reserve),
     ):
         try:

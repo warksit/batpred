@@ -250,6 +250,15 @@ NO_OVERFLOW_LABEL = "no overflow left"
 # gap: it blocks every flap-triggering moment and permits every clean one.
 SUNDOWN_ELEV_DEG = 8.0
 
+# v33 (2026-08-06): fraction of the battery held back through the DAWN GAP — the
+# window between PV START and PV MEETING LOAD, during which the battery is still
+# the only thing standing between house load and the grid. Released by measured
+# crossover, so over-reserving is self-correcting and the number needs no
+# precision: 10% of 18.08 kWh = 1.81 kWh against a measured August need of ~0.6
+# kWh, and releasing it costs ~27 min at the 3.68 kW cap against ~3 h of slack
+# before overflow starts. See _dawn_floor_kwh.
+DAWN_RESERVE_FRACTION = 0.10
+
 # Do not hand back in the run-up to a joined saving session — see _session_imminent.
 # 30 min comfortably covers the 5-minute plugin cycle plus the ownership handover,
 # without pinning CM active for a session hours away.
@@ -261,6 +270,7 @@ DRAIN_SOURCE_LABELS = {
     "session_protect": "saving session",
     "overflow_floor": "P90 overflow",
     "deep_floor": "deep-discharge floor",
+    "dawn_reserve": "dawn reserve (PV not yet covering load)",
     "reserve": "inverter reserve",
     "inactive": "CM inactive",
 }
@@ -425,6 +435,14 @@ class CurtailmentPlugin(PredBatPlugin):
         # day. Persisted — an evening restart otherwise re-takes the wheel (live
         # 2026-08-03, "PHASE none -> active" at 20:05 after a deploy).
         self._sundown_latched = False
+        # v33 dawn-gap reserve: released (one-way, per day) the first time measured
+        # PV >= load. Persisted — a deploy during the gap would otherwise re-arm a
+        # reserve we had already correctly spent, or vice versa.
+        self._dawn_released = False
+        # Forecast house load across the dawn gap, carried out of the pre-PV path so
+        # the reserve survives the phase boundary. MIN_BASE_LOAD_KW for one hour is
+        # the fallback when the pre-PV path has not run this day.
+        self._dawn_load_kwh = MIN_BASE_LOAD_KW * 1.0
         # v32 dawn-flap latch: once the pre-PV drain fires, CM owns the day. When the
         # drain completes but PV hasn't arrived (actual_pv < 0.1) and overflow is still
         # forecast, HOLD active instead of handing back to Predbat — otherwise the
@@ -550,6 +568,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_drained_today = bool(data.get("keep_drained_today", False))
         self._r48_engaged_today = bool(data.get("r48_engaged_today", False))
         self._sundown_latched = bool(data.get("sundown_latched", False))
+        self._dawn_released = bool(data.get("dawn_released", False))
+        self._dawn_load_kwh = float(data.get("dawn_load_kwh", MIN_BASE_LOAD_KW * 1.0))
         # Restore _pv_history (R49) — without this, every restart kills v20
         # buffer-reduction for the rest of the day until 60 min of fresh
         # samples accumulate.
@@ -614,6 +634,8 @@ class CurtailmentPlugin(PredBatPlugin):
             "keep_drained_today": self._keep_drained_today,
             "r48_engaged_today": self._r48_engaged_today,
             "sundown_latched": self._sundown_latched,
+            "dawn_released": self._dawn_released,
+            "dawn_load_kwh": self._dawn_load_kwh,
             "pv_history": [list(entry) for entry in self._pv_history],
             "yesterday_cap_avg": self._yesterday_cap_avg,
             "cap_samples": list(self._cap_samples),
@@ -654,6 +676,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
         self._sundown_latched = False  # O1 dusk-flap latch
+        self._dawn_released = False  # v33 dawn-gap reserve re-arms for the new dawn
+        self._dawn_load_kwh = MIN_BASE_LOAD_KW * 1.0
         self._pre_pv_engaged_today = False  # v32 dawn-flap latch
         self._pre_pv_drain_started = False  # v32.2 pre-PV drain start-latch
         self._policy_override = None
@@ -1241,6 +1265,10 @@ class CurtailmentPlugin(PredBatPlugin):
             start_off = max(0, int((pv_start_utc - utc_hours) * 60))
             cover_off = max(start_off, int((cover_utc - utc_hours) * 60))
             dawn_load_kwh = sum(max(load_step.get(m, 0.0), MIN_BASE_LOAD_KW * step_h) for m in range(start_off, cover_off, PREDICT_STEP))
+
+        # v33: carry it out of this path. The pre-PV phase ENDS at PV start, but the
+        # gap this number measures runs on past that boundary — see _dawn_floor_kwh.
+        self._dawn_load_kwh = dawn_load_kwh
 
         buffer_pct = self._pre_pv_buffer_pct()
         target_kwh = compute_pre_pv_target(
@@ -2363,10 +2391,15 @@ class CurtailmentPlugin(PredBatPlugin):
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
             charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
-            drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh), 2)
+            # v33: the hard-floor arm is the DAWN RESERVE until measured PV covers
+            # load, then POST_DAWN_FLOOR_KWH. Evaluated here rather than inside
+            # compute_drain_above so the pure function stays free of live sensor
+            # reads and the latch has exactly one owner.
+            dawn_floor = self._dawn_floor_kwh(soc_max)
+            drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh, dawn_floor), 2)
             # Name the arm that won so the sensor (and the card) can explain a
             # floor that its own P90 attributes do not account for.
-            drain_above_source = compute_drain_above_source(reserve, self._overflow_floor_kwh, self._session_protect_kwh)
+            drain_above_source = compute_drain_above_source(reserve, self._overflow_floor_kwh, self._session_protect_kwh, dawn_floor)
         else:
             charge_below = 0.0
             drain_above = round(soc_max, 2)
@@ -2622,6 +2655,65 @@ class CurtailmentPlugin(PredBatPlugin):
         if solar_elevation(lat, lon, utc_hours, doy) >= SUNDOWN_ELEV_DEG:
             return False
         return self._sundown_latched or (peaked and actual_pv < 0.1)
+
+    def _dawn_floor_kwh(self, soc_max):
+        """The hard-floor arm of `compute_drain_above`, gated on the DAWN GAP.
+
+        The gap is PV START -> PV MEETS LOAD. Inside it the battery is still the
+        only thing between house load and the import meter, so draining it buys
+        headroom hours before overflow can use it and pays for that headroom with
+        import. Outside it the battery has no load duty and PV is refilling it, so
+        the floor drops to POST_DAWN_FLOOR_KWH and the rest becomes headroom.
+
+        Live 2026-08-06, the shape this exists to stop:
+
+            04:00-05:30  pre-PV drain -> 5.5%
+            ~05:30       PV START — pre-PV phase ends, its dawn_load reserve is
+                         discarded, Schmitt drains on to drain_above = 2.8%
+            06:00-06:55  coasts 2.5% -> 1.3% on house load, importing
+            ~06:55       PV MEETS LOAD, 85 minutes too late
+
+        Released on MEASUREMENT, never forecast, and the latch is one-way for the
+        day: a cloud at 11:00 must not re-arm a 10% floor and stop the drain in the
+        middle of the overflow window. That is the dusk-flap failure (O1) arriving
+        at dawn, and the fix is the same shape — latch, do not re-decide.
+
+        Fails CLOSED: unreadable sensors hold the reserve. The cost of holding it
+        wrongly is ~27 min of drain against ~3 h of slack; the cost of releasing it
+        wrongly is importing the house through the dark.
+        """
+        if self._dawn_released:
+            return self._drain_floor_kwh(soc_max)
+        reserve = max(DAWN_RESERVE_FRACTION * soc_max, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, self._dawn_load_kwh))
+        try:
+            pv_kw = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0) or 0)
+            load_kw = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0) or 0)
+        except (TypeError, ValueError):
+            return reserve
+        # pv_kw > 0 guards the degenerate overnight case where BOTH read 0 (load
+        # sensor unavailable) — 0 >= 0 would otherwise release the reserve at
+        # midnight, the one moment it is most needed.
+        if pv_kw > 0 and pv_kw >= load_kw:
+            self._dawn_released = True
+            return self._drain_floor_kwh(soc_max)
+        return reserve
+
+    def _drain_floor_kwh(self, soc_max):
+        """The released floor, in kWh, from the ONE live drain-floor helper.
+
+        RD15 consolidated three coincident 5% floors into a single helper; adding a
+        plugin-side constant for the same quantity would re-create exactly that. The
+        helper is also what the heartbeat's sell-clamp reads, so a CM target below it
+        would simply be unreachable — one number, one owner.
+
+        Falls back to DEFAULT_DRAIN_FLOOR_PCT, which is deliberately the HIGHER of
+        the plausible values: an unreadable helper should under-drain, not over-drain.
+        """
+        try:
+            pct = float(self.base.get_state_wrapper(SIG_DRAIN_FLOOR_HELPER, default=DEFAULT_DRAIN_FLOOR_PCT))
+        except (TypeError, ValueError):
+            pct = DEFAULT_DRAIN_FLOOR_PCT
+        return max(0.0, pct / 100.0 * soc_max)
 
     def _session_imminent(self, within_minutes=SESSION_IMMINENT_MINS):
         """True when a joined session starts within `within_minutes`.
