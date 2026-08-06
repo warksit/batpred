@@ -261,6 +261,7 @@ else in this file.
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
+| RD21–RD23 | IN FORCE | v33 dawn gap (2026-08-06): reserve survives PV start; drain floor stops selling, not load-covering; one floor helper. |
 | RD13a | IN FORCE | Manual override is ONE select (`input_select.sig_override`); the boolean is deleted (2026-07-28). |
 
 ## Goal
@@ -1953,6 +1954,67 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   across the 0.1 kW boundary, bouncing the plugin between the pre-PV path (off) and the
   main flow (active) — observed 2026-07-21 05:39–05:52 BST, ~4 policy/heartbeat toggles.
   The block only runs pre-dawn (peak not yet observed), so it never affects the evening.
+
+---
+
+## v33 — The dawn gap (2026-08-06)
+
+- **RD21 — The dawn reserve must survive PV start.** The battery is not free of load
+  duty at PV START; it is free at PV MEETS LOAD. Those are ~85 min apart in August and
+  hours apart in winter. `compute_pre_pv_target` already reserved
+  `DEEP_DISCHARGE_FLOOR_KWH + dawn_load_kwh` for exactly this, but that term lived only
+  in the pre-PV path, so at PV start the phase ended and the reserve was discarded.
+  Live 2026-08-06:
+
+  | time | SOC | what happened |
+  |---|---|---|
+  | 04:00–05:30 | 35% → 5.5% | pre-PV drain, reserve honoured |
+  | ~05:30 | 5.5% | PV START — pre-PV phase ends, reserve term vanishes |
+  | 05:30–06:00 | → 2.5% | Schmitt drains on to `drain_above` = 2.8% |
+  | 06:00–06:55 | → 1.3% | coasts on house load, importing |
+  | ~06:55 | 1.3% | PV finally meets load, 85 min too late |
+
+  Therefore `compute_drain_above` takes the hard-floor arm as a parameter
+  (`floor_kwh`), and `_dawn_floor_kwh` supplies
+  `max(DAWN_RESERVE_FRACTION x soc_max, DEEP_DISCHARGE_FLOOR_KWH + dawn_load_kwh)`
+  until the gap closes. `DAWN_RESERVE_FRACTION` = 10%; the forecast `dawn_load` arm is
+  what carries winter, when 10% is not enough.
+
+  **Released on MEASUREMENT (`pv_kw >= load_kw`), never forecast, and the latch is
+  one-way for the day.** Measurement is what makes over-reserving harmless: the reserve
+  is returned the moment it is not needed, so the fraction needs no precision. One-way
+  because a cloud at 11:00 must not re-arm a 10% floor and stop the drain mid-overflow —
+  that is the dusk-flap failure (O1) arriving at dawn. Persisted in
+  `curtailment_state.json`; cleared by `_reset_for_new_day`. Fails CLOSED: unreadable
+  sensors hold the reserve (holding it wrongly costs ~27 min of drain against ~3 h of
+  slack; releasing it wrongly imports the house through the dark).
+
+  **Headroom cost is nil.** Releasing 10% → the drain floor is ~1.6 kWh, ~27 min at the
+  3.68 kW cap, and crossover sits ~3 h ahead of overflow start.
+
+- **RD22 — The drain floor stops SELLING, not load-covering.** The heartbeat clamp
+  `dispatch = min(raw, pv)` below `sig_drain_floor_pct` applied to every policy, and is
+  applied AFTER policy selection — so no policy, not even a human override, could use
+  the battery below the floor. Live 2026-08-06 06:48, manual Hold at SOC 1.3%:
+  `pv 0.311, load 0.359 → raw 0.359 → clamped to 0.311`, battery −0.003 kW (idle),
+  import 0.027 kW. The battery held 0.235 kWh while the house imported.
+
+  That is RD4's prohibition ("never forced to import while it holds charge") violated by
+  a mechanism protecting against nothing: **the SIG simply imports at 0%** — there is no
+  protection cliff (Andrew, 2026-08-06), which retires the RD15 note that the software
+  floor is the operational protection. R5 (stop selling at the floor) and RD4 (keep
+  covering load below it) are not in conflict; the clamp merely blocked both at once.
+
+  Therefore the clamp is gated on `policy == 'Max Export'`. `policy` is the EFFECTIVE
+  policy, so a session-forced Max Export is still clamped.
+
+- **RD23 — One drain floor, one owner.** The released floor is read from
+  `input_number.sig_drain_floor_pct` (via `_drain_floor_kwh`), never a plugin-side
+  constant. RD15 consolidated three coincident 5% floors into that helper; a twin
+  constant would silently undo it. It is also the entity the heartbeat's sell-clamp
+  reads, so a CM target below it is unreachable by construction. Fallback
+  `DEFAULT_DRAIN_FLOOR_PCT` is deliberately the HIGHER plausible value — an unreadable
+  helper should under-drain, not over-drain.
 
 ---
 
