@@ -16,7 +16,7 @@ Master policy surface: `input_select.sig_dispatch_policy`
 
 | Policy (effective) | Sole plant writer | Must not write plant |
 |---|---|---|
-| **Predbat** | The three Predbat mappers (below). Heartbeat only **parks** once on entry (Remote EMS ON + MSC); thereafter heartbeat writes **nothing**. | Heartbeat active/dispatch branches |
+| **Predbat** | The three Predbat mappers (below). Heartbeat **parks** on entry (Remote EMS ON + MSC) and **self-heals** — on any trigger, if it finds the plant in `PCS Remote Control` it writes MSC (RD24). Otherwise it writes **nothing**. | Heartbeat active/dispatch branches |
 | **Max Export** | `sig_dispatch_heartbeat` only | All three Predbat mappers (disabled while CM drives) |
 | **Hold Battery** | `sig_dispatch_heartbeat` only | Same |
 | **Solar Charge Battery** | `sig_dispatch_heartbeat` only | Same |

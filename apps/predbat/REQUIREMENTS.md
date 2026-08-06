@@ -228,6 +228,7 @@ memory — the grep found two sites that memory had not.
 | **Who may write `input_select.sig_override`** | the human | `sig_keep_floor_guard.yaml` (clears to Off) · `sig_manual_override_failsafe_off.yaml` | — ⚠ no test |
 | **Mid-window handback ban (RD27)** | `curtailment_plugin._publish_dispatch_policy` | acting path in the same function · `sig_keep_floor_guard.yaml` keep-floor branch | `test_low_soc_never_hands_back_mid_window`, `test_yaml_keep_floor_guard` |
 | **`sig_drain_floor_pct`** (sell floor) | the helper itself (RD23) | `sig_dispatch_heartbeat.yaml` clamp · `sig_dispatch_intent_helpers.yaml` · `curtailment_plugin._drain_floor_kwh` · `sig_keep_floor_guard.yaml` | `test_released_floor_comes_from_the_live_helper` |
+| **`OVERFLOW_SAFETY_FACTOR`** | `curtailment_plugin.py` = **1.05** | `tests/test_curtailment.py` keeps a *deliberately frozen* `V10_SIM_SAFETY_FACTOR = 1.2` for the legacy v10 scenario model — renamed 2026-08-06 because as `OVERFLOW_SAFETY_FACTOR` it **shadowed** the real one at module scope and silently produced a wrong expected value | `test_r9_safety_factor_is_1_05` |
 | **Predbat→SIG register writes** | three mapper automations, not one | `predbat_requested_mode_action` · `predbat_max_discharging_limit_action` · `predbat_max_charging_limit_action` (2026-07-28) | `test_exactly_one_writer_enabled_on_handback` |
 
 ⚠ = known duplicate, no single source yet. One remains: `curtailment_plugin.py`
