@@ -30,6 +30,7 @@ from curtailment_calc import (
     compute_drain_above_source,
     classify_forecast_tracking,
     forecast_energy_to_now,
+    day_tracking_ratio,
     p_scales_from_forecast,
     p90_scale_from_forecast,
     estimate_session_end_kwh,
@@ -1812,6 +1813,45 @@ def test_dispatch_policy_max_export_high_soc():
     plugin._publish_dispatch_policy(True, floor_kwh=14.0, soc_kwh=16.0, soc_max=18.08)
     assert _policy_calls(base) == ["Max Export"], base.services
     print("  test_dispatch_policy_max_export_high_soc: PASSED")
+
+
+def test_overflow_tracking_published_and_below_p90():
+    """RD31 end to end: the estimate reaches the phase sensor, and on a day that is
+    UNDER-delivering it must sit below the p90 bound.
+
+    Live 2026-08-07 13:52 is the case: bands p10 3.46 / p50 8.90 / p90 11.39 with
+    confidence 0.82, so CM braced for ~11 kWh on a day tracking below p10.
+    """
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0, all_bands=True))
+    fc = overrides["sensor.solcast_pv_forecast_forecast_today"]["detailedForecast"]
+    early = [{"period_start": "2025-07-12T{:02d}:{:02d}:00+00:00".format(9 + i // 2, 30 * (i % 2)), "pv_estimate10": 4.0, "pv_estimate": 6.0, "pv_estimate90": 8.0} for i in range(6)]
+    overrides["sensor.solcast_pv_forecast_forecast_today"] = {"detailedForecast": early + fc}
+    overrides["sensor.sigen_plant_daily_pv_energy"] = 12.0  # vs p50 expected 18.0 -> ratio 0.667
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.5, minutes_now=720, best_soc_keep=4.0, sensor_overrides=overrides)
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv, plugin._peak_pv_time = 9.0, 720
+    plugin.on_update()
+    attrs = base.published["sensor.predbat_curtailment_phase"]["attrs"]
+    assert "overflow_tracking" in attrs, "estimate must reach the phase sensor"
+    assert attrs["day_tracking_ratio"] is not None, "ratio must be computed with 18 kWh of expected energy behind us"
+    assert abs(attrs["day_tracking_ratio"] - 0.667) < 0.01, attrs["day_tracking_ratio"]
+    assert attrs["overflow_tracking"] <= attrs["overflow_p90"], "an under-delivering day cannot estimate ABOVE the p90 bound"
+    print("  test_overflow_tracking_published_and_below_p90: PASSED (ratio {} -> {} vs p90 {})".format(attrs["day_tracking_ratio"], attrs["overflow_tracking"], attrs["overflow_p90"]))
+
+
+def test_day_tracking_ratio():
+    """RD31: how the day is ACTUALLY delivering, as a ratio of forecast-to-now."""
+    assert abs(day_tracking_ratio(34.84, 39.85) - 0.874) < 0.001
+    # Too early / no sun yet -> no opinion, not a divide-by-zero or a wild ratio.
+    assert day_tracking_ratio(0.0, 0.0) is None
+    assert day_tracking_ratio(0.5, 0.2) is None, "below the minimum expected energy the ratio is noise"
+    # Clamped: a sensor glitch must not scale the forecast into fantasy.
+    assert day_tracking_ratio(200.0, 20.0) == 2.0
+    assert day_tracking_ratio(0.0, 20.0) == 0.1
+    print("  test_day_tracking_ratio: PASSED")
 
 
 def test_at_risk_kwh_is_raw_energy_not_padded_percent():
@@ -7604,6 +7644,8 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
+        test_day_tracking_ratio,
+        test_overflow_tracking_published_and_below_p90,
         test_at_risk_kwh_is_raw_energy_not_padded_percent,
         test_at_risk_is_zero_when_the_overflow_fits,
         test_forecast_energy_to_now_integrates_the_slots,
