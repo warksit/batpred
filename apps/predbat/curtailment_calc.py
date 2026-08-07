@@ -435,6 +435,61 @@ def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining,
     return max(float(floor_kwh), projected)
 
 
+def forecast_energy_to_now(detailed_forecast, minutes_now, local_offset_hours=0):
+    """RD29: forecast energy (kWh) generated SO FAR today, per band.
+
+    Solcast slots are kW **means over 30 minutes**, so energy = kW x 0.5 summed
+    over every slot that has already started.
+
+    **Why this replaces the peak for tracking.** `actual_scale` is a running max
+    of INSTANTANEOUS PV samples, while the forecast peak is a half-hourly MEAN —
+    not like for like, and biased high by construction. Cloud-edge enhancement
+    can push an instant above clear-sky, so the peak reads most optimistic on
+    exactly the broken-cloud days that under-deliver. Live 2026-08-06: one
+    10.14 kW instant against a 7.72 kW p90 slot mean reported "above p90, 100%"
+    on a day that returned 38.56 kWh against a 45.96 kWh p50 forecast.
+
+    An integral is the right statistic for "how is the day going": robust to
+    single spikes, meaningful from mid-morning, and directly comparable to
+    `sensor.sigen_plant_daily_pv_energy`.
+
+    `actual_scale` is deliberately NOT changed — it feeds safe_time (R21/R43),
+    where the optimistic peak is arguably correct because that decision asks
+    "could we still overflow?"
+
+    Args:
+        detailed_forecast: Solcast slots with 'period_start' and
+            'pv_estimate10' / 'pv_estimate' / 'pv_estimate90' (kW).
+        minutes_now: minutes past LOCAL midnight.
+        local_offset_hours: unused — slot timestamps are already local and
+            `minutes_now` is local, so no conversion is needed. Kept only so the
+            signature matches the scale helpers, which DO convert to UTC.
+
+    Returns:
+        (p10_kwh, p50_kwh, p90_kwh) generated so far. (0,0,0) if unusable.
+    """
+    if not detailed_forecast:
+        return 0.0, 0.0, 0.0
+    totals = {"pv_estimate10": 0.0, "pv_estimate": 0.0, "pv_estimate90": 0.0}
+    for slot in detailed_forecast:
+        try:
+            # period_start arrives as a datetime from HA — str() first, as in
+            # p_scales_from_forecast, where a bare [11:16] silently degraded
+            # every band (2026-08-05).
+            ps = str(slot["period_start"])
+            h, m = int(ps[11:13]), int(ps[14:16])
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if h * 60 + m >= minutes_now:
+            continue
+        for key in totals:
+            try:
+                totals[key] += float(slot.get(key, 0.0) or 0.0) * 0.5
+            except (TypeError, ValueError):
+                continue
+    return totals["pv_estimate10"], totals["pv_estimate"], totals["pv_estimate90"]
+
+
 def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale):
     """Which Solcast band is today's observed sky actually tracking?
 
