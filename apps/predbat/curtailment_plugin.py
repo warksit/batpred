@@ -58,6 +58,7 @@ from curtailment_calc import (
     compute_drain_above,
     compute_drain_above_source,
     classify_forecast_tracking,
+    forecast_energy_to_now,
     estimate_session_end_kwh,
     compute_proposed_phase,
     phase_to_policy,
@@ -2271,7 +2272,23 @@ class CurtailmentPlugin(PredBatPlugin):
         floor_pct = round(target_kwh / soc_max * 100, 1) if soc_max > 0 else 100
         state = "Active" if phase == "active" else "Off"
 
-        tracking_band, tracking_pct = classify_forecast_tracking(self._actual_scale, self._p10_scale, self._p50_scale, self._p90_scale)
+        # RD29: the band tracks ENERGY, not a single peak. `actual_scale` is a
+        # running max of INSTANTANEOUS samples while the forecast peak is a
+        # half-hourly MEAN — not like for like, and biased high by construction
+        # (cloud-edge enhancement can beat clear-sky for an instant). Live
+        # 2026-08-06: one 10.14 kW instant vs a 7.72 kW p90 slot mean read
+        # "above p90 100%" on a day that delivered 38.56 kWh against a 45.96 kWh
+        # p50. And on 2026-08-07, with Solcast confident, the whole-day peak
+        # bands collapsed to 10.12/10.15/10.23 so any miss saturated the
+        # interpolation and printed "below p10 (0%)" mid-morning.
+        #
+        # Energy-so-far vs forecast-energy-to-now is robust to spikes, honest
+        # from mid-morning, and directly comparable to the daily PV meter.
+        # `actual_scale` is unchanged — it still feeds safe_time (R21/R43),
+        # where the optimistic peak is defensible ("could we still overflow?").
+        p10_e, p50_e, p90_e = forecast_energy_to_now(self._get_solcast_detailed(), self.base.minutes_now)
+        actual_e = self._float_state(SIG_DAILY_PV, 0.0)
+        tracking_band, tracking_pct = classify_forecast_tracking(actual_e, p10_e, p50_e, p90_e)
 
         self.base.dashboard_item(
             "sensor.{}_curtailment_phase".format(prefix),
@@ -2291,6 +2308,11 @@ class CurtailmentPlugin(PredBatPlugin):
                 # answered after the fact.
                 "tracking_band": tracking_band,
                 "tracking_pct": tracking_pct,
+                # The energy the band is computed from, so the card can show its working.
+                "pv_actual_kwh": round(actual_e, 2),
+                "pv_expected_p10_kwh": round(p10_e, 2),
+                "pv_expected_p50_kwh": round(p50_e, 2),
+                "pv_expected_p90_kwh": round(p90_e, 2),
                 "peak_pv_kw": round(self._peak_pv, 2),
                 "peak_pv_time": self._peak_pv_time,
                 "overflow_kwh": round(self._remaining_overflow, 2),
