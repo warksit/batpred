@@ -1814,6 +1814,43 @@ def test_dispatch_policy_max_export_high_soc():
     print("  test_dispatch_policy_max_export_high_soc: PASSED")
 
 
+def test_at_risk_kwh_is_raw_energy_not_padded_percent():
+    """RD30: the human-facing shortfall is ENERGY, with no control padding.
+
+    The card showed `headroom_short_pct` — overflow x 1.05 plus a 1.8 kWh
+    reserve, expressed as a percentage of the pack. Live 2026-08-07 that printed
+    "short 35% room" for a raw shortfall of 3.8 kWh. The safety factor and the
+    reserve belong in the DECISION, not in the number a human acts on, and
+    "% of pack" is not a unit anyone can act on at all.
+
+    at_risk = max(0, overflow - headroom). Nothing else.
+    """
+    base = MockBase(soc_kw=18.08 * 0.435)  # live 2026-08-07 12:57
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 14.14
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=18.08 * 0.435, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    have = 18.08 - 18.08 * 0.435
+    assert abs(attrs["pv_at_risk_kwh"] - round(14.14 - have, 2)) < 0.02, "at_risk = overflow - headroom = {:.2f}, got {}".format(14.14 - have, attrs["pv_at_risk_kwh"])
+    assert attrs["pv_at_risk_kwh"] < attrs["headroom_short_kwh"], "at_risk must be SMALLER than the padded control figure — that padding is the bug being fixed"
+    print("  test_at_risk_kwh_is_raw_energy_not_padded_percent: PASSED ({} kWh vs padded {})".format(attrs["pv_at_risk_kwh"], attrs["headroom_short_kwh"]))
+
+
+def test_at_risk_is_zero_when_the_overflow_fits():
+    """No overflow, or it fits, means nothing is at risk — not a negative number."""
+    base = MockBase(soc_kw=1.0)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 2.0
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.0, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["pv_at_risk_kwh"] == 0.0, "fits comfortably -> 0, got {}".format(attrs["pv_at_risk_kwh"])
+    print("  test_at_risk_is_zero_when_the_overflow_fits: PASSED")
+
+
 def test_forecast_energy_to_now_integrates_the_slots():
     """RD29: the tracking band must compare ENERGY, not a single peak.
 
@@ -7567,6 +7604,8 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
+        test_at_risk_kwh_is_raw_energy_not_padded_percent,
+        test_at_risk_is_zero_when_the_overflow_fits,
         test_forecast_energy_to_now_integrates_the_slots,
         test_tracking_band_from_energy_not_peak,
         test_no_overflow_charge_target_is_the_overnight_need,
