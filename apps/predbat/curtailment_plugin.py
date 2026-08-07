@@ -59,6 +59,7 @@ from curtailment_calc import (
     compute_drain_above_source,
     classify_forecast_tracking,
     forecast_energy_to_now,
+    day_tracking_ratio,
     estimate_session_end_kwh,
     compute_proposed_phase,
     phase_to_policy,
@@ -387,6 +388,9 @@ class CurtailmentPlugin(PredBatPlugin):
         self._floor_scale = 0.0
         self._safe_scale = 0.0
         self._actual_scale = 0.0
+        # RD31 display-only: day-so-far delivery ratio and the p50 overflow rescaled by it.
+        self._day_ratio = None
+        self._overflow_tracking = None
         self._last_decision = "init"
         # R4 hysteresis: True while deferring to charge window (Bug 6).
         # Released only when SOC >= soc_keep + 0.2.
@@ -1307,6 +1311,30 @@ class CurtailmentPlugin(PredBatPlugin):
         decision = "pre-PV drain target={:.2f}kWh pv_start={} drain_start≈{:.0f}min ago".format(target_kwh, pv_start_str, max(0.0, (utc_hours - drain_start_utc) * 60))
         return target_kwh, decision
 
+    def _update_tracking_estimate(self, detailed, band_args):
+        """RD31 (DISPLAY ONLY): the p50 overflow rescaled by how the day is
+        ACTUALLY delivering so far. Bands answer "what could happen"; this
+        answers "what is happening".
+
+        Uses the day ratio INSTEAD of the R58 calibration_ratio, not on top of it —
+        R58 is a rolling 30-minute window (the cloud overhead now), this is the
+        whole day. Multiplying would double-count.
+
+        **Called from BOTH the active path and the forecast-publish path.** That is
+        deliberate: on 2026-08-05 the band scales were instrumented only on the
+        forecast-publish path, so on any active day they stayed at their init 0.0
+        and the metric read "unknown" all day. Same trap, caught in test this time.
+
+        `band_args` is (p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc).
+        """
+        p10_e, p50_e, _p90_e = forecast_energy_to_now(detailed, getattr(self.base, "minutes_now", 720))
+        self._day_ratio = day_tracking_ratio(self._float_state(SIG_DAILY_PV, 0.0), p50_e)
+        if self._day_ratio is None:
+            self._overflow_tracking = None
+            return
+        p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc = band_args
+        self._overflow_tracking = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, self._day_ratio, detailed), 2)
+
     def _publish_forecast_overflow(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw):
         """Update self._overflow_p10/p50/p90 from current Solcast forecast.
 
@@ -1351,6 +1379,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._overflow_p10 = round(self._compute_overflow_band("pv_estimate10", p10_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
             self._overflow_p50 = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
             self._overflow_p90 = round(self._compute_overflow_band("pv_estimate90", p90_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, calibration_ratio, detailed), 2)
+            self._update_tracking_estimate(detailed, (p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc))
         except Exception as exc:
             self._log_once("forecast_overflow_error", "_publish_forecast_overflow failed: {} — overflow bands frozen at previous cycle (pre-PV drain gating affected)".format(exc))
 
@@ -1697,6 +1726,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_p50 = round(overflow_p50, 2)
         self._overflow_p90 = round(overflow_p90, 2)
         self._confidence = round(confidence, 2)
+        self._update_tracking_estimate(detailed, (p50_fb, lat, lon, doy, utc_hours, safe_utc, self._effective_dno, load_forecast_kw))
 
         # R50a: p90 per R7/R42/R43 unless the blend is re-enabled from the dashboard.
         remaining_overflow = self._expected_overflow()
@@ -2319,6 +2349,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 "overflow_p10": self._overflow_p10,
                 "overflow_p50": self._overflow_p50,
                 "overflow_p90": self._overflow_p90,
+                # RD31 display-only: p90 is the BOUND ("what could happen"),
+                # overflow_tracking is the ESTIMATE ("what is happening") — the p50
+                # band rescaled by the day's actual delivery so far. Nothing
+                # downstream reads it; the floor still uses the confidence blend.
+                "overflow_tracking": self._overflow_tracking,
+                "day_tracking_ratio": round(self._day_ratio, 3) if self._day_ratio is not None else None,
                 "confidence": self._confidence,
                 "safe_time": self._safe_time_str,
                 "buffer_reduced": self._buffer_reduced,

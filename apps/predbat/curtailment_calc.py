@@ -490,6 +490,42 @@ def forecast_energy_to_now(detailed_forecast, minutes_now, local_offset_hours=0)
     return totals["pv_estimate10"], totals["pv_estimate"], totals["pv_estimate90"]
 
 
+def day_tracking_ratio(actual_kwh, expected_p50_kwh, min_expected_kwh=1.0, lo=0.1, hi=2.0):
+    """RD31: how today is ACTUALLY delivering, as a fraction of the p50 forecast
+    for the same period. `None` when there is not yet enough sun to mean anything.
+
+    Distinct from the R58 `calibration_ratio`, which is a rolling **30-minute**
+    window — that tracks the cloud overhead right now. This is the whole day so
+    far, which is what says "this day is a p10 day, not a p90 day".
+
+    **Why it matters more than it looks.** Overflow is NON-LINEAR in PV: it is
+    `sum(max(0, pv - load - cap))`, so slots that were just over the cap fall under
+    it entirely and stop contributing. Live 2026-08-07: a 12.6% shortfall in
+    generation (ratio 0.874) took the overflow estimate from 8.90 kWh to ~2.6 —
+    a 70% cut. "We're 12% down" sounds minor and changes the answer completely.
+
+    Clamped to [lo, hi] so a sensor glitch cannot scale the forecast into fantasy,
+    and gated on `min_expected_kwh` so dawn — when expected is ~0 and any actual
+    reading gives a huge ratio — returns None rather than noise.
+
+    Args:
+        actual_kwh: generation so far today (the daily PV meter).
+        expected_p50_kwh: p50 forecast energy over the same period
+            (`forecast_energy_to_now`).
+
+    Returns:
+        float ratio, or None when it would not be meaningful.
+    """
+    try:
+        actual = float(actual_kwh)
+        expected = float(expected_p50_kwh)
+    except (TypeError, ValueError):
+        return None
+    if expected < min_expected_kwh:
+        return None
+    return max(lo, min(hi, actual / expected))
+
+
 def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale):
     """Which Solcast band is today's observed sky actually tracking?
 
