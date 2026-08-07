@@ -3114,6 +3114,7 @@ class CurtailmentPlugin(PredBatPlugin):
         headroom_need_pct = None
         headroom_have_pct = None
         headroom_short_pct = None
+        pv_at_risk_kwh = None
         try:
             ovf = float(self._overflow_p90 or 0.0)
             # With no forecast overflow there is no headroom question to answer.
@@ -3125,6 +3126,14 @@ class CurtailmentPlugin(PredBatPlugin):
                 headroom_need_kwh = round(required_headroom_kwh(ovf, max_res, OVERFLOW_SAFETY_FACTOR), 2)
                 headroom_have_kwh = round(max(0.0, soc_max - soc_kwh), 2)
                 headroom_short_kwh = round(headroom_need_kwh - headroom_have_kwh, 2)
+                # RD30: the number a HUMAN acts on — raw energy likely curtailed,
+                # with none of the control padding. headroom_short carries the 1.05
+                # safety factor and the 1.8 kWh reserve, which belong in the
+                # DECISION, not on the card: live 2026-08-07 that printed
+                # "short 35% room" for a raw shortfall of 3.8 kWh. And "% of pack"
+                # is not a unit anyone can act on — "3.8 kWh at risk" is a
+                # dishwasher and a hot-water cycle.
+                pv_at_risk_kwh = round(max(0.0, ovf - headroom_have_kwh), 2)
                 denom = max(soc_max, 0.1)
                 headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
                 headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
@@ -3193,6 +3202,8 @@ class CurtailmentPlugin(PredBatPlugin):
                 "headroom_need_pct": headroom_need_pct,
                 "headroom_have_pct": headroom_have_pct,
                 "headroom_short_pct": headroom_short_pct,
+                # RD30: raw kWh at risk — what the card should show.
+                "pv_at_risk_kwh": pv_at_risk_kwh,
             }
             self.base.dashboard_item(
                 "sensor.{}_curtailment_intended_policy".format(prefix),
