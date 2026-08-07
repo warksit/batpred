@@ -29,6 +29,7 @@ from curtailment_calc import (
     compute_drain_above,
     compute_drain_above_source,
     classify_forecast_tracking,
+    forecast_energy_to_now,
     p_scales_from_forecast,
     p90_scale_from_forecast,
     estimate_session_end_kwh,
@@ -1811,6 +1812,41 @@ def test_dispatch_policy_max_export_high_soc():
     plugin._publish_dispatch_policy(True, floor_kwh=14.0, soc_kwh=16.0, soc_max=18.08)
     assert _policy_calls(base) == ["Max Export"], base.services
     print("  test_dispatch_policy_max_export_high_soc: PASSED")
+
+
+def test_forecast_energy_to_now_integrates_the_slots():
+    """RD29: the tracking band must compare ENERGY, not a single peak.
+
+    Solcast slots are kW means over 30 min, so energy-to-now is
+    sum(kW x 0.5) over slots that have already started.
+    """
+    fc = [
+        {"period_start": "2026-08-07T09:00:00+01:00", "pv_estimate10": 2.0, "pv_estimate": 4.0, "pv_estimate90": 6.0},
+        {"period_start": "2026-08-07T09:30:00+01:00", "pv_estimate10": 3.0, "pv_estimate": 5.0, "pv_estimate90": 7.0},
+        {"period_start": "2026-08-07T10:00:00+01:00", "pv_estimate10": 9.0, "pv_estimate": 9.0, "pv_estimate90": 9.0},
+    ]
+    # 10:00 local -> the first two slots have completed, the third has not started.
+    p10, p50, p90 = forecast_energy_to_now(fc, minutes_now=600, local_offset_hours=1)
+    assert abs(p10 - 2.5) < 1e-6, "p10 = (2.0+3.0)*0.5, got {}".format(p10)
+    assert abs(p50 - 4.5) < 1e-6, "p50 = (4.0+5.0)*0.5, got {}".format(p50)
+    assert abs(p90 - 6.5) < 1e-6, "p90 = (6.0+7.0)*0.5, got {}".format(p90)
+    assert forecast_energy_to_now([], 600, 1) == (0.0, 0.0, 0.0)
+    print("  test_forecast_energy_to_now_integrates_the_slots: PASSED")
+
+
+def test_tracking_band_from_energy_not_peak():
+    """The band classifier is band-agnostic — feed it kWh and it answers the
+    question that actually matters: how is the day GOING.
+
+    Live 2026-08-06: peak-based said "above p90, 100%" because one cloud-edge
+    instant hit 10.14 kW against a 7.72 kW half-hourly p90 mean, on a day that
+    delivered 38.56 kWh vs a 45.96 kWh p50 forecast — i.e. p10-p50 on energy.
+    """
+    # Yesterday's whole-day figures: actual 38.56 against p10 30.62 / p50 45.96 / p90 58.74.
+    label, pct = classify_forecast_tracking(38.56, 30.62, 45.96, 58.74)
+    assert label == "p10-p50", "38.56 kWh sits between p10 and p50, got {}".format(label)
+    assert 10 < pct < 50, "percentile should land inside the p10-p50 span, got {}".format(pct)
+    print("  test_tracking_band_from_energy_not_peak: PASSED ({} {:.0f}%)".format(label, pct))
 
 
 def test_no_overflow_charge_target_is_the_overnight_need():
@@ -7154,18 +7190,30 @@ def test_tracking_band_published_for_debugging():
     load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
     overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
     overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0, all_bands=True))
+    # RD29: the band is now ENERGY-based, so the rig needs slots that have already
+    # COMPLETED by minutes_now (the shared fixture's only slot starts exactly at
+    # 12:00 = minutes_now, so it contributes nothing) plus a daily PV reading.
+    # Two 30-min slots -> p10 2.0 / p50 4.0 / p90 6.0 kWh expected so far.
+    fc = overrides["sensor.solcast_pv_forecast_forecast_today"]["detailedForecast"]
+    early = [
+        {"period_start": "2025-07-12T10:00:00+00:00", "pv_estimate10": 2.0, "pv_estimate": 4.0, "pv_estimate90": 6.0},
+        {"period_start": "2025-07-12T11:00:00+00:00", "pv_estimate10": 2.0, "pv_estimate": 4.0, "pv_estimate90": 6.0},
+    ]
+    overrides["sensor.solcast_pv_forecast_forecast_today"] = {"detailedForecast": early + fc}
+    overrides["sensor.sigen_plant_daily_pv_energy"] = 3.0  # between p10 2.0 and p50 4.0
     base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.55, minutes_now=720, best_soc_keep=4.0, sensor_overrides=overrides)
     plugin = CurtailmentPlugin(base)
     plugin._peak_pv = 9.0
-    # actual_scale is peak / sin(elevation AT THE PEAK), so the peak TIME matters —
-    # leaving it at 0 puts the peak at midnight, sin <= 0, and actual_scale stays
-    # 0.0 no matter how big the peak was.
     plugin._peak_pv_time = 720
     plugin.on_update()
     attrs = base.published["sensor.predbat_curtailment_phase"]["attrs"]
     for key in ("p10_scale", "p50_scale", "p90_scale", "actual_scale", "tracking_band", "tracking_pct"):
         assert key in attrs, f"phase sensor missing {key}"
-    assert attrs["tracking_band"] in ("below p10", "p10-p50", "p50-p90", "above p90", "unknown"), attrs["tracking_band"]
+    # Assert the SPECIFIC band. The old form allowed "unknown" — the failure mode
+    # itself — and passed on the exact defect it existed to catch, twice (Charter).
+    assert attrs["tracking_band"] == "p10-p50", "3.0 kWh actual against p10 2.0 / p50 4.0 must be p10-p50, got {}".format(attrs["tracking_band"])
+    assert abs(attrs["pv_actual_kwh"] - 3.0) < 0.01
+    assert abs(attrs["pv_expected_p50_kwh"] - 4.0) < 0.01, attrs["pv_expected_p50_kwh"]
 
     # The band scales must be populated by the ACTIVE path, not just the pre-PV
     # ones. Instrumenting only the forecast-publish call sites left both at their
@@ -7519,6 +7567,8 @@ def run_curtailment_tests(my_predbat=None):
         test_dispatch_policy_gated_off_publishes_intended_only,
         test_dispatch_policy_drives_hold_when_enabled,
         test_dispatch_policy_max_export_high_soc,
+        test_forecast_energy_to_now_integrates_the_slots,
+        test_tracking_band_from_energy_not_peak,
         test_no_overflow_charge_target_is_the_overnight_need,
         test_no_overflow_charge_target_never_eats_the_headroom,
         test_no_drain_branch_charges_to_the_overnight_need,
