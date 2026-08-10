@@ -3213,10 +3213,14 @@ class CurtailmentPlugin(PredBatPlugin):
         headroom_have_pct = None
         headroom_short_pct = None
         pv_at_risk_kwh = None
-        # RD33: "too early" is the FAIL-SAFE default. With no overflow forecast
-        # there is no question to answer, and before the peak the answer is not
-        # knowable — neither case may publish a confident "fits".
-        risk_verdict = "too early"
+        # RD33: None = "no verdict", matching pv_at_risk_kwh below — with no
+        # forecast overflow there is simply no headroom question to answer and
+        # the card omits the line. NOT "too early", which implies an answer is
+        # coming: live 2026-08-10 18:34 that printed "too early" beside
+        # `overflow_fits: True` and `pv_at_risk_kwh: None`, contradicting both.
+        # Inside the ovf > 0 block "too early" IS the fail-safe default, because
+        # there the question is real and merely not yet answerable.
+        risk_verdict = None
         try:
             ovf = float(self._overflow_p90 or 0.0)
             # With no forecast overflow there is no headroom question to answer.
