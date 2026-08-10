@@ -1891,6 +1891,51 @@ def test_at_risk_is_zero_when_the_overflow_fits():
     print("  test_at_risk_is_zero_when_the_overflow_fits: PASSED")
 
 
+def test_risk_verdict_is_too_early_before_the_peak():
+    """RD33 — "overflow fits" is a VERDICT and must not be published pre-peak.
+
+    Live 2026-08-08 07:08 the card read "overflow fits — nothing at risk" with an
+    EMPTY battery: headroom 17.75 against overflow_p90 17.89, so at_risk rounded
+    to nothing. The arithmetic was right and the verdict was worthless — the
+    figure inverts as the battery fills, which is the opposite of a conclusion.
+
+    The real `overflow_fits` latch is already gated on `peaked` (calculate()).
+    The card line was driven by `pv_at_risk_kwh` instead, which is not. Publish
+    the verdict from the plugin so the card cannot re-derive it wrongly.
+    """
+    base = MockBase(soc_kw=0.33)  # 1.8%, the live SOC
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 17.89
+    plugin._charge_below, plugin._drain_above = 0.5, 0.18
+    plugin._peaked = False  # dawn: no peak observed yet
+    plugin._publish_dispatch_policy(True, floor_kwh=0.18, soc_kwh=0.33, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["risk_verdict"] == "too early", "pre-peak the verdict must be 'too early', got '{}'".format(attrs["risk_verdict"])
+    assert attrs["pv_at_risk_kwh"] == 0.14, "the arithmetic still publishes for diagnostics, got {}".format(attrs["pv_at_risk_kwh"])
+    print("  test_risk_verdict_is_too_early_before_the_peak: PASSED")
+
+
+def test_risk_verdict_calls_it_once_past_the_peak():
+    """RD33 must not gag the verdict either — past the peak it is a real call.
+
+    Same shape, `_peaked` True: a battery with room to spare reads "fits", and
+    one without reads "at risk". Asserting both directions so the gate cannot be
+    satisfied by always saying "too early".
+    """
+    for soc, p90, expected in ((1.0, 2.0, "fits"), (18.08 * 0.435, 14.14, "at risk")):
+        base = MockBase(soc_kw=soc)
+        base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+        plugin = CurtailmentPlugin(base)
+        plugin._overflow_p90 = p90
+        plugin._charge_below, plugin._drain_above = 2.0, 14.0
+        plugin._peaked = True
+        plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=soc, soc_max=18.08)
+        attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+        assert attrs["risk_verdict"] == expected, "SOC {:.2f} vs p90 {:.2f} must read '{}', got '{}'".format(soc, p90, expected, attrs["risk_verdict"])
+    print("  test_risk_verdict_calls_it_once_past_the_peak: PASSED")
+
+
 def test_forecast_energy_to_now_integrates_the_slots():
     """RD29: the tracking band must compare ENERGY, not a single peak.
 
@@ -6618,6 +6663,118 @@ def test_dawn_release_latch_persists_and_resets_daily():
     print("  test_dawn_release_latch_persists_and_resets_daily: PASSED")
 
 
+def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
+    """RD32 — R63 must drain to the SAME floor the Schmitt does.
+
+    Live 2026-08-08, the defect. RD21 armed correctly (drain_above 1.81 kWh =
+    10.0%, source `dawn_reserve`) and the Schmitt stopped the drain there at
+    05:25. Then R63 fired at 06:25 and ran the pack to 1.8% in the dark:
+
+        06:25:27  R63 drain deadline — need 3.80 kWh headroom,
+                  only 3.46 kWh sheddable before lockout 7.53Z -> Max Export
+
+    R63 computed its OWN floor and never consulted `_dawn_floor_kwh`:
+
+        r63_floor = max(reserve, DEEP_DISCHARGE_FLOOR_KWH,
+                        soc_max * hard_floor_pct / 100.0)      # = 0.50 kWh
+
+    so `drainable_kwh` read +0.80 instead of −0.51, the deadline "breached", and
+    `_policy_override = "max_export"` outranks every floor below it. PV did not
+    meet load until 06:52 — the reserve existed to cover exactly that gap.
+
+    Cost that morning was zero only because load was 0.35 kW and PV arrived in
+    time. On an overcast dawn, or with the DHW cycle an hour earlier, it is
+    import at 25p to buy headroom the peak may not even need.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37, soc_pct=0.072))
+    expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
+    floor = plugin._r63_floor_kwh(BATTERY_KWH)
+    assert abs(floor - expected) < 0.01, "in the dawn gap R63's floor must be the {:.2f} kWh dawn reserve, got {:.2f}".format(expected, floor)
+    print("  test_r63_floor_is_the_dawn_reserve_not_the_deep_floor: PASSED ({:.2f} kWh)".format(floor))
+
+
+def test_r63_does_not_engage_below_the_dawn_reserve():
+    """RD32, the consequence: the live 06:25 numbers must NOT force Max Export.
+
+    Uses the real logged figures — need 3.80 kWh, 3.46 kWh sheddable, SOC 7.2%
+    (1.30 kWh). The deadline IS breached on energy (3.80 > 3.46); the release is
+    `drainable_kwh <= 0`, which only holds once R63's floor is the dawn reserve.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37, soc_pct=0.072))
+    soc_kwh = BATTERY_KWH * 0.072
+    drainable = soc_kwh - plugin._r63_floor_kwh(BATTERY_KWH)
+    assert drainable < 0, "SOC 7.2% is BELOW the dawn reserve, so there is nothing R63 may shed (got {:.2f} kWh)".format(drainable)
+    assert not drain_deadline_breached(3.80, 3.46, engaged=False, drainable_kwh=drainable), "R63 must not force Max Export through the dawn reserve"
+    print("  test_r63_does_not_engage_below_the_dawn_reserve: PASSED (drainable {:.2f} kWh)".format(drainable))
+
+
+def test_r63_still_fires_above_the_dawn_reserve():
+    """RD32 must not disarm R63 — it is the last-chance drain (R25).
+
+    Same dawn gap, same unachievable deadline, but SOC at 60%: there is real
+    headroom to make, so R63 must still engage. Without this the fix above would
+    read as "R63 respects the reserve" while actually having switched it off.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37, soc_pct=0.60))
+    soc_kwh = BATTERY_KWH * 0.60
+    drainable = soc_kwh - plugin._r63_floor_kwh(BATTERY_KWH)
+    assert drainable > 0
+    assert drain_deadline_breached(3.80, 3.46, engaged=False, drainable_kwh=drainable), "with 9 kWh above the reserve R63 must still force the drain"
+    print("  test_r63_still_fires_above_the_dawn_reserve: PASSED (drainable {:.2f} kWh)".format(drainable))
+
+
+def test_r63_drain_sells_to_the_drain_target_not_the_overnight_reserve():
+    """RD32 — the published sell floor must be the floor R63 is draining TO.
+
+    Live 2026-08-08 06:25-06:44: R63 drove Max Export while the keep floor read
+    38% (the overnight reserve) against a 7% SOC, because
+    `is_curtailment_drain` required `_policy_override is None` and R63 sets it to
+    "max_export". `sig_keep_floor_guard` therefore clamped Max Export back to
+    Hold Battery every ~3 minutes — 8 policy writes in 20 minutes, plugin vs
+    guard, neither wrong about its own rule.
+
+    R63's drain IS a curtailment drain. The sell floor must be `drain_above`,
+    which already carries the dawn-reserve arm, so the guard enforces the same
+    number the Schmitt does instead of fighting it.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 1.81
+    plugin._overnight_target_kwh = 6.87  # 38% — what it wrongly published live
+    plugin._policy_override = "max_export"
+    plugin._r63_engaged = True
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.0, soc_kwh=1.30, soc_max=18.08)
+    assert _policy_calls(base) == ["Max Export"], base.services
+    kf = _keep_floor_calls(base)
+    assert kf, "R63 drain must publish a sell floor"
+    assert abs(kf[-1] - 10.0) <= 1, "sell floor must be drain_above (1.81 kWh = 10%), not the 38% overnight reserve — got {}".format(kf[-1])
+    print("  test_r63_drain_sells_to_the_drain_target_not_the_overnight_reserve: PASSED ({}%)".format(kf[-1]))
+
+
+def test_session_dump_still_sells_to_the_overnight_reserve():
+    """RD20 must survive RD32: a SAVING-SESSION dump is not a curtailment drain,
+    so it still stops at the overnight reserve.
+
+    Same override value ("max_export"), different reason — `_r63_engaged` is what
+    separates them. Without this test the RD32 fix would silently re-open the
+    session under-sell RD20 was written to close.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 0.5, 1.81
+    plugin._overnight_target_kwh = 6.87  # 38%
+    plugin._policy_override = "max_export"
+    plugin._r63_engaged = False
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=0.0, soc_kwh=8.0, soc_max=18.08)
+    kf = _keep_floor_calls(base)
+    assert kf and abs(kf[-1] - 38.0) <= 1, "a session dump must still stop at the 38% overnight reserve, got {}".format(kf)
+    print("  test_session_dump_still_sells_to_the_overnight_reserve: PASSED ({}%)".format(kf[-1]))
+
+
 def _session_publish_run(session):
     """Shared rig: a MODERATE overflow day, with and without an upcoming session.
 
@@ -7261,6 +7418,49 @@ def test_forecast_tracking_band():
     print("  test_forecast_tracking_band: PASSED")
 
 
+def test_tracking_band_is_too_early_before_enough_energy():
+    """RD33 — at dawn there is no day to track yet, so the band must say so.
+
+    Live 2026-08-08 07:10: actual 0.28 kWh against expected-to-now
+    p10/p50/p90 = 0.57 / 0.60 / 0.63. The card read "sky tracking below p10
+    (0%)" off 0.06 kWh of band spread — a confident verdict on the day, an hour
+    after sunrise, on a day that went on to forecast 55.8 kWh p50 remaining.
+
+    `day_tracking_ratio` already refuses this (min_expected_kwh); the classifier
+    had no such gate. "too early" is a distinct state from "unknown": unknown
+    means the bands are unusable, too early means they are fine but the day has
+    not happened yet.
+    """
+    label, pct = classify_forecast_tracking(0.28, 0.57, 0.60, 0.63)
+    assert label == "too early", "0.60 kWh expected so far cannot support a verdict, got '{}'".format(label)
+    assert pct is None, "no percentile may be published before the band means anything, got {}".format(pct)
+    print("  test_tracking_band_is_too_early_before_enough_energy: PASSED")
+
+
+def test_tracking_band_reports_no_spread_when_bands_collapse():
+    """RD33 — confident Solcast collapses the bands, and there is then nothing to
+    interpolate on.
+
+    Live 2026-08-07: whole-day peak bands 10.12 / 10.15 / 10.23. Any small miss
+    saturates a 0.11 kWh span and prints "below p10 (0%)" mid-morning. Reported
+    separately from "too early" because the cause and the cure differ — this one
+    never improves as the day goes on.
+    """
+    label, pct = classify_forecast_tracking(9.80, 10.12, 10.15, 10.23)
+    assert label == "no spread", "a 0.11 kWh p10-p90 span cannot discriminate, got '{}'".format(label)
+    assert pct is None, "got {}".format(pct)
+    print("  test_tracking_band_reports_no_spread_when_bands_collapse: PASSED")
+
+
+def test_tracking_band_still_calls_a_real_miss():
+    """RD33 must not gag the metric. A genuine shortfall on discriminating bands,
+    late enough in the day to mean something, must still read "below p10"."""
+    label, pct = classify_forecast_tracking(18.0, 24.0, 30.0, 36.0)
+    assert label == "below p10", "a 6 kWh miss on a 12 kWh span is a real call, got '{}'".format(label)
+    assert pct == 0.0, "extrapolated a full span below p10 clamps at 0, got {}".format(pct)
+    print("  test_tracking_band_still_calls_a_real_miss: PASSED")
+
+
 def test_tracking_band_published_for_debugging():
     """It has to reach the phase sensor or it is not a debug metric."""
     pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
@@ -7648,6 +7848,8 @@ def run_curtailment_tests(my_predbat=None):
         test_overflow_tracking_published_and_below_p90,
         test_at_risk_kwh_is_raw_energy_not_padded_percent,
         test_at_risk_is_zero_when_the_overflow_fits,
+        test_risk_verdict_is_too_early_before_the_peak,
+        test_risk_verdict_calls_it_once_past_the_peak,
         test_forecast_energy_to_now_integrates_the_slots,
         test_tracking_band_from_energy_not_peak,
         test_no_overflow_charge_target_is_the_overnight_need,
@@ -7759,6 +7961,9 @@ def run_curtailment_tests(my_predbat=None):
         test_sundown_defers_for_an_IMMINENT_session_not_just_a_live_one,
         test_forecast_bands_survive_a_datetime_period_start,
         test_forecast_tracking_band,
+        test_tracking_band_is_too_early_before_enough_energy,
+        test_tracking_band_reports_no_spread_when_bands_collapse,
+        test_tracking_band_still_calls_a_real_miss,
         test_tracking_band_published_for_debugging,
     ]
     print("  --- apply / on_update tests ---")
@@ -8020,6 +8225,11 @@ def run_curtailment_tests(my_predbat=None):
         test_dawn_release_latches_against_midday_cloud,
         test_dawn_reserve_uses_forecast_dawn_load_when_larger,
         test_dawn_release_latch_persists_and_resets_daily,
+        test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
+        test_r63_does_not_engage_below_the_dawn_reserve,
+        test_r63_still_fires_above_the_dawn_reserve,
+        test_r63_drain_sells_to_the_drain_target_not_the_overnight_reserve,
+        test_session_dump_still_sells_to_the_overnight_reserve,
         test_drain_above_publishes_its_source,
         test_session_dump_is_published_as_the_effective_policy,
         test_session_dump_respects_the_heartbeat_precedence_exactly,
