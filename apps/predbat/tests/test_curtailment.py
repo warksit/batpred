@@ -1926,6 +1926,69 @@ def test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up():
     print("  test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up: PASSED")
 
 
+def _advice_attrs(overflow_kwh, tracking, soc_frac):
+    """Publish the phase sensor and return the advice attributes."""
+    base = MockBase(soc_kw=BATTERY_KWH * soc_frac)
+    plugin = CurtailmentPlugin(base)
+    plugin._remaining_overflow = overflow_kwh
+    plugin._overflow_tracking = tracking
+    plugin.publish("active", 0.0, dno_limit_kw=3.68)
+    return base.published["sensor.predbat_curtailment_phase"]["attrs"]
+
+
+def test_advice_uses_the_actual_day_not_p90():
+    """The load-advice alert must be sized on how today is ACTUALLY delivering.
+
+    Andrew, 2026-08-10: "this alert should be on the actual day not p90". The
+    alert says "run the dishwasher, X kWh is going to waste" — advice, not
+    control — so the p90 defence argument does not apply. p90 is what we DEFEND
+    against; it is the wrong number to ask someone to act on, because on a day
+    tracking below p50 it overstates the waste and cries wolf.
+
+    Display-only: `overflow_kwh` is untouched and the drain still uses it.
+    """
+    attrs = _advice_attrs(overflow_kwh=9.8, tracking=6.1, soc_frac=0.56)
+    assert attrs["advice_overflow_kwh"] == 6.1, "advice must use the tracking estimate, got {}".format(attrs["advice_overflow_kwh"])
+    assert attrs["overflow_kwh"] == 9.8, "the CONTROL figure must be untouched, got {}".format(attrs["overflow_kwh"])
+    print("  test_advice_uses_the_actual_day_not_p90: PASSED")
+
+
+def test_advice_falls_back_to_the_forecast_before_the_day_has_data():
+    """`overflow_tracking` is None until the day has delivered enough to judge
+    (RD31/RD33). Before then the forecast is all we have, and advising on
+    nothing is worse than advising on p90."""
+    attrs = _advice_attrs(overflow_kwh=9.8, tracking=None, soc_frac=0.56)
+    assert attrs["advice_overflow_kwh"] == 9.8, "no tracking yet -> fall back to the forecast, got {}".format(attrs["advice_overflow_kwh"])
+    print("  test_advice_falls_back_to_the_forecast_before_the_day_has_data: PASSED")
+
+
+def test_advice_shortfall_is_computed_once_not_three_times():
+    """One number, three readers.
+
+    The two trigger helpers (`binary_sensor.big_overflow_shortfall` and
+    `..._high`) and the notification message each re-derived
+    `overflow - (1 - soc/100) * 18.08`, with the pack size hardcoded in all
+    three. That is the RD22 shape exactly: change one, the others drift. The
+    plugin now publishes the finished figure and all three just read it.
+    """
+    # 85% SOC leaves 2.71 kWh of room against 6.1 kWh of overflow — a real
+    # shortfall, which is the only case the alert exists for.
+    attrs = _advice_attrs(overflow_kwh=9.8, tracking=6.1, soc_frac=0.85)
+    room = BATTERY_KWH * (1 - 0.85)
+    assert abs(attrs["advice_room_kwh"] - round(room, 2)) < 0.02, "room {} vs {}".format(attrs["advice_room_kwh"], room)
+    assert abs(attrs["advice_shortfall_kwh"] - round(6.1 - room, 2)) < 0.02, "shortfall must be advice_overflow - room, got {}".format(attrs["advice_shortfall_kwh"])
+    # And the p90 figure would have overstated it by exactly the gap.
+    assert round(9.8 - room, 2) > attrs["advice_shortfall_kwh"], "p90 must overstate the waste — that is the defect being fixed"
+    print("  test_advice_shortfall_is_computed_once_not_three_times: PASSED")
+
+
+def test_advice_shortfall_never_goes_negative():
+    """A comfortable day must read 0, not a negative "waste"."""
+    attrs = _advice_attrs(overflow_kwh=1.0, tracking=0.4, soc_frac=0.10)
+    assert attrs["advice_shortfall_kwh"] == 0.0, "plenty of room -> 0, got {}".format(attrs["advice_shortfall_kwh"])
+    print("  test_advice_shortfall_never_goes_negative: PASSED")
+
+
 def test_risk_verdict_is_absent_when_there_is_no_overflow_question():
     """No forecast overflow means there is no headroom question to answer, so
     there must be no verdict — matching `pv_at_risk_kwh`, which already
@@ -7940,6 +8003,10 @@ def run_curtailment_tests(my_predbat=None):
         test_at_risk_kwh_is_raw_energy_not_padded_percent,
         test_at_risk_is_zero_when_the_overflow_fits,
         test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up,
+        test_advice_uses_the_actual_day_not_p90,
+        test_advice_falls_back_to_the_forecast_before_the_day_has_data,
+        test_advice_shortfall_is_computed_once_not_three_times,
+        test_advice_shortfall_never_goes_negative,
         test_risk_verdict_is_absent_when_there_is_no_overflow_question,
         test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it,
         test_risk_verdict_reports_risk_early_because_that_direction_is_safe,
