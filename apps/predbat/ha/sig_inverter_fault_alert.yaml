@@ -23,9 +23,9 @@ description: >-
 mode: single
 max_exceeded: silent
 
-trigger:
+triggers:
   # Catches brief protective disconnects (100-sec Environmental Abnormality, etc)
-  - platform: state
+  - trigger: state
     entity_id: sensor.sigen_plant_plant_running_state
     from: "Running"
     to:
@@ -36,7 +36,7 @@ trigger:
     for:
       seconds: 15
   # Catches meter comm fault (SIG still Running but active_power stuck near zero)
-  - platform: numeric_state
+  - trigger: numeric_state
     entity_id: sensor.sigen_inverter_active_power
     above: -0.01
     below: 0.01
@@ -59,8 +59,25 @@ trigger:
   # battery_power in the SAME Modbus poll updated every 1-2 s. The poll-liveness
   # term is what makes this specific: it says "the plant is talking, the meter
   # is not", so an integration outage or an HA restart cannot trigger it.
-  - platform: template
+  #
+  # Caveat, accepted: an HA restart re-stamps last_changed, so grid_age resets
+  # to 0 and the alert goes quiet for 10 min of uptime before it can re-fire.
+  # That is a self-healing FALSE NEGATIVE, never a false alarm, so it is the
+  # safe direction. A restart-proof version would need an input_datetime stamped
+  # on the last genuine grid reading — more moving parts than this is worth.
+  #
+  # A template trigger only fires on a false->true transition, so deploying this
+  # DURING an outage does not raise it for the outage already in progress
+  # (2026-08-10: fired manually to verify, trace showed meter_dead=true,
+  # grid_age_s=2596, poll_age_s=4).
+  - trigger: template
     id: meter_stale
+    note: >-
+      Grid CT stale while the plant still polls. Staleness not value: the fault
+      presented as consumed_power=3.679 (=AC out) before a reboot and 0.000
+      after, and grid power is legitimately ~0 during Solar Charge. A live CT
+      jitters. Not expressible as a native trigger - it compares last_changed
+      across three entities.
     value_template: >-
       {% set grid_age = (now() - states.sensor.sigen_plant_grid_active_power.last_changed).total_seconds() %}
       {% set poll_age = [(now() - states.sensor.sigen_plant_pv_power.last_changed).total_seconds(),
@@ -69,7 +86,7 @@ trigger:
     for:
       minutes: 2
 
-action:
+actions:
   - variables:
       running_state: "{{ states('sensor.sigen_plant_plant_running_state') }}"
       voltage: "{{ states('sensor.sigen_inverter_phase_a_voltage') }}"
