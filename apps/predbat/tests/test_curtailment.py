@@ -1891,49 +1891,74 @@ def test_at_risk_is_zero_when_the_overflow_fits():
     print("  test_at_risk_is_zero_when_the_overflow_fits: PASSED")
 
 
-def test_risk_verdict_is_too_early_before_the_peak():
-    """RD33 — "overflow fits" is a VERDICT and must not be published pre-peak.
+def test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up():
+    """RD33 — the verdict must key off the plugin's OWN fits determination.
 
-    Live 2026-08-08 07:08 the card read "overflow fits — nothing at risk" with an
-    EMPTY battery: headroom 17.75 against overflow_p90 17.89, so at_risk rounded
-    to nothing. The arithmetic was right and the verdict was worthless — the
-    figure inverts as the battery fills, which is the opposite of a conclusion.
+    The first cut of this gated on `_peaked`, which reads `_peak_pv > 0.5`. That
+    is a RUNNING MAXIMUM of PV seen today, so it means "the sun is up", NOT "we
+    are past the peak". On 2026-08-08 PV crossed 0.5 kW at ~07:08 — the exact
+    minute the card was complained about — so the gate would have flipped to
+    "fits" at precisely the moment it was wrong. A near no-op shipped as a fix.
 
-    The real `overflow_fits` latch is already gated on `peaked` (calculate()).
-    The card line was driven by `pv_at_risk_kwh` instead, which is not. Publish
-    the verdict from the plugin so the card cannot re-derive it wrongly.
+    `_overflow_fits_latched` is the real determination: it carries the safety
+    factor, the R45 reserve and FITS_HYST_KWH, and is what the drain logic acts
+    on. Here the sun is up (peak 0.66 kW, the live value) and the battery is
+    empty so the raw subtraction says nothing is at risk — but the plugin has
+    NOT concluded the overflow fits, so the honest answer is "too early".
     """
     base = MockBase(soc_kw=0.33)  # 1.8%, the live SOC
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
-    plugin._overflow_p90 = 17.89
+    plugin._overflow_p90 = 2.0  # headroom 17.75 >> 2.0, so at_risk == 0
     plugin._charge_below, plugin._drain_above = 0.5, 0.18
-    plugin._peaked = False  # dawn: no peak observed yet
+    # `_peaked` is what calculate() sets from `_peak_pv > 0.5`. Setting _peak_pv
+    # alone does NOT exercise the gate — the first version of this test did that
+    # and passed against the very code it was written to condemn.
+    plugin._peak_pv = 0.66  # the live 07:10 value
+    plugin._peaked = True  # sun IS up — the old gate would have said "fits" here
+    plugin._overflow_fits_latched = False
     plugin._publish_dispatch_policy(True, floor_kwh=0.18, soc_kwh=0.33, soc_max=18.08)
     attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
-    assert attrs["risk_verdict"] == "too early", "pre-peak the verdict must be 'too early', got '{}'".format(attrs["risk_verdict"])
-    assert attrs["pv_at_risk_kwh"] == 0.14, "the arithmetic still publishes for diagnostics, got {}".format(attrs["pv_at_risk_kwh"])
-    print("  test_risk_verdict_is_too_early_before_the_peak: PASSED")
+    assert attrs["pv_at_risk_kwh"] == 0.0, "precondition: the raw subtraction must read zero here"
+    assert attrs["risk_verdict"] == "too early", "sun up but no fits determination yet must NOT read as a verdict, got '{}'".format(attrs["risk_verdict"])
+    print("  test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up: PASSED")
 
 
-def test_risk_verdict_calls_it_once_past_the_peak():
-    """RD33 must not gag the verdict either — past the peak it is a real call.
+def test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it():
+    """The one state that may print "fits": the real latch is set."""
+    base = MockBase(soc_kw=1.0)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 2.0
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._overflow_fits_latched = True
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=1.0, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["risk_verdict"] == "fits", "latched fits must read 'fits', got '{}'".format(attrs["risk_verdict"])
+    print("  test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it: PASSED")
 
-    Same shape, `_peaked` True: a battery with room to spare reads "fits", and
-    one without reads "at risk". Asserting both directions so the gate cannot be
-    satisfied by always saying "too early".
+
+def test_risk_verdict_reports_risk_early_because_that_direction_is_safe():
+    """ "at risk" IS trustworthy early, and must not be gagged.
+
+    at_risk = remaining p90 overflow - headroom NOW. Early in the day headroom is
+    at its maximum, so this is the SMALLEST the figure will ever be — it can only
+    worsen as the battery fills. A shortfall visible at dawn is therefore real.
+    Only the "fits" direction is unsound early, which is why the gate is
+    asymmetric rather than a blanket "too early".
     """
-    for soc, p90, expected in ((1.0, 2.0, "fits"), (18.08 * 0.435, 14.14, "at risk")):
-        base = MockBase(soc_kw=soc)
-        base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-        plugin = CurtailmentPlugin(base)
-        plugin._overflow_p90 = p90
-        plugin._charge_below, plugin._drain_above = 2.0, 14.0
-        plugin._peaked = True
-        plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=soc, soc_max=18.08)
-        attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
-        assert attrs["risk_verdict"] == expected, "SOC {:.2f} vs p90 {:.2f} must read '{}', got '{}'".format(soc, p90, expected, attrs["risk_verdict"])
-    print("  test_risk_verdict_calls_it_once_past_the_peak: PASSED")
+    base = MockBase(soc_kw=18.08 * 0.435)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 14.14
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._peak_pv = 0.0  # not even sunrise
+    plugin._overflow_fits_latched = False
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=18.08 * 0.435, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["pv_at_risk_kwh"] > 0
+    assert attrs["risk_verdict"] == "at risk", "a real shortfall must be reported even pre-dawn, got '{}'".format(attrs["risk_verdict"])
+    print("  test_risk_verdict_reports_risk_early_because_that_direction_is_safe: PASSED")
 
 
 def test_forecast_energy_to_now_integrates_the_slots():
@@ -7848,8 +7873,9 @@ def run_curtailment_tests(my_predbat=None):
         test_overflow_tracking_published_and_below_p90,
         test_at_risk_kwh_is_raw_energy_not_padded_percent,
         test_at_risk_is_zero_when_the_overflow_fits,
-        test_risk_verdict_is_too_early_before_the_peak,
-        test_risk_verdict_calls_it_once_past_the_peak,
+        test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up,
+        test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it,
+        test_risk_verdict_reports_risk_early_because_that_direction_is_safe,
         test_forecast_energy_to_now_integrates_the_slots,
         test_tracking_band_from_energy_not_peak,
         test_no_overflow_charge_target_is_the_overnight_need,
