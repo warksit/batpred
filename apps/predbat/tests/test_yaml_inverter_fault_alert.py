@@ -352,6 +352,25 @@ def test_household_message_is_actionable_not_diagnostic():
     print("PASS  household: message is plain and actionable")
 
 
+def test_household_message_names_the_actual_fix():
+    """The fix is a power cycle of the meter, which lives in its own small
+    consumer unit above the tack room roof (Andrew, 2026-08-10).
+
+    The first version of this message deliberately withheld the procedure
+    because the install was unknown here, and pointed at Andrew instead. That
+    was the right call while it WAS unknown and the wrong thing to leave in
+    place once it is not — an alert that says "ring someone" costs a phone call
+    every time. Identified by LOCATION, not by product name: "Sub1G" is on no
+    label she will be looking at, and the tack room roof is unambiguous.
+    """
+    ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running"), _ages(grid_age=2175, poll_age=2))
+    msg = ctx["household_message"]
+    assert "power cycle" in msg.lower() or "switch it off" in msg.lower(), f"must name the fix: {msg}"
+    assert "tack room" in msg.lower(), f"must say where the unit is: {msg}"
+    assert "consumer unit" in msg.lower(), f"must say what to look for: {msg}"
+    print("PASS  household: names the power cycle and where the unit is")
+
+
 def test_household_alert_is_not_critical():
     """Critical overrides silent mode and Do Not Disturb. A meter that cannot
     count is not an emergency — nothing is damaged and export revenue is
@@ -369,6 +388,7 @@ def main():
         test_dead_meter_alerts_the_people_on_site,
         test_other_faults_stay_with_the_maintainer,
         test_household_message_is_actionable_not_diagnostic,
+        test_household_message_names_the_actual_fix,
         test_household_alert_is_not_critical,
         test_dead_meter_is_detected_while_the_plant_runs_normally,
         test_dead_meter_outranks_a_shut_limit,
