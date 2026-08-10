@@ -353,22 +353,31 @@ def test_household_message_is_actionable_not_diagnostic():
 
 
 def test_household_message_names_the_actual_fix():
-    """The fix is a power cycle of the meter, which lives in its own small
-    consumer unit above the tack room roof (Andrew, 2026-08-10).
+    """The fix is a power cycle of the grid meter, done at **a switch IN the
+    tack room** that feeds it (Andrew, 2026-08-10).
 
-    The first version of this message deliberately withheld the procedure
-    because the install was unknown here, and pointed at Andrew instead. That
-    was the right call while it WAS unknown and the wrong thing to leave in
-    place once it is not — an alert that says "ring someone" costs a phone call
-    every time. Identified by LOCATION, not by product name: "Sub1G" is on no
-    label she will be looking at, and the tack room roof is unambiguous.
+    Two corrections are baked into this test, both from getting it wrong first:
+
+    1. The first version withheld the procedure entirely and pointed at Andrew,
+       because the install was genuinely unknown here. Right while unknown,
+       wrong to leave once known — "ring someone" costs a phone call every time
+       the fault recurs, and this one recurs.
+    2. The second version sent her to "its own small consumer unit above the
+       tack room roof". That is where the METER is, not where the SWITCH is.
+       She would have been on a roof looking for the wrong thing. The switch is
+       inside the tack room.
+
+    So this asserts the SWITCH and its location, and explicitly bans the roof
+    wording — a wrong location is worse than no location.
     """
     ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running"), _ages(grid_age=2175, poll_age=2))
     msg = ctx["household_message"]
-    assert "power cycle" in msg.lower() or "switch it off" in msg.lower(), f"must name the fix: {msg}"
-    assert "tack room" in msg.lower(), f"must say where the unit is: {msg}"
-    assert "consumer unit" in msg.lower(), f"must say what to look for: {msg}"
-    print("PASS  household: names the power cycle and where the unit is")
+    low = msg.lower()
+    assert "switch" in low, f"must name the thing she operates: {msg}"
+    assert "tack room" in low, f"must say where that switch is: {msg}"
+    assert "roof" not in low, f"the switch is INSIDE the tack room — must not send her to the roof: {msg}"
+    assert "consumer unit" not in low, f"she operates a switch, not the consumer unit: {msg}"
+    print("PASS  household: names the tack-room switch, not the roof")
 
 
 def test_household_alert_is_not_critical():
