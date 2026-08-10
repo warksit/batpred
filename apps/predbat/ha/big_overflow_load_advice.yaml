@@ -31,11 +31,11 @@ description: >-
 mode: single
 max_exceeded: silent
 
-trigger:
-  - platform: time_pattern
+triggers:
+  - trigger: time_pattern
     minutes: "/15"
 
-condition:
+conditions:
   - condition: state
     entity_id: sensor.predbat_curtailment_phase
     state: "Active"
@@ -55,13 +55,14 @@ condition:
           - condition: time
             after: "09:00:00"
             before: "13:00:00"
+          # Native `for:` rather than hand-rolled last_changed maths — same
+          # semantics (both measure continuous time in state, both reset on an
+          # HA restart) with no Jinja to get wrong.
           - condition: state
             entity_id: binary_sensor.big_overflow_shortfall_high
             state: "on"
-          - condition: template
-            value_template: >-
-              {% set s = states.binary_sensor.big_overflow_shortfall_high %}
-              {{ (now() - s.last_changed).total_seconds() >= 7200 }}
+            for:
+              hours: 2
       - condition: and
         conditions:
           - condition: time
@@ -69,12 +70,10 @@ condition:
           - condition: state
             entity_id: binary_sensor.big_overflow_shortfall
             state: "on"
-          - condition: template
-            value_template: >-
-              {% set s = states.binary_sensor.big_overflow_shortfall %}
-              {{ (now() - s.last_changed).total_seconds() >= 1800 }}
+            for:
+              minutes: 30
 
-action:
+actions:
   - variables:
       # 2026-08-10: was `overflow_kwh` (the p90 CONTROL figure) with the room
       # maths re-derived here and in both trigger helpers, pack size hardcoded
