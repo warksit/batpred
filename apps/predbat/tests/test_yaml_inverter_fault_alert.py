@@ -35,6 +35,17 @@ POLICY = "input_select.sig_dispatch_policy"
 REQUESTED_MODE = "input_select.predbat_requested_mode"
 
 
+def _triggers(auto):
+    """HA accepts `trigger:` and `triggers:`; the deployed config uses the modern
+    plural. Read either so a key-style change cannot quietly bypass these tests."""
+    return auto.get("triggers", auto.get("trigger"))
+
+
+def _actions(auto):
+    """As _triggers, for `action:` / `actions:`."""
+    return auto.get("actions", auto.get("action"))
+
+
 def _load(path=None):
     with open(path or YAML_PATH) as f:
         return yaml.safe_load(f)
@@ -78,7 +89,7 @@ class _States:
 
 def _render_fault_type(auto, states, ages=None):
     """Render the action `variables` block in order, like HA does."""
-    variables = auto["action"][0]["variables"]
+    variables = _actions(auto)[0]["variables"]
     return _render_block(variables, states, ages)["fault_type"]
 
 
@@ -173,7 +184,7 @@ def test_protective_states_unchanged():
 def test_critical_sound_only_for_genuine_faults():
     """Protective states stay non-critical; clamp and meter faults stay critical."""
     auto = _load()
-    sound = auto["action"][1]["data"]["data"]["push"]["sound"]
+    sound = _actions(auto)[1]["data"]["data"]["push"]["sound"]
     assert "is_protective" in str(sound.get("critical")), f"critical flag must key off is_protective: {sound}"
     print("PASS  sound: critical gated on is_protective")
 
@@ -213,7 +224,7 @@ def test_clamp_still_fires_when_cm_owns_the_wheel():
 
 def _meter_trigger(auto):
     """The `meter_stale` trigger, by id."""
-    for trig in auto["trigger"]:
+    for trig in _triggers(auto):
         if trig.get("id") == "meter_stale":
             return trig
     raise AssertionError("no trigger with id 'meter_stale' — the 2026-08-10 fault has no detector")
@@ -229,7 +240,7 @@ def test_dead_meter_is_detected_while_the_plant_runs_normally():
     while pv_power and battery_power in the same poll updated every 1-2 s.
     """
     auto = _load()
-    ctx = _render_block(auto["action"][0]["variables"], _mock(running="Running"), _ages(grid_age=2175, poll_age=2))
+    ctx = _render_block(_actions(auto)[0]["variables"], _mock(running="Running"), _ages(grid_age=2175, poll_age=2))
     assert ctx["meter_dead"] is True, "38 min of frozen grid power with a live poll must read as a dead meter"
     msg = ctx["fault_type"]
     assert "METER DEAD" in msg, f"must name the fault: {msg}"
@@ -243,7 +254,7 @@ def test_dead_meter_outranks_a_shut_limit():
     """Ordering matters. With the meter dead, `consumed_power` is derived, so the
     clamp heuristic is reading fiction — the meter branch must come FIRST or the
     alert sends you after a battery clamp that may not exist."""
-    ctx = _render_block(_load()["action"][0]["variables"], _mock(running="Running", disch=0.0), _ages(grid_age=2175, poll_age=2))
+    ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running", disch=0.0), _ages(grid_age=2175, poll_age=2))
     assert "METER DEAD" in ctx["fault_type"], f"meter must win over clamp: {ctx['fault_type']}"
     print("PASS  meter dead: outranks the clamp branch")
 
@@ -253,7 +264,7 @@ def test_live_meter_is_never_reported_dead():
     silent — `Solar Charge Battery` targets zero grid flow BY DESIGN, so a
     value-based test would false-alarm every time it ran. Only staleness counts."""
     for grid_age in (0, 5, 60, 599):
-        ctx = _render_block(_load()["action"][0]["variables"], _mock(running="Running", policy="Solar Charge Battery"), _ages(grid_age=grid_age, poll_age=1))
+        ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running", policy="Solar Charge Battery"), _ages(grid_age=grid_age, poll_age=1))
         assert ctx["meter_dead"] is False, f"grid {grid_age}s old is a live meter, not a fault"
         assert "METER DEAD" not in ctx["fault_type"], f"grid {grid_age}s old must not alert"
     print("PASS  live meter: fresh grid reading never reported dead (incl. Solar Charge zero-flow)")
@@ -263,7 +274,7 @@ def test_stale_poll_is_not_blamed_on_the_meter():
     """If the whole integration stops (HA restart, Modbus drop) EVERYTHING goes
     stale. That is not a meter fault and must not be reported as one — the
     poll-liveness term is what makes the detector specific."""
-    ctx = _render_block(_load()["action"][0]["variables"], _mock(running="Running"), _ages(grid_age=3000, poll_age=3000))
+    ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running"), _ages(grid_age=3000, poll_age=3000))
     assert ctx["meter_dead"] is False, "a dead integration is not a dead meter"
     assert "METER DEAD" not in ctx["fault_type"]
     print("PASS  specificity: whole-integration outage is not reported as a meter fault")
@@ -275,7 +286,7 @@ def test_trigger_and_variable_agree():
     variable. Render both over the same cases and assert they never disagree —
     the RD22 sell-clamp shipped with one of two copies fixed (2026-08-06)."""
     trig_tmpl = _meter_trigger(_load())["value_template"]
-    variables = _load()["action"][0]["variables"]
+    variables = _actions(_load())[0]["variables"]
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
     for grid_age, poll_age in ((2175, 2), (5, 1), (3000, 3000), (601, 119), (599, 121), (700, 60)):
         states = _mock(running="Running")
