@@ -16,7 +16,7 @@
 # Companion sensors:
 #   binary_sensor.big_overflow_shortfall      — ON when shortfall ≥ 1 kWh (afternoon signal)
 #   binary_sensor.big_overflow_shortfall_high — ON when shortfall ≥ 3 kWh (morning signal)
-#   shortfall = (overflow_kwh - battery_room) where battery_room = (1 - soc/100) × 18.08
+#   shortfall = advice_shortfall_kwh, published by curtailment_plugin (one source)
 #
 # Sent to both Andrew and Shona since it's a friendly suggestion.
 
@@ -76,12 +76,14 @@ condition:
 
 action:
   - variables:
-      overflow_kwh: "{{ state_attr('sensor.predbat_curtailment_phase', 'overflow_kwh') | float(0) }}"
-      soc_pct: "{{ states('sensor.sigen_plant_battery_state_of_charge') | float(0) }}"
-      soc_max: 18.08
-      soc_kwh: "{{ (soc_pct / 100) * soc_max }}"
-      room_kwh: "{{ soc_max - soc_kwh }}"
-      shortfall_kwh: "{{ (overflow_kwh - room_kwh) | round(1) }}"
+      # 2026-08-10: was `overflow_kwh` (the p90 CONTROL figure) with the room
+      # maths re-derived here and in both trigger helpers, pack size hardcoded
+      # three times. Now one finished number from the plugin.
+      # p90 is what we DEFEND against; advice must be sized on the actual day,
+      # or it overstates the waste on a below-p50 day and cries wolf.
+      overflow_kwh: "{{ state_attr('sensor.predbat_curtailment_phase', 'advice_overflow_kwh') | float(0) }}"
+      room_kwh: "{{ state_attr('sensor.predbat_curtailment_phase', 'advice_room_kwh') | float(0) }}"
+      shortfall_kwh: "{{ state_attr('sensor.predbat_curtailment_phase', 'advice_shortfall_kwh') | float(0) | round(1) }}"
       safe_time: "{{ state_attr('sensor.predbat_curtailment_phase', 'safe_time') }}"
 
   - action: notify.mobile_app_andrew_iphone

@@ -2321,6 +2321,12 @@ class CurtailmentPlugin(PredBatPlugin):
             target_kwh = min(self._overnight_target_kwh, soc_max) if soc_max else self._overnight_target_kwh
 
         floor_pct = round(target_kwh / soc_max * 100, 1) if soc_max > 0 else 100
+
+        # Advice figures (see the attributes below). Computed here so the HA
+        # helpers and the notification all read one finished number.
+        advice_overflow_kwh = round(float(self._overflow_tracking if self._overflow_tracking is not None else (self._remaining_overflow or 0.0)), 2)
+        advice_room_kwh = round(max(0.0, soc_max - float(getattr(self.base, "soc_kw", 0) or 0)), 2)
+        advice_shortfall_kwh = round(max(0.0, advice_overflow_kwh - advice_room_kwh), 2)
         state = "Active" if phase == "active" else "Off"
 
         # RD29: the band tracks ENERGY, not a single peak. `actual_scale` is a
@@ -2375,6 +2381,20 @@ class CurtailmentPlugin(PredBatPlugin):
                 # band rescaled by the day's actual delivery so far. Nothing
                 # downstream reads it; the floor still uses the confidence blend.
                 "overflow_tracking": self._overflow_tracking,
+                # ADVICE figures — the load-advice alert only (RD31 use, display).
+                # Andrew 2026-08-10: "this alert should be on the actual day not
+                # p90". p90 is what we DEFEND against; it is the wrong number to
+                # ask a human to act on, because on a day tracking below p50 it
+                # overstates the waste and cries wolf. Falls back to the forecast
+                # while `overflow_tracking` is None (too early to judge).
+                #
+                # Published FINISHED, room and all. The two trigger helpers and
+                # the notification each re-derived
+                # `overflow - (1 - soc/100) * 18.08` with the pack size hardcoded
+                # three times — the RD22 shape exactly. One number, three readers.
+                "advice_overflow_kwh": advice_overflow_kwh,
+                "advice_room_kwh": advice_room_kwh,
+                "advice_shortfall_kwh": advice_shortfall_kwh,
                 "day_tracking_ratio": round(self._day_ratio, 3) if self._day_ratio is not None else None,
                 "confidence": self._confidence,
                 "safe_time": self._safe_time_str,
