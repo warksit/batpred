@@ -13,6 +13,15 @@ SAFE_PV_THRESHOLD_KW = 2.0
 
 MIN_BASE_LOAD_KW = 0.5
 
+# RD33 tracking-band gates. Below MIN_TRACKING_ENERGY_KWH of EXPECTED energy so
+# far there is not enough day to judge (dawn); below MIN_TRACKING_SPREAD_KWH of
+# p10-p90 span there is nothing to interpolate on (a confident Solcast collapses
+# the bands). 3.0 kWh lands mid-morning in summer, which is the earliest the
+# answer is worth printing; 1.0 kWh of span is roughly the point at which a
+# normal forecast error stops saturating the scale.
+MIN_TRACKING_ENERGY_KWH = 3.0
+MIN_TRACKING_SPREAD_KWH = 1.0
+
 # R63 drain-deadline release band (kWh). Draining CLEARS the breach, so this is
 # hysteresis on a closed loop, not a latch — see drain_deadline_breached().
 R63_HYST_KWH = 0.5
@@ -526,7 +535,7 @@ def day_tracking_ratio(actual_kwh, expected_p50_kwh, min_expected_kwh=1.0, lo=0.
     return max(lo, min(hi, actual / expected))
 
 
-def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale):
+def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale, min_expected_kwh=MIN_TRACKING_ENERGY_KWH, min_spread_kwh=MIN_TRACKING_SPREAD_KWH):
     """Which Solcast band is today's observed sky actually tracking?
 
     The plugin derives THREE overflow integrals from three clear-sky scales
@@ -561,6 +570,25 @@ def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale):
         return "unknown", None
     if not (p10 <= p50 <= p90):
         return "unknown", None
+
+    # RD33 — two ways the bands are USABLE but the answer is still meaningless.
+    # Both are distinct from "unknown", which means the bands are broken; these
+    # mean the bands are fine and the question is premature or unanswerable.
+    #
+    # "too early": live 2026-08-08 07:10, actual 0.28 kWh against expected
+    # p10/p50/p90 of 0.57/0.60/0.63. The card read "sky tracking below p10 (0%)"
+    # an hour after sunrise, on a day forecast at 55.8 kWh p50 remaining — a
+    # confident verdict on a day that had not happened yet. `day_tracking_ratio`
+    # already refuses this via min_expected_kwh; the classifier had no such gate.
+    #
+    # "no spread": live 2026-08-07, whole-day bands 10.12/10.15/10.23. When
+    # Solcast is confident the three collapse, any small miss saturates a 0.11 kWh
+    # span and prints "below p10". Unlike "too early" this never improves as the
+    # day goes on, so it is reported separately — the cause and the cure differ.
+    if p50 < min_expected_kwh:
+        return "too early", None
+    if (p90 - p10) < min_spread_kwh:
+        return "no spread", None
 
     if a < p10:
         label = "below p10"
