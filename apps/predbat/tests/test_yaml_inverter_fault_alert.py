@@ -298,8 +298,78 @@ def test_trigger_and_variable_agree():
     print("PASS  duplicate-logic: meter_stale trigger and meter_dead variable agree on all 6 cases")
 
 
+HOUSEHOLD_SERVICES = ("notify.mobile_app_iphone", "notify.mobile_app_shona_s_ipad")
+ANDREW_SERVICE = "notify.mobile_app_andrew_iphone"
+
+
+def _household_branch(auto):
+    """The `if meter_dead` block that notifies the people on site."""
+    for step in _actions(auto):
+        if "if" in step:
+            return step
+    raise AssertionError("no conditional branch — the on-site household is never notified")
+
+
+def _notify_targets(steps):
+    return [s.get("action") for s in steps if str(s.get("action", "")).startswith("notify.")]
+
+
+def test_dead_meter_alerts_the_people_on_site():
+    """Only someone AT the property can fix a meter comms fault, so a dead meter
+    must reach the household, not just the person who maintains the system.
+
+    2026-08-10: the fault ran from 08:23 with the one alert target being a phone
+    that was not on site. Deliberately scoped to the meter branch — see
+    test_other_faults_stay_with_the_maintainer."""
+    branch = _household_branch(_load())
+    targets = _notify_targets(branch["then"])
+    for svc in HOUSEHOLD_SERVICES:
+        assert svc in targets, f"{svc} must be notified for a dead meter, got {targets}"
+    print("PASS  household: dead meter reaches both on-site devices")
+
+
+def test_other_faults_stay_with_the_maintainer():
+    """A clamped battery, a G99 disconnect or a Predbat freeze are not on-site
+    actionable — routing those to the household is pure noise, and noise is how
+    the real 2026-07-28 lockout got dismissed."""
+    branch = _household_branch(_load())
+    cond = str(branch["if"])
+    assert "meter_dead" in cond, f"the household branch must be gated on meter_dead alone, got {cond}"
+    assert "is_clamped" not in cond and "is_protective" not in cond, f"must not widen beyond the meter fault: {cond}"
+    print("PASS  household: gated on meter_dead only")
+
+
+def test_household_message_is_actionable_not_diagnostic():
+    """Andrew's message names registers and Sub1G links. That text is useless to
+    someone being asked to go and look at the meter — and jargon they cannot act
+    on trains them to ignore the alert."""
+    ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running"), _ages(grid_age=2175, poll_age=2))
+    msg = ctx["household_message"]
+    for jargon in ("Sub1G", "CT", "DERIVED", "curtailment", "Modbus", "kW"):
+        assert jargon not in msg, f"household message must not contain {jargon!r}: {msg}"
+    assert "meter" in msg.lower(), f"must say what is wrong: {msg}"
+    assert "Andrew" in msg, f"must tell her he already knows, so she does not have to relay it: {msg}"
+    print("PASS  household: message is plain and actionable")
+
+
+def test_household_alert_is_not_critical():
+    """Critical overrides silent mode and Do Not Disturb. A meter that cannot
+    count is not an emergency — nothing is damaged and export revenue is
+    unaffected — and this can fire at 03:00 as easily as at noon."""
+    branch = _household_branch(_load())
+    for step in branch["then"]:
+        if str(step.get("action", "")).startswith("notify."):
+            crit = str(step["data"]["data"]["push"]["sound"]["critical"])
+            assert crit == "0", f"household alert must not be critical, got {crit}"
+    print("PASS  household: normal priority, not critical")
+
+
 def main():
     for t in (
+        test_dead_meter_alerts_the_people_on_site,
+        test_other_faults_stay_with_the_maintainer,
+        test_household_message_is_actionable_not_diagnostic,
+        test_household_alert_is_not_critical,
         test_dead_meter_is_detected_while_the_plant_runs_normally,
         test_dead_meter_outranks_a_shut_limit,
         test_live_meter_is_never_reported_dead,

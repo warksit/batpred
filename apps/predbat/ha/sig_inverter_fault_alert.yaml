@@ -135,6 +135,23 @@ actions:
         {% elif s == 'Standby' %}SIG Standby - recovering from protective disconnect. No action needed.
         {% else %}SIG Inverter Fault ({{ s }}) - check inverter.
         {% endif %}
+      # The same fault, written for whoever is AT the house. Only someone on
+      # site can fix a meter comms fault, and the diagnostic text above is
+      # useless to them — register names and Sub1G links are not instructions.
+      # Jargon you cannot act on is how an alert teaches you to ignore it, which
+      # is the 2026-07-28 lesson in a different costume.
+      #
+      # Deliberately does NOT prescribe electrical work: the exact physical step
+      # depends on the install and is not known here, so it carries Sigenergy's
+      # own wording and points at Andrew rather than inventing a procedure.
+      household_message: >-
+        Middlemuir solar: the electricity meter has stopped talking to the
+        battery system ({{ (grid_age_s | float(0) / 60) | round(0) }} minutes
+        ago). The solar and battery are still working normally and nothing is at
+        risk — but the system cannot read the meter, so it is running blind.
+        What to do: this one needs someone at the house. Sigenergy says to check
+        that the meter's communication connection is secure and properly seated.
+        Andrew has had the technical alert too and can talk you through it.
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
       pv: "{{ states('sensor.sigen_plant_pv_power') }}"
 
@@ -148,3 +165,37 @@ actions:
             name: "default"
             critical: "{{ 0 if is_protective else 1 }}"
             volume: 0.5
+
+  # A dead meter is the ONE fault only someone on site can clear, so it is the
+  # one that goes to the household as well. Everything else here (battery
+  # clamps, G99 disconnects, Predbat freezes) is remote-actionable and would be
+  # pure noise on their phones.
+  #
+  # NOT critical, unlike Andrew's copy: critical overrides silent mode and Do
+  # Not Disturb, and this can fire at 03:00 as easily as at noon. Nothing is
+  # damaged by a meter that cannot count, and export revenue is unaffected
+  # (Octopus meters that independently) — so it can wait until morning.
+  - if:
+      - condition: template
+        value_template: "{{ meter_dead }}"
+    then:
+      - action: notify.mobile_app_iphone
+        data:
+          title: "Middlemuir solar — needs a look"
+          message: "{{ household_message }}"
+          data:
+            push:
+              sound:
+                name: "default"
+                critical: "0"
+                volume: 0.5
+      - action: notify.mobile_app_shona_s_ipad
+        data:
+          title: "Middlemuir solar — needs a look"
+          message: "{{ household_message }}"
+          data:
+            push:
+              sound:
+                name: "default"
+                critical: "0"
+                volume: 0.5
