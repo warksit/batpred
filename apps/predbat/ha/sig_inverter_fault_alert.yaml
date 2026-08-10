@@ -127,7 +127,7 @@ actions:
       meter_dead: "{{ grid_age_s | float(0) > 600 and poll_age_s | float(999) < 120 }}"
       fault_type: >-
         {% set s = states('sensor.sigen_plant_plant_running_state') %}
-        {% if meter_dead %}METER DEAD - the grid CT has stopped reporting. Grid power frozen at {{ states('sensor.sigen_plant_grid_active_power') }} kW for {{ (grid_age_s | float(0) / 60) | round(0) }} min while the plant polls normally (PV {{ states('sensor.sigen_plant_pv_power') }} kW, updated {{ poll_age_s }}s ago). Consumed power is DERIVED, not measured, so load and export figures are fiction and curtailment control is flying blind on load. Export REVENUE is unaffected (Octopus meters that separately). ACTION: power-cycle the Sub1G meter in its own consumer unit above the tack room roof (30 s off). mySigen alert 4001. A plant reboot does NOT clear it (tried 2026-08-10).
+        {% if meter_dead %}METER DEAD - the grid CT has stopped reporting. Grid power frozen at {{ states('sensor.sigen_plant_grid_active_power') }} kW for {{ (grid_age_s | float(0) / 60) | round(0) }} min while the plant polls normally (PV {{ states('sensor.sigen_plant_pv_power') }} kW, updated {{ poll_age_s }}s ago). Consumed power is DERIVED, not measured, so load and export figures are fiction and curtailment control is flying blind on load. Export REVENUE is unaffected (Octopus meters that separately). ACTION: power-cycle the grid meter at the switch IN the tack room that feeds it (30 s off). mySigen alert 4001. A plant reboot does NOT clear it (tried 2026-08-10).
         {% elif s == 'Running' and is_clamped %}Battery CLAMPED - inverter running but idle because the ESS limits are shut, not a meter fault. discharge_limit={{ disch_limit }}kW (rated {{ rated_disch }}), import_limit={{ import_limit }}. Predbat is NOT deliberately freezing (policy={{ states('input_select.sig_dispatch_policy') }}, requested_mode={{ states('input_select.predbat_requested_mode') }}), so this is a stale clamp nobody owns. ACTION: check sig_dispatch_heartbeat is enabled and input_number.discharge_rate is not 0.
         {% elif s == 'Running' %}Meter Communication Fault - inverter running but idle, limits are open so likely lost meter connection. ACTION: Check mySigen app for alert 4001_2. May need meter power cycle.
         {% elif s == 'Shutdown' %}SIG Protective Disconnect (Shutdown) - G99 grid protection. Auto-recovers in 3-5 min. No action needed.
@@ -153,9 +153,9 @@ actions:
         battery system ({{ (grid_age_s | float(0) / 60) | round(0) }} minutes
         ago). The solar and battery are still working normally and nothing is at
         risk — but the system cannot read the meter, so it is running blind.
-        What to do: the meter needs switching off and on again. It has its own
-        small consumer unit above the tack room roof — switch it off there, wait
-        about 30 seconds, then switch it back on, and give it a few minutes to
+        What to do: the meter needs switching off and on again. There is a
+        switch in the tack room that powers it — switch that off, wait about 30
+        seconds, then switch it back on, and give it a few minutes to
         reconnect. Andrew has had the technical alert too and can talk you
         through it if anything looks different to that.
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
