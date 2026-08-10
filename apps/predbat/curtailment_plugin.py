@@ -3230,7 +3230,25 @@ class CurtailmentPlugin(PredBatPlugin):
                 # correctly None at the time; the card just was not reading it.
                 # Publish the verdict from here so the card cannot re-derive it
                 # wrongly, and say "too early" until the peak has been observed.
-                risk_verdict = "too early" if not self._peaked else ("fits" if pv_at_risk_kwh <= 0 else "at risk")
+                # Gate on the plugin's OWN determination, not on `_peaked`.
+                # `_peaked` is `_peak_pv > 0.5` and `_peak_pv` is a RUNNING MAX of
+                # PV seen today, so it means "the sun is up", not "past the peak".
+                # Live 2026-08-08 PV crossed 0.5 kW at ~07:08 — the exact minute
+                # the card was wrong — so gating on it flipped to "fits" precisely
+                # when it should not have. `_overflow_fits_latched` is the real
+                # test: safety factor, R45 reserve and FITS_HYST_KWH included, and
+                # it is what the drain logic acts on.
+                #
+                # Asymmetric on purpose. "at risk" IS sound early: at_risk is
+                # p90 remaining minus headroom NOW, and headroom is at its maximum
+                # early, so the figure can only worsen as the battery fills. Only
+                # "fits" is unsound before the plugin has concluded it.
+                if self._overflow_fits_latched:
+                    risk_verdict = "fits"
+                elif pv_at_risk_kwh > 0:
+                    risk_verdict = "at risk"
+                else:
+                    risk_verdict = "too early"
                 denom = max(soc_max, 0.1)
                 headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
                 headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
@@ -3304,7 +3322,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 # RD33 display: "too early" | "fits" | "at risk". The card renders
                 # THIS, never its own subtraction of the two numbers above.
                 "risk_verdict": risk_verdict,
-                "peaked": self._peaked,
+                # Named for what it MEANS, not for the internal variable: a
+                # running-max test reading "peaked" is what caused the bad gate.
+                "sun_seen_today": self._peaked,
+                "overflow_fits": self._overflow_fits_latched,
             }
             self.base.dashboard_item(
                 "sensor.{}_curtailment_intended_policy".format(prefix),
