@@ -11,6 +11,8 @@ import os
 import re
 import sys
 from datetime import datetime
+from datetime import datetime as _dt
+from datetime import timezone as _tz
 
 # Ensure apps/predbat is on the path when run standalone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -6688,6 +6690,75 @@ def test_dawn_release_latch_persists_and_resets_daily():
     print("  test_dawn_release_latch_persists_and_resets_daily: PASSED")
 
 
+def test_r63_never_forces_max_export_through_a_session_reserve():
+    """R63 RETIRED (2026-08-10). The deadline is a DIAGNOSTIC, not a lever.
+
+    Audit finding: R63's condition is `needed > sheddable` and the ordinary
+    Schmitt drains on `needed > 0`, with `sheddable >= 0` by construction. So
+    every state where R63 fires is one where the Schmitt is ALREADY draining —
+    it can never fire earlier, contrary to the requirement's central claim. It
+    was written against the bare energy test, which was replaced by the
+    safety-factored `required_headroom_kwh` in the SAME 2026-07-28 change set.
+
+    Its documented purpose (outrank `no_drain`) is unreachable in both branches:
+    `overflow_fits` needs fits_margin >= buffer while R63 needs needed > 0, and
+    needed == -fits_margin, so they are mutually exclusive; `past_safe` is an
+    evening state while R63 is hard-gated on lockout still being ahead.
+
+    That left exactly one distinct behaviour, which this test pins: draining
+    through a SAVING-SESSION reserve. SOC sits below `session_protect` (so the
+    Schmitt correctly Holds) but above R63's own floor, and the day is short of
+    headroom. The old code forced Max Export here — dumping premium-rate energy
+    at the ordinary export rate to buy headroom, a trade nobody chose.
+    """
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 1.2, "sensor.sigen_plant_consumed_power": 0.6}
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    overrides.update(_saving_session_sensors(active=False, next_mins=60, next_start="2025-07-12T19:00:00+00:00"))
+    # now_utc MUST match minutes_now — the solar geometry reads now_utc, so a
+    # mismatched rig puts lockout in the past and R63 never engages, and the test
+    # passes against the very code it condemns. First version of this test did
+    # exactly that (2026-08-10), the same rig-fidelity trap as 2026-08-05.
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.40,  # 7.23 kWh — BELOW session_protect 7.68, so the Schmitt Holds
+        minutes_now=360,  # 06:00 — lockout still ahead, so R63 is live
+        now_utc=_dt(2025, 7, 12, 6, 0, tzinfo=_tz.utc),
+        best_soc_keep=4.0,
+        sensor_overrides=overrides,
+    )
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 1.2
+    plugin._overnight_target_kwh = 6.0
+    plugin.calculate(dno_limit_kw=3.68)
+
+    assert plugin._policy_override != "max_export", "R63 must not force Max Export through the session reserve (override={})".format(plugin._policy_override)
+    print("  test_r63_never_forces_max_export_through_a_session_reserve: PASSED")
+
+
+def test_deadline_shortfall_is_published_as_a_diagnostic():
+    """Removing the override must NOT throw away the measurement.
+
+    "We cannot make enough room before the cap locks out" is real and useful —
+    it is the honest input for the load-advice alert ("run the dishwasher"), and
+    it is the one thing the Schmitt does not already tell us. It just is not an
+    instruction, because when it is true we are already draining flat out.
+    """
+    base = MockBase(soc_kw=18.08 * 0.435)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 14.14
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._r63_needed_kwh = 3.8
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=18.08 * 0.435, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert "headroom_deadline_short_kwh" in attrs, "the deadline measurement must survive as a diagnostic: {}".format(sorted(attrs))
+    print("  test_deadline_shortfall_is_published_as_a_diagnostic: PASSED")
+
+
 def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     """RD32 — R63 must drain to the SAME floor the Schmitt does.
 
@@ -6746,36 +6817,6 @@ def test_r63_still_fires_above_the_dawn_reserve():
     assert drainable > 0
     assert drain_deadline_breached(3.80, 3.46, engaged=False, drainable_kwh=drainable), "with 9 kWh above the reserve R63 must still force the drain"
     print("  test_r63_still_fires_above_the_dawn_reserve: PASSED (drainable {:.2f} kWh)".format(drainable))
-
-
-def test_r63_drain_sells_to_the_drain_target_not_the_overnight_reserve():
-    """RD32 — the published sell floor must be the floor R63 is draining TO.
-
-    Live 2026-08-08 06:25-06:44: R63 drove Max Export while the keep floor read
-    38% (the overnight reserve) against a 7% SOC, because
-    `is_curtailment_drain` required `_policy_override is None` and R63 sets it to
-    "max_export". `sig_keep_floor_guard` therefore clamped Max Export back to
-    Hold Battery every ~3 minutes — 8 policy writes in 20 minutes, plugin vs
-    guard, neither wrong about its own rule.
-
-    R63's drain IS a curtailment drain. The sell floor must be `drain_above`,
-    which already carries the dawn-reserve arm, so the guard enforces the same
-    number the Schmitt does instead of fighting it.
-    """
-    base = MockBase()
-    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    plugin = CurtailmentPlugin(base)
-    plugin._charge_below, plugin._drain_above = 0.5, 1.81
-    plugin._overnight_target_kwh = 6.87  # 38% — what it wrongly published live
-    plugin._policy_override = "max_export"
-    plugin._r63_engaged = True
-    base.services.clear()
-    plugin._publish_dispatch_policy(True, floor_kwh=0.0, soc_kwh=1.30, soc_max=18.08)
-    assert _policy_calls(base) == ["Max Export"], base.services
-    kf = _keep_floor_calls(base)
-    assert kf, "R63 drain must publish a sell floor"
-    assert abs(kf[-1] - 10.0) <= 1, "sell floor must be drain_above (1.81 kWh = 10%), not the 38% overnight reserve — got {}".format(kf[-1])
-    print("  test_r63_drain_sells_to_the_drain_target_not_the_overnight_reserve: PASSED ({}%)".format(kf[-1]))
 
 
 def test_session_dump_still_sells_to_the_overnight_reserve():
@@ -8251,10 +8292,11 @@ def run_curtailment_tests(my_predbat=None):
         test_dawn_release_latches_against_midday_cloud,
         test_dawn_reserve_uses_forecast_dawn_load_when_larger,
         test_dawn_release_latch_persists_and_resets_daily,
+        test_r63_never_forces_max_export_through_a_session_reserve,
+        test_deadline_shortfall_is_published_as_a_diagnostic,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,
-        test_r63_drain_sells_to_the_drain_target_not_the_overnight_reserve,
         test_session_dump_still_sells_to_the_overnight_reserve,
         test_drain_above_publishes_its_source,
         test_session_dump_is_published_as_the_effective_policy,

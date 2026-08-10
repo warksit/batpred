@@ -1870,11 +1870,28 @@ class CurtailmentPlugin(PredBatPlugin):
         # 5 min 46 s of selling the battery past the paid window. The heartbeat
         # cannot fix that edge while the plugin overrides the select.
         self._session_active = self._is_saving_session_active()
-        if self._r63_engaged:
-            # Outranks no_drain: that says "it fits right now", R63 says "it won't
-            # fit later and this is the last chance to do anything about it".
-            self._policy_override = "max_export"
-        elif self._overflow_fits_latched or past_safe:
+        # R63 RETIRED 2026-08-10 — it used to set `_policy_override = "max_export"`
+        # here. Audit: its condition is `needed > sheddable` while the ordinary
+        # Schmitt drains on `needed > 0` and `sheddable >= 0`, so it could only
+        # ever fire in states where the drain was ALREADY running — never earlier,
+        # contrary to the requirement's central claim. It was written against the
+        # bare energy test, which the same 2026-07-28 change set replaced with the
+        # safety-factored `required_headroom_kwh`.
+        #
+        # Its stated job (outrank no_drain) is unreachable: `overflow_fits` needs
+        # fits_margin >= buffer and R63 needs needed > 0, with needed ==
+        # -fits_margin — mutually exclusive; `past_safe` is an evening state and
+        # R63 is gated on lockout still being ahead.
+        #
+        # So its only distinct effect was draining through a floor something else
+        # had deliberately raised: the dawn reserve (2026-08-08, ran the pack to
+        # 1.8% in the dark) and `session_protect` (premium energy dumped at the
+        # ordinary export rate). Neither was a decision anyone took.
+        #
+        # The measurement is kept and published — "we cannot make room before the
+        # cap locks out" is real and useful. It is a DIAGNOSTIC, not a lever:
+        # when it is true we are already draining flat out, so it names no action.
+        if self._overflow_fits_latched or past_safe:
             # v32.1 (2026-07-22): "no_drain" — no curtailment risk left (overflow
             # fits, or past safe_time), so DRAIN is a pointless round-trip and is
             # suppressed. But the Schmitt still runs: CHARGE fires when SOC is below
@@ -3113,9 +3130,9 @@ class CurtailmentPlugin(PredBatPlugin):
             # have clamped a normal curtailment drain 23 points above its target
             # (caught by test_sell_floor_overflow_floor_during_curtailment_drain,
             # which sets drain_above 5.0 kWh against floor_kwh 0.9).
-            is_curtailment_drain = schmitt == "Drain" and (self._policy_override is None or self._r63_engaged)
+            is_curtailment_drain = self._policy_override is None and schmitt == "Drain"
             if is_curtailment_drain:
-                sell_floor_kwh = self._r63_floor_kwh(soc_max) if self._r63_engaged else floor_kwh
+                sell_floor_kwh = floor_kwh
             elif self._overnight_target_kwh:
                 sell_floor_kwh = self._overnight_target_kwh
             else:
@@ -3319,6 +3336,11 @@ class CurtailmentPlugin(PredBatPlugin):
                 "headroom_short_pct": headroom_short_pct,
                 # RD30: raw kWh at risk — what the card should show.
                 "pv_at_risk_kwh": pv_at_risk_kwh,
+                # Retired-R63 measurement, kept as a diagnostic: how much headroom
+                # we still need that cannot be shed before the export cap locks
+                # out. Names no action (we are already draining) but it is the
+                # honest input for the load-advice alert.
+                "headroom_deadline_short_kwh": round(max(0.0, float(self._r63_needed_kwh or 0.0)), 2),
                 # RD33 display: "too early" | "fits" | "at risk". The card renders
                 # THIS, never its own subtraction of the two numbers above.
                 "risk_verdict": risk_verdict,

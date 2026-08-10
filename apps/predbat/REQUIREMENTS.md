@@ -323,7 +323,8 @@ else in this file.
 | R59 | ❌ SUPERSEDED by R59b | |
 | R59a | ❌ **WITHDRAWN** | Circular reasoning; blocked the morning drain. **Do not implement.** |
 | R59b | IN FORCE | Recovery floor nets against P10 **generation**. |
-| R60, R61, R62, R63 | IN FORCE | R63 = drain deadline (2026-07-28). |
+| R60, R61, R62 | IN FORCE | |
+| R63 | **RETIRED as a lever, 2026-08-10** | Drain deadline. The measurement is kept and published (`headroom_deadline_short_kwh`); the Max Export override is gone. See below. |
 | R64 | IN FORCE | Rolling median on the overflow estimate (2026-07-28). |
 | RD14c | IN FORCE | Saving sessions driven by the Octoplus **calendar** + native calendar triggers, not the lagging binary sensor (2026-07-28). |
 | RD1–RD20 | IN FORCE | v30/v32 DC-coupled control layer — see Part 1 sections at the end. |
@@ -1603,6 +1604,55 @@ used until the window fills.
 
 **Implemented in:** `curtailment_calc.py:smooth_overflow_samples`,
 `curtailment_plugin.py` (`_overflow_history`, `OVERFLOW_SMOOTH_WINDOW_MIN`).
+
+### R63 — drain deadline (2026-07-28) — **RETIRED as a lever 2026-08-10**
+
+**Retired because its central claim is false as implemented.** The requirement
+says "It can only fire EARLIER, never later". It cannot:
+
+```text
+Schmitt drains when:   needed > 0            (needed = required_headroom - headroom)
+R63 fired when:        needed > sheddable    (sheddable >= 0 by construction)
+```
+
+`needed > sheddable >= 0` implies `needed > 0`, so **every state where R63 fired
+was one where the ordinary drain was already running.** It was designed against
+the *bare* energy test (`headroom < overflow + flat buffer`) — and the same
+2026-07-28 change set replaced that with the safety-factored
+`required_headroom_kwh()`, which closed the gap R63 existed for. The two landed
+together and the redundancy went unnoticed.
+
+**Its documented purpose was unreachable.** R63 was to outrank `no_drain`:
+
+- via `overflow_fits`: needs `fits_margin >= early_buffer` (positive), while R63
+  needs `needed > 0`, and `needed == -fits_margin`. Mutually exclusive.
+- via `past_safe`: an evening state, while R63 is hard-gated on `lock_mins > 0`
+  and lockout is a *morning* crossing. Never overlap.
+
+**What it actually did** was drain through floors something else had
+deliberately raised — the only states where the Schmitt was NOT already
+draining:
+
+| Floor | Consequence |
+|---|---|
+| dawn reserve (RD21) | 2026-08-08: ran the pack 7.2% -> 1.8% in the dark, 27 min before PV met load |
+| `session_protect` | dumps premium-rate session energy at the ordinary export rate for headroom |
+
+Neither was a decision anyone took.
+
+**The conceptual error:** knowing you cannot make enough headroom before lockout
+gives you no new action — you are already draining flat out. It is a
+**diagnostic, not a lever**, and turning it into an override gave it the only
+power an override has: to break floors. Kept as
+`headroom_deadline_short_kwh` on the intended-policy sensor, which is the honest
+input for the load-advice alert.
+
+Pinned by `test_r63_never_forces_max_export_through_a_session_reserve` and
+`test_deadline_shortfall_is_published_as_a_diagnostic`.
+
+---
+
+#### Original rationale (retained for the record)
 
 ### R63 — drain deadline: the trigger needs TIME, not just energy (2026-07-28)
 
