@@ -374,6 +374,9 @@ class CurtailmentPlugin(PredBatPlugin):
         # Day's peak PV (actual observed) for scale calibration (R43)
         self._peak_pv = 0.0
         self._peak_pv_time = 0
+        # RD33: has today's peak been observed? Set in calculate(), read by the
+        # publish path. Fails CLOSED (no verdict) before the first cycle.
+        self._peaked = False
         # p90 scale from Solcast (set at activation, stable through day, R42)
         self._p90_scale = 0.0
         # Retained so the phase sensor can report which band today's sky is
@@ -672,6 +675,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._cap_samples.clear()
         self._peak_pv = 0.0
         self._peak_pv_time = 0
+        self._peaked = False  # RD33: a new day has no peak yet
         self._last_floor_scale = 0.0
         self._overflow_history.clear()
         self._r63_engaged = False
@@ -1760,6 +1764,10 @@ class CurtailmentPlugin(PredBatPlugin):
         # sundown must be peak-guarded: pre-dawn is handled by the "no PV yet" early
         # return above, so a genuine end-of-day PV≈0 is the only path here.
         peaked = self._peak_pv > 0.5
+        # RD33: ONE owner for "has today's peak been observed". `_publish_dispatch_policy`
+        # needs it to gate the at-risk verdict, and re-deriving `_peak_pv > 0.5` there
+        # would be a second copy of a control threshold (the duplicate-logic rule).
+        self._peaked = peaked
         past_safe = reached_safe_time
         # Sundown must NOT hand back while a joined saving session is still
         # running. The heartbeat can only force Max Export while CM holds the
@@ -1835,12 +1843,8 @@ class CurtailmentPlugin(PredBatPlugin):
             # Hold once SOC is no longer above drain_above). Live 2026-07-29
             # 07:39: SOC 0.54 kWh exactly on drain_above 0.54, 0.00 drainable,
             # yet the policy read "active Drain (override max_export)".
-            try:
-                hard_floor_pct = float(self.base.get_state_wrapper(SIG_DRAIN_FLOOR_HELPER, default=DEFAULT_DRAIN_FLOOR_PCT))
-            except (TypeError, ValueError):
-                hard_floor_pct = DEFAULT_DRAIN_FLOOR_PCT
-            r63_floor = max(float(getattr(self.base, "reserve", 0) or 0), DEEP_DISCHARGE_FLOOR_KWH, soc_max * hard_floor_pct / 100.0)
-            drainable_kwh = float(soc_kw) - r63_floor
+            # RD32: the same floor the Schmitt drains to, dawn reserve included.
+            drainable_kwh = float(soc_kw) - self._r63_floor_kwh(soc_max)
             was_engaged = self._r63_engaged
             self._r63_engaged = drain_deadline_breached(needed_kwh, sheddable_kwh, engaged=was_engaged, drainable_kwh=drainable_kwh)
             if self._r63_engaged and not was_engaged:
@@ -2768,6 +2772,28 @@ class CurtailmentPlugin(PredBatPlugin):
             return self._drain_floor_kwh(soc_max)
         return reserve
 
+    def _r63_floor_kwh(self, soc_max):
+        """RD32 — the SOC R63's last-chance drain may run down to, in kWh.
+
+        This is the SAME floor the Schmitt uses, and that is the whole point.
+        R63 used to build its own from `max(reserve, DEEP_DISCHARGE_FLOOR_KWH,
+        soc_max × drain_floor_pct)` — 0.50 kWh — with no dawn arm, so it could
+        (and did) drain straight through the RD21 dawn reserve while the sensor
+        published 1.81 kWh and the Schmitt correctly said Hold.
+
+        Live 2026-08-08: reserve armed at 03:20, drain stopped at 10% at 05:25 as
+        designed, then R63 fired at 06:25 with SOC 7.2% and ran the pack to 1.8%.
+        PV did not meet load until 06:52. `drainable_kwh` read +0.80 instead of
+        −0.51, so `drain_deadline_breached` never took its "nothing to shed"
+        release, and `_policy_override = "max_export"` outranks every floor.
+
+        Two floors for one question is the duplicate-logic failure in miniature:
+        the fix is not to teach R63 about the dawn reserve but to stop it having
+        an opinion. `_dawn_floor_kwh` already returns the released floor (the
+        RD15 helper) once PV meets load, so this reads identically post-dawn.
+        """
+        return max(float(getattr(self.base, "reserve", 0) or 0), DEEP_DISCHARGE_FLOOR_KWH, self._dawn_floor_kwh(soc_max))
+
     def _drain_floor_kwh(self, soc_max):
         """The released floor, in kWh, from the ONE live drain-floor helper.
 
@@ -3068,9 +3094,28 @@ class CurtailmentPlugin(PredBatPlugin):
             # overflow_floor as the sell floor while Holding read as nonsense on a
             # low-overflow morning (climbed to ~68% at 8% SOC) and under-sold saving
             # sessions (stopped the dump at 68% instead of the overnight reserve).
-            is_curtailment_drain = self._policy_override is None and schmitt == "Drain"
+            #
+            # RD32 (2026-08-08): R63's forced drain is a curtailment drain too —
+            # it sets `_policy_override = "max_export"`, which this test read as
+            # "not a curtailment drain" and so published the OVERNIGHT reserve as
+            # the sell floor. Live 06:25-06:44: R63 drove Max Export while the
+            # keep floor said 38% against a 7% SOC, so `sig_keep_floor_guard`
+            # clamped it back to Hold Battery every ~3 min — 8 policy writes in 20
+            # minutes, plugin against guard, neither wrong about its own rule.
+            # `_r63_engaged` is what separates R63's drain from a saving-session
+            # dump, which still stops at the overnight reserve (RD20).
+            #
+            # Under R63 the floor published is R63's OWN floor, not `floor_kwh`:
+            # that is the level its forced drain actually stops at, so the guard
+            # enforces the same number instead of fighting it. The ordinary
+            # Schmitt drain keeps publishing `floor_kwh` unchanged — an earlier
+            # cut of this used `max(floor_kwh, drain_above)` for both and would
+            # have clamped a normal curtailment drain 23 points above its target
+            # (caught by test_sell_floor_overflow_floor_during_curtailment_drain,
+            # which sets drain_above 5.0 kWh against floor_kwh 0.9).
+            is_curtailment_drain = schmitt == "Drain" and (self._policy_override is None or self._r63_engaged)
             if is_curtailment_drain:
-                sell_floor_kwh = floor_kwh
+                sell_floor_kwh = self._r63_floor_kwh(soc_max) if self._r63_engaged else floor_kwh
             elif self._overnight_target_kwh:
                 sell_floor_kwh = self._overnight_target_kwh
             else:
@@ -3151,6 +3196,10 @@ class CurtailmentPlugin(PredBatPlugin):
         headroom_have_pct = None
         headroom_short_pct = None
         pv_at_risk_kwh = None
+        # RD33: "too early" is the FAIL-SAFE default. With no overflow forecast
+        # there is no question to answer, and before the peak the answer is not
+        # knowable — neither case may publish a confident "fits".
+        risk_verdict = "too early"
         try:
             ovf = float(self._overflow_p90 or 0.0)
             # With no forecast overflow there is no headroom question to answer.
@@ -3170,6 +3219,18 @@ class CurtailmentPlugin(PredBatPlugin):
                 # is not a unit anyone can act on — "3.8 kWh at risk" is a
                 # dishwasher and a hot-water cycle.
                 pv_at_risk_kwh = round(max(0.0, ovf - headroom_have_kwh), 2)
+                # RD33: at_risk is a SNAPSHOT subtraction, not a verdict, and the
+                # card was rendering it as one. Live 2026-08-08 07:08 it printed
+                # "overflow fits — nothing at risk" with an EMPTY battery: headroom
+                # 17.75 against p90 17.89, so at_risk rounded to nothing. The
+                # arithmetic was right and the conclusion worthless — the figure
+                # inverts as the battery fills, which is backwards for a verdict.
+                #
+                # The real `overflow_fits` latch is gated on `peaked` and was
+                # correctly None at the time; the card just was not reading it.
+                # Publish the verdict from here so the card cannot re-derive it
+                # wrongly, and say "too early" until the peak has been observed.
+                risk_verdict = "too early" if not self._peaked else ("fits" if pv_at_risk_kwh <= 0 else "at risk")
                 denom = max(soc_max, 0.1)
                 headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
                 headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
@@ -3240,6 +3301,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 "headroom_short_pct": headroom_short_pct,
                 # RD30: raw kWh at risk — what the card should show.
                 "pv_at_risk_kwh": pv_at_risk_kwh,
+                # RD33 display: "too early" | "fits" | "at risk". The card renders
+                # THIS, never its own subtraction of the two numbers above.
+                "risk_verdict": risk_verdict,
+                "peaked": self._peaked,
             }
             self.base.dashboard_item(
                 "sensor.{}_curtailment_intended_policy".format(prefix),
