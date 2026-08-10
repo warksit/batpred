@@ -1,0 +1,32 @@
+# UI template helpers backing the big-overflow load advice — RECORD ONLY.
+#
+# These are HA config-entry helpers (Settings > Devices & Services > Helpers),
+# NOT loaded from this file. They live in HA's config entries and were untracked
+# until 2026-08-10; recorded here so the repo remains the source of truth and so
+# the duplicate-logic index has something to point at.
+#
+# Edit via ha_config_set_helper (MCP), then update this file in the same change.
+#
+# 2026-08-10: both previously re-derived
+#   overflow = state_attr('sensor.predbat_curtailment_phase','overflow_kwh')
+#   room     = (1 - soc/100) * 18.08          <- pack size hardcoded
+#   (overflow - room) >= N
+# i.e. three copies of one formula across two helpers and the automation, each
+# free to drift. They now read the finished `advice_shortfall_kwh`, which is
+# sized on the ACTUAL day (overflow_tracking) rather than the p90 control figure.
+
+- entry_id: "01KQ2708V5254ZX6MMV82VRS2N"
+  name: "Big Overflow Shortfall"
+  template_type: binary_sensor
+  device_class: problem
+  # Afternoon signal: >= 1 kWh at risk.
+  state: >-
+    {{ state_attr('sensor.predbat_curtailment_phase', 'advice_shortfall_kwh') | float(0) >= 1 }}
+
+- entry_id: "01KQ4PPHTRB4FZ4QCES21HJCGD"
+  name: "Big Overflow Shortfall High"
+  template_type: binary_sensor
+  device_class: problem
+  # Morning signal: >= 3 kWh at risk.
+  state: >-
+    {{ state_attr('sensor.predbat_curtailment_phase', 'advice_shortfall_kwh') | float(0) >= 3 }}
