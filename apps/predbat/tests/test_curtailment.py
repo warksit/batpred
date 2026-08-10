@@ -1926,6 +1926,31 @@ def test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up():
     print("  test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up: PASSED")
 
 
+def test_risk_verdict_is_absent_when_there_is_no_overflow_question():
+    """No forecast overflow means there is no headroom question to answer, so
+    there must be no verdict — matching `pv_at_risk_kwh`, which already
+    publishes None here so the card omits the line.
+
+    Found by reading the LIVE value after deploying, 2026-08-10 18:34: the
+    sensor read `overflow_fits: True` and `pv_at_risk_kwh: None` next to
+    `risk_verdict: "too early"`. The verdict is initialised to "too early" and
+    only computed inside `if ovf > 0`, so with no overflow it kept the default
+    and contradicted the attribute beside it. "Too early" also implies the
+    answer is coming later, when there is nothing to know.
+    """
+    base = MockBase(soc_kw=14.4)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 0.0  # end of day — the live 18:34 case
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._overflow_fits_latched = True
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=14.4, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["pv_at_risk_kwh"] is None, "precondition: no overflow -> no at-risk figure"
+    assert attrs["risk_verdict"] is None, "no overflow -> no verdict, got '{}'".format(attrs["risk_verdict"])
+    print("  test_risk_verdict_is_absent_when_there_is_no_overflow_question: PASSED")
+
+
 def test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it():
     """The one state that may print "fits": the real latch is set."""
     base = MockBase(soc_kw=1.0)
@@ -7915,6 +7940,7 @@ def run_curtailment_tests(my_predbat=None):
         test_at_risk_kwh_is_raw_energy_not_padded_percent,
         test_at_risk_is_zero_when_the_overflow_fits,
         test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up,
+        test_risk_verdict_is_absent_when_there_is_no_overflow_question,
         test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it,
         test_risk_verdict_reports_risk_early_because_that_direction_is_safe,
         test_forecast_energy_to_now_integrates_the_slots,
