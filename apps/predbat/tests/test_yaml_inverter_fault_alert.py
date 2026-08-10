@@ -17,6 +17,7 @@
 # Run: cd apps/predbat && python3 tests/test_yaml_inverter_fault_alert.py
 import os
 import sys
+from datetime import datetime, timedelta
 
 import jinja2
 import yaml
@@ -34,18 +35,60 @@ POLICY = "input_select.sig_dispatch_policy"
 REQUESTED_MODE = "input_select.predbat_requested_mode"
 
 
-def _load():
-    with open(YAML_PATH) as f:
+def _load(path=None):
+    with open(path or YAML_PATH) as f:
         return yaml.safe_load(f)
 
 
-def _render_fault_type(auto, states):
+NOW = datetime(2026, 8, 10, 9, 34, 13)
+
+
+class _Entity:
+    """One entity's object form — `states.sensor.x.last_changed` in HA."""
+
+    def __init__(self, state, age_s):
+        self.state = state
+        self.last_changed = NOW - timedelta(seconds=age_s)
+        self.last_updated = self.last_changed
+
+
+class _Domain:
+    """`states.sensor` — attribute access by object_id."""
+
+    def __init__(self, entities):
+        self._entities = entities
+
+    def __getattr__(self, name):
+        if name in self._entities:
+            return self._entities[name]
+        raise jinja2.UndefinedError("states.sensor.{} is not in the mock".format(name))
+
+
+class _States:
+    """HA's `states` is BOTH callable and attribute-accessible. The staleness
+    check needs the object form, so the mock has to be both too."""
+
+    def __init__(self, values, ages):
+        self._values = values
+        self.sensor = _Domain({e.split(".", 1)[1]: _Entity(values.get(e, "unknown"), age) for e, age in ages.items()})
+
+    def __call__(self, entity):
+        return self._values.get(entity, "unknown")
+
+
+def _render_fault_type(auto, states, ages=None):
     """Render the action `variables` block in order, like HA does."""
     variables = auto["action"][0]["variables"]
+    return _render_block(variables, states, ages)["fault_type"]
+
+
+def _render_block(variables, states, ages=None):
+    """Render an ordered variables dict under StrictUndefined; return the context."""
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
     ctx = {
-        "states": lambda e: states.get(e, "unknown"),
+        "states": _States(states, ages or {}),
         "is_state": lambda e, v: states.get(e) == v,
+        "now": lambda: NOW,
     }
     for key, tmpl in variables.items():
         rendered = env.from_string(tmpl).render(**ctx).strip()
@@ -57,7 +100,17 @@ def _render_fault_type(auto, states):
                 ctx[key] = float(rendered)
             except ValueError:
                 ctx[key] = rendered
-    return ctx["fault_type"]
+    return ctx
+
+
+# Default ages: meter fresh (5 s), poll fresh (1 s) -> meter_dead False, so every
+# pre-existing test keeps exercising the branch it was written for.
+def _ages(grid_age=5, poll_age=1):
+    return {
+        "sensor.sigen_plant_grid_active_power": grid_age,
+        "sensor.sigen_plant_pv_power": poll_age,
+        "sensor.sigen_plant_battery_power": poll_age,
+    }
 
 
 def _mock(running="Running", disch=9.6, rated=9.6, imp=100, policy="Max Export", requested_mode="Demand"):
@@ -72,12 +125,14 @@ def _mock(running="Running", disch=9.6, rated=9.6, imp=100, policy="Max Export",
         "sensor.sigen_inverter_grid_frequency": "50.0",
         "sensor.sigen_plant_battery_state_of_charge": "44.6",
         "sensor.sigen_plant_pv_power": "0.0",
+        "sensor.sigen_plant_battery_power": "0.0",
+        "sensor.sigen_plant_grid_active_power": "0.0",
     }
 
 
 def test_clamped_battery_is_not_reported_as_a_meter_fault():
     """The 2026-07-28 05:33 case: Running, idle, ESS discharge limit shut."""
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0), _ages())
     assert "CLAMPED" in msg, f"clamped battery must not be reported as a meter fault: {msg}"
     assert "4001_2" not in msg, f"must not send the user to mySigen for a clamp: {msg}"
     assert "discharge_rate" in msg, f"must name the actual thing to check: {msg}"
@@ -86,14 +141,14 @@ def test_clamped_battery_is_not_reported_as_a_meter_fault():
 
 def test_blocked_import_also_reads_as_clamped():
     """grid_import_limitation=0 is the other half of a Predbat freeze."""
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=9.6, imp=0))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=9.6, imp=0), _ages())
     assert "CLAMPED" in msg, f"import block must read as clamped: {msg}"
     print("PASS  clamped: import limit 0 -> battery-clamped diagnosis")
 
 
 def test_open_limits_still_report_meter_fault():
     """Limits open and still idle -> genuinely the meter. Must not be swallowed."""
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=9.6, imp=100))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=9.6, imp=100), _ages())
     assert "Meter Communication Fault" in msg, f"open limits must still flag the meter: {msg}"
     assert "4001_2" in msg, f"meter fault must still point at mySigen: {msg}"
     assert "CLAMPED" not in msg, f"must not cry clamp when limits are open: {msg}"
@@ -107,7 +162,7 @@ def test_protective_states_unchanged():
         ("Environmental Abnormality", "Environmental Abnormality"),
         ("Standby", "Standby"),
     ):
-        msg = _render_fault_type(_load(), _mock(running=state, disch=0.0))
+        msg = _render_fault_type(_load(), _mock(running=state, disch=0.0), _ages())
         assert expect in msg, f"{state}: expected {expect!r}, got {msg}"
         assert "No action needed" in msg, f"{state} must stay benign: {msg}"
         # A clamp must never hijack a protective-state message.
@@ -134,10 +189,10 @@ def test_predbat_freeze_is_not_a_fault():
     An alert that fires on intended behaviour and gives advice that does not apply
     is worse than no alert: it is how the REAL 2026-07-28 lockout got dismissed.
     """
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, imp=0, policy="Predbat", requested_mode="Freeze Charging"))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, imp=0, policy="Predbat", requested_mode="Freeze Charging"), _ages())
     assert "CLAMPED" not in msg, f"Predbat deliberately freezing is not a clamp fault: {msg}"
 
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Freeze Discharging"))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Freeze Discharging"), _ages())
     assert "CLAMPED" not in msg, f"export freeze is equally intended: {msg}"
     print("PASS  intended: Predbat owns the wheel and is freezing -> no clamp alert")
 
@@ -146,18 +201,99 @@ def test_clamp_still_fires_when_cm_owns_the_wheel():
     """The case that MUST still alert: CM is driving and the limits are shut, so
     nobody intends the clamp. This is 2026-07-26 / 07-28 — SOC flat for hours with
     Max Export commanding into a locked battery."""
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Max Export", requested_mode="Demand"))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Max Export", requested_mode="Demand"), _ages())
     assert "CLAMPED" in msg, f"CM driving into shut limits must still alert: {msg}"
     assert "discharge_rate" in msg
 
     # And a shut limit while Predbat owns it but is NOT freezing is still a fault.
-    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Demand"))
+    msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Demand"), _ages())
     assert "CLAMPED" in msg, f"Predbat idle with shut limits is nobody's intent: {msg}"
     print("PASS  fault: shut limits with no freeze intent -> still alerts")
 
 
+def _meter_trigger(auto):
+    """The `meter_stale` trigger, by id."""
+    for trig in auto["trigger"]:
+        if trig.get("id") == "meter_stale":
+            return trig
+    raise AssertionError("no trigger with id 'meter_stale' — the 2026-08-10 fault has no detector")
+
+
+def test_dead_meter_is_detected_while_the_plant_runs_normally():
+    """2026-08-10, the three-hour silence this exists to end.
+
+    mySigen raised 4001 "Electric meter communication anomaly" at 08:23:58. The
+    plant kept RUNNING and producing 4.4 kW throughout, so the only meter trigger
+    (inverter active power stuck near zero for 2 min) never fired, and HA said
+    nothing. The measured signature at 09:34: grid_active_power frozen 2175 s
+    while pv_power and battery_power in the same poll updated every 1-2 s.
+    """
+    auto = _load()
+    ctx = _render_block(auto["action"][0]["variables"], _mock(running="Running"), _ages(grid_age=2175, poll_age=2))
+    assert ctx["meter_dead"] is True, "38 min of frozen grid power with a live poll must read as a dead meter"
+    msg = ctx["fault_type"]
+    assert "METER DEAD" in msg, f"must name the fault: {msg}"
+    assert "4001" in msg, f"must point at the mySigen alert code: {msg}"
+    assert "reboot does NOT clear it" in msg, f"must record that today's reboot did not fix it: {msg}"
+    assert "CLAMPED" not in msg, f"a dead meter must outrank the clamp diagnosis: {msg}"
+    print("PASS  meter dead: 2175 s stale grid + live poll -> METER DEAD diagnosis")
+
+
+def test_dead_meter_outranks_a_shut_limit():
+    """Ordering matters. With the meter dead, `consumed_power` is derived, so the
+    clamp heuristic is reading fiction — the meter branch must come FIRST or the
+    alert sends you after a battery clamp that may not exist."""
+    ctx = _render_block(_load()["action"][0]["variables"], _mock(running="Running", disch=0.0), _ages(grid_age=2175, poll_age=2))
+    assert "METER DEAD" in ctx["fault_type"], f"meter must win over clamp: {ctx['fault_type']}"
+    print("PASS  meter dead: outranks the clamp branch")
+
+
+def test_live_meter_is_never_reported_dead():
+    """The gag test. A jittering CT and a legitimately-zero grid must both stay
+    silent — `Solar Charge Battery` targets zero grid flow BY DESIGN, so a
+    value-based test would false-alarm every time it ran. Only staleness counts."""
+    for grid_age in (0, 5, 60, 599):
+        ctx = _render_block(_load()["action"][0]["variables"], _mock(running="Running", policy="Solar Charge Battery"), _ages(grid_age=grid_age, poll_age=1))
+        assert ctx["meter_dead"] is False, f"grid {grid_age}s old is a live meter, not a fault"
+        assert "METER DEAD" not in ctx["fault_type"], f"grid {grid_age}s old must not alert"
+    print("PASS  live meter: fresh grid reading never reported dead (incl. Solar Charge zero-flow)")
+
+
+def test_stale_poll_is_not_blamed_on_the_meter():
+    """If the whole integration stops (HA restart, Modbus drop) EVERYTHING goes
+    stale. That is not a meter fault and must not be reported as one — the
+    poll-liveness term is what makes the detector specific."""
+    ctx = _render_block(_load()["action"][0]["variables"], _mock(running="Running"), _ages(grid_age=3000, poll_age=3000))
+    assert ctx["meter_dead"] is False, "a dead integration is not a dead meter"
+    assert "METER DEAD" not in ctx["fault_type"]
+    print("PASS  specificity: whole-integration outage is not reported as a meter fault")
+
+
+def test_trigger_and_variable_agree():
+    """Duplicate-logic guard. HA gives triggers no access to `variables`, so the
+    staleness test exists in BOTH the `meter_stale` trigger and the `meter_dead`
+    variable. Render both over the same cases and assert they never disagree —
+    the RD22 sell-clamp shipped with one of two copies fixed (2026-08-06)."""
+    trig_tmpl = _meter_trigger(_load())["value_template"]
+    variables = _load()["action"][0]["variables"]
+    env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+    for grid_age, poll_age in ((2175, 2), (5, 1), (3000, 3000), (601, 119), (599, 121), (700, 60)):
+        states = _mock(running="Running")
+        ages = _ages(grid_age=grid_age, poll_age=poll_age)
+        ctx = {"states": _States(states, ages), "is_state": lambda e, v: states.get(e) == v, "now": lambda: NOW}
+        trig = env.from_string(trig_tmpl).render(**ctx).strip().lower() == "true"
+        var = _render_block(variables, states, ages)["meter_dead"]
+        assert trig == var, f"grid_age={grid_age} poll_age={poll_age}: trigger says {trig}, variable says {var}"
+    print("PASS  duplicate-logic: meter_stale trigger and meter_dead variable agree on all 6 cases")
+
+
 def main():
     for t in (
+        test_dead_meter_is_detected_while_the_plant_runs_normally,
+        test_dead_meter_outranks_a_shut_limit,
+        test_live_meter_is_never_reported_dead,
+        test_stale_poll_is_not_blamed_on_the_meter,
+        test_trigger_and_variable_agree,
         test_clamped_battery_is_not_reported_as_a_meter_fault,
         test_predbat_freeze_is_not_a_fault,
         test_clamp_still_fires_when_cm_owns_the_wheel,
