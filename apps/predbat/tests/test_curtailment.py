@@ -1912,7 +1912,16 @@ def test_overflow_tracking_published_and_below_p90():
     assert attrs["day_tracking_ratio"] is not None, "ratio must be computed with 18 kWh of expected energy behind us"
     assert abs(attrs["day_tracking_ratio"] - 0.667) < 0.01, attrs["day_tracking_ratio"]
     assert attrs["overflow_tracking"] <= attrs["overflow_p90"], "an under-delivering day cannot estimate ABOVE the p90 bound"
-    print("  test_overflow_tracking_published_and_below_p90: PASSED (ratio {} -> {} vs p90 {})".format(attrs["day_tracking_ratio"], attrs["overflow_tracking"], attrs["overflow_p90"]))
+    # "<= p90" was the ONLY assertion here and it is far too weak: it passed
+    # happily while overflow_tracking equalled overflow_p50 exactly, which is
+    # what a no-op looks like. Live 2026-08-11 09:39: day_ratio 0.694,
+    # overflow_p50 16.43, overflow_tracking 16.43 — RD31 had done nothing since
+    # it shipped, because the ratio went into R58's 30-minute window knob.
+    #
+    # Overflow is non-linear in PV, so a 0.667 ratio must cut it SHARPLY, not
+    # shave it. Assert against p50 (the band it rescales), with real headroom.
+    assert attrs["overflow_tracking"] < attrs["overflow_p50"] * 0.75, "a 0.667 day must estimate WELL below p50 ({} vs p50 {}) — equal-to-p50 is the no-op signature".format(attrs["overflow_tracking"], attrs["overflow_p50"])
+    print("  test_overflow_tracking_published_and_below_p90: PASSED (ratio {} -> {} vs p50 {} / p90 {})".format(attrs["day_tracking_ratio"], attrs["overflow_tracking"], attrs["overflow_p50"], attrs["overflow_p90"]))
 
 
 def test_day_tracking_ratio():
@@ -3587,6 +3596,89 @@ def test_R53_compute_solcast_overflow_uniform_sunny_slot():
     # 30 min × (8 - 0.5 - 4) kW = 0.5h × 3.5 kW = 1.75 kWh
     assert abs(out - 1.75) < 0.01, f"Expected ~1.75 kWh, got {out:.3f}"
     print("  test_R53_compute_solcast_overflow_uniform_sunny_slot: PASSED")
+
+
+def test_global_scale_applies_beyond_the_r58_calibration_window():
+    """RD31 fix (2026-08-11). The whole-day ratio must scale the ENTIRE integral.
+
+    The defect: `_update_tracking_estimate` passed the day ratio into
+    `calibration_ratio`, which is R58's SHORT-WINDOW knob — it only multiplies
+    pv_kw for the first `calibration_window_hours` (0.5 h). Over an ~8 h
+    remaining window that is ~6% of the slots, so the ratio barely moved the
+    answer and `overflow_tracking` came out equal to `overflow_p50`.
+
+    Live 2026-08-11 09:39: day_ratio 0.694, overflow_p50 16.43,
+    overflow_tracking 16.43 — identical. RD31 had been a no-op since it shipped,
+    and yesterday's advice alert inherited it.
+
+    This pins the distinction directly: ALL the overflow here sits AFTER the
+    calibration window, so `calibration_ratio` provably cannot touch it and only
+    a global scale can.
+    """
+    from curtailment_calc import compute_solcast_overflow
+
+    # 10:00-10:30 UTC quiet (no overflow), 11:00-12:00 UTC sunny.
+    slots = _make_solcast_slots([(11, 0, 4.0, 4.0, 4.0), (12, 0, 8.0, 8.0, 8.0), (12, 30, 8.0, 8.0, 8.0)])
+    kwargs = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=11.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 20,
+    )
+    base = compute_solcast_overflow(**kwargs)
+    r58_only = compute_solcast_overflow(calibration_ratio=0.694, **kwargs)
+    scaled = compute_solcast_overflow(global_scale=0.694, **kwargs)
+
+    assert base > 0, "precondition: the fixture must produce overflow"
+    assert abs(r58_only - base) < 0.01, "precondition: overflow is all outside the R58 window, so calibration_ratio must NOT change it (got {:.3f} vs {:.3f}) — otherwise this test proves nothing".format(r58_only, base)
+    assert scaled < base * 0.5, "a 0.694 global scale must cut the overflow SHARPLY (non-linear), got {:.3f} vs base {:.3f}".format(scaled, base)
+    print("  test_global_scale_applies_beyond_the_r58_calibration_window: PASSED ({:.2f} -> {:.2f})".format(base, scaled))
+
+
+def test_global_scale_is_non_linear_in_pv():
+    """Overflow is `sum(max(0, pv - load - cap))`, so scaling PV down by 31% must
+    cut overflow by far MORE than 31% — slots that were just over the cap drop
+    under it entirely and stop contributing. That non-linearity is the whole
+    reason the metric matters (12.6% shortfall cut it ~70% on 2026-08-07)."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 5.0, 5.0, 5.0), (11, 30, 5.0, 5.0, 5.0)])
+    kwargs = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=11.0,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 12,
+    )
+    base = compute_solcast_overflow(**kwargs)
+    scaled = compute_solcast_overflow(global_scale=0.694, **kwargs)
+    assert base > 0
+    # 5.0 -> 3.47 kW is BELOW cap+base_load, so the overflow vanishes entirely.
+    assert scaled == 0.0, "PV scaled under the cap must yield zero overflow, got {:.3f}".format(scaled)
+    print("  test_global_scale_is_non_linear_in_pv: PASSED ({:.2f} -> {:.2f})".format(base, scaled))
+
+
+def test_r58_calibration_window_still_behaves():
+    """Regression: the global scale must not disturb R58's short-window knob."""
+    from curtailment_calc import compute_solcast_overflow
+
+    slots = _make_solcast_slots([(11, 0, 8.0, 8.0, 8.0)])
+    kwargs = dict(
+        detailed_forecast=slots,
+        from_utc_hours=10.0,
+        to_utc_hours=10.5,
+        dno_limit=4.0,
+        local_offset_hours=1.0,
+        load_forecast_kw=[0.0] * 6,
+    )
+    assert abs(compute_solcast_overflow(**kwargs) - 1.75) < 0.01
+    # Inside the window, calibration still scales: 8 x 1.2 = 9.6 -> (9.6-0.5-4) x 0.5
+    hot = compute_solcast_overflow(calibration_ratio=1.2, **kwargs)
+    assert abs(hot - 2.55) < 0.02, "R58 in-window scaling must be unchanged, got {:.3f}".format(hot)
+    print("  test_r58_calibration_window_still_behaves: PASSED")
 
 
 def test_R53_compute_solcast_overflow_preserves_day_shape():
@@ -8404,6 +8496,9 @@ def run_curtailment_tests(my_predbat=None):
     r53_tests = [
         test_R53_compute_solcast_overflow_empty_returns_zero,
         test_R53_compute_solcast_overflow_uniform_sunny_slot,
+        test_global_scale_applies_beyond_the_r58_calibration_window,
+        test_global_scale_is_non_linear_in_pv,
+        test_r58_calibration_window_still_behaves,
         test_R53_compute_solcast_overflow_preserves_day_shape,
         test_R53_compute_solcast_overflow_uses_load_forecast,
         test_R53_real_2026_05_02_shape_preserved,
