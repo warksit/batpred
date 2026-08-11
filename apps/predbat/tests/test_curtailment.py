@@ -2033,7 +2033,13 @@ def test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up():
     plugin._publish_dispatch_policy(True, floor_kwh=0.18, soc_kwh=0.33, soc_max=18.08)
     attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
     assert attrs["pv_at_risk_kwh"] == 0.0, "precondition: the raw subtraction must read zero here"
-    assert attrs["risk_verdict"] == "too early", "sun up but no fits determination yet must NOT read as a verdict, got '{}'".format(attrs["risk_verdict"])
+    # 2026-08-11: this asserted "too early". Once "tight" existed as its own
+    # state that became the honest answer here — the sun IS up, so the verdict
+    # is not premature, it is simply that the latch has not concluded "fits".
+    # The defect being pinned is unchanged and is the important half: `_peaked`
+    # must never by itself produce "fits".
+    assert attrs["risk_verdict"] == "tight", "sun up without a fits determination is 'tight', got '{}'".format(attrs["risk_verdict"])
+    assert attrs["risk_verdict"] != "fits", "the 07:08 defect: sun-up must never read as 'fits'"
     print("  test_risk_verdict_is_not_fooled_by_the_sun_merely_being_up: PASSED")
 
 
@@ -2123,6 +2129,36 @@ def test_risk_verdict_is_absent_when_there_is_no_overflow_question():
     assert attrs["pv_at_risk_kwh"] is None, "precondition: no overflow -> no at-risk figure"
     assert attrs["risk_verdict"] is None, "no overflow -> no verdict, got '{}'".format(attrs["risk_verdict"])
     print("  test_risk_verdict_is_absent_when_there_is_no_overflow_question: PASSED")
+
+
+def test_risk_verdict_names_the_tight_case_instead_of_calling_it_early():
+    """RD33 fix — "too early" was a catch-all hiding a real, common state.
+
+    Live 2026-08-11 14:31: overflow_p90 8.29 against 9.13 kWh of headroom, so
+    the raw energy FITS (pv_at_risk 0.0) — but the safety-factored requirement
+    is 10.5 (1.05x + the R45 reserve), short by 1.37. The latch is therefore
+    False while at_risk is 0, which fell through to the `else` and printed
+    "too early to call" at half past two in the afternoon.
+
+    That is not too early, it is TIGHT: fits on raw energy, no margin. It is
+    also precisely the state CM armed on this morning (need 19.23 vs have
+    17.32), so it is the common case, not an edge.
+
+    "too early" now means only what it says: no basis to judge yet, i.e. the
+    peak has not been seen.
+    """
+    base = MockBase(soc_kw=18.08 - 9.13)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 8.29
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._peaked = True
+    plugin._overflow_fits_latched = False
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=18.08 - 9.13, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["pv_at_risk_kwh"] == 0.0, "precondition: raw energy must fit"
+    assert attrs["risk_verdict"] == "tight", "raw fits but no margin is 'tight', not 'too early' — got '{}'".format(attrs["risk_verdict"])
+    print("  test_risk_verdict_names_the_tight_case_instead_of_calling_it_early: PASSED")
 
 
 def test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it():
@@ -8281,6 +8317,7 @@ def run_curtailment_tests(my_predbat=None):
         test_advice_shortfall_is_computed_once_not_three_times,
         test_advice_shortfall_never_goes_negative,
         test_risk_verdict_is_absent_when_there_is_no_overflow_question,
+        test_risk_verdict_names_the_tight_case_instead_of_calling_it_early,
         test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it,
         test_risk_verdict_reports_risk_early_because_that_direction_is_safe,
         test_forecast_energy_to_now_integrates_the_slots,
