@@ -267,6 +267,20 @@ DAWN_RESERVE_FRACTION = 0.10
 # without pinning CM active for a session hours away.
 SESSION_IMMINENT_MINS = 30.0
 
+# RD34: Predbat's export-plan floor. `optimise_export` clamps every export
+# window's SOC target to this (`plan.py:1736`, "Never go below the minimum
+# level"), so it is the one lever that says "stop exporting below X" without
+# creating a reason to charge.
+#
+# Proven live 2026-08-11 11:45: raised to 16%, every export target that had been
+# 13% moved to exactly 16.0%, and no charge window appeared. The two obvious
+# alternatives are both wrong:
+#   * best_soc_keep is a TARGET — raising it makes Predbat IMPORT to reach it
+#     (R26 comment says so; test_before_plan_never_increases pins it).
+#   * set_reserve_min is inert — SIG has has_reserve_soc: False, so Predbat
+#     never writes the reserve, and enabling it means patching config.py.
+PREDBAT_SOC_MIN_HELPER = "input_number.predbat_best_soc_min"
+
 # How far ahead of a joined saving session the export reserve arms (hours).
 #
 # 2026-08-11: there was NO horizon — `_get_session_reserve_kwh` reads the
@@ -2521,6 +2535,10 @@ class CurtailmentPlugin(PredBatPlugin):
             # compute_drain_above so the pure function stays free of live sensor
             # reads and the latch has exactly one owner.
             dawn_floor = self._dawn_floor_kwh(soc_max)
+            # RD34: the SAME number also floors Predbat's export plan, so the
+            # dawn reserve binds whoever is draining. Cleared once released, so
+            # CM can take the last stretch to the drain floor for headroom.
+            self._set_predbat_export_floor(0.0 if self._dawn_released else dawn_floor)
             drain_above = round(compute_drain_above(reserve, self._overflow_floor_kwh, self._effective_keep_kwh, self._session_protect_kwh, dawn_floor), 2)
             # Name the arm that won so the sensor (and the card) can explain a
             # floor that its own P90 attributes do not account for.
@@ -2689,6 +2707,36 @@ class CurtailmentPlugin(PredBatPlugin):
             self.log("Curtailment: keep floor {:.0f} -> {:.0f}".format(current, pct))
         except Exception as e:
             self._log_once("keepfloor_set_err", "Curtailment: failed to set keep floor {}: {}".format(pct, e))
+
+    def _set_predbat_export_floor(self, kwh):
+        """RD34 — floor Predbat's export plan at the dawn reserve, 0 once released.
+
+        The dawn reserve exists to stop the house being run onto the import meter
+        in the dark. RD21/RD32 enforce it only while CM drives, and CM hands back
+        every night — so on 2026-08-11 Predbat exported to 3.4% with the reserve
+        sitting at 10% and nothing to apply it.
+
+        Andrew's split: Predbat exports down to the reserve, CM takes the last
+        stretch to the drain floor once PV meets load. Sequential, not competing —
+        the reserve is about not IMPORTING, the final drain is about HEADROOM, and
+        there is ample time between them (08-11: PV met load 07:05, lockout 08:32,
+        ~5.5 kWh of shed capacity for the 1.8 kWh in between).
+
+        Write-if-changed: the planner reads this helper every cycle and a write
+        storm is how `sig_keep_floor_pct` wedged on 2026-07-22.
+        """
+        kwh = round(max(0.0, float(kwh)), 2)
+        try:
+            current = float(self.base.get_state_wrapper(PREDBAT_SOC_MIN_HELPER, default=-1))
+        except (TypeError, ValueError):
+            current = -1
+        if abs(current - kwh) < 0.01:
+            return
+        try:
+            self.base.call_service_wrapper("input_number/set_value", entity_id=PREDBAT_SOC_MIN_HELPER, value=kwh)
+            self.log("Curtailment: RD34 Predbat export floor {:.2f} -> {:.2f} kWh (dawn reserve binds Predbat too)".format(current, kwh))
+        except Exception as e:
+            self._log_once("soc_min_set_err", "Curtailment: failed to set Predbat export floor {}: {}".format(kwh, e))
 
     def _set_read_only(self, value):
         """R3 mutex: suppress/resume Predbat via its internal read_only flag (NOT an
