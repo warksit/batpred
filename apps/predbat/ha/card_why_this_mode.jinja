@@ -1,0 +1,83 @@
+<!--
+cspell:disable
+Lovelace markdown card: "Why This Mode" — dashboard `sig-predbat-debug`,
+views[0] ("Solar") / sections[2] / cards[1].
+
+RECORD ONLY — this file is not loaded by HA. The card lives in Lovelace
+storage; edit it with ha_config_set_dashboard(python_transform=...) and update
+this file in the same change, so the repo stays the source of truth.
+
+views[3] ("Archive (old layout)") holds an older copy that still renders
+`headroom_short_pct` ("short N% room"). Left alone deliberately — it is
+labelled as the archive. Do not "fix" it and do not treat it as a second live
+site.
+
+2026-08-11 — three lines were lying:
+  * session reserve advertised 43.0% held while 0% was held (the plugin now
+    publishes the EFFECTIVE reserve; the `{% if sesspct %}` guard then hides
+    the line by itself)
+  * "overflow fits — nothing at risk" was re-derived from `pv_at_risk_kwh`
+    instead of reading `risk_verdict`, which is published for exactly this
+    purpose — so it printed the reassuring branch while the plugin said
+    "too early" and headroom was short
+  * "sky tracking below p10 (0%)" showed the clamped percentile, which
+    saturates at the extremes and says nothing; now a signed kWh delta
+-->
+{% set ip = 'sensor.predbat_curtailment_intended_policy' %}
+{% set a = state_attr(ip, 'reason') %}
+{% set mode = states(ip) %}
+{% set live = states('input_select.sig_dispatch_policy') %}
+{% set ov = states('input_select.sig_override') %}
+{% set overriding = ov not in ['Off', 'unknown', 'unavailable', ''] %}
+{% set soc = state_attr(ip, 'soc_pct') %}
+{% set lo = state_attr(ip, 'charge_below_pct') %}
+{% set hi = state_attr(ip, 'drain_above_pct') %}
+{% set onight = state_attr(ip, 'overnight_target_pct') %}
+{% set risk = state_attr(ip, 'pv_at_risk_kwh') %}
+{% set verdict = state_attr(ip, 'risk_verdict') %}
+{% set ovr = state_attr(ip, 'override_label') %}
+{% set src = state_attr(ip, 'drain_above_source') %}
+{% set srclabel = state_attr(ip, 'drain_above_source_label') %}
+{% set sesspct = state_attr(ip, 'session_reserve_pct') %}
+{% set sessstart = state_attr(ip, 'session_start') %}
+{% set sessdisp = state_attr(ip, 'session_dispatch') %}
+{% set ph = 'sensor.predbat_curtailment_phase' %}
+{% set trk = state_attr(ph, 'tracking_band') %}
+{% set pvact = state_attr(ph, 'pv_actual_kwh') %}
+{% set pvexp = state_attr(ph, 'pv_expected_p50_kwh') %}
+{% set sessend = state_attr(ip, 'session_end_soc_pct') %}
+{% set sesstime = (sessstart | as_datetime | as_local).strftime('%H:%M') if sessstart else '' %}
+{% set held = relative_time(states[ip].last_changed) if states[ip] is not none else '?' %}
+{% set stale_s = (now() - (states[ip].last_reported or states[ip].last_updated)).total_seconds() if states[ip] is not none else 0 %}
+### → {{ ov if overriding else mode }}
+*{{ a }}*
+
+{% if overriding %}✋ **You set this**
+{% elif sessdisp %}⚡ **saving session** · heartbeat dispatching at the cap · {{ held }}
+{% if sessend is not none %}   ↳ ends at ~**{{ sessend | round(0) }}%**
+{% endif %}
+{% else %}Live **{{ live }}**{% if live != mode and stale_s < 360 %} · ⏳ not applied{% elif live != mode %} · ⏳ awaiting next cycle{% endif %} · {{ held }}
+{% endif %}
+{% if stale_s > 660 %}⚠ **stale {{ (stale_s / 60) | round(0) }} min**
+{% endif %}
+{% if not overriding and not state_attr(ip,'acting') %}⚠ **not acting** — policy gate off
+{% endif %}
+{% if soc is not none %}
+**{{ soc | round(0) }}%**{% if lo is not none and hi is not none %} · band **{{ lo | round(0) }}–{{ hi | round(0) }}%**
+{% endif %}
+{% endif %}
+{% if lo is not none %}↑ charge if below **{{ lo | round(1) }}%** (P10 recovery floor)
+{% endif %}
+{% if onight is not none %}🌙 overnight target **{{ onight | round(1) }}%** (tonight's need)
+{% endif %}
+{% if hi is not none %}↓ drain if above **{{ hi | round(0) }}%** ({{ srclabel or 'headroom floor' }})
+{% endif %}
+{% if sesspct %}⚡ **{{ sesspct | round(1) }}%** held for the {{ sesstime }} saving session{% if src != 'session_protect' %} (inside the charge floor){% endif %}
+{% endif %}
+{% if trk in ['below p10', 'p10-p50', 'p50-p90', 'above p90'] %}🔭 sky tracking **{{ trk }}**{% if pvact is not none and pvexp is not none %} ({{ '%+.1f' | format(pvact - pvexp) }} kWh vs forecast){% endif %}
+{% elif trk in ['too early', 'no spread'] %}🔭 sky tracking — {{ trk }}
+{% endif %}
+{% if verdict == 'at risk' %}⚠ **{{ risk | round(1) }} kWh at risk** — run a load to use it
+{% elif verdict == 'fits' %}✓ overflow fits — nothing at risk
+{% elif verdict == 'too early' %}⏳ overflow verdict — too early to call
+{% endif %}
