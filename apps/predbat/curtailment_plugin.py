@@ -267,6 +267,23 @@ DAWN_RESERVE_FRACTION = 0.10
 # without pinning CM active for a session hours away.
 SESSION_IMMINENT_MINS = 30.0
 
+# How far ahead of a joined saving session the export reserve arms (hours).
+#
+# 2026-08-11: there was NO horizon — `_get_session_reserve_kwh` reads the
+# Octopus `next_joined_event_*` attributes, so the floor armed the instant a
+# session was announced. Live at 06:30 a session 35.5 h away had pinned
+# `drain_above` to 81.4% on a day CM had just armed 1.9 kWh SHORT of headroom,
+# silently disabling the pre-emptive drain (CM would not drain until 81% full,
+# which is not reached until around the peak — past the point draining is
+# possible at all, R25).
+#
+# 18 h, because the drain this guards against is the same-day pre-dawn/morning
+# one — roughly 10-15 h before a typical 16:00-19:00 session. The horizon has to
+# cover the whole session day from before dawn, and nothing beyond it: the pack
+# refills from PV every day, so reserving a day early protects nothing and costs
+# the headroom drain.
+SESSION_PROTECT_HORIZON_HOURS = 18.0
+
 # Human labels for the arm of compute_drain_above that set the Headroom Floor.
 # The card REPORTS these (Charter: never re-derive a second decision).
 DRAIN_SOURCE_LABELS = {
@@ -2041,7 +2058,10 @@ class CurtailmentPlugin(PredBatPlugin):
         # only protect it while the session is upcoming, not active. This pulls
         # session handling back into CM until the RD7 Predbat mapper lands.
         overnight_target = self._overnight_target_kwh if self._overnight_target_kwh is not None else effective_keep
-        if self._session_reserve_kwh > 0 and not self._session_active:
+        # Horizon gate (2026-08-11): reserving for a session that is still days
+        # out protects nothing — PV refills the pack daily — and costs the
+        # curtailment drain. `_session_imminent` is the existing primitive.
+        if self._session_reserve_kwh > 0 and not self._session_active and self._session_imminent(within_minutes=SESSION_PROTECT_HORIZON_HOURS * 60.0):
             reserve_for_recovery = self._session_reserve_kwh
             self._session_protect_kwh = min(soc_max, overnight_target + self._session_reserve_kwh)
         else:

@@ -854,6 +854,77 @@ def test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin():
     print("  test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin: PASSED")
 
 
+def _session_protect_run(hours_ahead, active=False):
+    """calculate() with a joined saving session `hours_ahead` in the future."""
+    from datetime import timedelta
+
+    now = _dt(2025, 7, 12, 6, 0, tzinfo=_tz.utc)
+    start = (now + timedelta(hours=hours_ahead)).isoformat()
+    pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 1.2, "sensor.sigen_plant_consumed_power": 0.6}
+    overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
+    overrides.update(_saving_session_sensors(active=active, next_mins=120, next_start=start))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.50,
+        minutes_now=360,
+        now_utc=now,  # MUST match minutes_now — see the R63 rig note
+        best_soc_keep=4.0,
+        sensor_overrides=overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 1.2
+    plugin._overnight_target_kwh = 6.0
+    plugin.calculate(dno_limit_kw=3.68)
+    return plugin
+
+
+def test_session_reserve_does_not_arm_days_ahead():
+    """The session floor must not arm the moment Octopus announces a session.
+
+    Live 2026-08-11 06:30: a session at Wed 12/08 18:00 — **35.5 hours away** —
+    had already pinned `drain_above` to 14.71 kWh (81.4%), source
+    `session_protect`, on a day CM had just armed 1.9 kWh SHORT of headroom.
+    That silently disables the pre-emptive drain: CM will not drain until the
+    battery is 81% full, which does not happen until around the peak, by which
+    point PV surplus exceeds the cap and draining is impossible (R25).
+
+    `_get_session_reserve_kwh` reads `next_joined_event_duration_in_minutes`
+    with no horizon at all. `_session_imminent` right next door already has the
+    correct instinct in its docstring — "a session six hours out must not pin CM
+    active all evening" — the drain-floor arm just never used it.
+
+    Cost nothing on the day it was found only because Predbat had already
+    emptied the pack overnight, so there was nothing to drain either way.
+    """
+    plugin = _session_protect_run(hours_ahead=35.5)
+    assert plugin._session_protect_kwh == 0.0, "a session 35.5 h out must not hold the drain floor, got {:.2f} kWh".format(plugin._session_protect_kwh)
+    print("  test_session_reserve_does_not_arm_days_ahead: PASSED")
+
+
+def test_session_reserve_arms_in_time_for_the_morning_drain():
+    """It must still arm early enough to matter.
+
+    The drain it guards against is the same-day pre-dawn/morning one — roughly
+    10-15 h before a typical 16:00-19:00 session — so the horizon has to cover
+    the whole session day from before dawn, not just the hours around it.
+    """
+    plugin = _session_protect_run(hours_ahead=12.0)
+    assert plugin._session_protect_kwh > 0, "a session 12 h out (same day) must hold the reserve"
+    print("  test_session_reserve_arms_in_time_for_the_morning_drain: PASSED ({:.2f} kWh)".format(plugin._session_protect_kwh))
+
+
+def test_session_reserve_horizon_boundary():
+    """Assert the boundary specifically, so the horizon cannot drift unnoticed."""
+    inside = _session_protect_run(hours_ahead=SESSION_PROTECT_HORIZON_HOURS - 1)._session_protect_kwh
+    outside = _session_protect_run(hours_ahead=SESSION_PROTECT_HORIZON_HOURS + 1)._session_protect_kwh
+    assert inside > 0, "just inside the horizon must arm"
+    assert outside == 0.0, "just outside must not, got {:.2f}".format(outside)
+    print("  test_session_reserve_horizon_boundary: PASSED ({}h)".format(SESSION_PROTECT_HORIZON_HOURS))
+
+
 def test_session_reserve_still_protects_the_drain_floor():
     """The PLANNING half stays: ahead of a known session, keep duration x cap in
     the battery so there is something to sell. Without this the curtailment drain
@@ -3941,6 +4012,7 @@ from curtailment_plugin import (
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
     SIG_SAVING_SESSION_CALENDAR,
     DAWN_RESERVE_FRACTION,
+    SESSION_PROTECT_HORIZON_HOURS,
 )
 
 
@@ -6522,7 +6594,11 @@ def test_v32_upcoming_session_raises_drain_floor():
         sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
         sensor_overrides.update(_make_p90_sensors(p90_peak_kw=10.0, solcast_remaining=45.0))
         if session:
-            sensor_overrides.update(_saving_session_sensors(active=False, next_mins=120))
+            # A duration with no start is not a state Octopus can produce, and
+            # since 2026-08-11 the reserve is gated on WHEN the session is
+            # (SESSION_PROTECT_HORIZON_HOURS). Rig clock is 12:00, so 19:00 the
+            # same day is a realistic 7 h out.
+            sensor_overrides.update(_saving_session_sensors(active=False, next_mins=120, next_start="2025-07-12T19:00:00+00:00"))
         base = MockBase(
             pv_step=pv,
             load_step=load,
@@ -6943,7 +7019,11 @@ def _session_publish_run(session):
     sensor_overrides = {"sensor.sigen_plant_pv_power": 8.0, "sensor.sigen_plant_consumed_power": 1.0}
     sensor_overrides.update(_make_p90_sensors(p90_peak_kw=7.0, solcast_remaining=14.0))
     if session:
-        sensor_overrides.update(_saving_session_sensors(active=False, next_mins=60, next_start="2026-08-03T19:00:00+01:00"))
+        # Start must be REAL relative to the rig clock (now_utc 2025-07-12 12:00).
+        # This was "2026-08-03T19:00:00+01:00" — a session a YEAR ahead — which
+        # only ever exercised the reserve because there was no horizon at all
+        # (2026-08-11). A fixture that cannot happen tests nothing.
+        sensor_overrides.update(_saving_session_sensors(active=False, next_mins=60, next_start="2025-07-12T19:00:00+00:00"))
     base = MockBase(
         pv_step=pv,
         load_step=load,
@@ -7935,6 +8015,9 @@ def run_curtailment_tests(my_predbat=None):
         test_intended_policy_reports_the_override_not_the_plugins_wish,
         test_override_is_the_select_alone_no_boolean,
         test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
+        test_session_reserve_does_not_arm_days_ahead,
+        test_session_reserve_arms_in_time_for_the_morning_drain,
+        test_session_reserve_horizon_boundary,
         test_session_reserve_still_protects_the_drain_floor,
         test_required_headroom_is_defined_once,
         test_no_drain_and_floor_agree_when_r49_reduces_the_buffer,
