@@ -4136,6 +4136,7 @@ from curtailment_plugin import (
     SIG_SAVING_SESSION_CALENDAR,
     DAWN_RESERVE_FRACTION,
     SESSION_PROTECT_HORIZON_HOURS,
+    PREDBAT_SOC_MIN_HELPER,
 )
 
 
@@ -7046,6 +7047,70 @@ def test_deadline_shortfall_is_published_as_a_diagnostic():
     print("  test_deadline_shortfall_is_published_as_a_diagnostic: PASSED")
 
 
+def _soc_min_writes(base):
+    return [c[1]["value"] for c in base.services if c[0] == "input_number/set_value" and c[1].get("entity_id") == PREDBAT_SOC_MIN_HELPER]
+
+
+def _soc_min_run(pv_kw, load_kw, soc_pct=0.30, current=-1):
+    """publish() with the dawn gap open or closed; `current` = helper's existing value."""
+    base = _make_dawn_base(pv_kw=pv_kw, load_kw=load_kw, soc_pct=soc_pct)
+    base._sensor_overrides[PREDBAT_SOC_MIN_HELPER] = current
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_floor_kwh = 0.0
+    plugin._effective_keep_kwh = 0.0
+    plugin._p10_recovery_floor = 0.0
+    plugin._session_protect_kwh = 0.0
+    base.services.clear()
+    plugin.publish("active", 0.0, dno_limit_kw=4.0)
+    return plugin, base
+
+
+def test_dawn_reserve_floors_predbat_export_plan():
+    """RD34 — the dawn reserve must bind WHOEVER is draining.
+
+    2026-08-11: Predbat exported to 3.4% overnight while CM's reserve sat at 10%.
+    Nothing was broken — RD21/RD32 guard the dawn gap only while CM holds the
+    wheel, and CM hands back every night, so on the nights that matter the
+    reserve was inert.
+
+    `best_soc_min` is the lever, proven live at 11:45: raised to 16%, every
+    export target that had been 13% moved to exactly 16.0%, and NO charge window
+    appeared. The two obvious alternatives are both wrong and were tried first:
+
+      * `best_soc_keep` is a TARGET, not a floor — raising it makes Predbat
+        IMPORT to reach it. Caught by test_before_plan_never_increases and
+        stated outright in the R26 comment.
+      * `set_reserve_min` is inert: SIG has `has_reserve_soc: False`, so Predbat
+        never writes the reserve, and enabling it means patching config.py,
+        which the charter forbids.
+    """
+    plugin, base = _soc_min_run(pv_kw=0.09, load_kw=0.37)
+    writes = _soc_min_writes(base)
+    expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
+    assert writes, "in the dawn gap CM must floor Predbat's export plan"
+    assert abs(writes[-1] - expected) < 0.01, "must write the dawn reserve {:.2f}, got {}".format(expected, writes[-1])
+    print("  test_dawn_reserve_floors_predbat_export_plan: PASSED ({:.2f} kWh)".format(writes[-1]))
+
+
+def test_export_floor_clears_when_pv_meets_load():
+    """Released -> clear it, so the last stretch to the drain floor is available
+    for headroom. Same one-way latch as the drain floor: one owner, both move
+    together."""
+    plugin, base = _soc_min_run(pv_kw=0.59, load_kw=0.42, current=1.81)
+    writes = _soc_min_writes(base)
+    assert plugin._dawn_released is True, "precondition: PV >= load must release"
+    assert writes and writes[-1] == 0.0, "released reserve must clear the floor, got {}".format(writes)
+    print("  test_export_floor_clears_when_pv_meets_load: PASSED")
+
+
+def test_export_floor_not_rewritten_when_unchanged():
+    """No redundant writes — the helper is read by the planner every cycle and a
+    write storm is how `sig_keep_floor_pct` wedged on 2026-07-22."""
+    plugin, base = _soc_min_run(pv_kw=0.09, load_kw=0.37, current=round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2))
+    assert not _soc_min_writes(base), "already correct -> must not rewrite, got {}".format(_soc_min_writes(base))
+    print("  test_export_floor_not_rewritten_when_unchanged: PASSED")
+
+
 def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     """RD32 — R63 must drain to the SAME floor the Schmitt does.
 
@@ -8598,6 +8663,9 @@ def run_curtailment_tests(my_predbat=None):
         test_dawn_release_latch_persists_and_resets_daily,
         test_r63_never_forces_max_export_through_a_session_reserve,
         test_deadline_shortfall_is_published_as_a_diagnostic,
+        test_dawn_reserve_floors_predbat_export_plan,
+        test_export_floor_clears_when_pv_meets_load,
+        test_export_floor_not_rewritten_when_unchanged,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,
