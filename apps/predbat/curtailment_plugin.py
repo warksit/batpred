@@ -3322,6 +3322,11 @@ class CurtailmentPlugin(PredBatPlugin):
         except (TypeError, ValueError):
             pass
 
+        # The reserve actually being held. `_session_protect_kwh` is 0 whenever the
+        # horizon gate is closed, so this collapses to 0 exactly when nothing is
+        # reserved — while a LIVE session still advertises what it is dumping.
+        held_reserve_kwh = self._session_reserve_kwh if (self._session_protect_kwh or self._session_active) else 0.0
+
         # Where the dump leaves us: the number you actually want mid-session,
         # and one the card cannot derive from anything else it shows.
         session_end_soc_pct = None
@@ -3369,8 +3374,15 @@ class CurtailmentPlugin(PredBatPlugin):
                 # (A0: at-a-glance is % SOC), kWh as the detail.
                 "drain_above_source": self._drain_above_source,
                 "drain_above_source_label": DRAIN_SOURCE_LABELS.get(self._drain_above_source, self._drain_above_source),
-                "session_reserve_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else 0.0,
-                "session_reserve_pct": round(self._session_reserve_kwh / max(soc_max, 0.1) * 100.0, 1) if self._session_reserve_kwh else 0.0,
+                # EFFECTIVE reserve — what is actually being held, not the raw
+                # Octopus read. Live 2026-08-11 12:16 the card said "43.0% held
+                # for the 18:00 saving session" while session_protect_kwh was
+                # None and drain_above was 1.0%: the horizon gated the USE of
+                # the reserve but not its PUBLICATION, so the card advertised a
+                # number that no longer meant anything. Display follows the
+                # controller (`_session_protect_kwh` is the gated one).
+                "session_reserve_kwh": round(held_reserve_kwh, 2),
+                "session_reserve_pct": round(held_reserve_kwh / max(soc_max, 0.1) * 100.0, 1),
                 "session_start": self._get_session_start(),
                 # True while the HEARTBEAT (not the select) is driving the dump.
                 # The card must not warn "not applied" when the select and the
