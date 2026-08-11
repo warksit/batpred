@@ -1108,7 +1108,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._effective_max_reserved = effective
         return effective
 
-    def _compute_overflow_band(self, band, scale_fallback, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed):
+    def _compute_overflow_band(self, band, scale_fallback, lat, lon, doy, utc_hours, safe_utc, dno_limit_kw, load_fc, calibration_ratio, detailed, global_scale=1.0):
         """R53/R50/R58: compute overflow integral for one Solcast band.
 
         Uses compute_solcast_overflow when detailedForecast has 4+ slots
@@ -1129,11 +1129,12 @@ class CurtailmentPlugin(PredBatPlugin):
                 local_offset_hours=0.0,
                 band=band,
                 calibration_ratio=calibration_ratio,
+                global_scale=global_scale,
             )
         if scale_fallback <= 0:
             return 0.0
         return compute_solar_overflow(
-            scale_fallback,
+            scale_fallback * max(0.0, global_scale),
             lat,
             lon,
             doy,
@@ -1354,7 +1355,11 @@ class CurtailmentPlugin(PredBatPlugin):
             self._overflow_tracking = None
             return
         p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc = band_args
-        self._overflow_tracking = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, self._day_ratio, detailed), 2)
+        # global_scale, NOT calibration_ratio: the latter is R58's 30-minute
+        # window and swallowed the whole-day ratio (RD31 was a no-op until
+        # 2026-08-11). calibration_ratio stays 1.0 — multiplying a 30-min ratio
+        # by a whole-day one double-counts.
+        self._overflow_tracking = round(self._compute_overflow_band("pv_estimate", p50_fb, lat, lon, doy, utc_hours, safe_utc, eff_dno, load_fc, 1.0, detailed, global_scale=self._day_ratio), 2)
 
     def _publish_forecast_overflow(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw):
         """Update self._overflow_p10/p50/p90 from current Solcast forecast.

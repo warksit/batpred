@@ -1268,6 +1268,7 @@ def compute_solcast_overflow(
     band="pv_estimate",
     calibration_ratio=1.0,
     calibration_window_hours=0.5,
+    global_scale=1.0,
 ):
     """
     Integrate overflow energy from Solcast per-slot forecast (R53, v20).
@@ -1279,6 +1280,15 @@ def compute_solcast_overflow(
     For each integration step, looks up the Solcast 30-min slot containing
     that UTC time, takes the band's kW value, then:
         overflow_step = max(0, pv_kw - effective_load_kw - dno_limit) × step_h
+
+    `global_scale` multiplies pv_kw across the WHOLE integration — distinct from
+    `calibration_ratio`, which is windowed (below). Added 2026-08-11 for RD31,
+    which had been passing its whole-day ratio into `calibration_ratio` and so
+    only ever scaled the first 30 minutes: on an ~8 h remaining window that is
+    ~6% of the slots, and `overflow_tracking` came out equal to `overflow_p50`
+    (live 09:39, day_ratio 0.694, both 16.43). The two compose if both are
+    given; RD31 passes calibration_ratio=1.0 because multiplying a 30-minute
+    ratio by a whole-day one would double-count.
 
     R58 live calibration: pv_kw is multiplied by min(CALIBRATION_RATIO_MAX,
     calibration_ratio) for the first calibration_window_hours of integration
@@ -1330,6 +1340,7 @@ def compute_solcast_overflow(
 
     step_hours = step_minutes / 60.0
     capped_calibration = min(CALIBRATION_RATIO_MAX, max(0.0, calibration_ratio))
+    capped_global = max(0.0, global_scale)
     total = 0.0
     t = from_utc_hours
     i = 0
@@ -1346,6 +1357,10 @@ def compute_solcast_overflow(
             pv_kw = 0.0
         else:
             pv_kw = s_pv
+        # Whole-day scale: EVERY slot (RD31). Must come before the windowed
+        # calibration so the two compose rather than one masking the other.
+        if capped_global != 1.0:
+            pv_kw = pv_kw * capped_global
         # R58 live calibration: scale only within the calibration window
         if (t - from_utc_hours) < calibration_window_hours and capped_calibration != 1.0:
             pv_kw = pv_kw * capped_calibration
