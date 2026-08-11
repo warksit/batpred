@@ -35,6 +35,8 @@ site.
 {% set onight = state_attr(ip, 'overnight_target_pct') %}
 {% set risk = state_attr(ip, 'pv_at_risk_kwh') %}
 {% set short = state_attr(ip, 'headroom_short_kwh') %}
+{% set trkmargin = state_attr(ip, 'headroom_margin_tracking_kwh') %}
+{% set trkovf = state_attr('sensor.predbat_curtailment_phase', 'overflow_tracking') %}{# literal, not ph: ph is defined BELOW and Jinja evaluates top-down #}
 {% set verdict = state_attr(ip, 'risk_verdict') %}
 {% set ovr = state_attr(ip, 'override_label') %}
 {% set src = state_attr(ip, 'drain_above_source') %}
@@ -80,6 +82,6 @@ site.
 {% endif %}
 {% if verdict == 'at risk' %}⚠ **{{ risk | round(1) }} kWh at risk** — run a load to use it
 {% elif verdict == 'fits' %}✓ overflow fits — nothing at risk
-{% elif verdict == 'tight' %}⚠ fits on energy, **no safety margin** — {{ short | round(1) }} kWh short of the buffer
+{% elif verdict == 'tight' %}⚠ **tight vs p90** — {{ short | round(1) }} kWh short of the buffer{% if trkmargin is not none and trkmargin > 0 %} · fits on today's actual ({{ trkovf | round(1) }} kWh){% endif %}
 {% elif verdict == 'too early' %}⏳ overflow verdict — too early to call
 {% endif %}
