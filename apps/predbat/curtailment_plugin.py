@@ -3306,6 +3306,7 @@ class CurtailmentPlugin(PredBatPlugin):
         headroom_have_pct = None
         headroom_short_pct = None
         pv_at_risk_kwh = None
+        headroom_margin_tracking_kwh = None
         # RD33: None = "no verdict", matching pv_at_risk_kwh below — with no
         # forecast overflow there is simply no headroom question to answer and
         # the card omits the line. NOT "too early", which implies an answer is
@@ -3374,6 +3375,19 @@ class CurtailmentPlugin(PredBatPlugin):
                     risk_verdict = "too early"
                 else:
                     risk_verdict = "tight"
+                # The verdict above is p90-based (the defence). The card also
+                # shows the day's TRACKING band, and adjacent with no basis
+                # stated the two read as a contradiction — live 2026-08-11 14:36
+                # "sky tracking below p10" next to "tight". Both were true: p90
+                # 8.29 needed 10.5 against 9.13 of headroom, while the day was
+                # actually tracking 5.74, needing 7.83 (margin +1.3).
+                #
+                # Publish the tracking-based margin so the card can say "tight
+                # against p90, fine on today's actual". Control is unchanged and
+                # stays on p90 — defending it is the whole point.
+                if self._overflow_tracking is not None:
+                    trk = float(self._overflow_tracking)
+                    headroom_margin_tracking_kwh = round(headroom_have_kwh - required_headroom_kwh(trk, max_res, OVERFLOW_SAFETY_FACTOR), 2)
                 denom = max(soc_max, 0.1)
                 headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
                 headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
@@ -3460,6 +3474,9 @@ class CurtailmentPlugin(PredBatPlugin):
                 # we still need that cannot be shed before the export cap locks
                 # out. Names no action (we are already draining) but it is the
                 # honest input for the load-advice alert.
+                # Signed margin against the day's ACTUAL tracking estimate, so the
+                # card can state which basis the verdict used. Display only.
+                "headroom_margin_tracking_kwh": headroom_margin_tracking_kwh,
                 "headroom_deadline_short_kwh": round(max(0.0, float(self._r63_needed_kwh or 0.0)), 2),
                 # RD33 display: "too early" | "fits" | "at risk". The card renders
                 # THIS, never its own subtraction of the two numbers above.
