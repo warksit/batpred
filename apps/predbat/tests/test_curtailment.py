@@ -2131,6 +2131,37 @@ def test_risk_verdict_is_absent_when_there_is_no_overflow_question():
     print("  test_risk_verdict_is_absent_when_there_is_no_overflow_question: PASSED")
 
 
+def test_publishes_the_tracking_margin_beside_the_p90_verdict():
+    """The verdict is p90-based; the card also shows the day's tracking band.
+    Adjacent, unexplained, they read as a contradiction.
+
+    Live 2026-08-11 14:36: "sky tracking below p10" next to "tight". Both true —
+    p90 8.29 needs 10.5 against 9.13 of headroom (short 1.37), while the day is
+    actually tracking 5.74 which needs 7.83 (margin +1.3, comfortable). The card
+    had no way to say "tight against the p90 defence, fine on today's actual".
+
+    Publish the tracking-based margin so the card states the basis instead of
+    the reader inferring a bug. Control is unchanged and stays on p90 — that is
+    the whole point of defending it.
+    """
+    base = MockBase(soc_kw=18.08 - 9.13)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._overflow_p90 = 8.29
+    plugin._overflow_tracking = 5.74
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._peaked = True
+    plugin._overflow_fits_latched = False
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=18.08 - 9.13, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["risk_verdict"] == "tight", "p90 verdict unchanged"
+    margin = attrs["headroom_margin_tracking_kwh"]
+    assert margin is not None, "must publish the tracking-based margin"
+    assert abs(margin - 1.3) < 0.05, "have 9.13 - need_on_tracking 7.83 = +1.3, got {}".format(margin)
+    assert margin > 0, "the point: comfortable on today's actual while tight on p90"
+    print("  test_publishes_the_tracking_margin_beside_the_p90_verdict: PASSED (+{:.2f} kWh)".format(margin))
+
+
 def test_risk_verdict_names_the_tight_case_instead_of_calling_it_early():
     """RD33 fix — "too early" was a catch-all hiding a real, common state.
 
@@ -8317,6 +8348,7 @@ def run_curtailment_tests(my_predbat=None):
         test_advice_shortfall_is_computed_once_not_three_times,
         test_advice_shortfall_never_goes_negative,
         test_risk_verdict_is_absent_when_there_is_no_overflow_question,
+        test_publishes_the_tracking_margin_beside_the_p90_verdict,
         test_risk_verdict_names_the_tight_case_instead_of_calling_it_early,
         test_risk_verdict_says_fits_only_when_the_plugin_has_decided_it,
         test_risk_verdict_reports_risk_early_because_that_direction_is_safe,
