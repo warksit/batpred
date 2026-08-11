@@ -878,7 +878,38 @@ def _session_protect_run(hours_ahead, active=False):
     plugin._peak_pv = 1.2
     plugin._overnight_target_kwh = 6.0
     plugin.calculate(dno_limit_kw=3.68)
+    # Publish too, so the DISPLAY attributes can be asserted alongside the floor.
+    plugin._publish_dispatch_policy(True, floor_kwh=0.0, soc_kwh=BATTERY_KWH * 0.50, soc_max=BATTERY_KWH)
     return plugin
+
+
+def test_session_reserve_is_not_advertised_when_it_is_not_held():
+    """Display must follow the CONTROL value, not the raw sensor.
+
+    Live 2026-08-11 12:16 the card read "43.0% held for the 18:00 saving
+    session" while `session_protect_kwh` was None and `drain_above` was 1.0%
+    (source `reserve`) — i.e. exactly 0% was being held. The horizon gated the
+    USE of the reserve but `_get_session_reserve_kwh` is published raw and
+    unconditionally, so the card faithfully rendered a number that no longer
+    meant anything.
+
+    Same class as every other display defect this week: the card deriving from
+    a different source than the controller.
+    """
+    plugin = _session_protect_run(hours_ahead=35.5)
+    attrs = plugin.base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["session_reserve_kwh"] == 0.0, "nothing is held, so nothing may be advertised: got {}".format(attrs["session_reserve_kwh"])
+    assert attrs["session_reserve_pct"] == 0.0, "got {}".format(attrs["session_reserve_pct"])
+    print("  test_session_reserve_is_not_advertised_when_it_is_not_held: PASSED")
+
+
+def test_session_reserve_is_advertised_once_actually_held():
+    """And it must still show when it IS held — the gag must not be blanket."""
+    plugin = _session_protect_run(hours_ahead=12.0)
+    attrs = plugin.base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["session_reserve_kwh"] > 0, "an armed reserve must be shown"
+    assert attrs["session_reserve_pct"] > 0
+    print("  test_session_reserve_is_advertised_once_actually_held: PASSED ({}%)".format(attrs["session_reserve_pct"]))
 
 
 def test_session_reserve_does_not_arm_days_ahead():
@@ -8107,6 +8138,8 @@ def run_curtailment_tests(my_predbat=None):
         test_intended_policy_reports_the_override_not_the_plugins_wish,
         test_override_is_the_select_alone_no_boolean,
         test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
+        test_session_reserve_is_not_advertised_when_it_is_not_held,
+        test_session_reserve_is_advertised_once_actually_held,
         test_session_reserve_does_not_arm_days_ahead,
         test_session_reserve_arms_in_time_for_the_morning_drain,
         test_session_reserve_horizon_boundary,
