@@ -34,6 +34,7 @@ site.
 {% set hi = state_attr(ip, 'drain_above_pct') %}
 {% set onight = state_attr(ip, 'overnight_target_pct') %}
 {% set risk = state_attr(ip, 'pv_at_risk_kwh') %}
+{% set short = state_attr(ip, 'headroom_short_kwh') %}
 {% set verdict = state_attr(ip, 'risk_verdict') %}
 {% set ovr = state_attr(ip, 'override_label') %}
 {% set src = state_attr(ip, 'drain_above_source') %}
@@ -79,5 +80,6 @@ site.
 {% endif %}
 {% if verdict == 'at risk' %}⚠ **{{ risk | round(1) }} kWh at risk** — run a load to use it
 {% elif verdict == 'fits' %}✓ overflow fits — nothing at risk
+{% elif verdict == 'tight' %}⚠ fits on energy, **no safety margin** — {{ short | round(1) }} kWh short of the buffer
 {% elif verdict == 'too early' %}⏳ overflow verdict — too early to call
 {% endif %}

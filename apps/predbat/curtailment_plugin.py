@@ -3357,12 +3357,23 @@ class CurtailmentPlugin(PredBatPlugin):
                 # p90 remaining minus headroom NOW, and headroom is at its maximum
                 # early, so the figure can only worsen as the battery fills. Only
                 # "fits" is unsound before the plugin has concluded it.
+                # Four states, because "too early" was a catch-all hiding a
+                # real one. Live 2026-08-11 14:31: p90 8.29 vs 9.13 kWh of
+                # headroom — raw energy fits (at_risk 0), but the safety-factored
+                # requirement is 10.5, short by 1.37, so the latch is False. That
+                # fell through to the else and printed "too early to call" at
+                # half past two. It is not early, it is TIGHT — and it is the
+                # common case (CM armed on exactly it this morning), not an edge.
+                #
+                # "too early" now means only what it says: no basis to judge yet.
                 if self._overflow_fits_latched:
                     risk_verdict = "fits"
                 elif pv_at_risk_kwh > 0:
                     risk_verdict = "at risk"
-                else:
+                elif not self._peaked:
                     risk_verdict = "too early"
+                else:
+                    risk_verdict = "tight"
                 denom = max(soc_max, 0.1)
                 headroom_need_pct = round(headroom_need_kwh / denom * 100.0, 1)
                 headroom_have_pct = round(headroom_have_kwh / denom * 100.0, 1)
