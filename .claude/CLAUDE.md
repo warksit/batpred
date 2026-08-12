@@ -98,6 +98,51 @@ access to `variables`), it goes in the **Duplicate-logic index** in
 `REQUIREMENTS.md` with all its sites, and a test must render every copy and
 assert they agree.
 
+## A green test proves nothing until you know it RAN and REACHED its subject
+
+"Watch it fail" is not enough. Four distinct ways a test passed while proving
+nothing, all on 2026-08-10/12:
+
+- **Never registered.** Written, never added to the runner. Ran zero times.
+  Check the PASS count changes, not just that the suite is green.
+- **Never called in production.** `_evaluate_dawn_crossing` was exercised only
+  by the test rig; nothing in `calculate()` called it. Grep the call site.
+- **Precondition never reached.** The rig set `_peak_pv` but not `_peaked`;
+  another paired `minutes_now=360` with a `now_utc` of 12:00, so the solar
+  geometry put lockout in the past and R63 never engaged. **Assert the
+  precondition fired**, not just the outcome.
+- **Fixture impossible.** A saving session dated a YEAR ahead; a session
+  duration with no start time. Neither state can occur. If a fixture cannot
+  happen, it tests nothing.
+
+When a change makes an existing test fail, first ask whether the FIXTURE was
+lying. Four rigs this week had abundant PV or absent dates that quietly stopped
+them reaching the branch they named.
+
+## Never let a shell chain mask a failing gate
+
+`pre-commit run --files ... | grep -E "Failed" && git commit` **commits when the
+hooks fail** — grep succeeds precisely when something broke. Done twice on
+2026-08-11/12; the second let a C901 ratchet breach through. Check the exit
+code, or run the gate as its own step and read it.
+
+Also: an empty `grep` result is not evidence of absence. A mangled remote
+pattern returned nothing and was read as "no log activity"; the log was
+complete. Sanity-check the pattern against a line known to exist.
+
+## Check freshness before diagnosing
+
+Twice on 2026-08-11 a deploy was declared broken when it had simply not
+published yet. Read `last_reported` FIRST, and use `| as_local` — `now()` in a
+Jinja template is local while `.strftime()` on a timestamp prints UTC, so a
+1-hour offset makes fresh data look an hour stale.
+
+## A question is not an instruction
+
+"Should we X?" is an invitation to think, not authorisation to build, test and
+deploy X. RD35 shipped to the live control path off a question mark. If the
+answer is "yes and here is why", say that and stop.
+
 ## "Deployed" is not "verified"
 
 Verification requires a **discriminating** observation: conditions under which
