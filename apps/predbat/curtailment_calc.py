@@ -686,16 +686,31 @@ def day_tracking_ratio(actual_kwh, expected_p50_kwh, min_expected_kwh=1.0, lo=0.
     return max(lo, min(hi, actual / expected))
 
 
-def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale, min_expected_kwh=MIN_TRACKING_ENERGY_KWH, min_spread_kwh=MIN_TRACKING_SPREAD_KWH):
-    """Which Solcast band is today's observed sky actually tracking?
+def classify_forecast_tracking(actual_kwh, p10_kwh, p50_kwh, p90_kwh, min_expected_kwh=MIN_TRACKING_ENERGY_KWH, min_spread_kwh=MIN_TRACKING_SPREAD_KWH):
+    """Which Solcast band is today's delivered ENERGY actually tracking?
 
     The plugin derives THREE overflow integrals from three clear-sky scales
     (p_scales_from_forecast) and blends them. When the day goes wrong it matters
     which of the three was right — but nothing said so, which left "was the
     forecast bad, or was the control bad?" unanswerable after the fact.
 
-    Compares the OBSERVED clear-sky scale (from today's peak, R43) against the
-    three forecast scales and returns:
+    **Units: kWh of generation SO FAR TODAY, against the p10/p50/p90 forecast
+    energy for the same period** (`forecast_energy_to_now`). The caller passes
+    energies — `curtailment_plugin` calls this with `(actual_e, p10_e, p50_e,
+    p90_e)`. Both gates below are therefore in kWh and only make sense that way.
+
+    Do NOT pass the clear-sky *scales* (`actual_scale`, `p10_scale`, ... as
+    published on the phase sensor). Those are a different quantity — peak-derived
+    shape factors, typically 6-10 — and they sail past `min_expected_kwh`, so the
+    "too early" gate silently stops working and a dawn reading prints a confident
+    band. Live 2026-08-12 08:20 the two disagreed outright: the energies
+    (1.86 / 2.33 / 2.52 / 2.55) gave "too early", the scales
+    (6.19 / 7.52 / 9.72 / 9.72) gave "below p10". Naming fixed 2026-08-12 after
+    the old `*_scale` parameter names and this docstring claimed the opposite of
+    what the code does, and misled a reader into working the gate by hand
+    against the wrong numbers.
+
+    Returns:
 
         (label, percentile)
 
@@ -705,15 +720,14 @@ def classify_forecast_tracking(actual_scale, p10_scale, p50_scale, p90_scale, mi
                clamped to 0-100, so "above p90" reads 90-100 rather than
                pretending to precision the bands cannot support.
 
-    Peak-based, like every other scale in the system — it answers "which band is
-    today's SKY tracking", not "which band is today's ENERGY tracking". Cloud
-    timing can put those two apart.
+    Energy-based, so it answers "which band is today's ENERGY tracking", not
+    "which band is today's SKY tracking". Cloud timing can put those two apart.
     """
     try:
-        a = float(actual_scale)
-        p10 = float(p10_scale)
-        p50 = float(p50_scale)
-        p90 = float(p90_scale)
+        a = float(actual_kwh)
+        p10 = float(p10_kwh)
+        p50 = float(p50_kwh)
+        p90 = float(p90_kwh)
     except (TypeError, ValueError):
         return "unknown", None
     # Bands must be present and correctly ordered to interpolate on.
