@@ -3594,6 +3594,14 @@ class CurtailmentPlugin(PredBatPlugin):
                 # controller (`_session_protect_kwh` is the gated one).
                 "session_reserve_kwh": round(held_reserve_kwh, 2),
                 "session_reserve_pct": round(held_reserve_kwh / max(soc_max, 0.1) * 100.0, 1),
+                # RD40: what the session NEEDS, published whenever one exists —
+                # independent of whether we are holding it. `session_reserve_*`
+                # is the HELD value, so it collapses to 0 the moment RD37 stands
+                # the reserve aside, which on a sunny day is all day; the card
+                # then said only "PV will fill it in time" and never said how big
+                # "it" was. Need and held are different questions.
+                "session_need_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else None,
+                "session_need_pct": round(self._session_reserve_kwh / max(soc_max, 0.1) * 100.0, 1) if self._session_reserve_kwh else None,
                 "session_start": self._get_session_start(),
                 # True while the HEARTBEAT (not the select) is driving the dump.
                 # The card must not warn "not applied" when the select and the
