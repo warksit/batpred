@@ -28,6 +28,28 @@ afterwards. A message with two parts has two asks — answer both or ask about
 both. Explaining away the part you did not understand is the specific move that
 caused this rule.
 
+**6. Read memory BEFORE diagnosing, not after.** Before investigating any
+symptom, grep `~/.claude/projects/-Users-home-Documents-code-batpred/memory/` for
+the subsystem. Rules 1-5 govern scope; this one governs *knowledge*, and it is the
+one that actually cost a day. On 2026-08-11/12 an "inflated overnight forecast"
+was diagnosed from scratch — while `project_overnight_load_band.md` already
+carried the exact warning ("comparing a measurement over a different window is how
+I wrongly found a 35% forecast inflation that did not exist"). The same error had
+been made, recorded, and then repeated.
+
+**But read it for the TRAPS and the METHOD, never for current values.** Memory is
+a point-in-time observation and the numbers rot fastest:
+
+- the morning-gap window was recorded as 11 h; it is PV-derived and had already
+  moved to 12.0 h
+- a "fixed ~95 W standby" was recorded from five hours that all happened to sit at
+  the same discharge rate; the idle-battery test later showed **no** standby at all
+
+So: **memory tells you which mistakes have already been made and how to measure
+correctly. It does not tell you what is true right now — measure that.** If a
+memory states a number, verify it before relying on it, and correct the file when
+it has moved.
+
 ### The self-check that makes these bite
 
 Before sending any reply, re-read the user's last message and answer:
@@ -37,6 +59,8 @@ Before sending any reply, re-read the user's last message and answer:
   the second was actioned.)
 - Is there anything in my reply that is **not** in my scope line?
 - Am I reporting **their** issue as fixed, or **mine**?
+- If I diagnosed something: did I grep memory **first**, and did I verify any
+  number I took from it rather than quoting it?
 
 If the reply fails any of these, delete the surplus and finish the ask. A
 question mark from Andrew is not a work order (see "A question is not an
