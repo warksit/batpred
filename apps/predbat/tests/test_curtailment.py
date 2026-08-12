@@ -8244,6 +8244,25 @@ def test_tracking_band_still_calls_a_real_miss():
     print("  test_tracking_band_still_calls_a_real_miss: PASSED")
 
 
+def test_RD33_classifier_takes_energy_kwh_not_clear_sky_scale():
+    """The classifier's units are kWh-to-now. Passing the clear-sky scales breaks it.
+
+    The parameters were named `*_scale` and the docstring claimed the metric was
+    peak/sky-based, while the caller has always passed `(actual_e, p10_e, p50_e,
+    p90_e)` — forecast ENERGY to now. Names fixed 2026-08-12.
+
+    This matters beyond tidiness: the scales are ~6-10, so they sail past the
+    3.0 kWh `min_expected_kwh` gate and "too early" silently stops working. Both
+    triples below are the SAME live moment (2026-08-12 08:20) and they disagree,
+    so this test fails if anyone "aligns" the caller onto the scales.
+    """
+    # Energies to now — expected p50 2.52 kWh is under the 3.0 kWh gate.
+    assert classify_forecast_tracking(1.86, 2.33, 2.52, 2.55)[0] == "too early"
+    # The same moment's clear-sky scales clear the gate and answer confidently.
+    assert classify_forecast_tracking(6.19, 7.52, 9.72, 9.72)[0] == "below p10"
+    print("  test_RD33_classifier_takes_energy_kwh_not_clear_sky_scale: PASSED (kWh gate intact)")
+
+
 def test_tracking_band_published_for_debugging():
     """It has to reach the phase sensor or it is not a debug metric."""
     pv = {m: 8.0 for m in range(0, 480, PLUGIN_STEP)}
@@ -8763,6 +8782,7 @@ def run_curtailment_tests(my_predbat=None):
         test_tracking_band_is_too_early_before_enough_energy,
         test_tracking_band_reports_no_spread_when_bands_collapse,
         test_tracking_band_still_calls_a_real_miss,
+        test_RD33_classifier_takes_energy_kwh_not_clear_sky_scale,
         test_tracking_band_published_for_debugging,
     ]
     print("  --- apply / on_update tests ---")
