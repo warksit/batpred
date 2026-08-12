@@ -161,6 +161,65 @@ def compute_morning_gap(
     return gap_kwh
 
 
+def compute_pv_covers_load_minute(
+    pv_forecast,
+    load_forecast,
+    start_minute=0,
+    end_minute=1440,
+    step_minutes=5,
+    values_are_kwh=False,
+    sustained_minutes=30,
+):
+    """RD36: first minute at/after `start_minute` where forecast PV >= forecast
+    LOAD and STAYS there for `sustained_minutes`. None if it never does.
+
+    This is the moment the battery stops having to carry the house — the honest
+    end-point for the pre-PV drain.
+
+    Why it exists (2026-08-12): the drain was timed to end at
+    `compute_pv_start_time`, a CLEAR-SKY sine crossing of a fixed 0.5 kW, and
+    then coasted on the dawn reserve until PV actually covered load. Measured
+    that morning: drain ended 05:45, PV covered load ~06:45 — an hour of
+    coasting, on top of the sine prediction itself being ~35 min optimistic
+    (implied end 06:14 vs actual ~06:50).
+
+    Predbat's per-slot PV and load forecasts already carry this and were accurate
+    on the day (06:30 PV 0.10 vs load 0.24; 07:00 PV 0.43 vs 0.23), so use them
+    instead of a sine. Compare against the FORECAST LOAD rather than a fixed
+    threshold — the house is not a constant.
+
+    Sustained for the same reason RD35 requires a sustained measured crossing: a
+    single slot where load dips under PV is not dawn.
+
+    Args:
+        pv_forecast, load_forecast: dict {minute: value}, Predbat step maps.
+        start_minute, end_minute: scan window (inclusive, exclusive).
+        step_minutes: forecast step size.
+        values_are_kwh: True when values are kWh-per-step (Predbat format).
+        sustained_minutes: how long the crossing must hold.
+
+    Returns:
+        int minute-of-day, or None if PV never sustainedly covers load.
+    """
+    step_hours = step_minutes / 60.0
+    to_kw = (1.0 / step_hours) if values_are_kwh else 1.0
+    for m in range(start_minute, end_minute, step_minutes):
+        held = True
+        for probe in range(m, min(m + sustained_minutes, end_minute), step_minutes):
+            pv_kw = pv_forecast.get(probe, 0.0) * to_kw
+            load_kw = load_forecast.get(probe, 0.0) * to_kw
+            if pv_kw < load_kw:
+                held = False
+                break
+        if held:
+            # Guard the degenerate all-zero window (no forecast loaded): 0 >= 0
+            # would otherwise report a crossing at midnight.
+            if (pv_forecast.get(m, 0.0) * to_kw) <= 0:
+                continue
+            return m
+    return None
+
+
 def should_defer_to_charge(gshp_ch_active, soc_kw, soc_keep, was_deferring):
     """R4 (gated): defer to Predbat charge window only when GSHP heating is active.
 

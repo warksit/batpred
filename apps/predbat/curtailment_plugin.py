@@ -39,6 +39,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from curtailment_calc import (
+    compute_pv_covers_load_minute,
     apply_no_surplus_drain_hold,
     compute_morning_gap,
     compute_remaining_overflow,
@@ -1344,9 +1345,29 @@ class CurtailmentPlugin(PredBatPlugin):
         if soc_kw <= target_kwh + 0.1:
             return None  # already at/below pre-PV target
 
+        # RD36: the drain ENDS when PV covers load, not at PV-start.
+        #
+        # 2026-08-12: timed to end at `pv_start_utc` (clear-sky sine, fixed
+        # 0.5 kW), the drain finished 05:45 while PV did not cover load until
+        # ~06:45 — an hour of coasting on the reserve. The sine was itself ~35
+        # min optimistic (implied end 06:14 vs actual ~06:50). Predbat's per-slot
+        # forecasts carry the crossing directly and were right on the day, so use
+        # them and fall back to the sine only if they are unavailable.
+        end_utc = pv_start_utc
+        pv_step_fc = getattr(self.base, "pv_forecast_minute_step", {}) or {}
+        load_step_fc = getattr(self.base, "load_minutes_step", {}) or {}
+        cross_min = compute_pv_covers_load_minute(pv_step_fc, load_step_fc, 0, 24 * 60, PREDICT_STEP, values_are_kwh=True) if pv_step_fc else None
+        if cross_min is not None:
+            end_utc = utc_hours + cross_min / 60.0
+
+        # Rate is what leaves the BATTERY, not what leaves the meter: it supplies
+        # the export cap AND the house. Under-stating it (cap alone) makes the
+        # drain finish early, which is the defect above. Over-stating is the safe
+        # direction — a later start means arriving with charge in hand.
         drain_amount = soc_kw - target_kwh
-        drain_minutes = drain_amount / dno_limit_kw * 60.0
-        drain_start_utc = pv_start_utc - drain_minutes / 60.0
+        drain_rate_kw = dno_limit_kw + MIN_BASE_LOAD_KW
+        drain_minutes = drain_amount / drain_rate_kw * 60.0
+        drain_start_utc = end_utc - drain_minutes / 60.0
 
         # v32.2: the timing gate is a START gate ONLY. drain_start_utc tracks `now`
         # as SOC drains (draining at ~dno shrinks drain_minutes at ~60min/h), so
@@ -2928,7 +2949,16 @@ class CurtailmentPlugin(PredBatPlugin):
         # so any side effect here double-counts.
         if self._dawn_released:
             return self._drain_floor_kwh(soc_max)
-        return max(DAWN_RESERVE_FRACTION * soc_max, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, self._dawn_load_kwh))
+        # RD36: the fixed DAWN_RESERVE_FRACTION arm is GONE. It existed because
+        # the drain stopped before the crossing and the house then had to be
+        # carried; now the drain runs TO the crossing, so the only reserve needed
+        # is the deep floor plus whatever load the forecast still puts in the gap.
+        #
+        # It also actively broke the timed drain: 2026-08-12 the pre-PV path
+        # computed a target of 0.7 kWh (4%) and the 10% floor stopped the Schmitt
+        # at 8.4%, so the timing calculation could never reach its own target.
+        # Two floors for one question, and the constant won — the R63 shape again.
+        return DEEP_DISCHARGE_FLOOR_KWH + max(0.0, self._dawn_load_kwh)
 
     def _r63_floor_kwh(self, soc_max):
         """RD32 — the SOC R63's last-chance drain may run down to, in kWh.
