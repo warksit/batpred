@@ -262,6 +262,17 @@ SUNDOWN_ELEV_DEG = 8.0
 # before overflow starts. See _dawn_floor_kwh.
 DAWN_RESERVE_FRACTION = 0.10
 
+# RD35: consecutive cycles of measured pv >= load required to release the dawn
+# reserve. The latch is one-way for the day, so a single lucky sample — a load
+# dip against rising PV — spends the reserve and puts the house on the import
+# meter for the rest of the gap. 2 cycles is ~10 min at the 5-min plan loop.
+#
+# Asymmetric on purpose: releasing EARLY risks import at 12.4-25.3p; releasing
+# LATE defers export at a flat 12p with hours of shed time before lockout
+# (2026-08-12: crossing ~06:45, lockout ~09:30, and the remaining drain takes
+# ~18 min at the cap). Bias late.
+DAWN_RELEASE_CONFIRM_CYCLES = 2
+
 # Do not hand back in the run-up to a joined saving session — see _session_imminent.
 # 30 min comfortably covers the 5-minute plugin cycle plus the ownership handover,
 # without pinning CM active for a session hours away.
@@ -479,6 +490,9 @@ class CurtailmentPlugin(PredBatPlugin):
         # PV >= load. Persisted — a deploy during the gap would otherwise re-arm a
         # reserve we had already correctly spent, or vice versa.
         self._dawn_released = False
+        # RD35: consecutive cycles seen with pv >= load. Persisted so a deploy
+        # mid-gap neither loses nor invents confirmation.
+        self._dawn_cross_count = 0
         # Forecast house load across the dawn gap, carried out of the pre-PV path so
         # the reserve survives the phase boundary. MIN_BASE_LOAD_KW for one hour is
         # the fallback when the pre-PV path has not run this day.
@@ -609,6 +623,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = bool(data.get("r48_engaged_today", False))
         self._sundown_latched = bool(data.get("sundown_latched", False))
         self._dawn_released = bool(data.get("dawn_released", False))
+        self._dawn_cross_count = int(data.get("dawn_cross_count", 0))
         self._dawn_load_kwh = float(data.get("dawn_load_kwh", MIN_BASE_LOAD_KW * 1.0))
         # Restore _pv_history (R49) — without this, every restart kills v20
         # buffer-reduction for the rest of the day until 60 min of fresh
@@ -675,6 +690,7 @@ class CurtailmentPlugin(PredBatPlugin):
             "r48_engaged_today": self._r48_engaged_today,
             "sundown_latched": self._sundown_latched,
             "dawn_released": self._dawn_released,
+            "dawn_cross_count": self._dawn_cross_count,
             "dawn_load_kwh": self._dawn_load_kwh,
             "pv_history": [list(entry) for entry in self._pv_history],
             "yesterday_cap_avg": self._yesterday_cap_avg,
@@ -718,6 +734,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
         self._sundown_latched = False  # O1 dusk-flap latch
         self._dawn_released = False  # v33 dawn-gap reserve re-arms for the new dawn
+        self._dawn_cross_count = 0
         self._dawn_load_kwh = MIN_BASE_LOAD_KW * 1.0
         self._pre_pv_engaged_today = False  # v32 dawn-flap latch
         self._pre_pv_drain_started = False  # v32.2 pre-PV drain start-latch
@@ -1517,6 +1534,11 @@ class CurtailmentPlugin(PredBatPlugin):
         # session floor from yesterday evening.
         self._policy_override = None
         self._session_protect_kwh = 0.0
+
+        # RD35: advance the dawn-release latch exactly ONCE per cycle, here,
+        # before any early return — every path below reads the floor, and the
+        # floor itself must stay side-effect free (it is read twice per cycle).
+        self._evaluate_dawn_crossing()
 
         # R55: refresh overnight_target sensor every cycle. calculate() runs
         # via on_update which fires AFTER calculate_plan in update_pred, so
@@ -2840,6 +2862,41 @@ class CurtailmentPlugin(PredBatPlugin):
             return False
         return self._sundown_latched or (peaked and actual_pv < 0.1)
 
+    def _evaluate_dawn_crossing(self):
+        """RD35 — advance the dawn-release latch. Called ONCE per cycle.
+
+        Deliberately NOT inside `_dawn_floor_kwh`: that is read twice per cycle
+        (the publish path and `_r63_floor_kwh`), so counting there would make one
+        cycle count as two and release on a single sample — the very bug this
+        exists to fix, wearing a disguise.
+
+        Requires `DAWN_RELEASE_CONFIRM_CYCLES` CONSECUTIVE observations of
+        measured pv >= load. A momentary load dip against rising PV must not
+        spend the reserve for the day, because the latch is one-way.
+
+        `pv_kw > 0` still guards the degenerate overnight case where BOTH read 0
+        (load sensor unavailable) — 0 >= 0 would otherwise count at midnight, the
+        one moment the reserve is most needed.
+
+        Fails CLOSED: unreadable sensors reset the count rather than advance it.
+        """
+        if self._dawn_released:
+            return
+        try:
+            pv_kw = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0) or 0)
+            load_kw = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0) or 0)
+        except (TypeError, ValueError):
+            self._dawn_cross_count = 0
+            return
+        if pv_kw > 0 and pv_kw >= load_kw:
+            self._dawn_cross_count += 1
+            if self._dawn_cross_count >= DAWN_RELEASE_CONFIRM_CYCLES:
+                self._dawn_released = True
+                self.log("Curtailment: dawn reserve released — pv {:.2f} >= load {:.2f} sustained {} cycles".format(pv_kw, load_kw, self._dawn_cross_count))
+        elif self._dawn_cross_count:
+            self.log("Curtailment: dawn crossing not sustained (pv {:.2f} < load {:.2f}) — count reset".format(pv_kw, load_kw))
+            self._dawn_cross_count = 0
+
     def _dawn_floor_kwh(self, soc_max):
         """The hard-floor arm of `compute_drain_above`, gated on the DAWN GAP.
 
@@ -2866,21 +2923,12 @@ class CurtailmentPlugin(PredBatPlugin):
         wrongly is ~27 min of drain against ~3 h of slack; the cost of releasing it
         wrongly is importing the house through the dark.
         """
+        # PURE reader (RD35): the latch is advanced only by
+        # `_evaluate_dawn_crossing`, once per cycle. This is read twice per cycle,
+        # so any side effect here double-counts.
         if self._dawn_released:
             return self._drain_floor_kwh(soc_max)
-        reserve = max(DAWN_RESERVE_FRACTION * soc_max, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, self._dawn_load_kwh))
-        try:
-            pv_kw = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0) or 0)
-            load_kw = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0) or 0)
-        except (TypeError, ValueError):
-            return reserve
-        # pv_kw > 0 guards the degenerate overnight case where BOTH read 0 (load
-        # sensor unavailable) — 0 >= 0 would otherwise release the reserve at
-        # midnight, the one moment it is most needed.
-        if pv_kw > 0 and pv_kw >= load_kw:
-            self._dawn_released = True
-            return self._drain_floor_kwh(soc_max)
-        return reserve
+        return max(DAWN_RESERVE_FRACTION * soc_max, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, self._dawn_load_kwh))
 
     def _r63_floor_kwh(self, soc_max):
         """RD32 — the SOC R63's last-chance drain may run down to, in kWh.

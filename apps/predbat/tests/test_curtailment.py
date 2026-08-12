@@ -4202,6 +4202,7 @@ from curtailment_plugin import (
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
     SIG_SAVING_SESSION_CALENDAR,
     DAWN_RESERVE_FRACTION,
+    DAWN_RELEASE_CONFIRM_CYCLES,
     SESSION_PROTECT_HORIZON_HOURS,
     PREDBAT_SOC_MIN_HELPER,
 )
@@ -6925,7 +6926,14 @@ def _make_dawn_base(pv_kw, load_kw, soc_pct=0.30, hour=6, floor_pct=DAWN_TEST_FL
 
 
 def _dawn_drain_above(plugin):
-    """Publish on a maximum-overflow day (every other arm zero) and return the floor."""
+    """Publish on a maximum-overflow day (every other arm zero) and return the floor.
+
+    Runs DAWN_RELEASE_CONFIRM_CYCLES crossing evaluations first: since RD35 the
+    release needs a SUSTAINED crossing, so a rig that evaluates once would never
+    release and these tests would pass for the wrong reason.
+    """
+    for _ in range(DAWN_RELEASE_CONFIRM_CYCLES):
+        plugin._evaluate_dawn_crossing()
     plugin._overflow_floor_kwh = 0.0
     plugin._effective_keep_kwh = 0.0
     plugin._p10_recovery_floor = 0.0
@@ -6958,6 +6966,68 @@ def test_dawn_reserve_survives_pv_start():
     expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
     assert abs(floor - expected) < 0.01, "PV 0.31 < load 0.42 is still the dawn gap: floor must be the {:.2f} kWh dawn reserve, got {:.2f}".format(expected, floor)
     print("  test_dawn_reserve_survives_pv_start: PASSED ({:.2f} kWh held)".format(floor))
+
+
+def _cycle(plugin, pv_kw, load_kw):
+    """One plan cycle at the given PV/load, then read the floor (which is read
+    TWICE per real cycle — publish and R63 — so this catches double-counting)."""
+    plugin.base._sensor_overrides["sensor.sigen_plant_pv_power"] = pv_kw
+    plugin.base._sensor_overrides["sensor.sigen_plant_consumed_power"] = load_kw
+    plugin._evaluate_dawn_crossing()
+    plugin._dawn_floor_kwh(BATTERY_KWH)
+    plugin._dawn_floor_kwh(BATTERY_KWH)
+    return plugin._dawn_released
+
+
+def test_single_crossing_sample_does_not_release_the_reserve():
+    """RD35 — the release must be SUSTAINED, not a single lucky sample.
+
+    Andrew: "Rather than pick the first moment pv exceeds load we should check
+    it continues?" Right. The latch was one-way on ONE instantaneous reading, so
+    a momentary load dip against rising PV (fridge cycling off at 0.10 kW while
+    PV is 0.12) spends the dawn reserve for the whole day — and the house then
+    runs onto the import meter for the rest of the gap.
+
+    Asymmetric by design: releasing EARLY risks import at 12.4-25.3p; releasing
+    LATE costs a few minutes of deferred export at a flat 12p, and there are
+    hours of shed time before lockout. So bias late.
+    """
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37))
+    assert _cycle(plugin, pv_kw=0.12, load_kw=0.10) is False, "one sample must not release the reserve"
+    print("  test_single_crossing_sample_does_not_release_the_reserve: PASSED")
+
+
+def test_sustained_crossing_releases():
+    """Two consecutive cycles (~10 min) is a real dawn, not a blip."""
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37))
+    assert _cycle(plugin, pv_kw=0.60, load_kw=0.40) is False
+    assert _cycle(plugin, pv_kw=0.70, load_kw=0.40) is True, "sustained crossing must release"
+    print("  test_sustained_crossing_releases: PASSED")
+
+
+def test_interrupted_crossing_resets_the_count():
+    """A blip, a drop, then another blip is NOT sustained — the count resets, so
+    two isolated samples must not add up to a release."""
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37))
+    assert _cycle(plugin, pv_kw=0.60, load_kw=0.40) is False
+    assert _cycle(plugin, pv_kw=0.10, load_kw=0.40) is False, "PV fell back — must reset"
+    assert _cycle(plugin, pv_kw=0.60, load_kw=0.40) is False, "count restarted, so still not released"
+    assert _cycle(plugin, pv_kw=0.60, load_kw=0.40) is True
+    print("  test_interrupted_crossing_resets_the_count: PASSED")
+
+
+def test_crossing_counted_once_per_cycle_not_per_read():
+    """`_dawn_floor_kwh` is read TWICE per cycle (publish + R63's floor). If the
+    counting lived in it, one cycle would count as two and release immediately —
+    which is the single-sample bug wearing a disguise."""
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37))
+    plugin.base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.60
+    plugin.base._sensor_overrides["sensor.sigen_plant_consumed_power"] = 0.40
+    plugin._evaluate_dawn_crossing()
+    for _ in range(5):
+        plugin._dawn_floor_kwh(BATTERY_KWH)
+    assert plugin._dawn_released is False, "reading the floor must never advance the latch"
+    print("  test_crossing_counted_once_per_cycle_not_per_read: PASSED")
 
 
 def test_dawn_reserve_released_by_measured_crossover():
@@ -7123,6 +7193,8 @@ def _soc_min_run(pv_kw, load_kw, soc_pct=0.30, current=-1):
     base = _make_dawn_base(pv_kw=pv_kw, load_kw=load_kw, soc_pct=soc_pct)
     base._sensor_overrides[PREDBAT_SOC_MIN_HELPER] = current
     plugin = CurtailmentPlugin(base)
+    for _ in range(DAWN_RELEASE_CONFIRM_CYCLES):
+        plugin._evaluate_dawn_crossing()
     plugin._overflow_floor_kwh = 0.0
     plugin._effective_keep_kwh = 0.0
     plugin._p10_recovery_floor = 0.0
@@ -8725,6 +8797,10 @@ def run_curtailment_tests(my_predbat=None):
         test_two_floors_are_named_and_sourced_distinctly,
         test_drain_above_source_mirrors_compute_drain_above,
         test_dawn_reserve_survives_pv_start,
+        test_single_crossing_sample_does_not_release_the_reserve,
+        test_sustained_crossing_releases,
+        test_interrupted_crossing_resets_the_count,
+        test_crossing_counted_once_per_cycle_not_per_read,
         test_dawn_reserve_released_by_measured_crossover,
         test_released_floor_comes_from_the_live_helper,
         test_dawn_release_latches_against_midday_cloud,
