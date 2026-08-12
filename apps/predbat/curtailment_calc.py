@@ -274,6 +274,44 @@ def session_reserve_is_reachable(
     return net >= deficit_kwh * margin
 
 
+# RD38: how late the pv-covers-load crossing may plausibly be. The dawn reserve
+# now covers ONLY this error — RD36 made the drain run to the crossing, so a
+# correct forecast means the reserve is never touched. 45 min because the
+# clear-sky miss on 2026-08-12 was 35 min and the per-slot forecast should beat
+# it; at ~0.4 kW that is ~0.3 kWh, about 1.7% of pack.
+DAWN_ERROR_MARGIN_MINUTES = 45
+
+
+def compute_dawn_error_margin(load_forecast, crossing_minute, margin_minutes=DAWN_ERROR_MARGIN_MINUTES, step_minutes=5, values_are_kwh=False, base_load_kw=MIN_BASE_LOAD_KW):
+    """RD38: kWh the battery must hold in case the pv-covers-load crossing is late.
+
+    Literally "what it costs if the crossing arrives `margin_minutes` after the
+    forecast said it would" — the forecast house load over the window FOLLOWING
+    the predicted crossing.
+
+    Replaces `dawn_load_kwh`, which measured the PV-start-to-covers-load window.
+    That was the right quantity while the drain deliberately stopped at PV-start
+    and coasted (pre-RD36); once the drain runs TO the crossing it is a number
+    that no longer means what its name says, and in winter it could be hours.
+
+    The load AFTER the crossing is the relevant one — the risk is the crossing
+    being late, so it is the following hour the battery must cover. At dawn the
+    before/after loads genuinely differ (DHW, heating recovery).
+
+    Floored at `base_load_kw` over the window: a forecast claiming near-zero
+    overnight load must not produce a near-zero margin.
+    """
+    step_hours = step_minutes / 60.0
+    to_kwh = 1.0 if values_are_kwh else step_hours
+    total = 0.0
+    for m in range(int(crossing_minute), int(crossing_minute + margin_minutes), step_minutes):
+        total += load_forecast.get(m, 0.0) * to_kwh
+    # Floor the TOTAL, not each step: a per-step floor would override a
+    # legitimately lower forecast (base_load 0.5 kW vs a measured ~0.4), which is
+    # not "don't trust zero", it is "ignore the forecast".
+    return max(total, base_load_kw * (margin_minutes / 60.0))
+
+
 def should_defer_to_charge(gshp_ch_active, soc_kw, soc_keep, was_deferring):
     """R4 (gated): defer to Predbat charge window only when GSHP heating is active.
 

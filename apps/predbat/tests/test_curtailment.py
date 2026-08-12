@@ -7053,6 +7053,54 @@ def _dawn_drain_above(plugin):
     return plugin._drain_above
 
 
+def test_dawn_margin_is_load_over_the_error_window():
+    """RD38 — the reserve is now an ERROR MARGIN, and is sized as one.
+
+    RD36 made the drain run TO the pv-covers-load crossing, so the reserve no
+    longer bridges a designed gap — it only covers the case where the FORECAST
+    crossing is earlier than the real one. That is a different quantity, and it
+    was still being computed as the old PV-start-to-covers-load window load: a
+    number that means something else and, in winter, could be hours.
+
+    Sized as forecast house load over DAWN_ERROR_MARGIN_MINUTES following the
+    predicted crossing — literally "what it costs if the crossing is that late".
+    45 min because yesterday's clear-sky miss was 35 min and the per-slot
+    forecast should beat it; ~0.3 kWh, about 1.7% of pack.
+    """
+    from curtailment_calc import compute_dawn_error_margin
+
+    # 0.8 kW, deliberately ABOVE MIN_BASE_LOAD_KW: at 0.4 kW the base-load floor
+    # (0.5 x 0.75 = 0.375) dominates and the integration under test is never
+    # reached — the fixture would pass without exercising its own subject.
+    load = {m: 0.8 * (5 / 60.0) for m in range(0, 720, 5)}
+    got = compute_dawn_error_margin(load, crossing_minute=300, margin_minutes=45, step_minutes=5, values_are_kwh=True)
+    assert abs(got - 0.6) < 0.02, "45 min at 0.8 kW = 0.60 kWh, got {:.3f}".format(got)
+    print("  test_dawn_margin_is_load_over_the_error_window: PASSED ({:.2f} kWh)".format(got))
+
+
+def test_dawn_margin_uses_the_load_after_the_crossing_not_before():
+    """The risk is the crossing arriving LATE, so the margin must be the load
+    that follows it. Taking the load before would size it on the wrong hour —
+    and at dawn the two differ (DHW, heating recovery)."""
+    from curtailment_calc import compute_dawn_error_margin
+
+    load = {m: (3.0 if m < 300 else 0.8) * (5 / 60.0) for m in range(0, 720, 5)}
+    got = compute_dawn_error_margin(load, crossing_minute=300, margin_minutes=45, step_minutes=5, values_are_kwh=True)
+    assert abs(got - 0.6) < 0.02, "must use the 0.8 kW AFTER the crossing, not the 3.0 kW before it — got {:.3f}".format(got)
+    print("  test_dawn_margin_uses_the_load_after_the_crossing_not_before: PASSED")
+
+
+def test_dawn_margin_floors_at_base_load():
+    """A forecast that claims near-zero overnight load must not produce a
+    near-zero margin — the house always draws something."""
+    from curtailment_calc import compute_dawn_error_margin
+
+    load = {m: 0.0 for m in range(0, 720, 5)}
+    got = compute_dawn_error_margin(load, crossing_minute=300, margin_minutes=45, step_minutes=5, values_are_kwh=True)
+    assert got >= MIN_BASE_LOAD_KW * (45 / 60.0) - 0.01, "must floor at base load, got {:.3f}".format(got)
+    print("  test_dawn_margin_floors_at_base_load: PASSED ({:.2f} kWh)".format(got))
+
+
 def test_dawn_reserve_survives_pv_start():
     """The dawn reserve must hold until PV MEETS LOAD, not until PV starts.
 
@@ -8923,6 +8971,9 @@ def run_curtailment_tests(my_predbat=None):
         test_v32_upcoming_session_raises_drain_floor,
         test_two_floors_are_named_and_sourced_distinctly,
         test_drain_above_source_mirrors_compute_drain_above,
+        test_dawn_margin_is_load_over_the_error_window,
+        test_dawn_margin_uses_the_load_after_the_crossing_not_before,
+        test_dawn_margin_floors_at_base_load,
         test_dawn_reserve_survives_pv_start,
         test_single_crossing_sample_does_not_release_the_reserve,
         test_sustained_crossing_releases,

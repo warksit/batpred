@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 
 from curtailment_calc import (
     compute_pv_covers_load_minute,
+    compute_dawn_error_margin,
+    DAWN_ERROR_MARGIN_MINUTES,
     session_reserve_is_reachable,
     apply_no_surplus_drain_hold,
     compute_morning_gap,
@@ -1318,14 +1320,18 @@ class CurtailmentPlugin(PredBatPlugin):
         # Dawn load: house load the battery must carry from PV-start until PV
         # covers load (the R61 no-drain window). Crossing at base load + the
         # pv_covering margin; falls back to ~1h of base load if no crossing.
-        _cm, cover_utc = compute_pv_start_time(p90_scale, lat, lon, doy, MIN_BASE_LOAD_KW + 0.5, utc_hours)
-        dawn_load_kwh = MIN_BASE_LOAD_KW * 1.0
-        if cover_utc is not None and pv_start_utc is not None and cover_utc > pv_start_utc:
-            load_step = getattr(self.base, "load_minutes_step", {}) or {}
-            step_h = PREDICT_STEP / 60.0
-            start_off = max(0, int((pv_start_utc - utc_hours) * 60))
-            cover_off = max(start_off, int((cover_utc - utc_hours) * 60))
-            dawn_load_kwh = sum(max(load_step.get(m, 0.0), MIN_BASE_LOAD_KW * step_h) for m in range(start_off, cover_off, PREDICT_STEP))
+        # RD38: the reserve is an ERROR MARGIN now, not a gap bridge. RD36 runs the
+        # drain TO the crossing, so the only exposure left is the crossing arriving
+        # later than forecast — priced as the house load over the window FOLLOWING
+        # it. The old figure measured PV-start-to-covers-load, which since RD36 is
+        # a quantity that no longer matches its own name.
+        load_step = getattr(self.base, "load_minutes_step", {}) or {}
+        pv_step_dl = getattr(self.base, "pv_forecast_minute_step", {}) or {}
+        cross_for_margin = compute_pv_covers_load_minute(pv_step_dl, load_step, 0, 24 * 60, PREDICT_STEP, values_are_kwh=True) if pv_step_dl else None
+        if cross_for_margin is None:
+            dawn_load_kwh = MIN_BASE_LOAD_KW * (DAWN_ERROR_MARGIN_MINUTES / 60.0)
+        else:
+            dawn_load_kwh = compute_dawn_error_margin(load_step, cross_for_margin, DAWN_ERROR_MARGIN_MINUTES, PREDICT_STEP, values_are_kwh=True)
 
         # v33: carry it out of this path. The pre-PV phase ENDS at PV start, but the
         # gap this number measures runs on past that boundary — see _dawn_floor_kwh.
@@ -2673,6 +2679,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 "source_label": DRAIN_SOURCE_LABELS.get(drain_above_source, drain_above_source),
                 "session_reserve_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else 0.0,
                 "session_protect_kwh": round(self._session_protect_kwh, 2) if self._session_protect_kwh else 0.0,
+                # RD38: publish the margin so the computed arm is observable. It
+                # was invisible for its whole life, which is how a fixed constant
+                # came to override it unnoticed.
+                "dawn_margin_kwh": round(self._dawn_load_kwh, 2),
                 "session_start": self._get_session_start(),
                 "drives": "SOC above this -> Max Export (sell down to make room)",
             },
