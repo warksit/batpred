@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 from curtailment_calc import (
     compute_pv_covers_load_minute,
+    session_reserve_is_reachable,
     apply_no_surplus_drain_hold,
     compute_morning_gap,
     compute_remaining_overflow,
@@ -2123,12 +2124,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # Horizon gate (2026-08-11): reserving for a session that is still days
         # out protects nothing — PV refills the pack daily — and costs the
         # curtailment drain. `_session_imminent` is the existing primitive.
-        if self._session_reserve_kwh > 0 and not self._session_active and self._session_imminent(within_minutes=SESSION_PROTECT_HORIZON_HOURS * 60.0):
-            reserve_for_recovery = self._session_reserve_kwh
-            self._session_protect_kwh = min(soc_max, overnight_target + self._session_reserve_kwh)
-        else:
-            reserve_for_recovery = 0.0
-            self._session_protect_kwh = 0.0
+        reserve_for_recovery, self._session_protect_kwh = self._session_protect(soc_max, overnight_target)
         overnight_for_recovery = overnight_target + reserve_for_recovery
         p10_recovery = compute_p10_recovery_floor(
             overnight_target_kwh=overnight_for_recovery,
@@ -2998,6 +2994,54 @@ class CurtailmentPlugin(PredBatPlugin):
         except (TypeError, ValueError):
             pct = DEFAULT_DRAIN_FLOOR_PCT
         return max(0.0, pct / 100.0 * soc_max)
+
+    def _session_protect(self, soc_max, overnight_target):
+        """Session reserve: how much to hold back, and whether to hold it at all.
+
+        Returns (reserve_for_recovery, session_protect_kwh); both 0 when the
+        reserve should not bind. Three gates, each added after the previous one
+        let something through:
+
+        1. Not during a LIVE session — then we are dumping it, not hoarding it.
+        2. HORIZON (2026-08-11): a session 35 h out had pinned drain_above to
+           81.4%; the reserve armed the moment Octopus announced it.
+        3. REACHABILITY (RD37, 2026-08-12): SOC 1.16 kWh with the floor pinned at
+           15.29 kWh for an 18:00 session, suppressing the morning drain, while
+           60.6 kWh of PV was forecast and overflow_p90 was 16.0. The reserve was
+           protecting energy that did not exist against a refill never in doubt.
+
+        Deficit is measured from the DRAIN FLOOR, not current SOC: "may I drain
+        to the floor" is the decision being taken. P10 band with a margin — a
+        paid session is not staked on optimistic sun.
+        """
+        if self._session_reserve_kwh <= 0 or self._session_active:
+            return 0.0, 0.0
+        if not self._session_imminent(within_minutes=SESSION_PROTECT_HORIZON_HOURS * 60.0):
+            return 0.0, 0.0
+        target = min(soc_max, overnight_target + self._session_reserve_kwh)
+        mins = self._minutes_to_session()
+        pv10 = getattr(self.base, "pv_forecast_minute_step10", {}) or getattr(self.base, "pv_forecast_minute_step", {}) or {}
+        if mins is not None and pv10:
+            deficit = max(0.0, target - self._drain_floor_kwh(soc_max))
+            if session_reserve_is_reachable(pv10, getattr(self.base, "load_minutes_step", {}) or {}, mins, deficit, PREDICT_STEP, values_are_kwh=True):
+                self._log_once("session_reachable", "Curtailment: session reserve stands aside — forecast PV refills {:.1f} kWh before the session".format(deficit))
+                return 0.0, 0.0
+        return self._session_reserve_kwh, target
+
+    def _minutes_to_session(self):
+        """Minutes until the next joined session starts, or None."""
+        start = self._get_session_start()
+        if not start:
+            return None
+        try:
+            start_dt = datetime.fromisoformat(str(start))
+            now = self.base.now_utc if getattr(self.base, "now_utc", None) else datetime.now(start_dt.tzinfo)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=start_dt.tzinfo)
+            delta = (start_dt - now).total_seconds() / 60.0
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return delta if delta > 0 else None
 
     def _session_imminent(self, within_minutes=SESSION_IMMINENT_MINS):
         """True when a joined session starts within `within_minutes`.
