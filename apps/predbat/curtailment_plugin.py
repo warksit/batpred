@@ -3034,7 +3034,7 @@ class CurtailmentPlugin(PredBatPlugin):
         if mins is not None and pv10:
             deficit = max(0.0, target - self._drain_floor_kwh(soc_max))
             if session_reserve_is_reachable(pv10, getattr(self.base, "load_minutes_step", {}) or {}, mins, deficit, PREDICT_STEP, values_are_kwh=True):
-                self._log_once("session_reachable", "Curtailment: session reserve stands aside — forecast PV refills {:.1f} kWh before the session".format(deficit))
+                self._log_once("session_reachable", "Curtailment: session reserve stands aside — forecast PV fills {:.1f} kWh before the session".format(deficit))
                 return 0.0, 0.0
         return self._session_reserve_kwh, target
 
