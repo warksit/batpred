@@ -82,6 +82,6 @@ site.
 {% endif %}
 {% if verdict == 'at risk' %}⚠ **{{ risk | round(1) }} kWh at risk** — run a load to use it
 {% elif verdict == 'fits' %}✓ overflow fits — nothing at risk
-{% elif verdict == 'tight' %}⚠ **tight vs p90** — {{ short | round(1) }} kWh short of the buffer{% if trkmargin is not none and trkmargin > 0 %} · fits on today's actual ({{ trkovf | round(1) }} kWh){% endif %}
+{% elif verdict == 'tight' %}{% if trkmargin is not none and trkmargin > 0 %}✓ fits on today's actual ({{ trkovf | round(1) }} kWh) · p90 would be {{ short | round(1) }} kWh tight{% else %}⚠ **tight vs p90** — {{ short | round(1) }} kWh short of the buffer{% endif %}
 {% elif verdict == 'too early' %}⏳ overflow verdict — too early to call
 {% endif %}
