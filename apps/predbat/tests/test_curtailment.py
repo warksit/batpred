@@ -3663,6 +3663,62 @@ def _make_solcast_slots(slot_specs, date="2026-05-02", local_offset="+01:00"):
     return slots
 
 
+def _steps(pairs, step=5):
+    """{minute: kWh-per-step} for pv and load from (minute, pv_kw, load_kw) triples."""
+    h = step / 60.0
+    pv = {m: pv_kw * h for m, pv_kw, _ in pairs}
+    load = {m: ld * h for m, _, ld in pairs}
+    return pv, load
+
+
+def test_pv_covers_load_minute_finds_the_real_crossing():
+    """RD36 — the drain must end when PV COVERS LOAD, from the FORECAST.
+
+    2026-08-12: the drain was timed to end at `pv_start_utc`, a clear-sky sine
+    crossing of a fixed 0.5 kW, and then coasted on the dawn reserve until PV
+    actually covered load. Measured: drain ended 05:45, PV covered load ~06:45 —
+    an hour of coasting. The clear-sky prediction was itself ~35 min early
+    (implied end 06:14 vs actual ~06:50).
+
+    Predbat's own per-slot PV and load forecasts give the crossing directly and
+    were accurate on the day (plan: PV 0.10 vs load 0.24 at 06:30, PV 0.43 vs
+    0.23 at 07:00). Use those, not a sine.
+    """
+    from curtailment_calc import compute_pv_covers_load_minute
+
+    pairs = [(m, 0.0, 0.4) for m in range(300, 400, 5)]  # 05:00-06:40 dark
+    pairs += [(m, 0.6, 0.4) for m in range(400, 600, 5)]  # 06:40 on, PV over load
+    pv, load = _steps(pairs)
+    got = compute_pv_covers_load_minute(pv, load, start_minute=300, end_minute=600, values_are_kwh=True, sustained_minutes=30)
+    assert got == 400, "crossing is 06:40 (minute 400), got {}".format(got)
+    print("  test_pv_covers_load_minute_finds_the_real_crossing: PASSED")
+
+
+def test_pv_covers_load_ignores_a_blip():
+    """A single slot where load dips under PV is not dawn — same reasoning as
+    RD35's sustained release, applied to the forecast rather than the meter."""
+    from curtailment_calc import compute_pv_covers_load_minute
+
+    pairs = [(m, 0.0, 0.4) for m in range(300, 350, 5)]
+    pairs += [(350, 0.5, 0.4)]  # one-slot blip
+    pairs += [(m, 0.0, 0.4) for m in range(355, 420, 5)]
+    pairs += [(m, 0.6, 0.4) for m in range(420, 600, 5)]  # the real crossing
+    pv, load = _steps(pairs)
+    got = compute_pv_covers_load_minute(pv, load, start_minute=300, end_minute=600, values_are_kwh=True, sustained_minutes=30)
+    assert got == 420, "a one-slot blip must not count as the crossing, got {}".format(got)
+    print("  test_pv_covers_load_ignores_a_blip: PASSED")
+
+
+def test_pv_covers_load_returns_none_when_it_never_crosses():
+    """A dull winter day where PV never covers load: caller must fall back, not
+    plan a drain that finishes at a crossing which does not exist."""
+    from curtailment_calc import compute_pv_covers_load_minute
+
+    pv, load = _steps([(m, 0.1, 0.5) for m in range(300, 600, 5)])
+    assert compute_pv_covers_load_minute(pv, load, start_minute=300, end_minute=600, values_are_kwh=True) is None
+    print("  test_pv_covers_load_returns_none_when_it_never_crosses: PASSED")
+
+
 def test_R53_compute_solcast_overflow_empty_returns_zero():
     """Empty forecast → 0 kWh overflow."""
     from curtailment_calc import compute_solcast_overflow
@@ -4201,8 +4257,8 @@ from curtailment_plugin import (
     SIG_OVERRIDE_SELECT,
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
     SIG_SAVING_SESSION_CALENDAR,
-    DAWN_RESERVE_FRACTION,
     DAWN_RELEASE_CONFIRM_CYCLES,
+    MIN_BASE_LOAD_KW,
     SESSION_PROTECT_HORIZON_HOURS,
     PREDBAT_SOC_MIN_HELPER,
 )
@@ -6963,7 +7019,11 @@ def test_dawn_reserve_survives_pv_start():
     """
     plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.31, load_kw=0.42))
     floor = _dawn_drain_above(plugin)
-    expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
+    # RD36 (2026-08-12): the fixed DAWN_RESERVE_FRACTION arm is gone — the drain
+    # is now timed to END at the crossing, so the reserve is only the computed
+    # gap need. The BEHAVIOUR under test is unchanged: the reserve must survive
+    # PV-start rather than evaporating at the phase boundary.
+    expected = round(DEEP_DISCHARGE_FLOOR_KWH + plugin._dawn_load_kwh, 2)
     assert abs(floor - expected) < 0.01, "PV 0.31 < load 0.42 is still the dawn gap: floor must be the {:.2f} kWh dawn reserve, got {:.2f}".format(expected, floor)
     print("  test_dawn_reserve_survives_pv_start: PASSED ({:.2f} kWh held)".format(floor))
 
@@ -7225,7 +7285,7 @@ def test_dawn_reserve_floors_predbat_export_plan():
     """
     plugin, base = _soc_min_run(pv_kw=0.09, load_kw=0.37)
     writes = _soc_min_writes(base)
-    expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
+    expected = round(DEEP_DISCHARGE_FLOOR_KWH + plugin._dawn_load_kwh, 2)  # RD36: computed, not a fixed 10%
     assert writes, "in the dawn gap CM must floor Predbat's export plan"
     assert abs(writes[-1] - expected) < 0.01, "must write the dawn reserve {:.2f}, got {}".format(expected, writes[-1])
     print("  test_dawn_reserve_floors_predbat_export_plan: PASSED ({:.2f} kWh)".format(writes[-1]))
@@ -7245,7 +7305,7 @@ def test_export_floor_clears_when_pv_meets_load():
 def test_export_floor_not_rewritten_when_unchanged():
     """No redundant writes — the helper is read by the planner every cycle and a
     write storm is how `sig_keep_floor_pct` wedged on 2026-07-22."""
-    plugin, base = _soc_min_run(pv_kw=0.09, load_kw=0.37, current=round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2))
+    plugin, base = _soc_min_run(pv_kw=0.09, load_kw=0.37, current=round(DEEP_DISCHARGE_FLOOR_KWH + MIN_BASE_LOAD_KW * 1.0, 2))
     assert not _soc_min_writes(base), "already correct -> must not rewrite, got {}".format(_soc_min_writes(base))
     print("  test_export_floor_not_rewritten_when_unchanged: PASSED")
 
@@ -7274,7 +7334,7 @@ def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     import at 25p to buy headroom the peak may not even need.
     """
     plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37, soc_pct=0.072))
-    expected = round(DAWN_RESERVE_FRACTION * BATTERY_KWH, 2)
+    expected = round(DEEP_DISCHARGE_FLOOR_KWH + plugin._dawn_load_kwh, 2)  # RD36
     floor = plugin._r63_floor_kwh(BATTERY_KWH)
     assert abs(floor - expected) < 0.01, "in the dawn gap R63's floor must be the {:.2f} kWh dawn reserve, got {:.2f}".format(expected, floor)
     print("  test_r63_floor_is_the_dawn_reserve_not_the_deep_floor: PASSED ({:.2f} kWh)".format(floor))
@@ -7287,10 +7347,12 @@ def test_r63_does_not_engage_below_the_dawn_reserve():
     (1.30 kWh). The deadline IS breached on energy (3.80 > 3.46); the release is
     `drainable_kwh <= 0`, which only holds once R63's floor is the dawn reserve.
     """
-    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37, soc_pct=0.072))
-    soc_kwh = BATTERY_KWH * 0.072
+    # RD36 shrank the reserve to the computed gap need, so the SOC that sits
+    # below it is lower too: 4% (0.72 kWh) vs a 1.0 kWh floor.
+    plugin = CurtailmentPlugin(_make_dawn_base(pv_kw=0.09, load_kw=0.37, soc_pct=0.040))
+    soc_kwh = BATTERY_KWH * 0.040
     drainable = soc_kwh - plugin._r63_floor_kwh(BATTERY_KWH)
-    assert drainable < 0, "SOC 7.2% is BELOW the dawn reserve, so there is nothing R63 may shed (got {:.2f} kWh)".format(drainable)
+    assert drainable < 0, "SOC 4% is BELOW the dawn reserve, so there is nothing R63 may shed (got {:.2f} kWh)".format(drainable)
     assert not drain_deadline_breached(3.80, 3.46, engaged=False, drainable_kwh=drainable), "R63 must not force Max Export through the dawn reserve"
     print("  test_r63_does_not_engage_below_the_dawn_reserve: PASSED (drainable {:.2f} kWh)".format(drainable))
 
@@ -8733,6 +8795,9 @@ def run_curtailment_tests(my_predbat=None):
 
     # R53 per-slot Solcast integral tests (v20)
     r53_tests = [
+        test_pv_covers_load_minute_finds_the_real_crossing,
+        test_pv_covers_load_ignores_a_blip,
+        test_pv_covers_load_returns_none_when_it_never_crosses,
         test_R53_compute_solcast_overflow_empty_returns_zero,
         test_R53_compute_solcast_overflow_uniform_sunny_slot,
         test_global_scale_applies_beyond_the_r58_calibration_window,
