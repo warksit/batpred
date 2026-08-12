@@ -8244,6 +8244,34 @@ def test_tracking_band_still_calls_a_real_miss():
     print("  test_tracking_band_still_calls_a_real_miss: PASSED")
 
 
+def test_RD40_session_need_pct_shows_even_when_not_held():
+    """RD40: what the session NEEDS is published whenever a session exists.
+
+    `session_reserve_pct` is the reserve being HELD, so it collapses to 0 the
+    moment the reachability gate stands the reserve aside (RD37) — which on a
+    sunny day is all day. The card then said only "PV will fill it in time" and
+    never told you how big "it" was. Andrew, 2026-08-12: "If SOC is above the
+    need the % will not show all day."
+
+    Need and held are different questions and both must be answerable:
+      session_need_pct   — what a full dump at the cap would take   (always)
+      session_reserve_pct — what is actually being held back        (gated)
+    """
+    # 35.5 h out: the horizon gate closes, so nothing is held — the same rig the
+    # "not advertised when not held" test uses.
+    plugin = _session_protect_run(hours_ahead=35.5)
+    attrs = plugin.base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+
+    # Precondition: nothing held, otherwise this is not the case it names.
+    assert attrs["session_reserve_pct"] == 0.0, "fixture must have nothing held, got {}".format(attrs["session_reserve_pct"])
+    # RD40: the need is published anyway, and is non-zero.
+    need_kwh = attrs.get("session_need_kwh")
+    assert need_kwh and need_kwh > 0, "a joined session must publish its need, got {}".format(need_kwh)
+    expected = round(need_kwh / BATTERY_KWH * 100.0, 1)
+    assert attrs["session_need_pct"] == expected, "need must publish {}%, got {}".format(expected, attrs.get("session_need_pct"))
+    print("  test_RD40_session_need_pct_shows_even_when_not_held: PASSED (need {}% published while 0% held)".format(expected))
+
+
 def test_RD33_classifier_takes_energy_kwh_not_clear_sky_scale():
     """The classifier's units are kWh-to-now. Passing the clear-sky scales breaks it.
 
@@ -8783,6 +8811,7 @@ def run_curtailment_tests(my_predbat=None):
         test_tracking_band_reports_no_spread_when_bands_collapse,
         test_tracking_band_still_calls_a_real_miss,
         test_RD33_classifier_takes_energy_kwh_not_clear_sky_scale,
+        test_RD40_session_need_pct_shows_even_when_not_held,
         test_tracking_band_published_for_debugging,
     ]
     print("  --- apply / on_update tests ---")

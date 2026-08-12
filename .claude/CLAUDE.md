@@ -1,5 +1,48 @@
 # Batpred Project Instructions
 
+## HOW TO WORK WITH ANDREW — read before every reply, not just before code
+
+Agreed 2026-08-12 after a session where every reply ended with two or three
+findings Andrew never asked for, and the thing he DID report went unfixed. The
+failure is not laziness, it is **substitution**: doing adjacent work that is more
+interesting than the ask, then reporting it as if it were the ask.
+
+**1. Scope line first.** Before touching code, one line: `Scope: fixing X. Not
+touching Y, Z.` It gives Andrew five seconds to veto. If you cannot write that
+line, you do not yet understand the request — go to rule 5.
+
+**2. One ask, one fix, one report.** Report against the scope line and nothing
+else. If the reply contains work that is not in the scope line, you have already
+broken rule 1.
+
+**3. Findings are PARKED, never narrated.** Append to `.claude/PARKED.md`
+silently. Raise a finding mid-task only if it BLOCKS the current ask. "While I
+was there I noticed..." does not go in the reply. Andrew pulls from the list; you
+do not push it at him.
+
+**4. Disagreement is one sentence, then comply.** "I think X is wrong because Y —
+doing it as asked." Not a redesign, not a survey of options.
+
+**5. Ambiguity gets ONE question BEFORE work.** Never a guess plus commentary
+afterwards. A message with two parts has two asks — answer both or ask about
+both. Explaining away the part you did not understand is the specific move that
+caused this rule.
+
+### The self-check that makes these bite
+
+Before sending any reply, re-read the user's last message and answer:
+
+- Did I do **every** part of it? (Count the sentences. Two sentences often means
+  two asks — 2026-08-12: "the -% will not show all day" + "fix the naming"; only
+  the second was actioned.)
+- Is there anything in my reply that is **not** in my scope line?
+- Am I reporting **their** issue as fixed, or **mine**?
+
+If the reply fails any of these, delete the surplus and finish the ask. A
+question mark from Andrew is not a work order (see "A question is not an
+instruction") — but a reported symptom **is**, even when phrased as an
+observation.
+
 ## Curtailment Manager
 
 Before modifying ANY curtailment file (curtailment_plugin.py, curtailment_calc.py, tests/test_curtailment.py, or the HA automation `curtailment_manager_dynamic_export_limit`):
@@ -192,7 +235,7 @@ curtailment window closes, or pre-dawn). RD26 was correct and still cost a
 - `cd apps/predbat && python3 tests/test_yaml_dhw_meter.py` — GSHP DHW cycle meter (delta template + the once-per-day / sustain guards)
 - `cd apps/predbat && python3 tests/test_plugin_host_contract.py` — fails if the Predbat build lacks the `on_before_plan` host API
 - `cd apps/predbat && python3 tests/test_soc_keep_publish.py` — effective `best_soc_keep` sensor (read by `/soc-keep-review`)
-- `cd coverage && python3 ../apps/predbat/unit_test.py --quick`
+- `cd coverage && ./venv/bin/python ../apps/predbat/unit_test.py --quick` — **use the venv** (built by `source setup.csh`). Bare `python3`/`python3.11` fails on missing `protobuf` in `test_gateway.py`; that is an interpreter gap, not a regression. Check which interpreter you ran before investigating a failure.
 - **Commit before deploying** — always `git commit` before `scp`/deploy so deployed code is always in git history
 
 ## HA Automation Edits — MANDATORY workflow
