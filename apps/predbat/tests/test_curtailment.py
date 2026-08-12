@@ -5205,6 +5205,59 @@ def test_R55_overnight_target_formula_components():
     print(f"  test_R55_overnight_target_formula_components: PASSED (gap={morning_gap:.2f} + keep={soc_keep:.2f} = {pub['value']:.2f} kWh)")
 
 
+def test_R55_morning_gap_is_not_divided_by_discharge_efficiency():
+    """RD39: load_minutes_step is ALREADY pack-side, so no efficiency divide.
+
+    Predbat's load history comes from `sensor.sigen_plant_daily_load_consumption`,
+    which is a balance residual (pv + discharge + import - export). Measured
+    2026-08-12: that sensor exceeds the house CT by a steady ~95 W parasitic plus
+    a throughput-proportional conversion loss, and it tracks pack drawdown to
+    within 1.4% (forecast 5.66 kWh vs 5.58 kWh actually supplied, 20:00-06:00).
+
+    Dividing it by discharge_efficiency AGAIN charged the conversion loss twice
+    (+0.36 kWh on 2026-08-12, and it scaled with the window).
+
+    Every pre-existing R55 test used MockBase, which never sets the loss
+    attributes, so _discharge_efficiency() returned 1.0 and the divide was
+    invisible. This test sets them explicitly — hence the assertion that the
+    efficiency really is 0.947, proving the divide WOULD have applied here.
+    """
+    # 0.6 kW load over a PLUGIN_STEP grid -> 0.05 kWh per step.
+    # PV dark until minute 600, so sunset=5, sunrise=600 -> 119 steps.
+    pv = {}
+    load = {}
+    for m in range(0, 1440, PLUGIN_STEP):
+        pv[m] = 0.0 if m < 600 else 8.0
+        load[m] = 0.6
+    expected_gap = 119 * 0.05  # 5.95 kWh
+
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=10.0, minutes_now=0, soc_max=18.08, best_soc_keep=0)
+    # Production values for SIG: 3% battery discharge loss x ~2.3% inverter loss.
+    base.battery_loss_discharge = 0.947
+    base.inverter_loss = 1.0
+
+    plugin = CurtailmentPlugin(base)
+    try:
+        plugin.calculate(dno_limit_kw=4.0)
+    except Exception:
+        pass
+
+    pub = base.published["sensor.predbat_curtailment_overnight_target"]
+    attrs = pub["attrs"]
+
+    # Precondition: the efficiency is genuinely != 1.0, so a divide would bite.
+    assert abs(attrs["discharge_efficiency"] - 0.947) < 1e-6, f"rig must exercise a real efficiency, got {attrs['discharge_efficiency']}"
+    # The raw integral is the value we expect from the fixture.
+    assert abs(attrs["morning_gap_load_kwh"] - expected_gap) < 0.02, f"morning_gap_load should be {expected_gap:.2f}, got {attrs['morning_gap_load_kwh']:.2f}"
+    # RD39: morning_gap must equal the load integral — NOT load / 0.947 (= 6.28).
+    assert abs(attrs["morning_gap_kwh"] - expected_gap) < 0.02, f"morning_gap must NOT be divided by discharge_efficiency: expected {expected_gap:.2f}, got {attrs['morning_gap_kwh']:.2f}"
+
+    safety_pct = attrs["safety_pct"]
+    expected_target = expected_gap * (1 + safety_pct / 100.0) + attrs["soc_keep_kwh"]
+    assert abs(pub["value"] - expected_target) < 0.02, f"target should be {expected_target:.2f}, got {pub['value']:.2f}"
+    print(f"  test_R55_morning_gap_is_not_divided_by_discharge_efficiency: PASSED (gap={expected_gap:.2f} kWh undivided, eff={attrs['discharge_efficiency']})")
+
+
 def test_R55_overnight_target_window_extended_to_tomorrow():
     """Window extended to forecast_minutes (24h) so morning_gap covers tonight + overnight + dawn."""
     # Set up a day where today_solar_end window misses overnight load:
@@ -8882,6 +8935,7 @@ def run_curtailment_tests(my_predbat=None):
     r55_tests = [
         test_R55_overnight_target_published_on_overflow_day,
         test_R55_overnight_target_formula_components,
+        test_R55_morning_gap_is_not_divided_by_discharge_efficiency,
         test_R55_overnight_target_window_extended_to_tomorrow,
         test_R55_overnight_target_published_when_no_overflow,
         test_R55_overnight_target_published_from_calculate_with_real_pv_step,
