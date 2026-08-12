@@ -47,7 +47,7 @@ observation.
 
 Before modifying ANY curtailment file (curtailment_plugin.py, curtailment_calc.py, tests/test_curtailment.py, or the HA automation `curtailment_manager_dynamic_export_limit`):
 
-1. **Read `apps/predbat/REQUIREMENTS.md` first** — it contains the definitive requirements (R1-R30)
+1. **Read `apps/predbat/REQUIREMENTS.md` first** — it contains the definitive requirements (R1-R64, RD1-RD40) — the Status index near the top beats the prose
 2. **Check every change against the requirements** — do not remove, weaken, or bypass any requirement
 3. **If a requirement seems wrong**, discuss with the user before changing it. Update REQUIREMENTS.md if agreed.
 4. **R25 is the key design principle**: once PV-load > DNO, we have NO control levers. All management (drain/charge/hold) must happen BEFORE overflow. Never remove the drain mechanism.
