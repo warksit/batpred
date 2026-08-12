@@ -75,7 +75,7 @@ site.
 {% endif %}
 {% if hi is not none %}↓ drain if above **{{ hi | round(0) }}%** ({{ srclabel or 'headroom floor' }})
 {% endif %}
-{% if sessstart %}⚡ {{ sesstime }} saving session{% if sesspct %} · **{{ sesspct | round(1) }}%** held{% if src != 'session_protect' %} (inside the charge floor){% endif %}{% else %} · PV will refill it, not holding back{% endif %}
+{% if sessstart %}⚡ {{ sesstime }} saving session{% if sesspct %} · **{{ sesspct | round(1) }}%** held{% if src != 'session_protect' %} (inside the charge floor){% endif %}{% else %} · PV will fill it in time, not holding back{% endif %}
 {% endif %}
 {% if trk in ['below p10', 'p10-p50', 'p50-p90', 'above p90'] %}☀️ PV vs forecast: **{{ trk }}**{% if pvact is not none and pvexp is not none %} · {{ '%+.1f' | format(pvact - pvexp) }} kWh{% endif %}
 {% elif trk in ['too early', 'no spread'] %}☀️ PV vs forecast — {{ trk }}
