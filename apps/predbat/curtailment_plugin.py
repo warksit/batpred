@@ -986,14 +986,20 @@ class CurtailmentPlugin(PredBatPlugin):
                 step_minutes=PREDICT_STEP,
                 values_are_kwh=True,
             )
-            # Translate load energy → battery drawdown by accounting for
-            # discharge inefficiency (battery_loss_discharge × inverter_loss).
-            # Predbat already applies these in its predict trajectory; without
-            # the same factor our morning_gap underestimates by the same %
-            # (e.g. 5.29 kWh load → 6.20 kWh battery drawdown for SIG with
-            # 12% inverter loss + 3% battery discharge loss).
+            # RD39: NO efficiency divide here. load_minutes_step is built from
+            # `sensor.sigen_plant_daily_load_consumption`, which is a balance
+            # residual (pv + discharge + import - export) and is therefore
+            # ALREADY pack-side — it carries the ~95 W parasitic and the
+            # conversion loss. Measured 2026-08-12: forecast 5.66 kWh for
+            # 20:00-06:00 against 5.58 kWh actually supplied by the pack (1.4%),
+            # while dividing by 0.947 gave 5.98 kWh (7% over).
+            #
+            # The divide was double-counting the conversion loss (+0.36 kWh on
+            # 2026-08-12, growing with the window). It is kept in
+            # compute_session_reserve, where it IS correct: that converts a
+            # grid-side export cap into the pack energy needed to sustain it.
             discharge_efficiency = self._discharge_efficiency()
-            morning_gap_battery = morning_gap_load / discharge_efficiency
+            morning_gap_battery = morning_gap_load
 
             safety_pct = self._get_overnight_safety_pct()
             target = morning_gap_battery * (1.0 + safety_pct / 100.0) + soc_keep
