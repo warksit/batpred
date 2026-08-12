@@ -220,6 +220,60 @@ def compute_pv_covers_load_minute(
     return None
 
 
+def session_reserve_is_reachable(
+    pv_forecast,
+    load_forecast,
+    minutes_to_session,
+    deficit_kwh,
+    step_minutes=5,
+    values_are_kwh=False,
+    margin=1.2,
+):
+    """RD37: can forecast PV refill `deficit_kwh` before the session starts?
+
+    When it can, the session reserve must NOT hold the curtailment drain back —
+    it would be protecting energy the sun is about to deliver, at the cost of the
+    headroom the day actually needs.
+
+    Live 2026-08-12 06:59: SOC 1.16 kWh with `drain_above` pinned to 15.29 kWh
+    (84.6%) for an 18:00 session, suppressing the morning drain, while 60.6 kWh
+    of PV was forecast and overflow_p90 was 16.0 kWh. The reserve was protecting
+    energy that did not exist against a refill that was never in doubt.
+
+    Caller passes the deficit measured from the DRAIN FLOOR, not from current
+    SOC: the question is "if I drain to the floor, can PV still refill in time",
+    which is the decision being taken.
+
+    Pass the P10 band as `pv_forecast` — a paid session should not be staked on
+    optimistic sun. `margin` requires headroom beyond break-even for the same
+    reason.
+
+    Args:
+        pv_forecast, load_forecast: dict {minute-from-now: value}.
+        minutes_to_session: how long until the session starts.
+        deficit_kwh: kWh needed between the drain floor and the reserve target.
+        step_minutes: forecast step.
+        values_are_kwh: True for Predbat's kWh-per-step maps.
+        margin: required surplus multiple (1.2 = 20% clear).
+
+    Returns:
+        bool — True when PV comfortably covers the refill, so the reserve should
+        stand aside.
+    """
+    if deficit_kwh <= 0:
+        return True
+    if minutes_to_session <= 0:
+        return False
+    step_hours = step_minutes / 60.0
+    to_kwh = 1.0 if values_are_kwh else step_hours
+    net = 0.0
+    for m in range(0, int(minutes_to_session), step_minutes):
+        pv = pv_forecast.get(m, 0.0) * to_kwh
+        load = load_forecast.get(m, 0.0) * to_kwh
+        net += max(0.0, pv - load)
+    return net >= deficit_kwh * margin
+
+
 def should_defer_to_charge(gshp_ch_active, soc_kw, soc_keep, was_deferring):
     """R4 (gated): defer to Predbat charge window only when GSHP heating is active.
 

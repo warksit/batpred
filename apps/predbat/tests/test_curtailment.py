@@ -874,6 +874,11 @@ def _session_protect_run(hours_ahead, active=False):
         best_soc_keep=4.0,
         sensor_overrides=overrides,
     )
+    # RD37: the reserve now stands aside when forecast PV can refill it before
+    # the session. These tests are about the HORIZON, so give them a P10 profile
+    # that CANNOT refill — otherwise reachability decides the outcome and the
+    # horizon is never exercised.
+    base.pv_forecast_minute_step10 = {m: 0.05 * (PLUGIN_STEP / 60.0) for m in range(0, 24 * 60, PLUGIN_STEP)}
     plugin = CurtailmentPlugin(base)
     plugin._peak_pv = 1.2
     plugin._overnight_target_kwh = 6.0
@@ -910,6 +915,53 @@ def test_session_reserve_is_advertised_once_actually_held():
     assert attrs["session_reserve_kwh"] > 0, "an armed reserve must be shown"
     assert attrs["session_reserve_pct"] > 0
     print("  test_session_reserve_is_advertised_once_actually_held: PASSED ({}%)".format(attrs["session_reserve_pct"]))
+
+
+def test_session_reserve_does_not_block_a_drain_pv_will_refill():
+    """RD37 — the session reserve must not protect energy PV will supply anyway.
+
+    Live 2026-08-12 06:59: SOC 1.16 kWh, `drain_above` pinned to 15.29 kWh
+    (84.6%, source session_protect) for the 18:00 session, so the morning drain
+    from 6.4% to 1% was suppressed — while 60.6 kWh of PV was forecast for the
+    day and overflow_p90 was 16.0 kWh. The reserve was protecting 15.29 kWh that
+    did not exist, against a refill that was never in doubt, and cost exactly the
+    headroom the day needed.
+
+    Same shape as the horizon bug: the reserve applied without asking whether it
+    is actually at risk. Judged from the DRAIN FLOOR, not current SOC — the
+    question is "if I drain to the floor, can PV still refill before the
+    session", which is the decision being made.
+
+    Uses the P10 band: do not bet a paid session on optimistic sun.
+    """
+    from curtailment_calc import session_reserve_is_reachable
+
+    # 6 h to the session, 4 kW of PV against 0.4 kW of load = ~21.6 kWh net.
+    pv = {m: 4.0 * (5 / 60.0) for m in range(0, 360, 5)}
+    load = {m: 0.4 * (5 / 60.0) for m in range(0, 360, 5)}
+    assert session_reserve_is_reachable(pv, load, 360, deficit_kwh=14.1, step_minutes=5, values_are_kwh=True) is True
+    print("  test_session_reserve_does_not_block_a_drain_pv_will_refill: PASSED")
+
+
+def test_session_reserve_still_binds_when_pv_cannot_refill():
+    """The reserve must still hold on a dull day — that is what it is for."""
+    from curtailment_calc import session_reserve_is_reachable
+
+    pv = {m: 0.6 * (5 / 60.0) for m in range(0, 360, 5)}  # ~1.8 kWh net over 6 h
+    load = {m: 0.4 * (5 / 60.0) for m in range(0, 360, 5)}
+    assert session_reserve_is_reachable(pv, load, 360, deficit_kwh=14.1, step_minutes=5, values_are_kwh=True) is False
+    print("  test_session_reserve_still_binds_when_pv_cannot_refill: PASSED")
+
+
+def test_session_reserve_reachability_ignores_pv_after_the_session():
+    """Only PV BEFORE the session can refill it. A dull morning followed by a
+    blazing evening must not count as reachable."""
+    from curtailment_calc import session_reserve_is_reachable
+
+    pv = {m: (0.5 if m < 360 else 8.0) * (5 / 60.0) for m in range(0, 720, 5)}
+    load = {m: 0.4 * (5 / 60.0) for m in range(0, 720, 5)}
+    assert session_reserve_is_reachable(pv, load, 360, deficit_kwh=14.1, step_minutes=5, values_are_kwh=True) is False
+    print("  test_session_reserve_reachability_ignores_pv_after_the_session: PASSED")
 
 
 def test_session_reserve_does_not_arm_days_ahead():
@@ -6856,6 +6908,9 @@ def test_v32_upcoming_session_raises_drain_floor():
             sensor_overrides=sensor_overrides,
         )
         base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+        # RD37: dull P10 — this test is about the reserve RAISING the floor, not
+        # about whether PV can refill it.
+        base.pv_forecast_minute_step10 = {m: 0.05 * (PLUGIN_STEP / 60.0) for m in range(0, 24 * 60, PLUGIN_STEP)}
         plugin = CurtailmentPlugin(base)
         plugin._peak_pv = 9.0
         plugin._overnight_target_kwh = 6.0
@@ -7422,6 +7477,10 @@ def _session_publish_run(session):
         sensor_overrides=sensor_overrides,
     )
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    # RD37: dull P10 so REACHABILITY does not decide this test. The subject is
+    # the session reserve raising the floor and naming itself as the arm; with a
+    # sunny P10 the reserve correctly stands aside and there is nothing to see.
+    base.pv_forecast_minute_step10 = {m: 0.05 * (PLUGIN_STEP / 60.0) for m in range(0, 24 * 60, PLUGIN_STEP)}
     plugin = CurtailmentPlugin(base)
     plugin._peak_pv = 6.0
     plugin._overnight_target_kwh = 6.0
@@ -8406,6 +8465,9 @@ def run_curtailment_tests(my_predbat=None):
         test_session_dispatch_belongs_to_the_heartbeat_not_the_plugin,
         test_session_reserve_is_not_advertised_when_it_is_not_held,
         test_session_reserve_is_advertised_once_actually_held,
+        test_session_reserve_does_not_block_a_drain_pv_will_refill,
+        test_session_reserve_still_binds_when_pv_cannot_refill,
+        test_session_reserve_reachability_ignores_pv_after_the_session,
         test_session_reserve_does_not_arm_days_ahead,
         test_session_reserve_arms_in_time_for_the_morning_drain,
         test_session_reserve_horizon_boundary,
