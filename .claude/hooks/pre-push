@@ -1,0 +1,82 @@
+#!/bin/sh
+# Pre-push gate — run the suites that actually prove correctness.
+#
+# The pre-commit hook covers lint/format/spell. It does NOT run tests, so the
+# checks that matter most were still manual steps that could be skipped by
+# forgetting, or by a shell chain reporting the wrong exit code. This makes git
+# run them.
+#
+# Installed locally (.git/hooks is not tracked). A fresh clone needs it again.
+# Bypass deliberately with:  git push --no-verify
+#
+# Fails fast: the first failing suite stops the push and is named.
+
+set -u
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT" || exit 1
+
+VENV="$ROOT/coverage/venv/bin/python"
+
+# Each entry: "<label>|<working dir>|<command>"
+# unit_test MUST use the venv — bare python3/python3.11 fails on a missing
+# protobuf in test_gateway.py, which is an interpreter gap, not a regression.
+SUITES="
+no-orphan-tests|$ROOT/apps/predbat|python3 tests/test_all_tests_registered.py
+requirements-implemented|$ROOT/apps/predbat|python3 tests/test_requirements_implemented.py
+curtailment|$ROOT/apps/predbat|python3 tests/test_curtailment.py
+soc-keep-publish|$ROOT/apps/predbat|python3 tests/test_soc_keep_publish.py
+plugin-host-contract|$ROOT/apps/predbat|python3 tests/test_plugin_host_contract.py
+"
+
+FAILED=""
+START=$(date +%s)
+
+run_suite() {
+    label="$1"
+    dir="$2"
+    cmd="$3"
+    out=$(cd "$dir" && eval "$cmd" 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo ""
+        echo "pre-push: FAILED — $label (exit $rc)"
+        # Show the DIAGNOSIS, not the tail. These suites print a PASSED line per
+        # test, so `tail` buries the one failing assertion under 25 lines of
+        # green — which is how a gate gets bypassed instead of read.
+        diag=$(echo "$out" | grep -nE "FAIL|AssertionError|Error|Traceback|^E " | head -15)
+        if [ -n "$diag" ]; then
+            echo "$diag"
+        else
+            echo "$out" | tail -15
+        fi
+        FAILED="$label"
+        return 1
+    fi
+    printf '  ok  %s\n' "$label"
+    return 0
+}
+
+echo "pre-push: running test suites (bypass with --no-verify)"
+
+echo "$SUITES" | while IFS='|' read -r label dir cmd; do
+    [ -z "$label" ] && continue
+    run_suite "$label" "$dir" "$cmd" || exit 1
+done || exit 1
+
+# The YAML harnesses — one per HA automation. Globbed so a new harness is
+# picked up automatically rather than needing to be listed here.
+for f in "$ROOT"/apps/predbat/tests/test_yaml_*.py; do
+    [ -e "$f" ] || continue
+    run_suite "yaml:$(basename "$f" .py | sed 's/^test_yaml_//')" "$ROOT/apps/predbat" "python3 $f" || exit 1
+done
+
+# Full unit suite last: slowest, and the one most likely to be unrelated.
+if [ -x "$VENV" ]; then
+    run_suite "predbat-unit --quick" "$ROOT/coverage" "$VENV ../apps/predbat/unit_test.py --quick" || exit 1
+else
+    echo "  SKIP predbat-unit — $VENV missing (run: cd coverage && source setup.csh)"
+fi
+
+echo "pre-push: all suites passed in $(( $(date +%s) - START ))s"
+exit 0
