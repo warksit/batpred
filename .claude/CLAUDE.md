@@ -100,8 +100,19 @@ a **discriminating** check.
 
 ## Pre-deploy gate
 
-Run each as its OWN step and read its exit code — a piped `grep`/`tail` reports
-the pipe's status, not the test's.
+**These are enforced by git, not by memory** — install once per clone:
+
+```
+pre-commit install                    # lint/format/spell, blocks the commit
+cp .claude/hooks/pre-push .git/hooks/ # runs the suites below, blocks the push
+```
+
+`.git/hooks` is not tracked, so a fresh clone needs both again. Bypass a push
+deliberately with `--no-verify`; there is no bypass worth using routinely.
+
+If running by hand anyway, run each as its OWN step and read its exit code — a
+piped `grep`/`tail` reports the pipe's status, not the test's (this let a failed
+gate commit through on 2026-08-13).
 
 ```
 pre-commit run --all-files
