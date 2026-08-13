@@ -105,6 +105,7 @@ the pipe's status, not the test's.
 
 ```
 pre-commit run --all-files
+cd apps/predbat && python3 tests/test_all_tests_registered.py   # no orphaned tests
 cd apps/predbat && python3 tests/test_requirements_implemented.py
 cd apps/predbat && python3 tests/test_curtailment.py
 cd apps/predbat && python3 tests/test_yaml_*.py          # one per changed automation
