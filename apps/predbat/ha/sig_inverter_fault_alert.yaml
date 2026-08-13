@@ -129,6 +129,7 @@ actions:
         {% set s = states('sensor.sigen_plant_plant_running_state') %}
         {% if meter_dead %}METER DEAD - the grid CT has stopped reporting. Grid power frozen at {{ states('sensor.sigen_plant_grid_active_power') }} kW for {{ (grid_age_s | float(0) / 60) | round(0) }} min while the plant polls normally (PV {{ states('sensor.sigen_plant_pv_power') }} kW, updated {{ poll_age_s }}s ago). Consumed power is DERIVED, not measured, so load and export figures are fiction and curtailment control is flying blind on load. Export REVENUE is unaffected (Octopus meters that separately). ACTION: power-cycle the grid meter at the switch IN the tack room that feeds it (30 s off). mySigen alert 4001. A plant reboot does NOT clear it (tried 2026-08-10).
         {% elif s == 'Running' and is_clamped %}Battery CLAMPED - inverter running but idle because the ESS limits are shut, not a meter fault. discharge_limit={{ disch_limit }}kW (rated {{ rated_disch }}), import_limit={{ import_limit }}. Predbat is NOT deliberately freezing (policy={{ states('input_select.sig_dispatch_policy') }}, requested_mode={{ states('input_select.predbat_requested_mode') }}), so this is a stale clamp nobody owns. ACTION: check sig_dispatch_heartbeat is enabled and input_number.discharge_rate is not 0.
+        {% elif s == 'Running' and intended_freeze %}Predbat freeze - INTENDED, no action. The inverter is idle because Predbat owns the wheel (policy={{ states('input_select.sig_dispatch_policy') }}) and is in {{ states('input_select.predbat_requested_mode') }}, which shuts the limits on purpose. The meter is HEALTHY (grid updated {{ grid_age_s }}s ago). This clears itself when Predbat leaves the freeze. You should not be seeing this - the stop guard above should have suppressed it.
         {% elif s == 'Running' %}Meter Communication Fault - inverter running but idle, limits are open so likely lost meter connection. ACTION: Check mySigen app for alert 4001_2. May need meter power cycle.
         {% elif s == 'Shutdown' %}SIG Protective Disconnect (Shutdown) - G99 grid protection. Auto-recovers in 3-5 min. No action needed.
         {% elif s == 'Environmental Abnormality' %}SIG Environmental Abnormality - grid voltage/frequency excursion. Auto-recovers in 1-2 min. No action needed.
@@ -160,6 +161,26 @@ actions:
         through it if anything looks different to that.
       soc: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
       pv: "{{ states('sensor.sigen_plant_pv_power') }}"
+
+  # 2026-08-13 05:55. Pre-dawn, SOC 3.4%, Predbat freezing on purpose: the inverter
+  # sat idle as instructed, the numeric_state trigger fired, and this paged Andrew
+  # on the CRITICAL channel with "Meter Communication Fault" — while the SAME trace
+  # held meter_dead=false, grid_age_s=0 and intended_freeze=true.
+  #
+  # Third instance of one lesson (2026-07-28, 2026-08-05, 2026-08-13): the
+  # discriminator is computed and then not consulted on every path. `intended_freeze`
+  # was wired into `is_clamped` only, which made it WORSE — it flipped is_clamped
+  # false, so the chain fell past the clamp branch into the bare Running catch-all
+  # and blamed the meter.
+  #
+  # Fixing the message is not enough: an intended freeze must not notify AT ALL, or
+  # it recurs every morning on the same channel that carried the real 2026-08-12
+  # meter fault. `not meter_dead` keeps a genuine dead meter DURING a freeze alerting.
+  - if:
+      - condition: template
+        value_template: "{{ intended_freeze and not meter_dead }}"
+    then:
+      - stop: "Predbat freeze is intended — not a fault"
 
   - action: notify.mobile_app_andrew_iphone
     data:
