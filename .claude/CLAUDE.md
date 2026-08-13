@@ -1,327 +1,166 @@
-# Batpred Project Instructions
+# Batpred — working charter
 
-## HOW TO WORK WITH ANDREW — read before every reply, not just before code
+Organised by **moment**, not by incident. At any decision point one block applies;
+read that block, not the file. If you are about to write a reply, edit code,
+diagnose a symptom, or claim something is done — the checklist is below.
 
-Agreed 2026-08-12 after a session where every reply ended with two or three
-findings Andrew never asked for, and the thing he DID report went unfixed. The
-failure is not laziness, it is **substitution**: doing adjacent work that is more
-interesting than the ask, then reporting it as if it were the ask.
+Everything here was paid for with a live failure. Nothing is generic advice.
 
-**1. Scope line first.** Before touching code, one line: `Scope: fixing X. Not
-touching Y, Z.` It gives Andrew five seconds to veto. If you cannot write that
-line, you do not yet understand the request — go to rule 5.
+---
 
-**2. One ask, one fix, one report.** Report against the scope line and nothing
-else. If the reply contains work that is not in the scope line, you have already
-broken rule 1.
+## Before you REPLY
 
-**3. Findings are PARKED, never narrated.** Append to `.claude/PARKED.md`
-silently. Raise a finding mid-task only if it BLOCKS the current ask. "While I
-was there I noticed..." does not go in the reply. Andrew pulls from the list; you
-do not push it at him.
+1. **Count the asks.** Two sentences usually means two asks. Answer every part or
+   ask about every part. Explaining away the half you did not understand is the
+   move that loses the actual issue.
+2. **A question is not an instruction.** "Should we X?" invites thought, not
+   deployment. Answer it and stop.
+3. **A reported symptom IS an instruction**, even phrased as an observation.
+   "The % doesn't show" is a bug report.
+4. **Findings go to `.claude/PARKED.md`, not the reply.** Raise one mid-task only
+   if it blocks the ask. No "while I was there I noticed". Andrew pulls that list.
+5. **Am I reporting THEIR issue as fixed, or mine?** If the reply contains work
+   nobody asked for, delete it and finish the ask.
 
-**4. Disagreement is one sentence, then comply.** "I think X is wrong because Y —
-doing it as asked." Not a redesign, not a survey of options.
+## Before you touch CODE
 
-**5. Ambiguity gets ONE question BEFORE work.** Never a guess plus commentary
-afterwards. A message with two parts has two asks — answer both or ask about
-both. Explaining away the part you did not understand is the specific move that
-caused this rule.
+1. **Scope line first**: `Scope: fixing X. Not touching Y, Z.` If you cannot write
+   it, you do not understand the request — ask one question instead.
+2. **Read what already exists** — the function, its callers, the helper you are
+   about to duplicate, the tests you are about to extend. Most defects here come
+   from writing before reading, not from writing badly.
+3. **Enumerate the sites.** grep the *concept* (entity, threshold, policy name),
+   not the code in front of you. If a quantity legitimately lives in two places it
+   belongs in the **Duplicate-logic index** in `REQUIREMENTS.md`, with a test that
+   renders every copy and asserts they agree.
+4. **Read `REQUIREMENTS.md` before any curtailment file** (`curtailment_*.py`,
+   `tests/test_curtailment.py`, `ha/*.yaml`). Requirements are R1-R64 + RD1-RD40;
+   the **Status index** table beats the prose. Do not remove or weaken one without
+   agreeing it first.
+5. **Disagree in one sentence, then comply.** Not a redesign.
 
-**6. Read memory BEFORE diagnosing, not after.** Before investigating any
-symptom, grep `~/.claude/projects/-Users-home-Documents-code-batpred/memory/` for
-the subsystem. Rules 1-5 govern scope; this one governs *knowledge*, and it is the
-one that actually cost a day. On 2026-08-11/12 an "inflated overnight forecast"
-was diagnosed from scratch — while `project_overnight_load_band.md` already
-carried the exact warning ("comparing a measurement over a different window is how
-I wrongly found a 35% forecast inflation that did not exist"). The same error had
-been made, recorded, and then repeated.
+## Before you DIAGNOSE
 
-**But read it for the TRAPS and the METHOD, never for current values.** Memory is
-a point-in-time observation and the numbers rot fastest:
+1. **Read memory first** — grep
+   `~/.claude/projects/-Users-home-Documents-code-batpred/memory/`. The warning
+   that would have prevented the 2026-08-11 overnight misdiagnosis was already
+   written down, and unread.
+2. **But read it for TRAPS and METHOD, never for current values.** Memory numbers
+   rot: a window recorded as 11 h had moved to 12.0; a "fixed ~95 W standby"
+   turned out to be a converter curve with no standby at all. Verify any number
+   before relying on it, then correct the file.
+3. **Check freshness before concluding anything is broken.** Read `last_reported`
+   FIRST, and compare against the BOX clock, not yours — a deploy was called
+   broken twice on 2026-08-11, and again on 08-12 by reading a remote timestamp
+   against a local clock.
+4. **Prefer a trace over a state read.** Three defects on 2026-08-06 were
+   invisible in state and obvious in the trace.
+5. **Two surprises in one subsystem = stop patching, start auditing.** The mental
+   model is wrong; there are not simply two bugs.
 
-- the morning-gap window was recorded as 11 h; it is PV-derived and had already
-  moved to 12.0 h
-- a "fixed ~95 W standby" was recorded from five hours that all happened to sit at
-  the same discharge rate; the idle-battery test later showed **no** standby at all
+## Before you say it is DONE
 
-So: **memory tells you which mistakes have already been made and how to measure
-correctly. It does not tell you what is true right now — measure that.** If a
-memory states a number, verify it before relying on it, and correct the file when
-it has moved.
+Never call work done before **all four**: pre-commit + full test suite + deploy +
+a **discriminating** check.
 
-### The self-check that makes these bite
+- **Discriminating** means conditions under which old and new behaviour differ.
+  If today's conditions cannot tell them apart, the honest report is "deployed,
+  not yet verified — needs X".
+- **Blocked sub-goals are the FIRST line, not a caveat inside a success report.**
+- Say what is true: "committed, not deployed", "deployed, unverified".
+- **Commit before deploying**, always, so deployed code is in git history.
 
-Before sending any reply, re-read the user's last message and answer:
+---
 
-- Did I do **every** part of it? (Count the sentences. Two sentences often means
-  two asks — 2026-08-12: "the -% will not show all day" + "fix the naming"; only
-  the second was actioned.)
-- Is there anything in my reply that is **not** in my scope line?
-- Am I reporting **their** issue as fixed, or **mine**?
-- If I diagnosed something: did I grep memory **first**, and did I verify any
-  number I took from it rather than quoting it?
+## Site facts you cannot derive
 
-If the reply fails any of these, delete the surplus and finish the ask. A
-question mark from Andrew is not a work order (see "A question is not an
-instruction") — but a reported symptom **is**, even when phrased as an
-observation.
+- **R25 — the key design principle.** Once PV−load > DNO cap there are NO control
+  levers. All management (drain/charge/hold) must happen BEFORE overflow. The
+  drain mechanism has been deleted twice and restored twice. Never remove it.
+- **Never edit upgrade-overwritten stock Predbat modules** (`config.py`, `plan.py`,
+  `fetch.py`, `predbat.py`) for site behaviour — an update silently undoes it.
+  Site logic lives in `curtailment_*`, plugins, `ha/*.yaml`, HA entities. Hence
+  `switch.predbat_expert_mode` stays On rather than un-gating `set_charge_freeze`.
+- **Diagnose ownership from `predbat.status`, NEVER `switch.predbat_set_read_only`.**
+  The switch lags Predbat's internal state by HOURS (cost a long misdiagnosis
+  2026-08-03), and every change to it forces a full inverter reset to defaults.
+- **Predbat writes PLANT registers via THREE mapper automations**, not one:
+  `predbat_requested_mode_action`, `predbat_max_discharging_limit_action`,
+  `predbat_max_charging_limit_action`. Disabling them stops further writes but
+  leaves everything already written in place — **the writer that changed a
+  register changes it back** (`_neutralise_predbat()` before disabling the chain).
+  Setting mode to MSC does NOT clear the ESS clamps; those hang off the RATE
+  helpers. Symptom of getting it wrong: SOC flat for hours, battery power 0.000,
+  dispatch commanded, nothing moving.
+- **Clipped ≠ curtailed.** Clipped = PV over the inverter's 6.6 kW AC capacity.
+  Curtailed = export over the 3.68 kW DNO cap. Never interchange them.
+- **Plan values are kWh per slot, not kW.**
+- **Every deploy resets plugin state** (`_peak_pv`, caches). Expect it when
+  debugging live.
 
-## Curtailment Manager
+## Pre-deploy gate
 
-Before modifying ANY curtailment file (curtailment_plugin.py, curtailment_calc.py, tests/test_curtailment.py, or the HA automation `curtailment_manager_dynamic_export_limit`):
+Run each as its OWN step and read its exit code — a piped `grep`/`tail` reports
+the pipe's status, not the test's.
 
-1. **Read `apps/predbat/REQUIREMENTS.md` first** — it contains the definitive requirements (R1-R64, RD1-RD40) — the Status index near the top beats the prose
-2. **Check every change against the requirements** — do not remove, weaken, or bypass any requirement
-3. **If a requirement seems wrong**, discuss with the user before changing it. Update REQUIREMENTS.md if agreed.
-4. **R25 is the key design principle**: once PV-load > DNO, we have NO control levers. All management (drain/charge/hold) must happen BEFORE overflow. Never remove the drain mechanism.
-
-## Stock Predbat files (Charter — Working practices)
-
-**Do not edit upgrade-overwritten stock Predbat modules** (`config.py`, `plan.py`, `fetch.py`, `predbat.py`, etc.) for site behaviour. A Predbat update overwrites them and silently undoes the patch. Put site logic in our tree: `curtailment_*`, plugins, `ha/*.yaml`, HA entities. Prefer expert mode / existing switches over patching stock config gates.
-
-## TDD for Curtailment
-
-When a flaw is found: **write a failing test FIRST**, then fix the code. Never deploy a fix without a test that would have caught the bug. Never break production code to make tests pass (R36/R37).
-
-**Watch it FAIL, and fail for the right reason.** A test that has never failed has
-proved nothing. If it passes the moment you write it, you have not pinned the
-behaviour — you have written a description.
-
-**Never let the failure mode into the allowed set.** Assert the SPECIFIC expected
-value, not a set of acceptable ones. Broken twice on 2026-08-05: the new
-forecast-tracking metric was shipped with
-
-```python
-assert attrs["tracking_band"] in ("below p10", "p10-p50", "p50-p90", "above p90", "unknown")
+```
+pre-commit run --all-files
+cd apps/predbat && python3 tests/test_requirements_implemented.py
+cd apps/predbat && python3 tests/test_curtailment.py
+cd apps/predbat && python3 tests/test_yaml_*.py          # one per changed automation
+cd coverage && ./venv/bin/python ../apps/predbat/unit_test.py --quick
 ```
 
-`"unknown"` IS the failure mode, so the test passed on the exact defect it existed
-to catch, twice, through two deploys. It was only found by reading the live value.
-**If you cannot name the value it should be, you do not understand it well enough
-to ship it.**
+`unit_test` **must** use `coverage/venv/bin/python` (built by `source setup.csh`).
+Bare `python3`/`python3.11` fails on a missing `protobuf` in `test_gateway.py` —
+that is an interpreter gap, NOT a regression. Check which interpreter you ran
+before investigating a failure, and never stash the working tree to "prove" it.
 
-**The rig is not production — check the shapes.** Four rig-fidelity gaps surfaced in
-one day (2026-08-05), each hiding a real defect: MockBase's lat/lon is 55.86N when
-`zone.home` is 52.31N; plant SOC was absent so every rig hit the A0 fail-closed
-hold; `_peak_pv` was set without `_peak_pv_time`, so `actual_scale` computed as 0;
-and `_make_p90_sensors` supplied only `pv_estimate90`, so the other two bands were
-always 0. A green test on an unfaithful rig is not evidence. When adding a
-diagnostic, **read the live value after deploying** — that is the only check that
-caught any of these.
+Deploy: `ssh hassio@100.110.70.80`, `sudo cp /dev/stdin /addon_configs/6adb4f0d_predbat/<file>`,
+then `sudo touch .../plugin_system.py`. Deploy ALL changed .py together.
 
-## Key Curtailment Lessons (2026-04-05)
+## HA automation edits — mandatory workflow
 
-- **Activation = "is there a problem?"** (excess > headroom). **Floor = "what's the solution?"** (how much to drain). Keep them separate.
-- Use **TOTALS** (Solcast remaining, LoadML sum) not per-slot overflow. Per-slot shape only for TIMING (overflow window, release fraction).
-- **Tomorrow sensor is simple**: excess vs headroom. Floor is live's job.
-- Never break production for tests (R37). If tests fail but production works, fix tests.
-- Every deploy resets plugin state (_peak_pv, cache). Be aware during live debugging.
-- **Do not arbitrarily remove features** without checking REQUIREMENTS.md. The drain mechanism was removed twice and had to be restored both times.
-- **Discuss before coding** when the approach is uncertain. Don't iterate through 10 broken deploys mid-day.
+`python_transform` can silently reorder the `variables` dict, and HA evaluates
+variables top-down, so a reorder leaves templates reading Undefined and falling
+through every branch. This caused a 2-hour controller outage on 2026-05-06.
 
-## Diagnosing ownership — use `predbat.status`, NOT the read_only switch
+1. Edit the YAML in `apps/predbat/ha/` first, in repo
+2. Run the matching Jinja harness — it must pass with the NEW behaviour asserted
+3. Apply via `config:` (full replacement), **never** `python_transform`
+4. Verify the live entity produces an expected value for a known input — not just
+   that the automation is `on`
 
-**`switch.predbat_set_read_only` lags Predbat's internal state by hours.** On
-2026-08-03 CM wrote `read_only -> False` at 20:16:06, Predbat went Read-Only →
-**Demand** by 20:20:30, and the switch entity still read `on` at 20:30 (unchanged
-since 20:05:23). Apparent "changes" at 22:56 / 14:55 on other days are the entity
-being reconciled, not the mode changing.
+## Tests: the three ways a green test lies
 
-Reading the switch instead of `predbat.status` cost a long live misdiagnosis on
-2026-08-03 — it looked like CM's write path was broken. It is not.
+1. **Never ran** — written, never registered. Check the PASS count CHANGES.
+2. **Never reached its subject** — the production call site does not exist, or the
+   precondition never fired. Assert the precondition, not just the outcome.
+3. **The failure mode is inside the allowed set** — `assert x in (good, bad)`, or
+   `assert "CLAMPED" not in msg` passing on a worse wrong answer. **Assert the
+   specific expected value.** If you cannot name it, you do not understand it well
+   enough to ship it.
 
-Also: **every change to that switch forces a full inverter reset to defaults**
-(charge/discharge disabled, rates to full, reserve to default —
-`docs/customisation.md:38`, `config.py` `reset_inverter_force: True`). It is
-designed as an occasional human mode switch, not a high-frequency mutex. See
-plan §11 O3/O4.
+Watch it FAIL, and fail for the RIGHT reason. When a change makes an old test
+fail, first ask whether the FIXTURE was lying — impossible dates, absent state,
+abundant PV that stops the branch being reached, positional indexing that
+silently re-points.
 
-## HA Automation Version Control
+## Frozen — do not start
 
-The HA automation `curtailment_manager_dynamic_export_limit` is stored in:
-`apps/predbat/ha/curtailment_manager_dynamic_export_limit.yaml`
+Architecture is frozen while CM is stable; edge fine-tuning only. Do not begin a
+structural rewrite (Python PCS executor, delete heartbeat, wholesale
+`sig-control-v2` merge) unless multi-writer defects burn multiple days again.
+**No structural refactor of the live control path on a high-stakes day** — land it
+pre-dawn or after the curtailment window.
 
-**Never change the automation in HA without first updating and committing this file.**
-After changing in HA, pull the updated config and commit it so the file stays in sync.
+- Ownership table + deploy + golden checks: `apps/predbat/ha/README.md`
+- Freeze detail: `.claude/memory/sig-control-maintenance.md`
+- Deferred proposal (NOT the current path): `.claude/plans/sig-control-python-migration.md`
 
-## Before editing control logic — ENUMERATE THE SITES
+---
 
-Never edit a control rule until you have listed every place that implements it
-and can say why the list is complete. grep the **concept** — the entity, the
-threshold, the policy name — not the code in front of you.
-
-2026-08-06, four instances in one day:
-
-- the RD22 sell-clamp existed in the action variables **and** the
-  `stale_setpoint` trigger; the first fix changed one
-- the MSC handback had two entry paths (`policy_change`, override); one covered
-- the low-SOC handover had a decision-side copy **and** an acting-side WRITER —
-  the first edit changed only the published reason and nothing real
-- three Predbat mapper automations, not one (2026-07-28, same lesson)
-
-If a quantity legitimately lives in two places (HA gives template triggers no
-access to `variables`), it goes in the **Duplicate-logic index** in
-`REQUIREMENTS.md` with all its sites, and a test must render every copy and
-assert they agree.
-
-## A green test proves nothing until you know it RAN and REACHED its subject
-
-"Watch it fail" is not enough. Four distinct ways a test passed while proving
-nothing, all on 2026-08-10/12:
-
-- **Never registered.** Written, never added to the runner. Ran zero times.
-  Check the PASS count changes, not just that the suite is green.
-- **Never called in production.** `_evaluate_dawn_crossing` was exercised only
-  by the test rig; nothing in `calculate()` called it. Grep the call site.
-- **Precondition never reached.** The rig set `_peak_pv` but not `_peaked`;
-  another paired `minutes_now=360` with a `now_utc` of 12:00, so the solar
-  geometry put lockout in the past and R63 never engaged. **Assert the
-  precondition fired**, not just the outcome.
-- **Fixture impossible.** A saving session dated a YEAR ahead; a session
-  duration with no start time. Neither state can occur. If a fixture cannot
-  happen, it tests nothing.
-
-When a change makes an existing test fail, first ask whether the FIXTURE was
-lying. Four rigs this week had abundant PV or absent dates that quietly stopped
-them reaching the branch they named.
-
-## Never let a shell chain mask a failing gate
-
-`pre-commit run --files ... | grep -E "Failed" && git commit` **commits when the
-hooks fail** — grep succeeds precisely when something broke. Done twice on
-2026-08-11/12; the second let a C901 ratchet breach through. Check the exit
-code, or run the gate as its own step and read it.
-
-Also: an empty `grep` result is not evidence of absence. A mangled remote
-pattern returned nothing and was read as "no log activity"; the log was
-complete. Sanity-check the pattern against a line known to exist.
-
-## Check freshness before diagnosing
-
-Twice on 2026-08-11 a deploy was declared broken when it had simply not
-published yet. Read `last_reported` FIRST, and use `| as_local` — `now()` in a
-Jinja template is local while `.strftime()` on a timestamp prints UTC, so a
-1-hour offset makes fresh data look an hour stale.
-
-## A question is not an instruction
-
-"Should we X?" is an invitation to think, not authorisation to build, test and
-deploy X. RD35 shipped to the live control path off a question mark. If the
-answer is "yes and here is why", say that and stop.
-
-## "Deployed" is not "verified"
-
-Verification requires a **discriminating** observation: conditions under which
-the old and new behaviour differ. If current conditions cannot tell them apart,
-the correct report is "deployed, not yet verified — needs X to confirm".
-
-Prefer an automation **trace** over a state read. Three defects on 2026-08-06
-were invisible in state and obvious in the trace: `policy="Predbat"` with stale
-variables; a 12 ms run that took no branch; the self-heal firing on the beat.
-
-Never call work done before **pre-commit + full test suite + deploy +
-a discriminating check**. Until all four, say what is actually true —
-"committed, not deployed", "deployed, unverified".
-
-## Blocked sub-goals are headlines, not footnotes
-
-If part of an agreed change cannot land, say so as the FIRST line, not as a
-caveat inside a success report. 2026-08-06: the 1% drain floor was agreed,
-blocked by three separate things, mentioned in passing, and was still not in
-force hours later while the user believed it was.
-
-## Two surprises = stop patching, start auditing
-
-Two unexpected findings in the same subsystem in one session means the mental
-model is wrong, not that there are two bugs. Stop shipping fixes and enumerate
-the subsystem instead. On 2026-08-06 this threshold was passed by ~09:00 and
-five more deploys followed, three of which introduced new faults.
-
-## No structural refactor of the live control path on a high-stakes day
-
-Build it, test it, commit it — land it in a low-stakes window (after the
-curtailment window closes, or pre-dawn). RD26 was correct and still cost a
-47-second dead zone on the human override because it shipped at 11:00 on a
-20 kWh overflow day.
-
-## Pre-Deploy Checks
-
-- `pre-commit run --all-files`
-- `cd apps/predbat && python3 tests/test_requirements_implemented.py` — every IN FORCE requirement has code behind it (catches R16a-class drift)
-- `cd apps/predbat && python3 tests/test_curtailment.py`
-- `cd apps/predbat && python3 tests/test_yaml_curtailment.py` — Jinja harness for the curtailment HA automation YAML
-- `cd apps/predbat && python3 tests/test_yaml_voltage_seek.py` — Jinja harness for voltage_seek_controller YAML (catches variable-order bugs under StrictUndefined)
-- `cd apps/predbat && python3 tests/test_yaml_heartbeat.py` — heartbeat dispatch + the ESS/import limit re-open (regressed twice; see below)
-- `cd apps/predbat && python3 tests/test_yaml_dispatch_intent.py` — RD26 single point of truth: the dispatch maths lives ONLY in `ha/sig_dispatch_intent_helpers.yaml`; fails if the automation re-inlines it
-- `cd apps/predbat && python3 tests/test_yaml_inverter_fault_alert.py` — fault-alert diagnosis (clamped battery vs meter fault)
-- `cd apps/predbat && python3 tests/test_yaml_requested_mode.py` — Predbat→SIG mode mapper
-- `cd apps/predbat && python3 tests/test_yaml_dhw_meter.py` — GSHP DHW cycle meter (delta template + the once-per-day / sustain guards)
-- `cd apps/predbat && python3 tests/test_plugin_host_contract.py` — fails if the Predbat build lacks the `on_before_plan` host API
-- `cd apps/predbat && python3 tests/test_soc_keep_publish.py` — effective `best_soc_keep` sensor (read by `/soc-keep-review`)
-- `cd coverage && ./venv/bin/python ../apps/predbat/unit_test.py --quick` — **use the venv** (built by `source setup.csh`). Bare `python3`/`python3.11` fails on missing `protobuf` in `test_gateway.py`; that is an interpreter gap, not a regression. Check which interpreter you ran before investigating a failure.
-- **Commit before deploying** — always `git commit` before `scp`/deploy so deployed code is always in git history
-
-## HA Automation Edits — MANDATORY workflow
-
-Editing an HA automation Jinja via MCP `python_transform` can silently
-reorder the `variables` dict. HA evaluates variables top-down, so a
-reordered dict can leave templates referencing Undefined values, falling
-through every branch silently. This caused a 2-hour controller outage on
-2026-05-06.
-
-Before any HA automation edit (`ha_config_set_automation`):
-
-1. Edit the YAML file in `apps/predbat/ha/` first, in repo
-2. Run the matching Jinja harness — it MUST pass with new behaviour asserted
-3. Apply the change to HA via `config:` (full replacement), NOT
-   `python_transform` (which reorders dict keys)
-4. After deploy, query the live entity and verify it produces an
-   expected value for a known input — never just check that the
-   automation is "on" or "running"
-
-## SIG / CM maintenance posture (from 2026-08)
-
-**Architecture is frozen while CM is stable.** Edge fine-tuning only. Do not start
-a structural rewrite (Python PCS executor, delete heartbeat, wholesale
-`sig-control-v2` merge) unless multi-writer defects burn multiple days again —
-and not as an autumn project when Predbat owns most hours.
-
-- **Ownership table + deploy + golden checks:** `apps/predbat/ha/README.md`
-- **Freeze / what not to do / seasonal focus:** `.claude/memory/sig-control-maintenance.md`
-- **Deferred proposal (not current path):** `.claude/plans/sig-control-python-migration.md`
-- **Historical Predbat EMS driver (reference only):** `origin/sig-control-v2`
-
-Prefer plan-side CM off (tighter activation) over clever handback. Prefer golden
-tests and the ownership table over new writers.
-
-## Writer Ownership (SIG control) — learned the hard way 2026-07-28
-
-**Exactly one writer enabled is NOT sufficient.** Predbat writes PLANT registers
-via THREE mapper automations, and disabling them stops further writes but leaves
-everything they already wrote in place:
-
-| Automation | Writes | Driven by |
-|---|---|---|
-| `predbat_requested_mode_action` | EMS control mode, `grid_import_limitation` | `input_select.predbat_requested_mode` |
-| `predbat_max_discharging_limit_action` | `ess_max_discharging_limit` | `input_number.discharge_rate` |
-| `predbat_max_charging_limit_action` | `ess_max_charging_limit` | `input_number.charge_rate` |
-
-Rules:
-
-1. **The writer that changed a register changes it back.** `_neutralise_predbat()`
-   sets Predbat's own INPUTS back to neutral so Predbat's own mappers unwind the
-   registers — before the chain is disabled. Never enumerate registers in CM; we
-   missed two that way.
-2. **Setting mode to MSC does NOT clear the ESS clamps** — those hang off the RATE
-   helpers, not the mode.
-3. **The heartbeat re-opens all three registers on every active-policy run** as a
-   backstop, and mirrors the rate helpers (writing only the register leaves the
-   helper at 0, so the next change re-clamps).
-4. **Under manual override the writer role still follows the policy select** —
-   override means the user owns the POLICY, not that the role goes stale.
-
-Symptom of getting this wrong: SOC flat for hours under an active policy, battery
-power 0.000, dispatch commanded but nothing moving. Happened 2026-07-26 (fixed by
-5bbdedeb) and again 2026-07-28 (the v8.46.4 port predated that commit, so
-redeploying the heartbeat from the ported file dropped it).
+**Assumed, not listed as rules:** DRY, no positional indexing into fixtures, read
+before you edit, don't mask exit codes, name things for what they hold. These are
+standards to meet unprompted. Writing them as rules implies the default is
+otherwise — and a rule you must remember to read cannot save you anyway.
