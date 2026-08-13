@@ -184,7 +184,11 @@ def test_protective_states_unchanged():
 def test_critical_sound_only_for_genuine_faults():
     """Protective states stay non-critical; clamp and meter faults stay critical."""
     auto = _load()
-    sound = _actions(auto)[1]["data"]["data"]["push"]["sound"]
+    # Located by SERVICE, not by index: `_actions(auto)[1]` broke the moment the
+    # 2026-08-13 intended-freeze stop was inserted ahead of the notify. Same
+    # positional-fixture failure as _household_branch, in the same edit.
+    notify = next(s for s in _actions(auto) if s.get("action") == ANDREW_SERVICE)
+    sound = notify["data"]["data"]["push"]["sound"]
     assert "is_protective" in str(sound.get("critical")), f"critical flag must key off is_protective: {sound}"
     print("PASS  sound: critical gated on is_protective")
 
@@ -202,10 +206,51 @@ def test_predbat_freeze_is_not_a_fault():
     """
     msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, imp=0, policy="Predbat", requested_mode="Freeze Charging"), _ages())
     assert "CLAMPED" not in msg, f"Predbat deliberately freezing is not a clamp fault: {msg}"
+    # 2026-08-13: asserting only "not CLAMPED" let the WORSE answer through — the
+    # chain fell past the clamp branch into the bare Running catch-all and said
+    # "Meter Communication Fault" with meter_dead=false in the same trace. Name the
+    # value it should be, not a set of values it may avoid (Charter).
+    assert "Meter Communication Fault" not in msg, f"an intended freeze is not a meter fault: {msg}"
+    assert "intended" in msg.lower(), f"must name the freeze as intended: {msg}"
 
     msg = _render_fault_type(_load(), _mock(running="Running", disch=0.0, policy="Predbat", requested_mode="Freeze Discharging"), _ages())
     assert "CLAMPED" not in msg, f"export freeze is equally intended: {msg}"
+    assert "Meter Communication Fault" not in msg, f"export freeze is not a meter fault: {msg}"
     print("PASS  intended: Predbat owns the wheel and is freezing -> no clamp alert")
+
+
+def test_intended_freeze_sends_no_notification_at_all():
+    """2026-08-13 05:55. Pre-dawn, SOC 3.4%, Predbat freezing on purpose. The
+    inverter sat idle as instructed, the numeric_state trigger fired, and the alert
+    paged Andrew's phone on the CRITICAL channel with "Meter Communication Fault" —
+    while its own variables held meter_dead=false, grid_age_s=0, intended_freeze=true.
+
+    Third instance of one lesson (2026-07-28, 2026-08-05, 2026-08-13): the
+    discriminator gets computed and then not consulted on every path. Fixing the
+    message is not enough — an intended freeze must not notify at all, or it
+    recurs every morning on the same channel that carried the real 2026-08-12
+    meter fault.
+    """
+    actions = _actions(_load())
+
+    def _has_stop(step):
+        """A `stop` nested in the if/then form HA actually uses."""
+        if not isinstance(step, dict):
+            return False
+        return any("stop" in s for s in step.get("then", []) if isinstance(s, dict))
+
+    stops = [a for a in actions if _has_stop(a)]
+    assert stops, "actions must contain a stop that aborts on an intended freeze"
+    guard = stops[0].get("if") or []
+    guard_text = " ".join(str(c.get("value_template", "")) for c in guard)
+    assert "intended_freeze" in guard_text, f"the stop must be guarded on intended_freeze, got: {guard_text}"
+    assert "meter_dead" in guard_text, f"a real dead meter DURING a freeze must still alert, got: {guard_text}"
+
+    # The stop must come before any notify, or it stops nothing.
+    stop_idx = next(i for i, a in enumerate(actions) if _has_stop(a))
+    notify_idx = next(i for i, a in enumerate(actions) if isinstance(a, dict) and str(a.get("action", "")).startswith("notify"))
+    assert stop_idx < notify_idx, f"stop at {stop_idx} must precede the notify at {notify_idx}"
+    print("PASS  intended freeze aborts before notifying, and still alerts on a dead meter")
 
 
 def test_clamp_still_fires_when_cm_owns_the_wheel():
@@ -303,11 +348,23 @@ ANDREW_SERVICE = "notify.mobile_app_andrew_iphone"
 
 
 def _household_branch(auto):
-    """The `if meter_dead` block that notifies the people on site."""
+    """The `if meter_dead` block that notifies the people on site.
+
+    Keyed on the GUARD, not on position. It used to return the first step
+    containing an `if`, which silently re-pointed at the 2026-08-13
+    intended-freeze stop guard the moment that was added ahead of it — the
+    household assertions then ran against a branch with no notifies at all.
+    Selecting on `meter_dead` keeps the test non-tautological: it still has to
+    prove that the DEAD-METER branch is the one reaching the household.
+    """
     for step in _actions(auto):
-        if "if" in step:
+        guard = step.get("if") if isinstance(step, dict) else None
+        if not guard:
+            continue
+        text = " ".join(str(c.get("value_template", "")) for c in guard)
+        if "meter_dead" in text and "intended_freeze" not in text:
             return step
-    raise AssertionError("no conditional branch — the on-site household is never notified")
+    raise AssertionError("no `if meter_dead` branch — the on-site household is never notified")
 
 
 def _notify_targets(steps):
@@ -406,6 +463,7 @@ def main():
         test_trigger_and_variable_agree,
         test_clamped_battery_is_not_reported_as_a_meter_fault,
         test_predbat_freeze_is_not_a_fault,
+        test_intended_freeze_sends_no_notification_at_all,
         test_clamp_still_fires_when_cm_owns_the_wheel,
         test_blocked_import_also_reads_as_clamped,
         test_open_limits_still_report_meter_fault,
