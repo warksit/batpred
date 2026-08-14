@@ -1022,6 +1022,158 @@ def test_session_reserve_still_protects_the_drain_floor():
     print(f"  test_session_reserve_still_protects_the_drain_floor: PASSED ({without} -> {with_session})")
 
 
+# --- RD41: the session reserve is a level to REACH, not only one not to fall below ---
+#
+# Every number below is logged from 12 Aug 2026, the 18:00-20:00 session that
+# started 2.08 kWh short. soc_max 18.08 kWh throughout.
+AUG12_SESSION_PROTECT_KWH = 14.86  # overnight 7.08 + session reserve 7.78
+AUG12_SOC_AT_1420_KWH = 9.11  # 50.4%
+AUG12_SOC_AT_SESSION_KWH = 12.82  # 70.9% — flat from 16:50
+AUG12_OVERFLOW_FLOOR_1420_KWH = 6.93  # soc_max - required_headroom 11.15
+AUG12_OVERFLOW_FLOOR_1600_KWH = 16.54  # logged drain_above once the overflow arm won
+
+
+def test_session_reserve_drives_the_charge_line_not_only_the_drain_line():
+    """RD41: `session_protect_kwh` fed `drain_above` and nothing fed `charge_below`.
+
+    Live 12 Aug 2026 14:20 the Hold band was [0.50, 14.86] kWh — a 14 kWh dead
+    zone in which CM neither drains nor charges. In Hold the pack receives only
+    the above-cap overflow, so SOC sat at 12.82 kWh from 16:50 and the session
+    started 2.08 kWh short of the 14.86 it had itself reserved.
+
+    Once the day's overflow is done the headroom clamp is soc_max, so the whole
+    reserve is affordable and the charge line must be the reserve itself.
+    """
+    overflow_done = 18.08  # no headroom still required -> overflow_floor == soc_max
+    cb = compute_charge_below(0.50, 0.0, min(AUG12_SESSION_PROTECT_KWH, overflow_done))
+    assert abs(cb - AUG12_SESSION_PROTECT_KWH) < 0.01, f"charge line must reach the reserve, got {cb}"
+    assert AUG12_SOC_AT_SESSION_KWH < cb, f"SOC {AUG12_SOC_AT_SESSION_KWH} must sit BELOW the charge line, got {cb}"
+    print(f"  test_session_reserve_drives_the_charge_line_not_only_the_drain_line: PASSED ({cb} kWh)")
+
+
+def test_session_charge_target_is_clamped_by_remaining_headroom():
+    """Defend p90 FIRST — the clamp that stops the charge line eating the drain.
+
+    12 Aug 14:20: required headroom 11.15 kWh, so only 6.93 kWh of pack was
+    affordable, while the session wanted 14.86. Charging to the reserve there
+    would have guaranteed the curtailment the drain exists to prevent, so the
+    clamp must win and SOC 9.11 kWh must NOT trigger Charge.
+    """
+    cb = compute_charge_below(0.50, 0.0, min(AUG12_SESSION_PROTECT_KWH, AUG12_OVERFLOW_FLOOR_1420_KWH))
+    assert abs(cb - AUG12_OVERFLOW_FLOOR_1420_KWH) < 0.01, f"headroom must clamp the session target, got {cb}"
+    assert AUG12_SOC_AT_1420_KWH > cb, f"SOC {AUG12_SOC_AT_1420_KWH} must stay ABOVE the charge line, got {cb}"
+    print(f"  test_session_charge_target_is_clamped_by_remaining_headroom: PASSED ({cb} kWh)")
+
+
+def test_aug12_session_day_flips_to_charge_while_pv_can_still_deliver():
+    """The discriminating shape: Hold at 14:20, Charge by 16:15 — not at 17:55.
+
+    The old deadline floor met SOC exactly (12.81 vs 12.82) at 17:55 with five
+    minutes of PV left, because its horizon was sundown while the session's
+    deadline was 18:00. The clamp lifting as remaining overflow decays is what
+    makes the catch-up fire while ~105 min of usable PV remain.
+
+    Asserts BOTH moments: a test that only pinned the afternoon would pass on a
+    change that simply charges all day and abandons the p90 defence.
+    """
+    early = compute_charge_below(0.50, 0.0, min(AUG12_SESSION_PROTECT_KWH, AUG12_OVERFLOW_FLOOR_1420_KWH))
+    late = compute_charge_below(0.50, 0.0, min(AUG12_SESSION_PROTECT_KWH, AUG12_OVERFLOW_FLOOR_1600_KWH))
+    assert AUG12_SOC_AT_1420_KWH > early, f"14:20 must Hold (headroom still owed), charge line {early}"
+    assert AUG12_SOC_AT_SESSION_KWH < late, f"16:00 must flip to Charge, charge line {late}"
+    deficit = late - AUG12_SOC_AT_SESSION_KWH
+    assert abs(deficit - 2.04) < 0.05, f"the gap to close is the 2.08 kWh we missed by, got {deficit:.2f}"
+    print(f"  test_aug12_session_day_flips_to_charge_while_pv_can_still_deliver: PASSED ({early} -> {late} kWh)")
+
+
+def test_charge_below_unchanged_without_a_session():
+    """Regression guard: no session -> the charge line is bit-identical to before.
+
+    The whole change must be confined to session days; a drift here would move
+    the Hold/Charge boundary on every ordinary day.
+    """
+    for recovery, keep in ((0.0, 0.0), (0.2, 2.0), (4.0, 1.5), (9.4, 0.0)):
+        with_arg = compute_charge_below(recovery, keep, 0.0)
+        legacy = max(recovery, keep, DEEP_DISCHARGE_FLOOR_KWH)
+        assert abs(with_arg - legacy) < 1e-9, f"no-session charge line moved: {legacy} -> {with_arg}"
+    print("  test_charge_below_unchanged_without_a_session: PASSED")
+
+
+def _session_charge_run(hours_ahead=4.0, overnight_target=3.0, p90_peak_kw=4.6, solcast_remaining=6.0):
+    """calculate()+publish() with a session armed and the day's overflow nearly done.
+
+    Deliberately a MODEST overflow: enough that the plugin is still active (R5),
+    little enough that the headroom clamp is above the session reserve — which is
+    the late-afternoon state the charge line has to act in. `_session_protect_run`
+    cannot be reused: its 10 kW p90 pins overflow_floor near zero, which clamps
+    the session target away and would make these tests vacuous.
+    """
+    from datetime import timedelta
+
+    now = _dt(2025, 7, 12, 12, 0, tzinfo=_tz.utc)
+    start = (now + timedelta(hours=hours_ahead)).isoformat()
+    pv = {m: 5.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 1.0 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 4.5, "sensor.sigen_plant_consumed_power": 0.6}
+    overrides.update(_make_p90_sensors(p90_peak_kw=p90_peak_kw, solcast_remaining=solcast_remaining))
+    overrides.update(_saving_session_sensors(active=False, next_mins=120, next_start=start))
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * 0.50,
+        minutes_now=720,
+        now_utc=now,
+        best_soc_keep=2.0,
+        sensor_overrides=overrides,
+    )
+    # RD37 must not stand the reserve aside — these tests are about what happens
+    # once it IS held, so give a P10 profile that cannot refill it.
+    base.pv_forecast_minute_step10 = {m: 0.05 * (PLUGIN_STEP / 60.0) for m in range(0, 24 * 60, PLUGIN_STEP)}
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 4.5
+    plugin._overnight_target_kwh = overnight_target
+    plugin.calculate(dno_limit_kw=3.68)
+    plugin.publish("active", floor_kwh=0.0, dno_limit_kw=3.68)
+    return plugin
+
+
+def test_published_charge_below_carries_the_session_target():
+    """Wiring, not just arithmetic: the PUBLISHED charge line must carry it.
+
+    A pure-function test passes whether or not the plugin ever calls it with the
+    session term — the "never reached its subject" failure. Assert the winning
+    arm explicitly so this cannot go vacuous if a fixture drifts.
+    """
+    plugin = _session_charge_run()
+    assert plugin._session_protect_kwh > 0, "precondition: the session reserve must be armed"
+    expected_target = min(plugin._session_protect_kwh, plugin._overflow_floor_kwh)
+    assert expected_target > max(plugin._p10_recovery_floor, 2.0, DEEP_DISCHARGE_FLOOR_KWH), (
+        "precondition: the session arm must be the one that WINS, else this test proves nothing " f"(target {expected_target}, recovery {plugin._p10_recovery_floor}, keep 2.0)"
+    )
+    assert abs(plugin._charge_below - expected_target) < 0.01, f"published charge_below must be the session target, got {plugin._charge_below} vs {expected_target}"
+    print(f"  test_published_charge_below_carries_the_session_target: PASSED ({plugin._charge_below} kWh)")
+
+
+def test_recovery_floor_no_longer_carries_the_session_term():
+    """One quantity, one place: the session belongs to the charge target now.
+
+    It used to be added into `overnight_for_recovery` as well, giving the reserve
+    two half-mechanisms with two different horizons — `p10_recovery` measures PV
+    to SUNDOWN, but the session's deadline is its start time. The recovery floor
+    goes back to being purely the overnight deadline, which its horizon is right
+    for.
+    """
+    plugin = _session_charge_run(overnight_target=8.0, solcast_remaining=3.0)
+    assert plugin._session_reserve_kwh > 0, "precondition: a session must be armed"
+    expected = compute_p10_recovery_floor(
+        overnight_target_kwh=plugin._overnight_target_kwh,
+        p10_pv_remaining_kwh=plugin._p10_pv_remaining_kwh,
+        load_remaining_kwh=plugin._load_remaining_kwh,
+    )
+    assert expected > 0, f"precondition: the recovery floor must be biting, got {expected}"
+    assert abs(plugin._p10_recovery_floor - expected) < 0.01, f"recovery floor must be overnight-only, got {plugin._p10_recovery_floor} vs {expected}"
+    print(f"  test_recovery_floor_no_longer_carries_the_session_term: PASSED ({plugin._p10_recovery_floor} kWh)")
+
+
 def test_required_headroom_is_defined_once():
     """Charter: one quantity, one definition. "How much headroom does the forecast
     overflow require?" was expressed in FIVE places in THREE different formulas —
@@ -8620,6 +8772,12 @@ def run_curtailment_tests(my_predbat=None):
         test_session_reserve_arms_in_time_for_the_morning_drain,
         test_session_reserve_horizon_boundary,
         test_session_reserve_still_protects_the_drain_floor,
+        test_session_reserve_drives_the_charge_line_not_only_the_drain_line,
+        test_session_charge_target_is_clamped_by_remaining_headroom,
+        test_aug12_session_day_flips_to_charge_while_pv_can_still_deliver,
+        test_charge_below_unchanged_without_a_session,
+        test_published_charge_below_carries_the_session_target,
+        test_recovery_floor_no_longer_carries_the_session_term,
         test_required_headroom_is_defined_once,
         test_no_drain_and_floor_agree_when_r49_reduces_the_buffer,
         test_recovery_floor_is_a_single_quantity,
