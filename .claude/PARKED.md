@@ -8,6 +8,19 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
+- **[2026-08-14] RD41 — session reserve as a charge target (`ac8b04cf`).**
+  Deployed 11:57 and confirmed LOADED: `session_charge_target_kwh` appears in the
+  published attributes from 12:02 (absent before the reload; HA keeps null
+  attributes, so the key's presence is the discriminator). **Not behaviourally
+  verified** — no session was armed on the 14th, and without one RD41 is a no-op
+  by construction, so today proves nothing about the control path.
+  **Success =** on the next session day, `session_charge_target_kwh` is non-null,
+  it sits at `min(session_protect, overflow_floor)` while headroom is still owed,
+  and CM flips to Solar Charge once the clamp lifts — with PV still to come, not
+  at the break-even minute. **Failure =** SOC stalls below the reserve through the
+  afternoon again, or Charge fires while `headroom_short_kwh` is still positive
+  (that would be the clamp failing, i.e. RD41 eating the p90 drain).
+
 - **[2026-08-13] Intended-freeze alert suppression (`99614c22`).** Deployed and
   structurally confirmed live (stop guard sits between the variables block and
   the notify). **Not behaviourally verified.** Needs a pre-dawn hour where
@@ -65,11 +78,6 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Done
 
-- [2026-08-14] Session reserve was a floor and never a target — fixed, RD41.
-  `charge_below` now takes `min(session_protect_kwh, overflow_floor)` and the
-  session term is out of `p10_recovery`. Needs a discriminating check: the next
-  session day must show `session_charge_target_kwh` published and Charge firing
-  while PV can still deliver, NOT at the 17:55 break-even.
 - [2026-08-12] Double-counted discharge efficiency in the overnight target —
   fixed, RD39, `5f37ad45`.
 - [2026-08-12] `classify_forecast_tracking` parameters named `*_scale` while the
