@@ -128,8 +128,27 @@ Bare `python3`/`python3.11` fails on a missing `protobuf` in `test_gateway.py` �
 that is an interpreter gap, NOT a regression. Check which interpreter you ran
 before investigating a failure, and never stash the working tree to "prove" it.
 
-Deploy: `ssh hassio@100.110.70.80`, `sudo cp /dev/stdin /addon_configs/6adb4f0d_predbat/<file>`,
-then `sudo touch .../plugin_system.py`. Deploy ALL changed .py together.
+## Deploy — PUSH before you deploy
+
+**Committed is not enough. Push first.** The pre-push hook is where the test
+suites run, so deploying from a local commit skips them entirely — untested code
+onto a live battery controller. Requiring the push makes the tests unskippable
+rather than a thing to remember.
+
+Use the script; it enforces this and will refuse otherwise:
+
+```
+.claude/bin/deploy              # standard curtailment set
+.claude/bin/deploy --dry-run    # check the gates, copy nothing
+```
+
+It refuses on a dirty tree, refuses on unpushed commits, verifies each file's
+md5 on the box after copying, writes the deployed commit to `DEPLOYED_SHA`
+(so "what is actually running?" is answerable without md5-ing every file), and
+touches `plugin_system.py` — plugin files are not watched, so nothing loads
+without it. Deploy ALL changed .py together.
+
+Bypass exists (`DEPLOY_FORCE=1`) and should stay unused.
 
 ## HA automation edits — mandatory workflow
 
