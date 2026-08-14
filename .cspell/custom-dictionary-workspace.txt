@@ -222,6 +222,7 @@ errno
 ESSAPI
 ETIMEDOUT
 etoday
+esac
 etok
 euids
 EVAC
@@ -765,6 +766,8 @@ unredacted
 unregisters
 unrepresentable
 unreproduced
+unpushed
+unskippable
 unsmoothed
 unstaged
 untriaged
