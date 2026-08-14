@@ -36,6 +36,7 @@ from curtailment_calc import (
     p_scales_from_forecast,
     p90_scale_from_forecast,
     estimate_session_end_kwh,
+    estimate_session_export_left_kwh,
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_proposed_phase,
     compute_p10_recovery_floor,
@@ -7872,30 +7873,73 @@ def test_session_dump_respects_the_heartbeat_precedence_exactly():
 
 
 def test_session_end_soc_projection():
-    """Projected SOC when the saving session ends.
+    """Projected SOC when the saving session ends, built from the kWh still to sell.
 
-    During the dump the battery supplies the export cap plus house load, less
-    whatever PV is still coming in — the same quantity the heartbeat commands,
-    so the projection matches the dispatch rather than a noisy instantaneous
-    battery reading. Clamped at the sell floor because the keep-floor guard
-    stops the discharge there.
+    The dump exports at the cap for whatever time is left, so `cap x hours` is
+    the quantity the projection is made of; the battery gives up that much at
+    the METER plus house load, less PV still coming in. Derived from the
+    commanded quantities rather than an instantaneous battery reading, so it
+    stays steady across a PV flicker.
     """
-    # 30 min left, 3.68 kW cap + 0.5 kW load, no PV -> 2.09 kWh out of 9.0.
-    end = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=30, floor_kwh=0.0)
+    # 30 min left, 3.68 kW cap + 0.5 kW load, no PV, lossless -> 2.09 kWh out of 9.0.
+    end = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=30)
     assert abs(end - (9.0 - (4.18 * 0.5))) < 0.01, end
 
     # PV offsets the draw.
-    end_pv = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=1.0, minutes_remaining=30, floor_kwh=0.0)
+    end_pv = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=1.0, minutes_remaining=30)
     assert end_pv > end, "PV during the session must reduce the battery draw"
 
-    # The guard stops the sell at the floor — never project through it.
-    clamped = estimate_session_end_kwh(soc_kwh=7.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=120, floor_kwh=6.46)
-    assert abs(clamped - 6.46) < 1e-6, f"must clamp at the sell floor, got {clamped}"
+    # The pack gives up MORE than the meter sees: same divide as
+    # compute_session_reserve, and for the same reason.
+    lossy = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=30, discharge_efficiency=0.947)
+    assert lossy < end, "the pack must give up more than the meter sees"
+    assert abs(lossy - (9.0 - (3.68 / 0.947 + 0.5) * 0.5)) < 0.01, lossy
 
     # No time left -> no change. Degenerate inputs must not explode.
-    assert abs(estimate_session_end_kwh(9.0, 3.68, 0.5, 0.0, 0, 0.0) - 9.0) < 1e-6
-    assert abs(estimate_session_end_kwh(9.0, 3.68, 0.5, 0.0, -5, 0.0) - 9.0) < 1e-6
+    assert abs(estimate_session_end_kwh(9.0, 3.68, 0.5, 0.0, 0) - 9.0) < 1e-6
+    assert abs(estimate_session_end_kwh(9.0, 3.68, 0.5, 0.0, -5) - 9.0) < 1e-6
     print("  test_session_end_soc_projection: PASSED")
+
+
+def test_session_export_left_is_the_display_quantity():
+    """ "How much is there still to sell" — the number the card leads with.
+
+    Grid-side by definition: it is what the meter will record and what Octopus
+    pays on, so it must NOT carry the discharge divide (that belongs to the pack
+    side of the same sum).
+    """
+    assert abs(estimate_session_export_left_kwh(3.68, 120) - 7.36) < 1e-6
+    assert abs(estimate_session_export_left_kwh(3.68, 60) - 3.68) < 1e-6
+    assert estimate_session_export_left_kwh(3.68, 0) == 0.0
+    assert estimate_session_export_left_kwh(3.68, -5) == 0.0, "a finished session has nothing left to sell"
+    print("  test_session_export_left_is_the_display_quantity: PASSED")
+
+
+def test_session_end_projection_is_not_clamped_at_a_floor_nothing_enforces():
+    """RD42: the clamp promised a stop that does not happen.
+
+    `estimate_session_end_kwh` clamped at the sell floor "because the keep-floor
+    guard stops the discharge there" — but the guard DEFERS to a live session
+    (RD14-own), so the dump runs straight through it. Live 12 Aug 2026 19:00 the
+    card published 39.3% (exactly `overnight_target_pct`, i.e. the clamp) with
+    SOC 57.2% and an hour to run; the session actually ended at 31.2%. The card
+    was at its most optimistic at the one moment you would have acted on it.
+
+    Real numbers from that cycle. The projection must land near the OUTCOME, and
+    must be free to project below the overnight reserve — that is the warning.
+    """
+    end = estimate_session_end_kwh(
+        soc_kwh=10.34,  # 57.2% of 18.08
+        cap_kw=3.68,
+        load_kw=0.86,
+        pv_kw=0.16,
+        minutes_remaining=60,
+        discharge_efficiency=0.947,
+    )
+    end_pct = end / 18.08 * 100.0
+    assert end_pct < 39.3, f"must be free to project below the overnight reserve, got {end_pct:.1f}%"
+    assert abs(end_pct - 31.2) < 1.5, f"must land near the 31.2% actual outcome, got {end_pct:.1f}%"
+    print(f"  test_session_end_projection_is_not_clamped_at_a_floor_nothing_enforces: PASSED ({end_pct:.1f}%)")
 
 
 def test_session_end_soc_is_published_during_the_dump():
@@ -7905,7 +7949,7 @@ def test_session_end_soc_is_published_during_the_dump():
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
-    base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=60, current_end="2026-08-03T20:00:00+01:00"))
+    base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=60, current_end="2025-07-12T13:00:00+00:00"))
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 6.2, 18.08
     plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.0, soc_max=18.08)
@@ -7921,7 +7965,57 @@ def test_session_end_soc_is_published_during_the_dump():
     p2._charge_below, p2._drain_above = 6.2, 18.08
     p2._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.0, soc_max=18.08)
     assert plain.published["sensor.predbat_curtailment_intended_policy"]["attrs"]["session_end_soc_pct"] is None
+    assert plain.published["sensor.predbat_curtailment_intended_policy"]["attrs"]["session_export_left_kwh"] is None
     print("  test_session_end_soc_is_published_during_the_dump: PASSED")
+
+
+def test_session_projection_is_blank_while_the_end_time_is_unknown():
+    """RD42: a number that says "no change" is worse than no number.
+
+    `session_dispatch` reads the CALENDAR; the end time comes off the binary
+    sensor, and they do not flip together — 12 Aug 2026 the calendar went on at
+    18:00:00.06 and the sensor at 18:00:43. Live in that gap the card published
+    `session_end_soc_pct: 70.9` against a soc_pct of 70.9: the dump had just
+    started and the card said it would cost nothing.
+
+    Reproduced by leaving the end attribute unset while the calendar says on.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=120, current_end=None))
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 6.2, 18.08
+    plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=12.82, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    assert attrs["session_dispatch"] is True, "precondition: the calendar must have us dumping"
+    assert attrs["session_end_soc_pct"] is None, f"unknown end time must publish blank, got {attrs['session_end_soc_pct']}"
+    assert attrs["session_export_left_kwh"] is None, f"unknown end time must publish blank, got {attrs['session_export_left_kwh']}"
+    print("  test_session_projection_is_blank_while_the_end_time_is_unknown: PASSED")
+
+
+def test_session_export_left_is_published_during_the_dump():
+    """RD42: the card must be able to say how much is still to sell.
+
+    Wired here as well as unit-tested, because a display quantity that is never
+    published is the "never reached its subject" failure — and the end-SOC
+    projection is now built FROM this number, so the two must agree on the card.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=60, current_end="2025-07-12T13:00:00+00:00"))
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 6.2, 18.08
+    plugin._publish_dispatch_policy(True, floor_kwh=18.08, soc_kwh=9.0, soc_max=18.08)
+    attrs = base.published["sensor.predbat_curtailment_intended_policy"]["attrs"]
+    left = attrs["session_export_left_kwh"]
+    assert left is not None and left > 0, f"mid-dump there must be something left to sell, got {left}"
+    # The projection is built from it: end SOC must be below current by at least
+    # the exported energy, since the pack also carries house load.
+    drop_kwh = (9.0 / 18.08 * 100 - attrs["session_end_soc_pct"]) / 100.0 * 18.08
+    assert drop_kwh >= left, f"the pack must give up at least the {left} kWh sold, got {drop_kwh:.2f}"
+    print(f"  test_session_export_left_is_published_during_the_dump: PASSED ({left} kWh)")
 
 
 def test_no_overflow_left_is_not_reported_as_surplus_fits():
@@ -9258,7 +9352,11 @@ def run_curtailment_tests(my_predbat=None):
         test_session_dump_is_published_as_the_effective_policy,
         test_session_dump_respects_the_heartbeat_precedence_exactly,
         test_session_end_soc_projection,
+        test_session_export_left_is_the_display_quantity,
+        test_session_end_projection_is_not_clamped_at_a_floor_nothing_enforces,
         test_session_end_soc_is_published_during_the_dump,
+        test_session_export_left_is_published_during_the_dump,
+        test_session_projection_is_blank_while_the_end_time_is_unknown,
         test_no_overflow_left_is_not_reported_as_surplus_fits,
         test_why_this_mode_reports_session_reserve,
         test_v32_drain_floor_drives_between_2_8_and_5pct,
