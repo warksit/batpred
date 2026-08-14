@@ -65,6 +65,7 @@ from curtailment_calc import (
     forecast_energy_to_now,
     day_tracking_ratio,
     estimate_session_end_kwh,
+    estimate_session_export_left_kwh,
     compute_proposed_phase,
     phase_to_policy,
     POLICY_MAX_EXPORT,
@@ -3281,10 +3282,6 @@ class CurtailmentPlugin(PredBatPlugin):
             low_soc = DEFAULT_DRAIN_FLOOR_PCT
         soc_pct = soc_kwh / max(soc_max, 0.1) * 100
 
-        # The level the guard stops a session dump at. Bound here so the
-        # projection below is safe on every branch, not just the active one.
-        session_sell_floor_kwh = 0.0
-
         # Decide the intended policy + keep floor (pure decision, no side effects yet)
         #
         # RD27 (2026-08-06): there is NO low-SOC handover. While active, CM keeps the
@@ -3393,9 +3390,6 @@ class CurtailmentPlugin(PredBatPlugin):
             else:
                 sell_floor_kwh = DEFAULT_KEEP_FLOOR_PCT / 100.0 * soc_max
             intended_keep = min(max(sell_floor_kwh / max(soc_max, 0.1) * 100, low_soc), 95.0)
-            # The level the guard will actually stop a session dump at — the
-            # projection must not run through it.
-            session_sell_floor_kwh = sell_floor_kwh
             # At-a-glance reason: mode + human override label + SOC% + band%
             # (never mix units; never expose internal codes like no_drain).
             # kWh stays on attributes for detail / cards that opt in.
@@ -3565,19 +3559,36 @@ class CurtailmentPlugin(PredBatPlugin):
         # Where the dump leaves us: the number you actually want mid-session,
         # and one the card cannot derive from anything else it shows.
         session_end_soc_pct = None
+        session_export_left_kwh = None
         if session_dispatch:
             try:
+                mins_left = self._session_minutes_remaining()
+                cap_kw = float(getattr(self, "_effective_dno", 3.68) or 3.68)
+                # RD42: "unknown" must publish as None, never as a number.
+                # `session_dispatch` reads the CALENDAR (RD14c) but the end time
+                # comes off the binary sensor, and the two do not flip together:
+                # 12 Aug 2026 the calendar went on at 18:00:00.06 and the sensor
+                # at 18:00:43. In that gap minutes_remaining is 0, and the old
+                # code published the CURRENT SOC as the end SOC — the card read
+                # "the session leaves you at 70.9%" at the moment the dump
+                # started. A blank is honest; a number that says "no change" is
+                # not. Unifying the two sources is a separate change (tz parsing
+                # on the calendar's naive end_time) — parked, not smuggled here.
+                if not mins_left or mins_left <= 0:
+                    raise ValueError("session end time not yet known")
+                session_export_left_kwh = round(estimate_session_export_left_kwh(cap_kw, mins_left), 2)
                 end_kwh = estimate_session_end_kwh(
                     soc_kwh=soc_kwh,
-                    cap_kw=float(getattr(self, "_effective_dno", 3.68) or 3.68),
+                    cap_kw=cap_kw,
                     load_kw=float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0.5) or 0.5),
                     pv_kw=float(self.base.get_state_wrapper(SIG_PV_POWER, default=0.0) or 0.0),
-                    minutes_remaining=self._session_minutes_remaining(),
-                    floor_kwh=session_sell_floor_kwh,
+                    minutes_remaining=mins_left,
+                    discharge_efficiency=self._discharge_efficiency(),
                 )
                 session_end_soc_pct = round(end_kwh / max(soc_max, 0.1) * 100.0, 1)
             except (TypeError, ValueError, AttributeError):
                 session_end_soc_pct = None
+                session_export_left_kwh = None
 
         # Always publish the intended decision — this is what you watch in observe-only.
         # Attributes are the single source for the Why This Mode card (report, never re-derive).
@@ -3639,6 +3650,10 @@ class CurtailmentPlugin(PredBatPlugin):
                 # policy in force legitimately differ for this one reason.
                 "session_dispatch": session_dispatch,
                 "session_end_soc_pct": session_end_soc_pct,
+                # RD42: what is still to SELL — the quantity the end-SOC
+                # projection is made of, and the one a human asks for
+                # mid-session. Grid-side: what the meter records.
+                "session_export_left_kwh": session_export_left_kwh,
                 "headroom_need_kwh": headroom_need_kwh,
                 "headroom_have_kwh": headroom_have_kwh,
                 "headroom_short_kwh": headroom_short_kwh,
