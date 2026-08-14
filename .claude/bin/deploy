@@ -1,0 +1,95 @@
+#!/bin/sh
+# Deploy site files to Mum's HA — refuses unless COMMITTED and PUSHED.
+#
+# Why pushed, not merely committed: the pre-push hook is where the test suites
+# run. Deploying from a local commit skips them entirely, which is exactly the
+# gap that let untested code onto a live battery controller. Requiring the push
+# makes the tests unskippable without making them a thing to remember.
+#
+# Usage:
+#   .claude/bin/deploy                 # the standard curtailment set
+#   .claude/bin/deploy <file> [file..] # specific files (paths under apps/predbat)
+#   .claude/bin/deploy --dry-run       # check the gates, copy nothing
+#
+# Deliberate bypass (do not make a habit of it):
+#   DEPLOY_FORCE=1 .claude/bin/deploy
+#
+# Records the deployed commit at DEPLOYED_SHA on the box, so "what is actually
+# running?" is answerable without md5-ing every file.
+
+set -eu
+
+HOST="hassio@100.110.70.80"
+REMOTE="/addon_configs/6adb4f0d_predbat"
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+
+DRY=0
+FILES=""
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY=1 ;;
+        *) FILES="$FILES $arg" ;;
+    esac
+done
+
+# The files that actually run at Mum's. Keep in step with what the box needs.
+if [ -z "$FILES" ]; then
+    FILES="apps/predbat/curtailment_plugin.py apps/predbat/curtailment_calc.py"
+fi
+
+fail() {
+    echo "deploy: REFUSED — $1" >&2
+    [ "${DEPLOY_FORCE:-0}" = "1" ] && { echo "deploy: DEPLOY_FORCE=1 — proceeding anyway" >&2; return 0; }
+    exit 1
+}
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# 1. Nothing uncommitted — you cannot deploy what is not in history.
+if [ -n "$(git status --porcelain)" ]; then
+    git status --short >&2
+    fail "working tree is dirty. Commit first — deployed code must be in git."
+fi
+
+# 2. Nothing unpushed — this is the gate that forces the tests to have run.
+git fetch -q origin "$BRANCH" 2>/dev/null || true
+if ! git rev-parse --verify -q "origin/$BRANCH" >/dev/null; then
+    fail "no origin/$BRANCH. Push the branch first (that is what runs the suites)."
+fi
+AHEAD=$(git rev-list --count "origin/$BRANCH..HEAD")
+if [ "$AHEAD" != "0" ]; then
+    git log --oneline "origin/$BRANCH..HEAD" >&2
+    fail "$AHEAD commit(s) not pushed. Push first — the pre-push hook runs the tests."
+fi
+
+SHA=$(git rev-parse --short HEAD)
+echo "deploy: branch $BRANCH @ $SHA (clean, pushed)"
+
+for f in $FILES; do
+    [ -f "$f" ] || { echo "deploy: no such file: $f" >&2; exit 1; }
+    base=$(basename "$f")
+    local_md5=$(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d' ' -f1)
+    if [ "$DRY" = "1" ]; then
+        echo "  would deploy $base ($local_md5)"
+        continue
+    fi
+    ssh -o ConnectTimeout=15 "$HOST" "sudo cp /dev/stdin $REMOTE/$base" < "$f"
+    remote_md5=$(ssh -o ConnectTimeout=15 "$HOST" "md5sum $REMOTE/$base" | cut -d' ' -f1)
+    if [ "$local_md5" != "$remote_md5" ]; then
+        echo "deploy: VERIFY FAILED for $base (local $local_md5 != remote $remote_md5)" >&2
+        exit 1
+    fi
+    echo "  ok  $base ($local_md5)"
+done
+
+if [ "$DRY" = "1" ]; then
+    echo "deploy: dry run — gates passed, nothing copied"
+    exit 0
+fi
+
+# Stamp what is running, then trigger the plugin reload.
+echo "$SHA $BRANCH $(date -u +%Y-%m-%dT%H:%M:%SZ)" | ssh -o ConnectTimeout=15 "$HOST" "sudo cp /dev/stdin $REMOTE/DEPLOYED_SHA"
+ssh -o ConnectTimeout=15 "$HOST" "sudo touch $REMOTE/plugin_system.py"
+echo "deploy: reload triggered. Plugin files are not watched, so this is what picks them up."
+echo "deploy: DEPLOYED_SHA = $SHA. Verify with a DISCRIMINATING check, not just 'it restarted'."
