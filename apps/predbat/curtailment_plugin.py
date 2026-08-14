@@ -463,6 +463,8 @@ class CurtailmentPlugin(PredBatPlugin):
         # v30 policy control (RD9): split thresholds stored by publish() this cycle
         self._charge_below = 0.0
         self._drain_above = 0.0
+        # RD41: the session reserve as a CHARGE target (clamped by headroom).
+        self._session_charge_target_kwh = 0.0
         # True while the plugin is actively driving the dispatch policy; used to
         # hand back exactly once on the active->off edge (RD10) without clobbering
         # manual/Predbat control on ordinary off cycles.
@@ -2136,10 +2138,17 @@ class CurtailmentPlugin(PredBatPlugin):
         # Horizon gate (2026-08-11): reserving for a session that is still days
         # out protects nothing — PV refills the pack daily — and costs the
         # curtailment drain. `_session_imminent` is the existing primitive.
-        reserve_for_recovery, self._session_protect_kwh = self._session_protect(soc_max, overnight_target)
-        overnight_for_recovery = overnight_target + reserve_for_recovery
+        self._session_protect_kwh = self._session_protect(soc_max, overnight_target)
+        # RD41: the session term is NOT added here any more. `p10_recovery`
+        # measures P10 PV remaining TODAY, i.e. its deadline is sundown — right
+        # for the overnight need, wrong for a session that needs the energy at
+        # its start time. On 12 Aug 2026 17:55 the floor read 12.81 kWh against
+        # SOC 12.82, tracking exactly and never triggering, because it still
+        # counted 2.09 kWh of PV forecast to land at or after 17:55 as funding a
+        # reserve that had to be full at 18:00. The session now rides on the
+        # charge target (see publish), which has no deadline to get wrong.
         p10_recovery = compute_p10_recovery_floor(
-            overnight_target_kwh=overnight_for_recovery,
+            overnight_target_kwh=overnight_target,
             p10_pv_remaining_kwh=p10_pv_remaining,
             load_remaining_kwh=load_remaining,
         )
@@ -2580,7 +2589,16 @@ class CurtailmentPlugin(PredBatPlugin):
         # The R54 floor input (self._p10_recovery_floor) is NOT clamped so
         # that R48's effective_keep relaxation still works on overflow days.
         if plugin_active:
-            charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh), 2)
+            # RD41: the session reserve drives the charge line too, clamped to the
+            # headroom the forecast still needs. p90 keeps priority — at 12 Aug
+            # 14:20 that clamp was 6.93 kWh against a 14.86 kWh reserve, so CM
+            # correctly declined to charge; by ~16:00 the remaining overflow had
+            # decayed, overflow_floor had risen past the reserve, and the whole
+            # 14.86 became affordable with ~105 min of usable PV still to come.
+            # The clamp is what keeps this from eating the drain it sits beside.
+            session_charge_target = min(self._session_protect_kwh, self._overflow_floor_kwh) if self._session_protect_kwh else 0.0
+            self._session_charge_target_kwh = round(session_charge_target, 2)
+            charge_below = round(compute_charge_below(self._p10_recovery_floor, soc_keep_kwh, session_charge_target), 2)
             # v33: the hard-floor arm is the DAWN RESERVE until measured PV covers
             # load, then POST_DAWN_FLOOR_KWH. Evaluated here rather than inside
             # compute_drain_above so the pure function stays free of live sensor
@@ -2598,6 +2616,7 @@ class CurtailmentPlugin(PredBatPlugin):
             charge_below = 0.0
             drain_above = round(soc_max, 2)
             drain_above_source = "inactive"
+            self._session_charge_target_kwh = 0.0
         self._drain_above_source = drain_above_source
 
         # Store for _publish_dispatch_policy (RD9): the v30 policy selection reuses
@@ -3012,11 +3031,16 @@ class CurtailmentPlugin(PredBatPlugin):
         return max(0.0, pct / 100.0 * soc_max)
 
     def _session_protect(self, soc_max, overnight_target):
-        """Session reserve: how much to hold back, and whether to hold it at all.
+        """Session reserve: the SOC level to hold for it, or 0 if it must not bind.
 
-        Returns (reserve_for_recovery, session_protect_kwh); both 0 when the
-        reserve should not bind. Three gates, each added after the previous one
-        let something through:
+        RD41: returns ONE value. It used to return `(reserve_for_recovery,
+        session_protect_kwh)` — the reserve and the level — and the caller then
+        rebuilt the level a second way as `overnight_target + reserve`. Two
+        routes to the same number is the drift the Charter's one-quantity-one-
+        definition rule exists to stop; the recovery floor no longer takes the
+        session at all, so the second route is gone.
+
+        Three gates, each added after the previous one let something through:
 
         1. Not during a LIVE session — then we are dumping it, not hoarding it.
         2. HORIZON (2026-08-11): a session 35 h out had pinned drain_above to
@@ -3031,9 +3055,9 @@ class CurtailmentPlugin(PredBatPlugin):
         paid session is not staked on optimistic sun.
         """
         if self._session_reserve_kwh <= 0 or self._session_active:
-            return 0.0, 0.0
+            return 0.0
         if not self._session_imminent(within_minutes=SESSION_PROTECT_HORIZON_HOURS * 60.0):
-            return 0.0, 0.0
+            return 0.0
         target = min(soc_max, overnight_target + self._session_reserve_kwh)
         mins = self._minutes_to_session()
         pv10 = getattr(self.base, "pv_forecast_minute_step10", {}) or getattr(self.base, "pv_forecast_minute_step", {}) or {}
@@ -3041,8 +3065,8 @@ class CurtailmentPlugin(PredBatPlugin):
             deficit = max(0.0, target - self._drain_floor_kwh(soc_max))
             if session_reserve_is_reachable(pv10, getattr(self.base, "load_minutes_step", {}) or {}, mins, deficit, PREDICT_STEP, values_are_kwh=True):
                 self._log_once("session_reachable", "Curtailment: session reserve stands aside — forecast PV fills {:.1f} kWh before the session".format(deficit))
-                return 0.0, 0.0
-        return self._session_reserve_kwh, target
+                return 0.0
+        return target
 
     def _minutes_to_session(self):
         """Minutes until the next joined session starts, or None."""
@@ -3600,6 +3624,13 @@ class CurtailmentPlugin(PredBatPlugin):
                 # the reserve aside, which on a sunny day is all day; the card
                 # then said only "PV will fill it in time" and never said how big
                 # "it" was. Need and held are different questions.
+                # RD41: the level CM is actively CHARGING toward for the session,
+                # already clamped by the headroom still owed. Distinct from
+                # session_need (what the session wants) and session_reserve (what
+                # is held): this is the one that explains why SOC is or is not
+                # rising, and on 12 Aug it was the number nobody could see.
+                "session_charge_target_kwh": round(self._session_charge_target_kwh, 2) if self._session_charge_target_kwh else None,
+                "session_charge_target_pct": round(self._session_charge_target_kwh / max(soc_max, 0.1) * 100.0, 1) if self._session_charge_target_kwh else None,
                 "session_need_kwh": round(self._session_reserve_kwh, 2) if self._session_reserve_kwh else None,
                 "session_need_pct": round(self._session_reserve_kwh / max(soc_max, 0.1) * 100.0, 1) if self._session_reserve_kwh else None,
                 "session_start": self._get_session_start(),

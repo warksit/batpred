@@ -21,6 +21,23 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-08-14] `session_reserve_is_reachable` measures PV the pack cannot
+  receive.** It sums `max(0, pv - load)` — gross surplus — but in Hold the pack
+  only receives the *overflow* (`pv - load - cap`). On 12 Aug that is ~44 kWh of
+  "available" PV against 11.5 kWh actually absorbable. Not what bit that
+  afternoon (the reserve was armed by 14:20), but it is what released the floor
+  to 0.18 kWh at 07:17 for the deep morning drain, and the arithmetic is wrong
+  either way. `curtailment_calc.py:269`.
+
+- **[2026-08-14] `estimate_session_end_kwh` clamps at a floor nothing enforces.**
+  The clamp exists "because the keep-floor guard stops the sell there", but the
+  guard defers to a live session (RD14-own), so the dump runs straight through
+  it. Live 12 Aug 19:00: published `session_end_soc_pct` **39.3%** (exactly
+  `overnight_target_pct`, i.e. the clamp), unclamped model 33.0%, actual end
+  **31.2%**. The card was most optimistic at the one moment you would act on it.
+  `curtailment_calc.py:595`. Either drop the clamp for a live session or make the
+  guard actually hold it.
+
 - **[2026-08-12] The saving-session reserve is not SOC-aware.**
   `session_reserve_is_reachable` compares remaining P10 PV against a deficit
   measured from the *drain floor*, never against current SOC. As
@@ -48,6 +65,11 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Done
 
+- [2026-08-14] Session reserve was a floor and never a target — fixed, RD41.
+  `charge_below` now takes `min(session_protect_kwh, overflow_floor)` and the
+  session term is out of `p10_recovery`. Needs a discriminating check: the next
+  session day must show `session_charge_target_kwh` published and Charge firing
+  while PV can still deliver, NOT at the 17:55 break-even.
 - [2026-08-12] Double-counted discharge efficiency in the overnight target —
   fixed, RD39, `5f37ad45`.
 - [2026-08-12] `classify_forecast_tracking` parameters named `*_scale` while the

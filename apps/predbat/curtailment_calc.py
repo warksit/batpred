@@ -774,12 +774,13 @@ def classify_forecast_tracking(actual_kwh, p10_kwh, p50_kwh, p90_kwh, min_expect
     return label, round(max(0.0, min(100.0, pct)), 1)
 
 
-def compute_charge_below(p10_recovery_floor, soc_keep):
+def compute_charge_below(p10_recovery_floor, soc_keep, session_charge_target=0.0):
     """Charge target: SOC level below which the system must not be exporting.
 
-    Returns: max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
+    Returns: max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH,
+                 session_charge_target)
 
-    Three terms in descending order of priority:
+    Four terms in descending order of priority:
       - p10_recovery_floor: SOC needed now to land on overnight target even on
         a worst-case (P10) PV day (R59).
       - soc_keep: overnight need / safety margin — the "soc_keep floor" clamp
@@ -791,8 +792,24 @@ def compute_charge_below(p10_recovery_floor, soc_keep):
         above 0.5 kWh, so the YAML never reports Hold/exporting while SOC sits
         at empty. Observed 2026-06-04 with battery at 0% during PV surplus +
         kettle transient → grid import.
+      - session_charge_target (RD41): the saving-session reserve, already
+        clamped by the caller to the headroom the forecast still needs. 0 when
+        no session is armed, so ordinary days are untouched.
+
+    RD41 (2026-08-14) — why the session term has to be HERE and not only in
+    compute_drain_above. It was a floor and never a target: on 12 Aug 2026 the
+    reserve held `drain_above` at 14.86 kWh while `charge_below` sat at 0.50,
+    leaving a 14 kWh band in which CM neither drained nor charged. In Hold the
+    pack receives only the above-cap overflow, so SOC stalled at 12.82 kWh from
+    16:50 and the 18:00 session opened 2.08 kWh short of the reserve CM had
+    itself computed. "Do not fall below X" does not get you to X.
+
+    The caller passes `min(session_protect_kwh, overflow_floor)` — the p90
+    defence keeps priority, and the clamp lifts on its own as the day's
+    remaining overflow decays, so the reserve is banked as soon as it is
+    affordable rather than at a deadline that has already passed.
     """
-    return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH)
+    return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH, session_charge_target)
 
 
 def compute_pre_pv_target(soc_keep, soc_max, buffer_pct, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.05):
