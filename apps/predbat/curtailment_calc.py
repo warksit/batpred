@@ -570,19 +570,51 @@ def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0,
     return "overflow_floor"
 
 
-def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining, floor_kwh=0.0):
+def estimate_session_export_left_kwh(cap_kw, minutes_remaining):
+    """Grid-side energy still to be sold before the saving session ends.
+
+        export_left = cap_kw x hours_remaining
+
+    The heartbeat holds export at the DNO cap for the whole paid window, so this
+    is simply the cap times the time left. GRID-side on purpose: it is what the
+    meter records and what the session pays on, so it carries no discharge
+    divide — that belongs to the pack side of the same sum, in
+    `estimate_session_end_kwh`.
+
+    This is the number the card leads with. "How much is there still to sell"
+    is the question a human asks mid-session, and it was not on the card at all.
+    """
+    try:
+        mins = float(minutes_remaining)
+    except (TypeError, ValueError):
+        return 0.0
+    if mins <= 0:
+        return 0.0
+    return max(0.0, float(cap_kw)) * (mins / 60.0)
+
+
+def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining, discharge_efficiency=1.0):
     """Projected battery energy (kWh) when a live saving session ends.
 
-    During the dump the heartbeat holds export at the DNO cap, so the battery
-    supplies `cap + load - pv`. Deriving it from the commanded quantities rather
-    than an instantaneous battery-power reading keeps the projection consistent
-    with the dispatch (and steady across a PV flicker).
+    Built from the energy still to sell rather than from a power extrapolation:
 
-        end = max(floor, soc - (cap + load - pv) x hours_remaining)
+        end = soc - (export_left / discharge_efficiency + (load - pv) x hours)
 
-    Clamped at `floor_kwh` because the keep-floor guard stops the sell there —
-    projecting through the floor would promise a discharge that cannot happen.
+    The pack must give up MORE than the meter will see, so the grid-side
+    `export_left` carries the discharge divide — the same conversion, in the
+    same direction, as `compute_session_reserve`. `load` and `pv` do not: the
+    site load sensor is a balance residual and is already pack-side (see RD39).
+
     Zero or negative time remaining returns the current SOC unchanged.
+
+    RD42 (2026-08-14) — why there is no floor clamp. It used to end
+    `return max(floor_kwh, projected)`, justified as "the keep-floor guard stops
+    the sell there". The guard DEFERS to a live session (RD14-own), so the dump
+    runs straight through the floor and the clamp promised a stop that does not
+    happen. Live 12 Aug 2026 19:00: published 39.3% — exactly the overnight
+    target, i.e. the clamp itself — with SOC 57.2% and an hour left to run. The
+    session ended at 31.2%. The projection must be free to go below the
+    overnight reserve, because that is precisely the warning worth having.
     """
     try:
         mins = float(minutes_remaining)
@@ -590,9 +622,11 @@ def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining,
         return soc_kwh
     if mins <= 0:
         return soc_kwh
-    draw_kw = max(0.0, float(cap_kw) + float(load_kw) - float(pv_kw))
-    projected = float(soc_kwh) - draw_kw * (mins / 60.0)
-    return max(float(floor_kwh), projected)
+    hours = mins / 60.0
+    eff = float(discharge_efficiency) if discharge_efficiency else 1.0
+    export_left = estimate_session_export_left_kwh(cap_kw, mins)
+    pack_draw = export_left / max(0.5, eff) + (float(load_kw) - float(pv_kw)) * hours
+    return float(soc_kwh) - max(0.0, pack_draw)
 
 
 def forecast_energy_to_now(detailed_forecast, minutes_now, local_offset_hours=0):
