@@ -18,7 +18,7 @@
 # Run: cd apps/predbat && python3 tests/test_yaml_sig_unreachable.py
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import jinja2
 import yaml
@@ -160,22 +160,34 @@ def test_power_cut_and_network_fault_are_told_apart():
     print("  test_power_cut_and_network_fault_are_told_apart: PASSED")
 
 
+def _state_gate(auto):
+    """The native state condition that gates the notify."""
+    for step in _actions(auto):
+        if isinstance(step, dict) and step.get("condition") == "state":
+            return step
+    raise AssertionError("no native state condition found")
+
+
 def test_short_blip_does_not_alert():
-    """The sweep trigger has no `for:`, so the duration gate lives in the
-    condition. A 2-minute integration reload must not page."""
-    auto = _load()
-    cond = [s for s in _actions(auto) if isinstance(s, dict) and "condition" in s and s.get("condition") == "template"]
-    assert cond, "there must be a template condition gating the notify"
-    expr = cond[0]["value_template"]
-    assert "dark_mins" in expr and ">= 5" in expr, f"condition must gate on >= 5 min, got {expr}"
-
-    blip = _render(DARK, dark_since=NOW - timedelta(minutes=2))
-    assert blip["dark_mins"] == 2.0, blip["dark_mins"]
-    assert not (blip["sig_dark"] and blip["dark_mins"] >= 5), "a 2-minute blip must not alert"
-
-    real = _render(DARK, dark_since=NOW - timedelta(minutes=82))
-    assert real["sig_dark"] and real["dark_mins"] >= 5, "an 82-minute outage must alert"
+    """The /15 sweep has no `for:`, so the duration gate lives in the condition.
+    A 2-minute integration reload must not page."""
+    gate = _state_gate(_load())
+    assert gate["for"]["minutes"] >= 5, f"gate must require >= 5 min, got {gate['for']}"
+    settle = _actions(_load())[0]["then"][0]["delay"]["minutes"]
+    assert settle > gate["for"]["minutes"], f"restart settle ({settle}) must exceed the gate ({gate['for']['minutes']}) or the restart path can never satisfy it"
     print("  test_short_blip_does_not_alert: PASSED")
+
+
+def test_gate_is_native_and_requires_all_three():
+    """Native condition over a template: validated at config load rather than
+    failing silently at runtime. A list of entity_ids is ANDed by HA, which is
+    the all-dark-not-any rule."""
+    gate = _state_gate(_load())
+    assert set(gate["entity_id"]) == {SOC, RUN, PV}, gate["entity_id"]
+    assert set(gate["state"]) == {"unavailable", "unknown"}, gate["state"]
+    templates = [s for s in _actions(_load()) if isinstance(s, dict) and s.get("condition") == "template"]
+    assert not templates, f"gate must be native, found template conditions: {templates}"
+    print("  test_gate_is_native_and_requires_all_three: PASSED")
 
 
 def test_the_2026_08_15_outage_would_have_paged():
@@ -218,6 +230,7 @@ def main():
         test_healthy_plant_is_never_dark,
         test_power_cut_and_network_fault_are_told_apart,
         test_short_blip_does_not_alert,
+        test_gate_is_native_and_requires_all_three,
         test_the_2026_08_15_outage_would_have_paged,
         test_renotify_is_throttled,
         test_notifies_andrew_critically,
