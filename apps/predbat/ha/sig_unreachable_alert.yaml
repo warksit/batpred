@@ -1,0 +1,134 @@
+# SIG Unreachable Alert
+# HA automation: the SIG is not talking to Home Assistant AT ALL.
+#
+# Distinct from sig_inverter_fault_alert on purpose. That one detects a plant
+# that IS talking but is misbehaving (idle, clamped, dead grid CT), and its
+# poll-liveness term deliberately excludes integration outages so it cannot
+# false-alarm on an HA restart. The consequence, seen on 2026-08-15, is that
+# nothing at all covers "the inverter has vanished":
+#
+#   15:48  every SIG entity -> unknown (site power cut; the generator carries
+#          Home Assistant but NOT the inverter)
+#   17:10  still unreachable — ARP FAILED on 192.168.5.145, 100% ping loss,
+#          tcp/502 closed — and sig_inverter_fault_alert's last_triggered was
+#          still 13 Aug 05:55. Nearly 90 minutes, no notification.
+#
+# The failure mode this is built for is the RESTART, not the transition. HA
+# comes back on the generator, the Sigen integration cannot reach the inverter,
+# and its entities are unknown from the moment they are created. No state
+# trigger will ever fire, because nothing ever changed while HA was watching.
+# Hence the `homeassistant: start` trigger, which is the load-bearing one.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+
+id: "1786900000001"
+alias: "SIG Unreachable Alert"
+description: >-
+  Alert when the SIG inverter is not reachable at all — every core entity
+  unknown/unavailable for 5+ minutes, including immediately after a Home
+  Assistant restart (power cut onto the generator, which does not power the
+  inverter). Complements sig_inverter_fault_alert, which covers a plant that is
+  talking but faulty.
+mode: single
+max_exceeded: silent
+
+triggers:
+  # 1. Live disappearance while HA is watching.
+  - trigger: state
+    entity_id:
+      - sensor.sigen_plant_battery_state_of_charge
+      - sensor.sigen_plant_plant_running_state
+    to:
+      - "unavailable"
+      - "unknown"
+    for:
+      minutes: 5
+    id: went_dark
+
+  # 2. THE one that matters. After a restart the entities are born unknown, so
+  #    trigger 1 can never fire — the change happened while HA was down.
+  - trigger: homeassistant
+    event: start
+    id: ha_restart
+
+  # 3. Backstop for anything the other two miss (integration reload, entity
+  #    re-registration). Gated on duration below so it cannot fire on a blip.
+  - trigger: time_pattern
+    minutes: "/15"
+    id: sweep
+
+conditions: []
+
+actions:
+  # On a restart every entity is briefly unknown, including healthy ones. Give
+  # the integration time to connect before judging it — without this the alert
+  # fires on every routine HA restart.
+  - if:
+      - condition: trigger
+        id: ha_restart
+    then:
+      - delay:
+          minutes: 5
+
+  # Variables are evaluated TOP-DOWN and each may only reference those above it.
+  # Do not reorder (a reordered variables block cost a 2-hour outage 2026-05-06).
+  - variables:
+      soc_state: "{{ states('sensor.sigen_plant_battery_state_of_charge') }}"
+      run_state: "{{ states('sensor.sigen_plant_plant_running_state') }}"
+      pv_state: "{{ states('sensor.sigen_plant_pv_power') }}"
+      # 'none' covers the entity having been removed entirely, which is what a
+      # failed integration setup produces (states() returns 'unknown' for a
+      # missing entity, but be explicit rather than rely on that).
+      dark: "{{ ['unavailable', 'unknown', 'none', ''] }}"
+      # ALL of them, not any: one entity dropping out is normal Modbus jitter,
+      # the whole plant going quiet is not.
+      sig_dark: >-
+        {{ soc_state | lower in dark and run_state | lower in dark
+           and pv_state | lower in dark }}
+      # How long the core entity has read dark. After an HA restart last_changed
+      # is re-stamped at startup, so on the ha_restart path this measures uptime,
+      # not the true outage length — the message says "at least" for that reason.
+      dark_since: >-
+        {{ states.sensor.sigen_plant_battery_state_of_charge.last_changed
+           if states.sensor.sigen_plant_battery_state_of_charge is not none
+           else now() }}
+      dark_mins: "{{ ((now() - dark_since).total_seconds() / 60) | round(0) }}"
+      # Triage hint, and the reason this alert exists in the form it does. The
+      # Octopus smart meter is metered and powered independently of the SIG:
+      #   both dark  -> site power (the 2026-08-15 shape)
+      #   SIG only   -> the local network path to the inverter
+      meter_state: >-
+        {{ states('sensor.octopus_energy_electricity_24j0698298_1100025301348_current_demand') }}
+      meter_dark: "{{ meter_state | lower in dark }}"
+      likely_cause: >-
+        {{ 'site power (the smart meter is dark too — the generator carries HA
+            but not the inverter)' if meter_dark
+           else 'the local network path to the inverter (the smart meter is
+            still reporting, so the site has power)' }}
+
+  # The sweep has no `for:`, so gate it on duration here. Without this a routine
+  # integration reload lands as a page.
+  - condition: template
+    value_template: "{{ sig_dark and (dark_mins | float(0)) >= 5 }}"
+
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "SIG Unreachable"
+      message: >-
+        No contact with the inverter for at least {{ dark_mins }} min.
+        Likely cause: {{ likely_cause }}.
+        Nothing can be written to the plant while this lasts — it is running on
+        the last registers written, and the software drain floor is not
+        enforceable.
+      data:
+        push:
+          sound:
+            name: "default"
+            critical: 1
+            volume: 0.5
+
+  # Re-notify interval. `mode: single` + `max_exceeded: silent` means every
+  # further trigger is dropped while this delay is in flight, so a long outage
+  # pages hourly instead of every 15 minutes. No helper entity needed.
+  - delay:
+      minutes: 60
