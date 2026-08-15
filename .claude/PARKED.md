@@ -34,6 +34,22 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-08-15] The fault alert cannot see a DEAD inverter, only a dead meter.**
+  SIG unreachable from ~15:48 (ARP FAILED on 192.168.5.145, 100% ping loss, TCP
+  502 closed) and `automation.sig_inverter_fault_alert` never fired — its
+  `last_triggered` was still 13 Aug 05:55 nearly 90 minutes in. The triggers key
+  on the meter-dead signature (`grid_*` stale while `pv`/`battery` update); when
+  the whole integration goes `unknown` there is nothing left to compare, so no
+  trigger fires. The site is blind to the more serious of the two failures.
+  Needs an availability trigger (`to: unavailable`/`unknown` on a core SIG
+  entity, `for:` a few minutes) rather than another value comparison.
+
+- **[2026-08-15] The heartbeat keeps beating into an unreachable plant.**
+  `sig_dispatch_heartbeat` was still firing every minute (last 17:08) with all
+  its target entities `unknown`, and `current: 1` — an instance in flight. It
+  neither backs off nor reports. Harmless in itself, but it means "the heartbeat
+  is running" tells you nothing about whether anything is being written.
+
 - **[2026-08-14] `session_reserve_is_reachable` measures PV the pack cannot
   receive.** It sums `max(0, pv - load)` — gross surplus — but in Hold the pack
   only receives the *overflow* (`pv - load - cap`). On 12 Aug that is ~44 kWh of
