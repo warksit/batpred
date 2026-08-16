@@ -1,0 +1,199 @@
+# Octoplus Power Up — grid charge
+#
+# Octopus "Power Up" = FREE ELECTRICITY. Import is free for the window, so the
+# right move is to take as much as the plant will accept: charge the battery
+# from the grid, then sell it back later at the export rate.
+#
+# WHY THE CALENDAR CANNOT BE THE TRIGGER (2026-08-16)
+# ADR 0004 renamed Saving Sessions -> "power down" and Free Electricity ->
+# "power up". Integration v19.0.0 creates `octoplus_power_down` (and the legacy
+# `octoplus_saving_sessions`, byte-identical) but NO `octoplus_power_up` entity
+# at all — so a Power Up has nowhere else to go and lands on the power-DOWN
+# feed. Both calendars therefore carry both kinds of event, with the same
+# summary. Triggering off either would grid-charge during a real saving session:
+# importing 6.6 kW in the hour you are paid a premium to export.
+#
+# THE DISCRIMINATOR IS THE REWARD, not the calendar. A saving session pays
+# octopoints per kWh saved; a Power Up pays none, because the benefit is the
+# free import. Verified against this account's 18 joined events:
+#
+#   every saving session   octopoints_per_kwh  16 .. 415   start 18:00-20:30
+#   2026-08-16 power up    octopoints_per_kwh  0           start 14:00
+#
+# Second gate on start hour (10:00-17:00) because every saving session in that
+# history starts at 18:00 or later. Belt and braces: a 0-point saving session
+# would otherwise be charged through, which is the one expensive mistake here.
+#
+# OWNERSHIP. CM must be stood down BEFORE the window opens, for two reasons:
+# the effective-policy template forces Max Export whenever the saving-sessions
+# calendar is on (which it will be, for this event) unless the select reads
+# `Predbat`; and RD14-own stops CM handing back discretionarily once it believes
+# a session is live. Setting the select to Predbat directly is what silences the
+# heartbeat — `sig_dispatch_heartbeat` writes nothing while policy == Predbat.
+#
+# IMPORTANT: Update and commit this file before changing the automation in HA.
+
+id: "1786900000002"
+alias: "Octoplus Power Up - grid charge"
+description: >-
+  During an Octopus Power Up (free electricity) window, stand CM down and
+  command the plant to import, charging the battery for free. Reverts on window
+  close, on timeout, and after an HA restart that finds the plant still
+  importing.
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: template
+    value_template: >-
+      {% set ns = namespace(a=false) %}
+      {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events','joined_events') or [] %}
+      {% set st = as_datetime(e.start) | as_local %}
+      {% if (e.octopoints_per_kwh | int(-1)) == 0 and 10 <= st.hour < 17
+            and st <= now() < (as_datetime(e.end) | as_local) %}
+      {% set ns.a = true %}
+      {% endif %}
+      {% endfor %}
+      {{ ns.a }}
+    id: window_open
+  - trigger: homeassistant
+    event: start
+    id: recover
+
+  # Backstop. The template trigger is the only thing that opens the window, and
+  # a missed edge means the whole hour is lost. HA re-renders templates
+  # containing now() each minute, so this should be redundant — but "should be"
+  # is not a plan when the window is 60 minutes long and does not come round
+  # again. Costs at most 5 minutes of the hour if the edge is missed.
+  - trigger: time_pattern
+    minutes: "/5"
+    id: sweep
+
+actions:
+  # RECOVERY. A restart mid-window loses the in-flight run, which would strand
+  # the plant importing at 6.6 kW with nobody to stop it. Same lesson as the
+  # unreachable alert: the restart is the case a state machine forgets.
+  - if:
+      - condition: trigger
+        id: recover
+    then:
+      - if:
+          - condition: numeric_state
+            entity_id: number.sigen_plant_active_power_fixed_adjustment
+            below: -0.01
+        then:
+          - action: number.set_value
+            target:
+              entity_id: number.sigen_plant_active_power_fixed_adjustment
+            data:
+              value: 0
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.curtailment_manager_enable
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "Power Up — recovered after restart"
+              message: "HA restarted while the plant was importing. Setpoint reset to 0 and CM re-enabled."
+      - stop: "Recovery path complete"
+
+  # --- WINDOW OPEN ---
+  # Gate. Mandatory once the /5 sweep exists: the sweep fires regardless of the
+  # window, so without this the automation would stand CM down every 5 minutes
+  # all day. Same expression as the trigger — they must not drift.
+  - condition: template
+    value_template: >-
+      {% set ns = namespace(a=false) %}
+      {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events','joined_events') or [] %}
+      {% set st = as_datetime(e.start) | as_local %}
+      {% if (e.octopoints_per_kwh | int(-1)) == 0 and 10 <= st.hour < 17
+            and st <= now() < (as_datetime(e.end) | as_local) %}
+      {% set ns.a = true %}
+      {% endif %}
+      {% endfor %}
+      {{ ns.a }}
+
+  # 1. Take the wheel off CM. Override first: it outranks the select.
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.sig_override
+    data:
+      option: "Off"
+  - action: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.curtailment_manager_enable
+  # 2. Silence the heartbeat NOW rather than waiting up to 5 min for CM's own
+  #    handback cycle — the window is only an hour and the calendar is already on.
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.sig_dispatch_policy
+    data:
+      option: "Predbat"
+  # 3. Stop Predbat becoming the second writer. Deliberately NOT via
+  #    predbat_set_read_only: changing that forces a full inverter reset to
+  #    defaults.
+  - action: automation.turn_off
+    target:
+      entity_id:
+        - automation.predbat_requested_mode_action
+        - automation.predbat_max_charging_limit_action
+        - automation.predbat_max_discharging_limit_action
+    data:
+      stop_actions: true
+
+  # 4. Command the import. Negative = draw from grid. The plant clamps to the
+  #    8.8 kW ESS charge limit and the 6.6 kW AC rating, so this asks for the
+  #    maximum and lets hardware decide — same pattern as Max Export's 6.6.
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_active_power_fixed_adjustment
+    data:
+      value: -6.6
+
+  # 5. Report what ACTUALLY happened, two minutes in. If import is still 0.000
+  #    something is writing over us and that needs to be known at 14:02, not 15:00.
+  - delay:
+      minutes: 2
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "Power Up — charging"
+      message: >-
+        import {{ states('sensor.sigen_plant_grid_import_power') }} kW ·
+        battery {{ states('sensor.sigen_plant_battery_power') }} kW ·
+        SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}% ·
+        setpoint {{ states('number.sigen_plant_active_power_fixed_adjustment') }}
+        {{ '— WARNING: not importing, something is overwriting the setpoint'
+           if (states('sensor.sigen_plant_grid_import_power') | float(0)) < 0.5 else '' }}
+
+  # 6. Hold until the window closes. The timeout is the belt to the wait's
+  #    braces: if the template never goes false the run still reverts.
+  - wait_for_trigger:
+      - trigger: template
+        value_template: >-
+          {% set ns = namespace(a=false) %}
+          {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events','joined_events') or [] %}
+          {% set st = as_datetime(e.start) | as_local %}
+          {% if (e.octopoints_per_kwh | int(-1)) == 0 and 10 <= st.hour < 17
+                and st <= now() < (as_datetime(e.end) | as_local) %}
+          {% set ns.a = true %}
+          {% endif %}
+          {% endfor %}
+          {{ not ns.a }}
+    timeout:
+      minutes: 70
+    continue_on_timeout: true
+
+  # --- WINDOW CLOSED: hand back ---
+  - action: number.set_value
+    target:
+      entity_id: number.sigen_plant_active_power_fixed_adjustment
+    data:
+      value: 0
+  - action: input_boolean.turn_on
+    target:
+      entity_id: input_boolean.curtailment_manager_enable
+  - action: notify.mobile_app_andrew_iphone
+    data:
+      title: "Power Up — finished"
+      message: >-
+        SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%.
+        Setpoint reset, CM re-enabled — it re-takes the wheel within a minute.
