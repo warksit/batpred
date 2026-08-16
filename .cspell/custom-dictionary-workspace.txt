@@ -2,6 +2,7 @@
 3hy
 aaaabbbbccccdddd
 acks
+#
 achievability
 activepower
 adata
@@ -117,6 +118,7 @@ ctrdis
 ctypes
 customauthorizer
 crtld
+Custom
 customisation
 Customise
 cvalue
@@ -162,6 +164,7 @@ devcontainers
 dexport
 deye
 deyecloud
+Dictionary
 digestmod
 dimport
 disch
@@ -790,6 +793,7 @@ Werror
 WEXITSTATUS
 WIFEXITED
 WNOHANG
+Words
 workmode
 worktree
 writeonly

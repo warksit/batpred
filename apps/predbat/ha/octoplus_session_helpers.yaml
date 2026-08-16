@@ -1,0 +1,97 @@
+# Octoplus session discrimination — THE single point of truth
+#
+# WHY THIS EXISTS
+#
+# Octopus merged every demand-flexibility scheme into two categories, Power Up
+# (use more, import is free) and Power Down (use less, paid per kWh saved), and
+# both arrive on the SAME feed with no type field. Acting on the wrong one is
+# expensive in both directions: exporting at the cap through a free-import hour,
+# or importing 6.6 kW through an hour you are paid a premium to export.
+#
+# Full background, upstream issue numbers and the evidence:
+#   ha/OCTOPUS_SESSIONS.md
+#
+# THE DISCRIMINATOR IS THE REWARD, not the calendar and not the clock:
+#
+#   octopoints_per_kwh == 0   ->  Power Up    (the benefit is the free import)
+#   octopoints_per_kwh  > 0   ->  Power Down  (paid per kWh saved)
+#
+# This is a PROXY. It is not the field we would choose — it is the only field in
+# the payload that varies between the two categories. `savingSessions` exposes
+# id / code / rewardPerKwhInOctoPoints / startAt / endAt and nothing else.
+#
+# WHY THE POWER UP ENTITIES ARE NOT USED. They look like the right answer and
+# they are not: the integration feeds them from a hardcoded third-party scrape
+# (`oe-api.davidskendall.co.uk/free_electricity.json`), dead since 2025-10-25.
+# They are not stale, they are abandoned. See OCTOPUS_SESSIONS.md.
+#
+# REMOVAL TRIGGER. When upstream #1590 lands and power_up is fed from
+# `customerFlexibilityCampaignEvents(campaignSlug:)`, or the integration exposes
+# any explicit type field, replace the BODY of these two sensors with the native
+# read and change nothing else. Every consumer reads these entities and none
+# re-implements the test — tests/test_yaml_octoplus_sessions.py enforces that,
+# so the swap cannot leave a stale copy behind.
+#
+# WHY JOINED EVENTS ONLY. `available_events` are offers, not participation, and
+# a Power Up arrives as several one-hour slots joined individually. Acting on an
+# offer we did not take would import at full rate. If a slot is missed the fix is
+# to join it, not to loosen this.
+#
+# FAIL-SAFE. Absent or unreadable points render as -1, which is NOT 0, so the
+# pair fails towards Power Down: no grid charge, keep exporting. Losing a free
+# hour costs the difference between import and export; importing 6.6 kW through
+# a real saving session costs the premium and the import. The sensors are exact
+# complements within a joined window, so an event can never be both or neither.
+#
+# The reward is read with `.get('octopoints_per_kwh', -1)`, NOT attribute access.
+# On a joined event that lacks the key, `e.octopoints_per_kwh` is Undefined and
+# `| int(-1)` RAISES rather than defaulting — Undefined is neither TypeError nor
+# ValueError, so the filter's own fallback never catches it. That takes BOTH
+# sensors to unavailable, which is not fail-safe: it also stops the Max Export
+# forcing during a real saving session. Caught by the harness, not in the field.
+#
+# NO TIME-OF-DAY GATE (Andrew, 2026-08-16). Octopus publish 11:00-16:00 for Power
+# Ups and every observed Power Down starts 18:00 or later, but the hour is
+# correlation, not the test. Recorded in OCTOPUS_SESSIONS.md as context. If it
+# ever becomes logic it belongs HERE, not in a consumer.
+#
+# DEPLOY: via ha_config_set_helper (helper_type: template). This file is the
+# source of truth — edit here, run tests/test_yaml_octoplus_sessions.py, then
+# push. Never edit the helper in the HA UI without updating this file.
+
+binary_sensors:
+  # ---------------------------------------------------------------------------
+  # Power Up: free import running right now -> charge the battery from the grid.
+  # ---------------------------------------------------------------------------
+  - name: Octoplus Power Up Active
+    unique_id: octoplus_power_up_active
+    state: >-
+      {% set ns = namespace(hit=false) %}
+      {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+      {% set st = as_datetime(e.start) %}
+      {% set en = as_datetime(e.end) %}
+      {% if st is not none and en is not none and st <= now() < en and (e.get('octopoints_per_kwh', -1) | int(-1)) == 0 %}
+      {% set ns.hit = true %}
+      {% endif %}
+      {% endfor %}
+      {{ ns.hit }}
+
+  # ---------------------------------------------------------------------------
+  # Power Down: paid saving session running right now -> export at the cap.
+  #
+  # `!= 0` rather than `> 0` so an event whose reward we cannot read still counts
+  # as Power Down. That is the fail-safe direction, and it makes this the exact
+  # complement of the sensor above within a joined window.
+  # ---------------------------------------------------------------------------
+  - name: Octoplus Power Down Active
+    unique_id: octoplus_power_down_active
+    state: >-
+      {% set ns = namespace(hit=false) %}
+      {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+      {% set st = as_datetime(e.start) %}
+      {% set en = as_datetime(e.end) %}
+      {% if st is not none and en is not none and st <= now() < en and (e.get('octopoints_per_kwh', -1) | int(-1)) != 0 %}
+      {% set ns.hit = true %}
+      {% endif %}
+      {% endfor %}
+      {{ ns.hit }}
