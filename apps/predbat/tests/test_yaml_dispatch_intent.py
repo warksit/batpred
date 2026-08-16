@@ -21,7 +21,11 @@ import yaml
 HERE = os.path.dirname(__file__)
 HELPERS_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_intent_helpers.yaml")
 HEARTBEAT_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_heartbeat.yaml")
-CALENDAR = "calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
+# What a live session MEANS comes from the discrimination sensor, not the
+# Octoplus calendar — the calendar is on for Power Ups (free import) as well as
+# Power Downs (paid), so keying the Max Export forcing on it exports through a
+# free-import hour. See ha/octoplus_session_helpers.yaml and OCTOPUS_SESSIONS.md.
+SESSION_SENSOR = "binary_sensor.octoplus_power_down_active"
 ACTIVE_POLICIES = ("Max Export", "Hold Battery", "Solar Charge Battery")
 
 
@@ -83,7 +87,7 @@ def _states(override, select, session, pv, load, soc, hard=2.8):
     return {
         "input_select.sig_override": override,
         "input_select.sig_dispatch_policy": select,
-        CALENDAR: "on" if session else "off",
+        SESSION_SENSOR: "on" if session else "off",
         "sensor.sigen_plant_pv_power": str(pv),
         "sensor.sigen_plant_total_load_power": str(load),
         "sensor.sigen_plant_battery_state_of_charge": str(soc),

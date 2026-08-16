@@ -125,8 +125,15 @@ actions:
       - conditions:
           - condition: trigger
             id: dusk
+          # Not during a paid session — the dusk release must not undo a dump.
+          #
+          # Was `binary_sensor...octoplus_saving_sessions`, which the integration
+          # REMOVED: it reads `unavailable`, so this condition could not match
+          # "off" and the dusk release never fired. Now the discrimination sensor
+          # (ha/octoplus_session_helpers.yaml), which also knows a Power Up from
+          # a Power Down — a free-import hour must not block the release.
           - condition: state
-            entity_id: binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions
+            entity_id: binary_sensor.octoplus_power_down_active
             state: "off"
           # Skip if already fully released on BOTH layers — keeps this a no-op.
           - condition: not

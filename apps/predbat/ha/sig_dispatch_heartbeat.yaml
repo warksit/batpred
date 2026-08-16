@@ -94,19 +94,35 @@ trigger:
   - platform: state
     entity_id: sensor.sig_effective_policy
     id: policy_change
-  # RD14c: NATIVE calendar triggers. The Octoplus saving-sessions calendar is
-  # "on when a saving session that the account has joined is active", and HA
-  # schedules calendar triggers to fire at the exact event boundary — no polling,
-  # no template window math, and joined-only so an un-joined session can never
-  # make us export for free.
+  # RD14c: NATIVE calendar triggers, on the POWER DOWN calendar. HA schedules
+  # calendar triggers to fire at the exact event boundary — no polling, no
+  # template window math, and joined-only so an un-joined session can never make
+  # us export for free.
+  #
+  # These wake the heartbeat; they do NOT decide anything. The calendar is on for
+  # Power Ups as well as Power Downs (Octopus publish both on one feed), so what
+  # a session MEANS comes from binary_sensor.octoplus_power_down_active via
+  # sensor.sig_effective_policy. Waking for a Power Up is harmless — the policy
+  # sensor says do not export, and the beat costs nothing.
+  #
+  # Named `..._power_down` rather than `..._octoplus_saving_sessions`: same feed,
+  # but the legacy name is removed January 2027, at which point these triggers
+  # would have stopped firing silently.
   - platform: calendar
-    entity_id: calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions
+    entity_id: calendar.octopus_energy_a_4ba7c915_octoplus_power_down
     event: start
     id: session_start
   - platform: calendar
-    entity_id: calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions
+    entity_id: calendar.octopus_energy_a_4ba7c915_octoplus_power_down
     event: end
     id: session_end
+  # Backstop for the boundary the calendar cannot express: the moment an event's
+  # CATEGORY becomes known or changes. The calendar fires on the window edge, the
+  # discrimination sensor on what the window is for, and only the second one can
+  # tell Max Export from a grid charge.
+  - platform: state
+    entity_id: binary_sensor.octoplus_power_down_active
+    id: session_category
   - platform: template
     value_template: >-
       {# RD26: this trigger is a READER. The effective policy and the setpoint are
