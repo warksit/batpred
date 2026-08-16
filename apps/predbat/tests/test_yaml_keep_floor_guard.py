@@ -45,7 +45,10 @@ YAML_PATH = os.path.join(
 
 POLICY = "input_select.sig_dispatch_policy"
 OVERRIDE = "input_select.sig_override"
-SESSION = "binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
+# The discrimination sensor, NOT the integration's own saving-sessions binary
+# sensor: that one has been removed upstream and reads `unavailable`, so the
+# guard's dusk-release condition could never match "off". See OCTOPUS_SESSIONS.md.
+SESSION = "binary_sensor.octoplus_power_down_active"
 
 
 def load_doc():
@@ -94,8 +97,9 @@ def _with_effective_policy(states):
     import test_yaml_dispatch_intent as intent
 
     st = dict(states)
-    # The intent sensor reads the CALENDAR; this harness speaks binary_sensor.
-    st.setdefault(intent.CALENDAR, st.get(SESSION, "off"))
+    # Both this harness and the intent sensor now read the same entity, so
+    # there is nothing left to translate between them.
+    st.setdefault(intent.SESSION_SENSOR, st.get(SESSION, "off"))
     st.setdefault("sensor.sigen_plant_pv_power", "1.0")
     st.setdefault("sensor.sigen_plant_total_load_power", "0.5")
     st.setdefault("sensor.sigen_plant_battery_state_of_charge", "50")

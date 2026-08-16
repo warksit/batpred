@@ -104,9 +104,14 @@ def _mock(policy, pv, load, soc, cap_w=3680, hard=12):
 
 
 def _session_mock(policy, session_on, pv=2.0, load=0.5, soc=60):
-    """Mock with the Octoplus saving-session CALENDAR on or off (RD14c)."""
+    """Mock with a live PAID session (Power Down) on or off (RD14c).
+
+    Drives binary_sensor.octoplus_power_down_active, not the Octoplus calendar:
+    the calendar is on for Power Ups too, so it cannot say what a session MEANS.
+    See ha/octoplus_session_helpers.yaml and ha/OCTOPUS_SESSIONS.md.
+    """
     m = _mock(policy, pv, load, soc)
-    m["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"] = "on" if session_on else "off"
+    m["binary_sensor.octoplus_power_down_active"] = "on" if session_on else "off"
     m.setdefault("input_select.sig_override", "Off")
     return m
 
@@ -407,7 +412,7 @@ def test_trigger_and_action_can_never_diverge():
                 for pv, load, soc in ((0.1, 1.5, 1.3), (1.329, 0.364, 1.7), (8.0, 0.5, 50), (0.0, 0.4, 90), (3.0, 3.0, 2.8)):
                     st = _mock(select, pv, load, soc, hard=2.8)
                     st["input_select.sig_override"] = override
-                    st["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"] = "on" if session else "off"
+                    st["binary_sensor.octoplus_power_down_active"] = "on" if session else "off"
                     cases.append(st)
 
     mismatches = []
@@ -418,7 +423,7 @@ def test_trigger_and_action_can_never_diverge():
         tag = "select={} override={} session={} pv={} load={} soc={}".format(
             st["input_select.sig_dispatch_policy"],
             st["input_select.sig_override"],
-            st["calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"],
+            st["binary_sensor.octoplus_power_down_active"],
             st["sensor.sigen_plant_pv_power"],
             st["sensor.sigen_plant_total_load_power"],
             st["sensor.sigen_plant_battery_state_of_charge"],
@@ -616,7 +621,16 @@ def test_rd14c_does_not_seize_control_from_predbat():
 def test_rd14c_uses_native_calendar_triggers():
     """Native calendar triggers, not a template window. HA schedules these at the
     exact event boundary; the previous template approach depended on the beat and
-    duplicated the window expression between trigger and action."""
+    duplicated the window expression between trigger and action.
+
+    Two things are asserted together because they are two halves of one fact:
+    the calendar says WHEN a session runs, the discrimination sensor says WHAT it
+    is. The calendar is on for Power Ups as well as Power Downs, so waking on it
+    alone would leave the heartbeat unable to tell an export hour from a
+    free-import hour. And it must be the `power_down` name — the legacy
+    `saving_sessions` calendar is removed January 2027, after which these
+    triggers would simply stop firing, with no error and no log.
+    """
     trigs = _load()["trigger"]
     ids = [t.get("id") for t in trigs]
     assert "session_start" in ids and "session_end" in ids, f"calendar triggers missing: {ids}"
@@ -624,8 +638,12 @@ def test_rd14c_uses_native_calendar_triggers():
     assert len(cal) == 2, f"expected exactly 2 calendar triggers, got {len(cal)}"
     assert {t.get("event") for t in cal} == {"start", "end"}, f"need both edges: {cal}"
     for t in cal:
-        assert "octoplus_saving_sessions" in t.get("entity_id", ""), t
-    print("PASS  RD14c: native calendar start/end triggers")
+        entity = t.get("entity_id", "")
+        assert "octoplus_power_down" in entity, f"must trigger on the power_down calendar, got {entity!r}"
+        assert "saving_sessions" not in entity, f"legacy calendar name is removed January 2027: {entity!r}"
+    state_entities = {t.get("entity_id") for t in trigs if t.get("platform") == "state"}
+    assert "binary_sensor.octoplus_power_down_active" in state_entities, "the heartbeat must also wake when the session CATEGORY changes — the calendar cannot distinguish a Power Up from a Power Down"
+    print("PASS  RD14c: native calendar start/end triggers + category trigger")
 
 
 def test_rd14c_no_template_window_math_remains():

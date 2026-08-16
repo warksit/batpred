@@ -44,6 +44,15 @@ sensors:
   # session dump — they can see something the automation cannot. The session only
   # forces Max Export when the select is not already parked on handback, so a
   # session can never drag us out of Predbat's hands.
+  #
+  # The session test reads `binary_sensor.octoplus_power_down_active`, NOT the
+  # Octoplus calendar. The calendar carries Power Ups as well as Power Downs
+  # (Octopus publish both on one feed with no type field), so keying on it forces
+  # Max Export through a free-import hour — the exact opposite of right. The one
+  # definition of that distinction lives in ha/octoplus_session_helpers.yaml;
+  # do not re-derive it here. The legacy calendar is also removed January 2027,
+  # at which point `is_state(..., 'on')` would have gone permanently false and
+  # this forcing would have stopped silently.
   # ---------------------------------------------------------------------------
   - name: SIG Effective Policy
     unique_id: sig_effective_policy
@@ -51,7 +60,7 @@ sensors:
       {% set ovr = states('input_select.sig_override') %}
       {% set rawp = states('input_select.sig_dispatch_policy') %}
       {{ ovr if ovr not in ['Off', 'unknown', 'unavailable', ''] else
-         ('Max Export' if (is_state('calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions', 'on') and rawp != 'Predbat') else rawp) }}
+         ('Max Export' if (is_state('binary_sensor.octoplus_power_down_active', 'on') and rawp != 'Predbat') else rawp) }}
 
   # ---------------------------------------------------------------------------
   # Dispatch setpoint (kW) — the INVERTER AC OUTPUT the plant should produce.
