@@ -34,6 +34,27 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-08-16] Octopus legacy entities: one already dead, the rest go Jan 2027.**
+  ADR 0004 renamed Saving Sessions -> power down, Free Electricity -> power up;
+  legacy entities are removed **January 2027**. On v19.0.0 the legacy
+  `binary_sensor...octoplus_saving_sessions` is ALREADY gone — it reads
+  `unavailable, restored: true`. CM still reads it at
+  `curtailment_plugin.py:175` (`_get_session_reserve_kwh`),
+  `sig_keep_floor_guard.yaml:129`, `sig_saving_session.yaml:34,38`, so the
+  session reserve is **blind today**: `session_need_kwh` is null because the
+  source no longer exists, not because there is no session. It computed 7.78 kWh
+  on 12 Aug. Next real saving session, CM dumps but does not prepare — and RD41's
+  charge target has nothing to act on.
+  The legacy CALENDAR is still alive but goes the same way, and we key off it at
+  `sig_dispatch_intent_helpers.yaml:54` (the Max Export forcing),
+  `sig_dispatch_heartbeat.yaml:103,107` and `curtailment_plugin.py:181`. When it
+  is removed, `is_state(..., 'on')` is permanently false and CM **silently stops
+  forcing Max Export during saving sessions** — no error, no log.
+  ONE migration fixes all of it: move to `...octoplus_power_down` and to the
+  `power_down_events` `joined_events` list (which is also where
+  `octopoints_per_kwh` lives, so the power-up/power-down discrimination lands in
+  the same change — see the RD14c note below). Needs the dispatch-intent harness.
+
 - **[2026-08-15] The fault alert cannot see a DEAD inverter, only a dead meter.**
   SIG unreachable from ~15:48 (ARP FAILED on 192.168.5.145, 100% ping loss, TCP
   502 closed) and `automation.sig_inverter_fault_alert` never fired — its
