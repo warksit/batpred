@@ -82,14 +82,14 @@ def render(joined, now=NOW):
     return one("octoplus_power_up_active"), one("octoplus_power_down_active")
 
 
-def render_attrs(joined, now=NOW):
-    """Render the Power Down WINDOW attributes against a joined_events list.
+def render_window(joined, now=NOW):
+    """Render the three Power Down WINDOW sensors against a joined_events list.
 
-    Same context as `render`, because the whole point is that the attributes and
-    the state answer the same question about the same events.
+    Same context as `render`, because the whole point is that the window sensors
+    and the binary sensor answer the same question about the same events.
     """
     doc = _load(HELPERS_PATH)
-    by_id = {s["unique_id"]: s for s in doc["binary_sensors"]}
+    by_id = {s["unique_id"]: s for s in doc["sensors"]}
     env = jinja2.Environment()
 
     def as_datetime(value):
@@ -105,8 +105,7 @@ def render_attrs(joined, now=NOW):
         "as_datetime": as_datetime,
         "now": lambda: now,
     }
-    attrs = by_id["octoplus_power_down_active"].get("attributes", {})
-    return {name: env.from_string(tpl).render(**ctx).strip() for name, tpl in attrs.items()}
+    return {uid: env.from_string(cfg["state"]).render(**ctx).strip() for uid, cfg in by_id.items()}
 
 
 # The observed corpus. Power Downs are this account's 18 joined events; the Power
@@ -254,77 +253,120 @@ def test_no_consumer_keys_on_the_legacy_calendar():
     print("PASS  consumers read the discrimination sensors, not the legacy calendar")
 
 
-def test_window_attributes_look_ahead_before_the_session():
-    """Ahead of a session CM must be able to size the reserve and say WHEN for.
+def test_plugin_reads_only_window_sensors_this_file_publishes():
+    """THE guard for the 2026-08-17 defect: a read whose source does not exist.
+
+    The plugin asked Octopus's binary sensor for `current_joined_event_*` long
+    after that entity was deleted. Nothing failed loudly — `get_state_wrapper`
+    returned the default and the reserve quietly computed 0, which is
+    indistinguishable from "no session booked". This asserts the contract in the
+    direction that rots: every session entity the plugin reads is one this file
+    actually publishes.
+    """
+    doc = _load(HELPERS_PATH)
+    published = {"sensor.{}".format(x["unique_id"]) for x in doc["sensors"]}
+    published |= {"binary_sensor.{}".format(x["unique_id"]) for x in doc["binary_sensors"]}
+    read = set(re.findall(r"[\"']((?:binary_)?sensor\.octoplus_[a-z_]+)[\"']", _plugin_source()))
+    assert read, "found no octoplus entity reads in curtailment_plugin.py — has the read moved?"
+    missing = read - published
+    assert not missing, "curtailment_plugin reads {} which octoplus_session_helpers.yaml does not publish".format(sorted(missing))
+    print("PASS  every octoplus entity the plugin reads is published ({} of them)".format(len(read)))
+
+
+def test_window_looks_ahead_before_the_session():
+    """Ahead of a session CM must size the reserve and say WHEN it is for.
 
     This is the case that was broken from v19.0.0 until 2026-08-17: with the
-    source entity gone every read returned None, so `session_need_kwh` published
-    null — indistinguishable from "no session booked" — and RD41's charge target
-    had nothing to aim at. Asserting the exact 18:00/60 rather than "not None",
-    because "some number appeared" is what the null looked like too.
+    source gone every read returned the default, so `session_need_kwh` published
+    null — indistinguishable from "nothing booked" — and RD41's charge target had
+    nothing to aim at. Asserting the exact 18:00/60, because "some number
+    appeared" is what the broken version looked like too.
     """
-    attrs = render_attrs([_event(18, 19, 101)], now=_at(13, 30))
-    assert attrs.get("next_joined_event_start", "<missing>") == "2026-08-16T18:00:00+00:00", "expected the 18:00 start, got {!r}".format(attrs.get("next_joined_event_start", "<missing>"))
-    assert attrs.get("next_joined_event_duration_in_minutes", "<missing>") == "60", "a one-hour session must size 60 min, got {!r}".format(attrs.get("next_joined_event_duration_in_minutes", "<missing>"))
-    assert attrs.get("current_joined_event_start", "<missing>") == "", "nothing is running at 13:30, got {!r}".format(attrs.get("current_joined_event_start", "<missing>"))
-    assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") == "0", "no live session means no current duration"
-    print("PASS  window attributes look ahead to a booked session")
+    win = render_window([_event(18, 19, 101)], now=_at(13, 30))
+    assert win["octoplus_power_down_start"] == "2026-08-16T18:00:00+00:00", "expected the 18:00 start, got {!r}".format(win["octoplus_power_down_start"])
+    assert win["octoplus_power_down_minutes"] == "60", "a one-hour session must size 60 min, got {!r}".format(win["octoplus_power_down_minutes"])
+    assert win["octoplus_power_down_end"] == "unknown", "nothing is running at 13:30, so there is no end yet"
+    print("PASS  the window looks ahead to a booked session")
 
 
-def test_window_attributes_describe_the_live_session():
-    """Mid-session the CURRENT window drives the end-SOC projection (RD42)."""
-    attrs = render_attrs([_event(18, 19, 101)], now=_at(18, 30))
-    assert attrs.get("current_joined_event_start", "<missing>") == "2026-08-16T18:00:00+00:00", "got {!r}".format(attrs.get("current_joined_event_start", "<missing>"))
-    assert attrs.get("current_joined_event_end", "<missing>") == "2026-08-16T19:00:00+00:00", "got {!r}".format(attrs.get("current_joined_event_end", "<missing>"))
-    assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") == "60", "got {!r}".format(attrs.get("current_joined_event_duration_in_minutes", "<missing>"))
-    assert attrs.get("next_joined_event_start", "<missing>") == "", "the running session is not also the next one"
-    print("PASS  window attributes describe the live session")
+def test_window_describes_the_live_session():
+    """Mid-session the END drives the end-SOC projection (RD42)."""
+    win = render_window([_event(18, 19, 101)], now=_at(18, 30))
+    assert win["octoplus_power_down_start"] == "2026-08-16T18:00:00+00:00", "got {!r}".format(win["octoplus_power_down_start"])
+    assert win["octoplus_power_down_end"] == "2026-08-16T19:00:00+00:00", "got {!r}".format(win["octoplus_power_down_end"])
+    assert win["octoplus_power_down_minutes"] == "60", "got {!r}".format(win["octoplus_power_down_minutes"])
+    print("PASS  the window describes the live session")
 
 
-def test_window_attributes_ignore_a_power_up():
+def test_window_ignores_a_power_up():
     """A free-import hour must never size an EXPORT reserve.
 
     Reading joined events without the discriminator would reserve battery to sell
-    into an hour Octopus is giving electricity away in — and CM would hold that
-    charge back instead of filling from the free grid.
+    into an hour Octopus is giving electricity away in, and hold that charge back
+    instead of filling from the free grid.
     """
-    for now in (_at(13, 30), _at(11, 30)):
-        attrs = render_attrs([_event(11, 12, 0)], now=now)
-        assert attrs.get("next_joined_event_duration_in_minutes", "<missing>") == "0", "a Power Up must not size a reserve, got {!r}".format(attrs.get("next_joined_event_duration_in_minutes", "<missing>"))
-        assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") == "0", "a Power Up is never a current export window"
-        assert attrs.get("current_joined_event_start", "<missing>") == "", "a Power Up must not publish an export window"
+    for now in (_at(9, 30), _at(11, 30)):
+        win = render_window([_event(11, 12, 0)], now=now)
+        assert win["octoplus_power_down_minutes"] == "0", "a Power Up must not size a reserve, got {!r}".format(win["octoplus_power_down_minutes"])
+        assert win["octoplus_power_down_start"] == "unknown", "a Power Up must not publish an export window"
+        assert win["octoplus_power_down_end"] == "unknown", "a Power Up is never a live export window"
     print("PASS  Power Ups never size an export reserve")
 
 
-def test_next_window_is_the_earliest_still_to_come():
+def test_window_start_is_the_earliest_unfinished():
     """Two booked sessions: the reserve is for the one that arrives first."""
-    attrs = render_attrs([_event(20, 21, 101), _event(18, 19, 96)], now=_at(13, 30))
-    assert attrs.get("next_joined_event_start", "<missing>") == "2026-08-16T18:00:00+00:00", "must pick the 18:00, got {!r}".format(attrs.get("next_joined_event_start", "<missing>"))
-    print("PASS  the next window is the earliest still to come")
+    win = render_window([_event(20, 21, 96), _event(18, 19, 101)], now=_at(13, 30))
+    assert win["octoplus_power_down_start"] == "2026-08-16T18:00:00+00:00", "must pick the 18:00, got {!r}".format(win["octoplus_power_down_start"])
+    print("PASS  the window start is the earliest unfinished session")
 
 
-def test_absent_times_render_empty_not_the_string_none():
+def test_minutes_takes_the_longest_not_the_soonest():
+    """The reserve must cover the biggest sell, not merely the next one.
+
+    A 30-min session tonight and a 2-hour one tomorrow: reserving 30 minutes'
+    worth would under-fill for the event that actually needs the energy.
+    """
+    win = render_window([_event(18, 19, 101), _event(20, 23, 96)], now=_at(13, 30))
+    assert win["octoplus_power_down_minutes"] == "180", "must size the longest unfinished session, got {!r}".format(win["octoplus_power_down_minutes"])
+    print("PASS  minutes takes the longest unfinished session")
+
+
+def test_a_running_session_still_counts_as_upcoming():
+    """ "Active or upcoming" is `end > now()`, not `start > now()`.
+
+    Keying on start would drop the reserve to zero the moment the session began —
+    mid-dump, which is precisely when CM must still know how much it is selling.
+    """
+    win = render_window([_event(18, 19, 101)], now=_at(18, 30))
+    assert win["octoplus_power_down_minutes"] == "60", "a running session must still size the reserve, got {!r}".format(win["octoplus_power_down_minutes"])
+    print("PASS  a running session still counts as upcoming")
+
+
+def test_absent_renders_unknown_never_the_string_none():
     """`{{ none }}` renders as "None", which is TRUTHY to every consumer.
 
     The plugin's `if value: return str(value)` would hand the card the literal
-    text "None" as a session start, and its `datetime.fromisoformat` would raise
-    on it. Empty string is the only falsy rendering.
+    text "None" as a session start, and `datetime.fromisoformat` would raise on
+    it. Finished sessions must read the same as no sessions.
     """
-    attrs = render_attrs([], now=_at(13, 30))
-    for name, value in attrs.items():
-        assert value.lower() != "none", "{} rendered the string 'None' — must be empty".format(name)
-    assert attrs.get("current_joined_event_start", "<missing>") == "", "got {!r}".format(attrs.get("current_joined_event_start", "<missing>"))
-    assert attrs.get("next_joined_event_start", "<missing>") == "", "got {!r}".format(attrs.get("next_joined_event_start", "<missing>"))
-    print("PASS  absent times render empty, not the string None")
+    for label, joined in (("nothing booked", []), ("already finished", [_event(9, 10, 101)])):
+        win = render_window(joined, now=_at(13, 30))
+        for name, value in win.items():
+            assert value.lower() != "none", "{}: {} rendered the string 'None'".format(label, name)
+            assert value != "", "{}: {} rendered blank; HA serves 'unknown'".format(label, name)
+        assert win["octoplus_power_down_start"] == "unknown", "{}: got {!r}".format(label, win["octoplus_power_down_start"])
+        assert win["octoplus_power_down_minutes"] == "0", "{}: got {!r}".format(label, win["octoplus_power_down_minutes"])
+    print("PASS  absent renders unknown, never blank and never the string None")
 
 
-def test_window_attributes_agree_with_the_sensor_state():
-    """The `!= 0` test is repeated per attribute — so prove the copies agree.
+def test_window_agrees_with_the_sensor_state():
+    """The `!= 0` test is repeated per sensor — so prove the copies agree.
 
-    HA gives attribute templates no shared scope, so the discriminator genuinely
-    lives in six places inside this one file. The charter's remedy for a quantity
-    that must live in more than one place is a test that renders EVERY copy and
-    asserts they agree, which is this.
+    Each template is rendered independently, so the discriminator genuinely lives
+    in four places inside this one file. The charter's remedy for a quantity that
+    must live in more than one place is a test that renders EVERY copy and asserts
+    they agree, which is this. The invariant: an END exists exactly while the
+    binary sensor says a Power Down is running.
     """
     scenarios = (
         ("live power down", [_event(18, 19, 101)], _at(18, 30)),
@@ -335,30 +377,12 @@ def test_window_attributes_agree_with_the_sensor_state():
     )
     for label, joined, now in scenarios:
         _up, down = render(joined, now=now)
-        attrs = render_attrs(joined, now=now)
-        has_current = attrs.get("current_joined_event_start", "<missing>") != ""
-        assert has_current == down, "{}: sensor says down={} but current window {}published".format(label, down, "" if has_current else "not ")
+        win = render_window(joined, now=now)
+        has_end = win["octoplus_power_down_end"] != "unknown"
+        assert has_end == down, "{}: sensor says down={} but end {}published".format(label, down, "" if has_end else "not ")
         if down:
-            assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") != "0", "{}: a live session must have a duration".format(label)
+            assert win["octoplus_power_down_minutes"] != "0", "{}: a live session must size a reserve".format(label)
     print("PASS  every copy of the discriminator agrees with the sensor state")
-
-
-def test_plugin_reads_only_attributes_this_file_publishes():
-    """THE guard for the 2026-08-17 defect: a read whose source does not exist.
-
-    The plugin asked Octopus's binary sensor for `current_joined_event_*` long
-    after that entity was deleted. Nothing failed loudly — `get_state_wrapper`
-    returned the default and the reserve quietly computed 0. This asserts the
-    reverse direction of the contract: every attribute name the plugin reads is
-    one this file actually publishes.
-    """
-    published = set(_load(HELPERS_PATH)["binary_sensors"][1].get("attributes", {}))
-    assert published, "the Power Down sensor publishes no attributes at all"
-    read = set(re.findall(r"[\"']((?:current|next)_joined_event_\w+)[\"']", _plugin_source()))
-    assert read, "found no session attribute reads in curtailment_plugin.py — has the read moved?"
-    missing = read - published
-    assert not missing, "curtailment_plugin reads {} which octoplus_session_helpers.yaml does not publish".format(sorted(missing))
-    print("PASS  every session attribute the plugin reads is published ({} of them)".format(len(read)))
 
 
 def test_plugin_points_at_the_discrimination_sensor():
@@ -426,13 +450,15 @@ def run():
         test_available_but_unjoined_events_are_ignored,
         test_no_consumer_reimplements_the_discriminator,
         test_no_consumer_keys_on_the_legacy_calendar,
-        test_plugin_reads_only_attributes_this_file_publishes,
-        test_window_attributes_look_ahead_before_the_session,
-        test_window_attributes_describe_the_live_session,
-        test_window_attributes_ignore_a_power_up,
-        test_next_window_is_the_earliest_still_to_come,
-        test_absent_times_render_empty_not_the_string_none,
-        test_window_attributes_agree_with_the_sensor_state,
+        test_plugin_reads_only_window_sensors_this_file_publishes,
+        test_window_looks_ahead_before_the_session,
+        test_window_describes_the_live_session,
+        test_window_ignores_a_power_up,
+        test_window_start_is_the_earliest_unfinished,
+        test_minutes_takes_the_longest_not_the_soonest,
+        test_a_running_session_still_counts_as_upcoming,
+        test_absent_renders_unknown_never_the_string_none,
+        test_window_agrees_with_the_sensor_state,
         test_plugin_points_at_the_discrimination_sensor,
         test_automation_has_no_time_of_day_gate,
         test_handback_restores_whoever_was_driving,

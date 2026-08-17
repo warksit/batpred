@@ -4489,6 +4489,9 @@ from curtailment_plugin import (
     SIG_DAILY_PV,
     SOLCAST_TODAY,
     SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY,
+    SIG_SESSION_MINUTES,
+    SIG_SESSION_START,
+    SIG_SESSION_END,
     SIG_POLICY_SELECT,
     SIG_OVERRIDE_SELECT,
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
@@ -6961,20 +6964,24 @@ def test_load_state_logs_corruption():
 
 
 def _saving_session_sensors(active=False, current_mins=0, next_mins=0, current_start=None, next_start=None, current_end=None):
-    """Octopus saving-session binary_sensor override (state + joined-event
-    duration attributes read by _get_session_reserve_kwh / _is_saving_session_active).
+    """The session entities CM reads: the discrimination binary sensor plus the
+    three window sensors from ha/octoplus_session_helpers.yaml.
 
-    The *_start attributes feed the published `session_start` — the dashboard
-    needs 'when', not just 'how much'."""
+    2026-08-17: these used to be attributes on Octopus's own binary sensor. That
+    entity was deleted by the integration, and the window shape now comes from
+    template sensors — the template config flow has no attributes field. The
+    signature is unchanged so every caller still says what it means; the mapping
+    below is where "current vs next" is resolved, exactly as the YAML resolves it:
+    the reserve takes the longest unfinished event, the start prefers the running
+    one, and the end only exists while one is running.
+
+    Absent is "unknown", which is what HA actually serves — not None and not "",
+    because "None" is the rendering that would slip past a truthiness check."""
     return {
-        SIG_SAVING_SESSION_ENTITY: {
-            "state": "on" if active else "off",
-            "current_joined_event_duration_in_minutes": current_mins,
-            "next_joined_event_duration_in_minutes": next_mins,
-            "current_joined_event_start": current_start,
-            "current_joined_event_end": current_end,
-            "next_joined_event_start": next_start,
-        }
+        SIG_SAVING_SESSION_ENTITY: "on" if active else "off",
+        SIG_SESSION_MINUTES: max(current_mins, next_mins),
+        SIG_SESSION_START: current_start or next_start or "unknown",
+        SIG_SESSION_END: current_end or "unknown",
     }
 
 
