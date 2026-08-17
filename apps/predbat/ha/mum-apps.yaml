@@ -286,8 +286,9 @@ pred_bat:
   #
   # Power Ups ride the same feed (0 octopoints/kWh). Safe here: a slot is only created when
   # saving_rate > 0, so a Power Up is auto-joined (free import - what we want) but never priced as
-  # a saving session. One wrinkle: this entity state is a timestamp, so always truthy where the
-  # binary sensor was on/off. The only reachable consumer is a cosmetic session-active log line.
+  # a saving session. Verified live 2026-08-17 13:00: joined EVENT_47_170826 at 12.625 p/kWh and
+  # loaded the 18:00-19:00 slot into the plan. Predbat resolves this entity state to False, so the
+  # on/off semantics the retired binary sensor provided are preserved, not merely tolerated.
   octopus_saving_session: 're:(event.octopus_energy([0-9a-z_]+|)_octoplus_power_down_events)'
   octopus_saving_session_octopoints_per_penny: 8
 

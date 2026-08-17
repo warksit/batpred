@@ -54,6 +54,7 @@ Cantarell
 cdn
 cexxxx
 ceyyyy
+CGNAT
 chargedischarge
 chargeenergytotal
 chargefreeze
@@ -484,6 +485,7 @@ sunsynk
 supabase
 syscmd
 tabindex
+tailnet
 tasmota
 TCWORLD
 tdata
@@ -540,6 +542,7 @@ Victron
 visibilitychange
 waf
 Wallbox
+warksit
 weblink
 welink
 Werror

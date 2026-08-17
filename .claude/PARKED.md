@@ -6,6 +6,27 @@ being appended to replies.
 
 Format: `- [date] finding — why it might matter — evidence`
 
+## Security
+
+- **[2026-08-17] The Predbat MCP bearer token is committed to a PUBLIC repo.**
+  `.mcp.json` is tracked and pushed to `origin/cm-on-latest-predbat`, and
+  `gh repo view warksit/batpred` reports `"visibility":"PUBLIC"`. The token is the
+  same value as `mcp_secret` in the box `apps.yaml`. Found while scanning apps.yaml
+  for credentials before mirroring it into the repo (the mirror redacts it; this
+  copy does not). **Mitigation already in place:** the endpoint is
+  `http://100.110.70.80:8199`, a Tailscale CGNAT address, so the token is only
+  usable by someone already on the tailnet — exposure, not an open door.
+  **Needs a decision:** rotate `mcp_secret` on the box and in `.mcp.json`, then
+  untrack `.mcp.json` (`.gitignore` + `git rm --cached`). Purging it from history
+  needs a force-push, which is a bigger call. Not actioned — rotating breaks the
+  running MCP config, so it is Andrew's to time.
+
+- **[2026-08-17] No API keys in apps.yaml.** Checked while mirroring: `ha_key`,
+  `solcast_api_key` and `axle_api_key` are all commented-out placeholders
+  (`'xxx'` / `'xxxx'` / `"xxxxxxx"`). Solar forecasts come from the Solcast HA
+  integration's sensors via `re:`, so no cloud key is needed. `mcp_secret` is the
+  only real credential in the file. Recorded so the next audit does not re-derive it.
+
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
 - **[2026-08-14] RD41 — session reserve as a charge target (`ac8b04cf`).**
