@@ -338,7 +338,7 @@ else in this file.
 | RD41 | IN FORCE | **The saving-session reserve is a target, not only a floor** (2026-08-14). `session_protect_kwh` fed `drain_above` and nothing fed `charge_below`, so a session day had a Hold band of `[0.5, session_protect]` — 14 kWh wide on 12 Aug — in which CM neither drained nor charged, and in Hold the pack receives only the above-cap overflow. `charge_below` now takes `min(session_protect_kwh, overflow_floor)`: the p90 defence keeps priority and the clamp lifts on its own as remaining overflow decays. The session term is **removed** from `p10_recovery` — that floor's horizon is sundown, which is right for the overnight need and wrong for a deadline at session start. Guards: `test_session_reserve_drives_the_charge_line_not_only_the_drain_line`, `test_session_charge_target_is_clamped_by_remaining_headroom`, `test_aug12_session_day_flips_to_charge_while_pv_can_still_deliver`, `test_published_charge_below_carries_the_session_target`, `test_recovery_floor_no_longer_carries_the_session_term`, `test_charge_below_unchanged_without_a_session`. |
 | RD42 | IN FORCE | **The session projection tells the truth** (2026-08-14). `estimate_session_end_kwh` clamped at the sell floor "because the keep-floor guard stops the discharge there" — but the guard **defers to a live session** (RD14-own), so the dump runs through it: 12 Aug published 39.3% (the clamp itself) against a 31.2% outcome. Clamp removed; the projection is built from **kWh left to export** (`cap x hours`, published as `session_export_left_kwh`) with the discharge divide on that grid-side term only. Second fault found in the same audit: `session_dispatch` reads the calendar while the end time reads the binary sensor, and they flip ~43 s apart — in the gap the card published the CURRENT SOC as the end SOC. Unknown time now publishes **blank**. Guards: `test_session_end_projection_is_not_clamped_at_a_floor_nothing_enforces`, `test_session_export_left_is_the_display_quantity`, `test_session_export_left_is_published_during_the_dump`, `test_session_projection_is_blank_while_the_end_time_is_unknown`. |
 
-| RD43 | IN FORCE | **The pre-PV drain depth is the forecast requirement, nothing else** (2026-08-17). R62 returned `min(legacy, floor_driven)` with `legacy = soc_keep + buffer_pct% × soc_max`. The `min()` was one-way — the forecast could only ever drain DEEPER — so on a day needing no headroom (`floor_driven` → `soc_max`) the static term bound and drained anyway. Overnight `best_soc_keep` is 0, making `legacy` a bare 10% of pack size: on 17 Aug it dumped 5.1 kWh pre-dawn and refilled 3.5 kWh from PV three hours later, an 8.6 kWh round trip against a realised 4.08 kWh requirement the starting SOC already covered twice. `legacy` removed; `overflow_floor` is the whole answer. `input_number.curtailment_pre_pv_buffer_pct` is now dead (present in HA, read by nothing). Guards: `test_R62_pre_pv_target_no_overflow_means_no_drain`, `test_R62_pre_pv_target_moderate_day_drains_only_to_headroom`. |
+| RD43 | IN FORCE | **The pre-PV drain depth is the forecast requirement, nothing else** (2026-08-17). R62 returned `min(legacy, floor_driven)` with `legacy = soc_keep + buffer_pct% × soc_max`. The `min()` was one-way — the forecast could only ever drain DEEPER — so on a day needing no headroom (`floor_driven` → `soc_max`) the static term bound and drained anyway. Overnight `best_soc_keep` is 0, making `legacy` a bare 10% of pack size: on 17 Aug it dumped 5.1 kWh pre-dawn and refilled 3.5 kWh from PV three hours later, an 8.6 kWh round trip against a realised 4.08 kWh requirement the starting SOC already covered twice. `legacy` removed; `overflow_floor` is the whole answer. `input_number.curtailment_pre_pv_buffer_pct` deleted from HA. Guards: `test_R62_pre_pv_target_no_overflow_means_no_drain`, `test_R62_pre_pv_target_moderate_day_drains_only_to_headroom`. |
 
 ## Goal
 
@@ -833,9 +833,8 @@ about a safety rule* is the most expensive kind — see the Charter.
   Helpers:
     - `input_boolean.gshp_ch_active` — central heating active flag (manual
       toggle in pump room, or HA dashboard tile).
-    - ~~`input_number.curtailment_pre_pv_buffer_pct`~~ — **DEAD since RD43
-      (2026-08-17)**. Still present in HA; nothing reads it. The pre-PV depth
-      comes from R62 `overflow_floor` alone.
+    - ~~`input_number.curtailment_pre_pv_buffer_pct`~~ — **DELETED 2026-08-17
+      (RD43)**. The pre-PV depth comes from R62 `overflow_floor` alone.
 
   Reference incident: 2026-04-29. Plugin activated only at first PV (~05:12
   BST), drained from 70% → 24% during 05:12-08:12 BST. Should have started
@@ -1445,8 +1444,9 @@ overnight it is a percentage of pack size carrying no information about the
 day. Over-drain protection is `overflow_floor` itself — the one quantity that
 knows how much room the day needs.
 
-`input_number.curtailment_pre_pv_buffer_pct` still exists in HA but **nothing
-reads it**; the plugin constants and `_pre_pv_buffer_pct()` are gone.
+`input_number.curtailment_pre_pv_buffer_pct` was **deleted from HA** on
+2026-08-17 once nothing read it; the plugin constants and `_pre_pv_buffer_pct()`
+are gone.
 
 **Guards:** `test_R62_pre_pv_target_no_overflow_means_no_drain`,
 `test_R62_pre_pv_target_moderate_day_drains_only_to_headroom`.
