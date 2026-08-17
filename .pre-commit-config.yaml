@@ -5,11 +5,20 @@ repos:
   - id: file-contents-sorter
     files: ^(\.cspell\/custom-dictionary-workspace.txt|requirements\.txt)$
     args: ["--ignore-case", "--unique"]
+  # apps/predbat/ha/mum-apps.yaml is a byte-for-byte MIRROR of the Predbat addon config on the
+  # box. A hook that tidies it makes it diverge from the live file, which is the one thing the
+  # mirror exists not to do — so the three rewriting/strict hooks skip that path. It is not left
+  # unchecked: tests/test_yaml_mum_apps.py parses it and guards the entity pointers.
   - id: trailing-whitespace
     args: [--markdown-linebreak-ext=md]
+    exclude: ^apps/predbat/ha/mum-apps\.yaml$
   - id: end-of-file-fixer
+    exclude: ^apps/predbat/ha/mum-apps\.yaml$
+  # check-yaml uses ruamel, which rejects duplicate keys; Predbat itself loads this file with
+  # PyYAML, which accepts them (last wins). The live config has three identical
+  # `sig_discharge_cut_off_soc` entries, so ruamel fails on a file Predbat reads happily.
   - id: check-yaml
-    exclude: (example_chart.yml)
+    exclude: (example_chart.yml|^apps/predbat/ha/mum-apps\.yaml$)
   - id: check-json
     exclude: ^(\.cspell\.json|\.devcontainer\/devcontainer\.json)$
 - repo: https://gitlab.com/bmares/check-json5
