@@ -199,6 +199,17 @@ POLICY_PREDBAT = "Predbat"
 # by construction. The heartbeat still takes its calendar TRIGGERS from
 # `calendar...octoplus_power_down` — edges, not meaning.
 SIG_SAVING_SESSION = "binary_sensor.octoplus_power_down_active"
+# The window shape, published by the same file as three template SENSORS.
+# Sensors and not attributes on the binary sensor because the template
+# config-flow schema has no attributes field — checked against the live flow,
+# not assumed. Absent renders "unknown", never "" and never "None".
+SIG_SESSION_MINUTES = "sensor.octoplus_power_down_minutes"
+SIG_SESSION_START = "sensor.octoplus_power_down_start"
+SIG_SESSION_END = "sensor.octoplus_power_down_end"
+# What HA hands back for a sensor with nothing to report. "None" is in the
+# list because a template that renders a bare `none` produces that string, and
+# `if value:` would take it for a real timestamp.
+SESSION_ABSENT = ("", "unknown", "unavailable", "none")
 HA_EARLY_HANDBACK_BUFFER = "input_number.curtailment_early_handback_buffer_kwh"
 EARLY_HANDBACK_BUFFER_DEFAULT = 1.5
 # v32: the "overflow fits headroom" buffer is now a Hold gate (not a deactivate
@@ -2834,17 +2845,14 @@ class CurtailmentPlugin(PredBatPlugin):
     def _get_session_reserve_kwh(self, cap_kw):
         """Saving-session export reserve (kWh): the largest of any active or
         upcoming joined Power Down's duration × cap. 0 if none scheduled. This is
-        the 'what's coming' CM reads directly. The duration attributes are
-        published by ha/octoplus_session_helpers.yaml under the names Octopus
-        used, so only Power Downs are counted — a joined Power Up is a free
+        the 'what's coming' CM reads directly. The sensor is published by
+        ha/octoplus_session_helpers.yaml and already picks the longest event that
+        has not finished, counting Power Downs only — a joined Power Up is a free
         import hour and must never size an export reserve."""
-        best_mins = 0.0
-        for attr in ("current_joined_event_duration_in_minutes", "next_joined_event_duration_in_minutes"):
-            try:
-                mins = float(self.base.get_state_wrapper(SIG_SAVING_SESSION, attribute=attr, default=0) or 0)
-            except (TypeError, ValueError):
-                mins = 0.0
-            best_mins = max(best_mins, mins)
+        try:
+            best_mins = float(self.base.get_state_wrapper(SIG_SESSION_MINUTES, default=0) or 0)
+        except (TypeError, ValueError):
+            best_mins = 0.0
         return compute_session_reserve(best_mins, cap_kw, discharge_efficiency=self._discharge_efficiency())
 
     def _override_label(self):
@@ -2862,15 +2870,14 @@ class CurtailmentPlugin(PredBatPlugin):
     def _get_session_end(self):
         """Datetime the active joined saving session ends, or None.
 
-        Uses the binary sensor's tz-aware `current_joined_event_end`. Unlike the
-        dispatch decision (which must read the calendar — RD14c), an end TIME is
-        not a control decision, and this attribute carries an explicit UTC
-        offset where the calendar's `end_time` string does not."""
+        Reads the tz-aware end of the session running RIGHT NOW. `unknown` when
+        nothing is running, so RD42's projection publishes blank rather than
+        inventing a horizon."""
         try:
-            raw = self.base.get_state_wrapper(SIG_SAVING_SESSION, attribute="current_joined_event_end", default=None)
+            raw = self.base.get_state_wrapper(SIG_SESSION_END, default=None)
         except (TypeError, ValueError):
             return None
-        if not raw:
+        if not raw or str(raw).strip().lower() in SESSION_ABSENT:
             return None
         try:
             return datetime.fromisoformat(str(raw))
@@ -3153,15 +3160,17 @@ class CurtailmentPlugin(PredBatPlugin):
         """ISO start time of the active/next joined saving session, or None.
 
         Published alongside the reserve so the dashboard can say WHEN the floor
-        is being held for, not just how much — 'when' is half the explanation."""
-        for attr in ("current_joined_event_start", "next_joined_event_start"):
-            try:
-                value = self.base.get_state_wrapper(SIG_SAVING_SESSION, attribute=attr, default=None)
-            except (TypeError, ValueError):
-                continue
-            if value:
-                return str(value)
-        return None
+        is being held for, not just how much — 'when' is half the explanation.
+
+        The sensor already resolves running-else-next, so there is no ordering
+        decision left here to get wrong."""
+        try:
+            value = self.base.get_state_wrapper(SIG_SESSION_START, default=None)
+        except (TypeError, ValueError):
+            return None
+        if not value or str(value).strip().lower() in SESSION_ABSENT:
+            return None
+        return str(value)
 
     def _is_saving_session_active(self):
         """True while a paid Power Down session is currently running.
