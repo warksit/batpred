@@ -8,43 +8,16 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Live behaviour
 
-- **[2026-08-17] RD41's session charge target never reaches the decision on an
-  overflow-fits day — RD28's branch does not know about sessions.**
-  Surfaced within minutes of CM regaining sight of sessions; it could not be seen
-  before, because `session_need_kwh` was always null.
-  `calculate()` takes the `_policy_override == "no_drain"` branch on an
-  overflow-fits day, and that branch deliberately does **not** run
-  `compute_proposed_phase`. It computes
-  `compute_no_overflow_charge_target(overnight_target_kwh=...)`, which considers
-  the overnight reserve and the p90 headroom and **nothing else**. So
-  `charge_below` can publish the RD41 session target (10.93 kWh / 60.5% live at
-  14:12) while the Schmitt compares SOC against ~6.93 kWh and answers Hold.
-  Live now: SOC 7.97 kWh (44.1%), published charge line 60.5%, policy **Hold**.
-  **Cost tonight if left:** the 18:00 dump wants 3.89 kWh from the pack on top of
-  a 6.93 kWh overnight reserve — about 59.9% — and the keep-floor guard stops Max
-  Export at `sig_keep_floor_pct` (39%). From 44% that is roughly 0.9 kWh sold
-  against a 3.89 kWh need.
-  **Fix shape:** the no_drain target becomes
-  `max(compute_no_overflow_charge_target(...), session_charge_target)` when a
-  session is armed — RD28's "bank to tonight's need then Hold" is right, the
-  session simply *is* part of tonight's need. NOT done: it is a policy change to
-  the live control path on a session day, which the charter says to land pre-dawn
-  or after the window. Needs a test that an armed session raises the no_drain
-  target and that a day with no session is unchanged.
-
-## Dead config
-
-- **[2026-08-17] `sig_saving_session.yaml` still triggers off the retired Octopus
-  binary sensor** (lines 34, 38:
-  `binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions`, deleted by
-  the integration in v19.0.0). Harmless **today only because
-  `automation.sig_saving_session_planner` is `off`** on the box — if anyone ever
-  enables it, it will sit there never triggering and look like a broken automation
-  rather than a stale entity reference. Left alone deliberately: it was outside
-  the ask, and re-pointing a disabled automation at
-  `binary_sensor.octoplus_power_down_active` is a change worth making on purpose,
-  not in passing. Either repoint it or delete it. Every live consumer (heartbeat,
-  effective policy, keep-floor guard, curtailment_plugin) is already migrated.
+- **[2026-08-17] FIXED same day (`81c5112d`), NOT yet verified live.** RD41's
+  session charge target did not reach the decision on an overflow-fits day: RD28's
+  `no_drain` branch computed its target from the overnight reserve alone, so
+  `charge_below` published 60.5% while the Schmitt compared SOC against 6.93 kWh
+  and answered Hold. Fixed by taking `max(no_overflow_target, session_charge_target)`.
+  **Success =** on the next overflow-fits day with a joined session, CM flips to
+  Solar Charge Battery while SOC is below the published `session_charge_target_pct`,
+  instead of sitting in Hold. **Failure =** policy stays Hold with SOC below that
+  line. Cannot be told apart tonight — the branch only runs inside the curtailment
+  window, and there is no session armed.
 
 ## Security
 
@@ -95,26 +68,23 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
-- **[2026-08-16] Octopus legacy entities: one already dead, the rest go Jan 2027.**
-  ADR 0004 renamed Saving Sessions -> power down, Free Electricity -> power up;
-  legacy entities are removed **January 2027**. On v19.0.0 the legacy
-  `binary_sensor...octoplus_saving_sessions` is ALREADY gone — it reads
-  `unavailable, restored: true`. CM still reads it at
-  `curtailment_plugin.py:175` (`_get_session_reserve_kwh`),
-  `sig_keep_floor_guard.yaml:129`, `sig_saving_session.yaml:34,38`, so the
-  session reserve is **blind today**: `session_need_kwh` is null because the
-  source no longer exists, not because there is no session. It computed 7.78 kWh
-  on 12 Aug. Next real saving session, CM dumps but does not prepare — and RD41's
-  charge target has nothing to act on.
-  The legacy CALENDAR is still alive but goes the same way, and we key off it at
-  `sig_dispatch_intent_helpers.yaml:54` (the Max Export forcing),
-  `sig_dispatch_heartbeat.yaml:103,107` and `curtailment_plugin.py:181`. When it
-  is removed, `is_state(..., 'on')` is permanently false and CM **silently stops
-  forcing Max Export during saving sessions** — no error, no log.
-  ONE migration fixes all of it: move to `...octoplus_power_down` and to the
-  `power_down_events` `joined_events` list (which is also where
-  `octopoints_per_kwh` lives, so the power-up/power-down discrimination lands in
-  the same change — see the RD14c note below). Needs the dispatch-intent harness.
+- **[2026-08-16] Octopus legacy entities — RESOLVED 2026-08-17.** ADR 0004 renamed
+  Saving Sessions -> Power Down; the legacy binary sensor AND calendar are both
+  gone on v19.0.0 (the calendar went too, sooner than this note predicted). All
+  three consequences landed and are fixed:
+  - `apps.yaml: octopus_saving_session` matched nothing, so `auto_config` deleted
+    the arg and Predbat skipped the whole saving-session block — no auto-join, no
+    saving rate in the plan (`ad6ae8c8`).
+  - `curtailment_plugin` read the dead sensor and calendar, so `session_need_kwh`
+    published null and RD41 had nothing to act on (`0aab0125`, `c5b1d811`).
+  - `sig_saving_session.yaml` triggered off the dead sensor; deleted rather than
+    repointed, because it pins the select to Max Export — the thing RD14c removed
+    (`81c5112d`).
+  Verified end to end on the 17 Aug 18:00 session: joined at 13:00, priced into
+  the plan at 12.625 p/kWh, the discrimination sensor and all three window sensors
+  flipped on at 18:00:00 and off at 19:00:00, and the dump ran the full hour.
+  Guarded by `test_plugin_reads_only_window_sensors_this_file_publishes` and
+  `test_yaml_mum_apps.py`, both watched failing first.
 
 - **[2026-08-15] The fault alert cannot see a DEAD inverter, only a dead meter.**
   SIG unreachable from ~15:48 (ARP FAILED on 192.168.5.145, 100% ping loss, TCP
