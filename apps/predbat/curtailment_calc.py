@@ -846,40 +846,54 @@ def compute_charge_below(p10_recovery_floor, soc_keep, session_charge_target=0.0
     return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH, session_charge_target)
 
 
-def compute_pre_pv_target(soc_keep, soc_max, buffer_pct, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.05):
+def compute_pre_pv_target(soc_max, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.05):
     """R62 (2026-07-07): forecast-driven pre-PV drain target.
 
-    Replaces R52's static `soc_keep + buffer_pct% × soc_max` with a target the
-    forecast machinery already knows how to size. The legacy static value
-    remains as a CEILING — the new formula can only ever be MORE aggressive,
-    never less, so cloudy/uncertain mornings behave exactly as before.
+    The drain goes exactly as deep as the forecast headroom requirement, and no
+    deeper:
 
-        legacy       = soc_keep + buffer_pct/100 × soc_max
         overflow_floor = max(0, (soc_max − min(max_reserved, overflow))
                                 − overflow × safety_factor)      # same shape as R54/R9
-        floor_driven = max(reserve,
-                           DEEP_DISCHARGE_FLOOR_KWH + dawn_load, # carry the house through
-                                                                  # the R61 dawn gap
-                           overflow_floor)
-        target       = min(legacy, floor_driven)
+        target         = max(reserve,
+                             DEEP_DISCHARGE_FLOOR_KWH + dawn_load,  # carry the house
+                                                                    # through the R61 dawn gap
+                             overflow_floor)
 
-    expected_overflow_kwh should be the R50 confidence-blended overflow against
-    the R60 effective export cap — so low confidence automatically shrinks the
-    overflow and lifts the target back to legacy (no over-drain on uncertain
-    days), and a throttled grid (smaller effective cap) automatically deepens
-    the drain.
+    A small forecast overflow leaves `overflow_floor` near `soc_max`, so the
+    target lands at or above current SOC and the caller drains nothing. That is
+    the intended answer on a day that does not need headroom.
 
     Motivation (2026-07-07): 63 kWh forecast at 0.92 confidence needed ~17-20
     kWh of battery room, but R52 stopped draining at soc_keep + 20% = 3.6 kWh,
     stranding 3 kWh of headroom on exactly the day it mattered. The plugin is
     supposed to be autonomous — no helper-tweaking the night before.
 
+    RD43 (2026-08-17) — why the legacy term is GONE. R62 originally returned
+    `min(legacy, floor_driven)` with `legacy = soc_keep + buffer_pct% × soc_max`,
+    described as a ceiling that let the forecast be "MORE aggressive, never
+    less". A `min()` in that position is one-way: the forecast could only ever
+    deepen the drain. Whenever the forecast said *no headroom needed*
+    (`floor_driven` → `soc_max`), `legacy` bound instead and drained anyway.
+
+    On 17 Aug 2026 that dumped 5.1 kWh pre-dawn and refilled 3.5 kWh from PV
+    three hours later. Overnight `best_soc_keep` was 0 and the buffer helper
+    10%, so `legacy` = 1.81 kWh — the battery was driven to 10% SOC on a day
+    whose realised requirement was 4.08 kWh of headroom, which the 51.5% SOC it
+    started at already covered twice over. `drain_above` published exactly 1.81
+    (= 0 + 0.10 × 18.08), which is how we know `legacy` was the binding term and
+    `floor_driven` wanted little or no drain.
+
+    The static term cannot be rescued by tuning: with `soc_keep` at 0 overnight
+    it is a bare percentage of pack size, carrying no information about the day.
+    Over-drain protection is `overflow_floor` itself — it is the quantity that
+    knows how much room the day needs.
+
     Args:
-        soc_keep: kWh — Predbat's keep value (legacy term).
         soc_max: kWh — battery capacity.
-        buffer_pct: % — legacy R52 buffer (now a ceiling knob).
         reserve: kWh — hardware reserve floor.
-        expected_overflow_kwh: kWh — R50-blended forecast overflow (≥ 0).
+        expected_overflow_kwh: kWh — forecast overflow against the R60 effective
+            export cap (≥ 0). A throttled grid (smaller effective cap) raises it
+            and so automatically deepens the drain.
         dawn_load_kwh: kWh — forecast house load from PV-start until PV covers
             load (the R61 window where the battery still carries the house).
         max_reserved_kwh: kWh — R45 buffer cap (MAX_RESERVED_KWH).
@@ -888,12 +902,10 @@ def compute_pre_pv_target(soc_keep, soc_max, buffer_pct, reserve, expected_overf
     Returns:
         kWh — pre-PV drain target.
     """
-    legacy = soc_keep + (buffer_pct / 100.0) * soc_max
     overflow = max(0.0, expected_overflow_kwh)
     buffer_kwh = min(max_reserved_kwh, overflow)
     overflow_floor = max(0.0, (soc_max - buffer_kwh) - overflow * safety_factor)
-    floor_driven = max(reserve, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, dawn_load_kwh), overflow_floor)
-    return min(legacy, floor_driven)
+    return max(reserve, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, dawn_load_kwh), overflow_floor)
 
 
 def apply_no_surplus_drain_hold(drain_target, soc_kw, pv_covering):
