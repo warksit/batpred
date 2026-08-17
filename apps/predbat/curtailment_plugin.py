@@ -387,10 +387,11 @@ HA_CONFIDENCE_LOW = "input_number.curtailment_confidence_low"
 
 # v22 R52 pre-PV drain: activate before sunrise on confirmed-overflow days
 # so we drain at full DNO rate while drain capacity is uncontested by PV.
-# Two-stage drain: pre-PV target = soc_keep + buffer%; post-PV target = R50 floor.
+# Two-stage drain: pre-PV target = R62 overflow_floor; post-PV target = R50 floor.
+# RD43 (2026-08-17): `input_number.curtailment_pre_pv_buffer_pct` is no longer
+# read — the static `soc_keep + buffer%` term it fed drained the battery on days
+# needing no headroom. The helper still exists in HA but nothing consumes it.
 HA_GSHP_CH_ACTIVE = "input_boolean.gshp_ch_active"
-HA_PRE_PV_BUFFER_PCT = "input_number.curtailment_pre_pv_buffer_pct"
-PRE_PV_BUFFER_PCT_DEFAULT = 20.0
 PRE_PV_OVERFLOW_THRESHOLD_KWH = 1.0  # Min forecast overflow to bother with pre-PV drain
 PV_START_THRESHOLD_KW = 0.5  # PV "started" when scale × sin(elev) ≥ this
 
@@ -1270,14 +1271,6 @@ class CurtailmentPlugin(PredBatPlugin):
         except (ValueError, TypeError):
             return True  # default safe — no pre-PV drain
 
-    def _pre_pv_buffer_pct(self):
-        """R52: read input_number.curtailment_pre_pv_buffer_pct (0-50%)."""
-        try:
-            v = float(self.base.get_state_wrapper(HA_PRE_PV_BUFFER_PCT, default=PRE_PV_BUFFER_PCT_DEFAULT))
-            return max(0.0, min(50.0, v))
-        except (ValueError, TypeError):
-            return PRE_PV_BUFFER_PCT_DEFAULT
-
     def _pre_pv_drain_decision(self, lat, lon, doy, local_offset, utc_hours, dno_limit_kw):
         """R52: should plugin activate pre-PV drain? Returns (target_kwh, str) or None.
 
@@ -1317,14 +1310,13 @@ class CurtailmentPlugin(PredBatPlugin):
 
         soc_kw = float(getattr(self.base, "soc_kw", 0))
         soc_max = float(getattr(self.base, "soc_max", 18.08))
-        soc_keep = float(getattr(self.base, "best_soc_keep", 0))
         reserve = float(getattr(self.base, "reserve", 0) or 0)
 
         # R62: forecast-driven target. Blend the overflow bands (already
         # computed this cycle by _publish_forecast_overflow, against the R60
         # effective cap) by Solcast confidence, then let the R54-shaped
-        # overflow floor set the drain depth. The legacy soc_keep + buffer%
-        # value survives as a ceiling only.
+        # overflow floor set the drain depth — RD43: it is now the ONLY term
+        # setting that depth, so a day needing no headroom drains nothing.
         expected_overflow = self._expected_overflow()
         # Dawn load: house load the battery must carry from PV-start until PV
         # covers load (the R61 no-drain window). Crossing at base load + the
@@ -1346,11 +1338,8 @@ class CurtailmentPlugin(PredBatPlugin):
         # gap this number measures runs on past that boundary — see _dawn_floor_kwh.
         self._dawn_load_kwh = dawn_load_kwh
 
-        buffer_pct = self._pre_pv_buffer_pct()
         target_kwh = compute_pre_pv_target(
-            soc_keep=soc_keep,
             soc_max=soc_max,
-            buffer_pct=buffer_pct,
             reserve=reserve,
             expected_overflow_kwh=expected_overflow,
             dawn_load_kwh=dawn_load_kwh,
