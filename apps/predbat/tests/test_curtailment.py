@@ -4492,7 +4492,6 @@ from curtailment_plugin import (
     SIG_POLICY_SELECT,
     SIG_OVERRIDE_SELECT,
     SIG_BATTERY_SOC_PCT as SIG_PLANT_SOC_ENTITY,
-    SIG_SAVING_SESSION_CALENDAR,
     DAWN_RELEASE_CONFIRM_CYCLES,
     MIN_BASE_LOAD_KW,
     SESSION_PROTECT_HORIZON_HOURS,
@@ -5037,7 +5036,7 @@ def test_sundown_defers_while_a_saving_session_is_live():
     # O1 elevation gate (20:00 UTC on doy 193 = 4.9 deg), so the session is the
     # only thing keeping CM active — not the gate.
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.03
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base.minutes_now = 21 * 60
     base.now_utc = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
     plugin.on_update()
@@ -5049,7 +5048,7 @@ def test_sundown_defers_while_a_saving_session_is_live():
     assert plugin._policy_override != "max_export", "dispatch stays with the heartbeat (RD14c)"
 
     # Session ends -> the very next cycle hands back normally.
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "off"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "off"
     base.minutes_now = 21 * 60 + 10
     base.now_utc = datetime(2025, 7, 12, 20, 10, tzinfo=timezone.utc)
     plugin.on_update()
@@ -7847,7 +7846,7 @@ def test_session_dump_is_published_as_the_effective_policy():
     """
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     plugin = CurtailmentPlugin(base)
     # A band that makes the plugin want Hold — exactly the live 19:13 shape.
     plugin._charge_below, plugin._drain_above = 6.2, 18.08
@@ -7882,7 +7881,7 @@ def test_session_dump_respects_the_heartbeat_precedence_exactly():
     # 1. Manual override outranks the session.
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base._sensor_overrides[SIG_OVERRIDE_SELECT] = "Hold Battery"
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 6.2, 18.08
@@ -7894,7 +7893,7 @@ def test_session_dump_respects_the_heartbeat_precedence_exactly():
     # 2. Handed back to Predbat -> the session must not claim the wheel.
     base2 = MockBase()
     base2._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base2._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base2._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     plugin2 = CurtailmentPlugin(base2)
     plugin2._publish_dispatch_policy(False, floor_kwh=0.0, soc_kwh=9.4, soc_max=18.08)
     pub2 = base2.published["sensor.predbat_curtailment_intended_policy"]
@@ -7979,7 +7978,7 @@ def test_session_end_soc_is_published_during_the_dump():
     from anything else on the card."""
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=60, current_end="2025-07-12T13:00:00+00:00"))
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 6.2, 18.08
@@ -8013,7 +8012,7 @@ def test_session_projection_is_blank_while_the_end_time_is_unknown():
     """
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=120, current_end=None))
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 6.2, 18.08
@@ -8034,7 +8033,7 @@ def test_session_export_left_is_published_during_the_dump():
     """
     base = MockBase()
     base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
-    base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base._sensor_overrides.update(_saving_session_sensors(active=True, current_mins=60, current_end="2025-07-12T13:00:00+00:00"))
     plugin = CurtailmentPlugin(base)
     plugin._charge_below, plugin._drain_above = 6.2, 18.08
@@ -8110,7 +8109,7 @@ def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False):
 
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = pv_kw
     if session:
-        base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+        base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base.minutes_now = minutes_now
     base.now_utc = now_local
     plugin._sundown_latched = latched
@@ -8233,7 +8232,7 @@ def test_cm_owns_a_session_through_every_discretionary_handback():
         if solcast_ok:
             overrides.update(_make_p90_sensors())
         if session:
-            overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+            overrides[SIG_SAVING_SESSION_ENTITY] = "on"
         base = MockBase(
             pv_step=pv,
             load_step=load,
@@ -8270,7 +8269,7 @@ def test_r4_defer_does_not_release_the_wheel_mid_session():
     load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
     overrides = {"sensor.sigen_plant_pv_power": 3.0, "sensor.sigen_plant_consumed_power": 0.5}
     overrides.update(_make_p90_sensors())
-    overrides[SIG_SAVING_SESSION_CALENDAR] = "on"
+    overrides[SIG_SAVING_SESSION_ENTITY] = "on"
     base = MockBase(pv_step=pv, load_step=load, soc_kw=1.0, minutes_now=20 * 60, best_soc_keep=8.0, sensor_overrides=overrides)
     # Make the defer branch genuinely reachable: GSHP heating on (its default),
     # SOC well below keep, and a live Predbat charge window that is not a freeze.
@@ -8284,7 +8283,7 @@ def test_r4_defer_does_not_release_the_wheel_mid_session():
     assert not plugin._r4_deferring, "and must not leave the defer latch armed"
 
     # Without the session the defer stands.
-    del base._sensor_overrides[SIG_SAVING_SESSION_CALENDAR]
+    del base._sensor_overrides[SIG_SAVING_SESSION_ENTITY]
     p2 = CurtailmentPlugin(base)
     p2._r4_deferring = False
     p2.on_update()
