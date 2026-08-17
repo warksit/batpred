@@ -95,3 +95,86 @@ binary_sensors:
       {% endif %}
       {% endfor %}
       {{ ns.hit }}
+    # -------------------------------------------------------------------------
+    # THE WINDOW SHAPE, for consumers that need more than on/off.
+    #
+    # WHY HERE. `curtailment_plugin` must size the export reserve (duration x
+    # cap), publish when the floor is being held FOR, and project the end SOC. It
+    # used to read those off Octopus's own binary sensor attributes; v19.0.0
+    # deleted that entity and the plugin went blind for days, publishing a null
+    # `session_need_kwh` that read as "no session" (found 2026-08-17). It must not
+    # read `joined_events` itself: that would be a second copy of the Power Up /
+    # Power Down test, which is the one thing this file exists to prevent.
+    #
+    # NAMES ARE DELIBERATELY OCTOPUS'S. `current_joined_event_*` /
+    # `next_joined_event_*` are the attribute names the retired sensor used, so
+    # consumers keep the contract they already had and the migration is a change
+    # of entity, not of shape.
+    #
+    # SAME TEST, EVERY TIME. Each attribute is its own template — HA gives them no
+    # shared scope — so the `!= 0` fail-safe is repeated below. That is copies
+    # WITHIN the single point of truth, which is tolerable where a copy in a
+    # consumer is not; tests/test_yaml_octoplus_sessions.py renders every one of
+    # them against the same events and asserts they agree with the state above.
+    #
+    # `current` is the joined Power Down containing now(); `next` is the earliest
+    # one starting after now(). Both are absent (None) rather than guessed when
+    # there is no such event — a guessed time became a published end-SOC of
+    # "whatever SOC is right now" once already (RD42).
+    # -------------------------------------------------------------------------
+    attributes:
+      current_joined_event_start: >-
+        {% set ns = namespace(v=none) %}
+        {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+        {% set st = as_datetime(e.start) %}
+        {% set en = as_datetime(e.end) %}
+        {% if st is not none and en is not none and st <= now() < en and (e.get('octopoints_per_kwh', -1) | int(-1)) != 0 %}
+        {% set ns.v = st.isoformat() %}
+        {% endif %}
+        {% endfor %}
+        {{ ns.v if ns.v is not none else '' }}
+      current_joined_event_end: >-
+        {% set ns = namespace(v=none) %}
+        {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+        {% set st = as_datetime(e.start) %}
+        {% set en = as_datetime(e.end) %}
+        {% if st is not none and en is not none and st <= now() < en and (e.get('octopoints_per_kwh', -1) | int(-1)) != 0 %}
+        {% set ns.v = en.isoformat() %}
+        {% endif %}
+        {% endfor %}
+        {{ ns.v if ns.v is not none else '' }}
+      current_joined_event_duration_in_minutes: >-
+        {% set ns = namespace(v=0) %}
+        {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+        {% set st = as_datetime(e.start) %}
+        {% set en = as_datetime(e.end) %}
+        {% if st is not none and en is not none and st <= now() < en and (e.get('octopoints_per_kwh', -1) | int(-1)) != 0 %}
+        {% set ns.v = ((en - st).total_seconds() / 60) | round(0) | int %}
+        {% endif %}
+        {% endfor %}
+        {{ ns.v if ns.v is not none else '' }}
+      next_joined_event_start: >-
+        {% set ns = namespace(v=none, best=none) %}
+        {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+        {% set st = as_datetime(e.start) %}
+        {% if st is not none and st > now() and (e.get('octopoints_per_kwh', -1) | int(-1)) != 0 %}
+        {% if ns.best is none or st < ns.best %}
+        {% set ns.best = st %}
+        {% set ns.v = st.isoformat() %}
+        {% endif %}
+        {% endif %}
+        {% endfor %}
+        {{ ns.v if ns.v is not none else '' }}
+      next_joined_event_duration_in_minutes: >-
+        {% set ns = namespace(v=0, best=none) %}
+        {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
+        {% set st = as_datetime(e.start) %}
+        {% set en = as_datetime(e.end) %}
+        {% if st is not none and en is not none and st > now() and (e.get('octopoints_per_kwh', -1) | int(-1)) != 0 %}
+        {% if ns.best is none or st < ns.best %}
+        {% set ns.best = st %}
+        {% set ns.v = ((en - st).total_seconds() / 60) | round(0) | int %}
+        {% endif %}
+        {% endif %}
+        {% endfor %}
+        {{ ns.v if ns.v is not none else '' }}
