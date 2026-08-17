@@ -6,6 +6,32 @@ being appended to replies.
 
 Format: `- [date] finding — why it might matter — evidence`
 
+## Live behaviour
+
+- **[2026-08-17] RD41's session charge target never reaches the decision on an
+  overflow-fits day — RD28's branch does not know about sessions.**
+  Surfaced within minutes of CM regaining sight of sessions; it could not be seen
+  before, because `session_need_kwh` was always null.
+  `calculate()` takes the `_policy_override == "no_drain"` branch on an
+  overflow-fits day, and that branch deliberately does **not** run
+  `compute_proposed_phase`. It computes
+  `compute_no_overflow_charge_target(overnight_target_kwh=...)`, which considers
+  the overnight reserve and the p90 headroom and **nothing else**. So
+  `charge_below` can publish the RD41 session target (10.93 kWh / 60.5% live at
+  14:12) while the Schmitt compares SOC against ~6.93 kWh and answers Hold.
+  Live now: SOC 7.97 kWh (44.1%), published charge line 60.5%, policy **Hold**.
+  **Cost tonight if left:** the 18:00 dump wants 3.89 kWh from the pack on top of
+  a 6.93 kWh overnight reserve — about 59.9% — and the keep-floor guard stops Max
+  Export at `sig_keep_floor_pct` (39%). From 44% that is roughly 0.9 kWh sold
+  against a 3.89 kWh need.
+  **Fix shape:** the no_drain target becomes
+  `max(compute_no_overflow_charge_target(...), session_charge_target)` when a
+  session is armed — RD28's "bank to tonight's need then Hold" is right, the
+  session simply *is* part of tonight's need. NOT done: it is a policy change to
+  the live control path on a session day, which the charter says to land pre-dawn
+  or after the window. Needs a test that an armed session raises the no_drain
+  target and that a day with no session is unchanged.
+
 ## Dead config
 
 - **[2026-08-17] `sig_saving_session.yaml` still triggers off the retired Octopus
