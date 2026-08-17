@@ -388,9 +388,9 @@ HA_CONFIDENCE_LOW = "input_number.curtailment_confidence_low"
 # v22 R52 pre-PV drain: activate before sunrise on confirmed-overflow days
 # so we drain at full DNO rate while drain capacity is uncontested by PV.
 # Two-stage drain: pre-PV target = R62 overflow_floor; post-PV target = R50 floor.
-# RD43 (2026-08-17): `input_number.curtailment_pre_pv_buffer_pct` is no longer
-# read — the static `soc_keep + buffer%` term it fed drained the battery on days
-# needing no headroom. The helper still exists in HA but nothing consumes it.
+# RD43 (2026-08-17): the static `soc_keep + buffer%` term drained the battery on
+# days needing no headroom. Term removed; `input_number.curtailment_pre_pv_buffer_pct`
+# was deleted from HA once nothing read it.
 HA_GSHP_CH_ACTIVE = "input_boolean.gshp_ch_active"
 PRE_PV_OVERFLOW_THRESHOLD_KWH = 1.0  # Min forecast overflow to bother with pre-PV drain
 PV_START_THRESHOLD_KW = 0.5  # PV "started" when scale × sin(elev) ≥ this
