@@ -170,15 +170,35 @@ SIG_EMS_MODE_SELECT = "select.sigen_plant_remote_ems_control_mode"
 SIG_EMS_MODE_MSC = "Maximum Self Consumption"
 DEFAULT_KEEP_FLOOR_PCT = 38.0  # overnight reserve default on handback (RD10)
 POLICY_PREDBAT = "Predbat"
-# v31 floor/handback (2026-07-19): saving-session reserve (Octopus sensor CM can
-# read directly) + early-handback buffer (fit p90 overflow with this to spare).
-SIG_SAVING_SESSION = "binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
-# RD14c: DISPATCH is driven off the Octoplus CALENDAR, not the binary sensor —
-# Octopus publishes the sensor ~1 min late at each edge, which cost 5 min 46 s
-# of selling past the paid window on 2026-07-28. The heartbeat reads this entity;
-# the display layer MUST read the same one, or the card can disagree with the
-# dispatcher at exactly the moments that matter.
-SIG_SAVING_SESSION_CALENDAR = "calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
+# v31 floor/handback (2026-07-19): saving-session reserve + early-handback buffer
+# (fit p90 overflow with this to spare).
+#
+# 2026-08-17: this used to be Octopus's own
+# `binary_sensor...octoplus_saving_sessions`, with a second constant for the
+# matching calendar. The integration deleted BOTH in v19.0.0 (ADR 0004 renamed
+# Saving Sessions -> Power Down), so every read here had been returning None for
+# days: `session_need_kwh` published null not because there was no session but
+# because the source no longer existed, and RD41's charge target had nothing to
+# act on. Found on the 17 Aug 18:00 session.
+#
+# Now reads the site's ONE definition of "a paid Power Down is running now"
+# (ha/octoplus_session_helpers.yaml). That file also publishes the window shape
+# as attributes under the SAME names Octopus used, so the reads below are
+# unchanged. Octopus put Power Ups and Power Downs on one feed with no type
+# field, so a plain calendar or event read cannot tell "export at the cap" from
+# "import for free" — the discrimination belongs in that one sensor and is never
+# re-derived here.
+#
+# This also collapses what RD14c split. That requirement used the CALENDAR for
+# dispatch because Octopus published their binary sensor ~1 min late at each
+# edge (5 min 46 s of selling past the paid window, 2026-07-28) — the fix was to
+# read PLANNED times rather than a lagging publication. The template sensor is
+# computed from the joined events' own start/end against `now()`, so it IS the
+# planned time; the lag it was avoiding no longer exists, and with one entity the
+# ~43 s divergence RD42 found between the dispatch flag and the end time is gone
+# by construction. The heartbeat still takes its calendar TRIGGERS from
+# `calendar...octoplus_power_down` — edges, not meaning.
+SIG_SAVING_SESSION = "binary_sensor.octoplus_power_down_active"
 HA_EARLY_HANDBACK_BUFFER = "input_number.curtailment_early_handback_buffer_kwh"
 EARLY_HANDBACK_BUFFER_DEFAULT = 1.5
 # v32: the "overflow fits headroom" buffer is now a Hold gate (not a deactivate
@@ -2812,9 +2832,12 @@ class CurtailmentPlugin(PredBatPlugin):
         self.log("Curtailment: read_only -> {} (Predbat {})".format(value, "suppressed" if value else "resumes"))
 
     def _get_session_reserve_kwh(self, cap_kw):
-        """Saving-session export reserve (kWh) from the Octopus sensor: the
-        largest of any active/upcoming joined session's duration × cap. 0 if
-        none scheduled. This is the 'what's coming' CM reads directly."""
+        """Saving-session export reserve (kWh): the largest of any active or
+        upcoming joined Power Down's duration × cap. 0 if none scheduled. This is
+        the 'what's coming' CM reads directly. The duration attributes are
+        published by ha/octoplus_session_helpers.yaml under the names Octopus
+        used, so only Power Downs are counted — a joined Power Up is a free
+        import hour and must never size an export reserve."""
         best_mins = 0.0
         for attr in ("current_joined_event_duration_in_minutes", "next_joined_event_duration_in_minutes"):
             try:
@@ -3114,12 +3137,15 @@ class CurtailmentPlugin(PredBatPlugin):
     def _is_session_dispatching(self):
         """True while the heartbeat is forcing Max Export for a live saving session.
 
-        Reads the CALENDAR — the same entity, with the same semantics, that
-        `sig_dispatch_heartbeat.yaml` uses to compute its effective policy. This
-        is a display mirror of a decision made elsewhere, so it must never be a
-        second opinion."""
+        Reads the discrimination sensor — the same entity, with the same
+        semantics, that `sig_dispatch_heartbeat.yaml` conditions on and that
+        `sensor.sig_effective_policy` turns into Max Export. This is a display
+        mirror of a decision made elsewhere, so it must never be a second
+        opinion. It used to read the legacy calendar, which the integration has
+        since removed AND which was on for Power Ups too — a free-import hour
+        would have read here as "dispatching"."""
         try:
-            return str(self.base.get_state_wrapper(SIG_SAVING_SESSION_CALENDAR, default="off")).lower() in ("on", "true")
+            return str(self.base.get_state_wrapper(SIG_SAVING_SESSION, default="off")).lower() in ("on", "true")
         except (TypeError, ValueError):
             return False
 
@@ -3138,9 +3164,13 @@ class CurtailmentPlugin(PredBatPlugin):
         return None
 
     def _is_saving_session_active(self):
-        """True while an Octopus saving session is currently running (the binary
-        sensor is 'on'). v32(b): during a live session CM forces Max Export to dump
-        the reserved energy at the cap, then resumes the lifecycle when it ends."""
+        """True while a paid Power Down session is currently running.
+
+        v32(b): during a live session CM forces Max Export to dump the reserved
+        energy at the cap, then resumes the lifecycle when it ends. Since
+        2026-08-17 this and `_is_session_dispatching` read the same sensor and so
+        can no longer disagree; both are kept because they answer different
+        questions (do I own the plant, versus what do I tell the card)."""
         try:
             state = str(self.base.get_state_wrapper(SIG_SAVING_SESSION, default="off")).lower()
         except (TypeError, ValueError):

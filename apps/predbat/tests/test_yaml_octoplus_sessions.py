@@ -17,6 +17,7 @@
 # Run: cd apps/predbat && python3 tests/test_yaml_octoplus_sessions.py
 import datetime
 import os
+import re
 import sys
 
 import jinja2
@@ -24,6 +25,7 @@ import yaml
 
 HERE = os.path.dirname(__file__)
 HELPERS_PATH = os.path.join(HERE, "..", "ha", "octoplus_session_helpers.yaml")
+PLUGIN_PATH = os.path.join(HERE, "..", "curtailment_plugin.py")
 INTENT_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_intent_helpers.yaml")
 AUTOMATION_PATH = os.path.join(HERE, "..", "ha", "octoplus_power_up_grid_charge.yaml")
 
@@ -78,6 +80,33 @@ def render(joined, now=NOW):
         return env.from_string(by_id[uid]["state"]).render(**ctx).strip().lower() == "true"
 
     return one("octoplus_power_up_active"), one("octoplus_power_down_active")
+
+
+def render_attrs(joined, now=NOW):
+    """Render the Power Down WINDOW attributes against a joined_events list.
+
+    Same context as `render`, because the whole point is that the attributes and
+    the state answer the same question about the same events.
+    """
+    doc = _load(HELPERS_PATH)
+    by_id = {s["unique_id"]: s for s in doc["binary_sensors"]}
+    env = jinja2.Environment()
+
+    def as_datetime(value):
+        if isinstance(value, datetime.datetime):
+            return value
+        try:
+            return datetime.datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    ctx = {
+        "state_attr": lambda e, a: joined if (e == EVENTS_ENTITY and a == "joined_events") else None,
+        "as_datetime": as_datetime,
+        "now": lambda: now,
+    }
+    attrs = by_id["octoplus_power_down_active"].get("attributes", {})
+    return {name: env.from_string(tpl).render(**ctx).strip() for name, tpl in attrs.items()}
 
 
 # The observed corpus. Power Downs are this account's 18 joined events; the Power
@@ -168,11 +197,31 @@ def test_available_but_unjoined_events_are_ignored():
     print("PASS  sensors read joined_events only, never available_events")
 
 
+def _plugin_source():
+    """curtailment_plugin.py as text, comments stripped.
+
+    Comments are removed because this file's history is written IN the comments —
+    the plugin explains at length which entities it used to read and why it
+    stopped. A blunt substring search over the raw text would match that prose
+    and fail on a correct file.
+    """
+    with open(PLUGIN_PATH) as f:
+        lines = f.read().split("\n")
+    return "\n".join(l for l in lines if not l.strip().startswith("#"))
+
+
 def _consumer_blobs():
-    """Every file that acts on a session, as text."""
+    """Every file that acts on a session, as text.
+
+    curtailment_plugin.py joined this list on 2026-08-17. It was reading Octopus's
+    own retired entities directly, which is exactly the coupling the other two
+    entries exist to prevent — it just was not being checked, so the rot was
+    invisible until a session day.
+    """
     return {
         "octoplus_power_up_grid_charge.yaml": yaml.safe_dump(_load(AUTOMATION_PATH)),
         "sig_dispatch_intent_helpers.yaml": yaml.safe_dump(_load(INTENT_PATH)),
+        "curtailment_plugin.py": _plugin_source(),
     }
 
 
@@ -203,6 +252,121 @@ def test_no_consumer_keys_on_the_legacy_calendar():
     automation = yaml.safe_dump(_load(AUTOMATION_PATH))
     assert UP_SENSOR in automation, "the grid charge must read {}".format(UP_SENSOR)
     print("PASS  consumers read the discrimination sensors, not the legacy calendar")
+
+
+def test_window_attributes_look_ahead_before_the_session():
+    """Ahead of a session CM must be able to size the reserve and say WHEN for.
+
+    This is the case that was broken from v19.0.0 until 2026-08-17: with the
+    source entity gone every read returned None, so `session_need_kwh` published
+    null — indistinguishable from "no session booked" — and RD41's charge target
+    had nothing to aim at. Asserting the exact 18:00/60 rather than "not None",
+    because "some number appeared" is what the null looked like too.
+    """
+    attrs = render_attrs([_event(18, 19, 101)], now=_at(13, 30))
+    assert attrs.get("next_joined_event_start", "<missing>") == "2026-08-16T18:00:00+00:00", "expected the 18:00 start, got {!r}".format(attrs.get("next_joined_event_start", "<missing>"))
+    assert attrs.get("next_joined_event_duration_in_minutes", "<missing>") == "60", "a one-hour session must size 60 min, got {!r}".format(attrs.get("next_joined_event_duration_in_minutes", "<missing>"))
+    assert attrs.get("current_joined_event_start", "<missing>") == "", "nothing is running at 13:30, got {!r}".format(attrs.get("current_joined_event_start", "<missing>"))
+    assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") == "0", "no live session means no current duration"
+    print("PASS  window attributes look ahead to a booked session")
+
+
+def test_window_attributes_describe_the_live_session():
+    """Mid-session the CURRENT window drives the end-SOC projection (RD42)."""
+    attrs = render_attrs([_event(18, 19, 101)], now=_at(18, 30))
+    assert attrs.get("current_joined_event_start", "<missing>") == "2026-08-16T18:00:00+00:00", "got {!r}".format(attrs.get("current_joined_event_start", "<missing>"))
+    assert attrs.get("current_joined_event_end", "<missing>") == "2026-08-16T19:00:00+00:00", "got {!r}".format(attrs.get("current_joined_event_end", "<missing>"))
+    assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") == "60", "got {!r}".format(attrs.get("current_joined_event_duration_in_minutes", "<missing>"))
+    assert attrs.get("next_joined_event_start", "<missing>") == "", "the running session is not also the next one"
+    print("PASS  window attributes describe the live session")
+
+
+def test_window_attributes_ignore_a_power_up():
+    """A free-import hour must never size an EXPORT reserve.
+
+    Reading joined events without the discriminator would reserve battery to sell
+    into an hour Octopus is giving electricity away in — and CM would hold that
+    charge back instead of filling from the free grid.
+    """
+    for now in (_at(13, 30), _at(11, 30)):
+        attrs = render_attrs([_event(11, 12, 0)], now=now)
+        assert attrs.get("next_joined_event_duration_in_minutes", "<missing>") == "0", "a Power Up must not size a reserve, got {!r}".format(attrs.get("next_joined_event_duration_in_minutes", "<missing>"))
+        assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") == "0", "a Power Up is never a current export window"
+        assert attrs.get("current_joined_event_start", "<missing>") == "", "a Power Up must not publish an export window"
+    print("PASS  Power Ups never size an export reserve")
+
+
+def test_next_window_is_the_earliest_still_to_come():
+    """Two booked sessions: the reserve is for the one that arrives first."""
+    attrs = render_attrs([_event(20, 21, 101), _event(18, 19, 96)], now=_at(13, 30))
+    assert attrs.get("next_joined_event_start", "<missing>") == "2026-08-16T18:00:00+00:00", "must pick the 18:00, got {!r}".format(attrs.get("next_joined_event_start", "<missing>"))
+    print("PASS  the next window is the earliest still to come")
+
+
+def test_absent_times_render_empty_not_the_string_none():
+    """`{{ none }}` renders as "None", which is TRUTHY to every consumer.
+
+    The plugin's `if value: return str(value)` would hand the card the literal
+    text "None" as a session start, and its `datetime.fromisoformat` would raise
+    on it. Empty string is the only falsy rendering.
+    """
+    attrs = render_attrs([], now=_at(13, 30))
+    for name, value in attrs.items():
+        assert value.lower() != "none", "{} rendered the string 'None' — must be empty".format(name)
+    assert attrs.get("current_joined_event_start", "<missing>") == "", "got {!r}".format(attrs.get("current_joined_event_start", "<missing>"))
+    assert attrs.get("next_joined_event_start", "<missing>") == "", "got {!r}".format(attrs.get("next_joined_event_start", "<missing>"))
+    print("PASS  absent times render empty, not the string None")
+
+
+def test_window_attributes_agree_with_the_sensor_state():
+    """The `!= 0` test is repeated per attribute — so prove the copies agree.
+
+    HA gives attribute templates no shared scope, so the discriminator genuinely
+    lives in six places inside this one file. The charter's remedy for a quantity
+    that must live in more than one place is a test that renders EVERY copy and
+    asserts they agree, which is this.
+    """
+    scenarios = (
+        ("live power down", [_event(18, 19, 101)], _at(18, 30)),
+        ("power down later", [_event(18, 19, 101)], _at(13, 30)),
+        ("live power up", [_event(11, 12, 0)], _at(11, 30)),
+        ("nothing booked", [], _at(13, 30)),
+        ("unreadable reward", [_event(18, 19, 0, drop_points=True)], _at(18, 30)),
+    )
+    for label, joined, now in scenarios:
+        _up, down = render(joined, now=now)
+        attrs = render_attrs(joined, now=now)
+        has_current = attrs.get("current_joined_event_start", "<missing>") != ""
+        assert has_current == down, "{}: sensor says down={} but current window {}published".format(label, down, "" if has_current else "not ")
+        if down:
+            assert attrs.get("current_joined_event_duration_in_minutes", "<missing>") != "0", "{}: a live session must have a duration".format(label)
+    print("PASS  every copy of the discriminator agrees with the sensor state")
+
+
+def test_plugin_reads_only_attributes_this_file_publishes():
+    """THE guard for the 2026-08-17 defect: a read whose source does not exist.
+
+    The plugin asked Octopus's binary sensor for `current_joined_event_*` long
+    after that entity was deleted. Nothing failed loudly — `get_state_wrapper`
+    returned the default and the reserve quietly computed 0. This asserts the
+    reverse direction of the contract: every attribute name the plugin reads is
+    one this file actually publishes.
+    """
+    published = set(_load(HELPERS_PATH)["binary_sensors"][1].get("attributes", {}))
+    assert published, "the Power Down sensor publishes no attributes at all"
+    read = set(re.findall(r"[\"']((?:current|next)_joined_event_\w+)[\"']", _plugin_source()))
+    assert read, "found no session attribute reads in curtailment_plugin.py — has the read moved?"
+    missing = read - published
+    assert not missing, "curtailment_plugin reads {} which octoplus_session_helpers.yaml does not publish".format(sorted(missing))
+    print("PASS  every session attribute the plugin reads is published ({} of them)".format(len(read)))
+
+
+def test_plugin_points_at_the_discrimination_sensor():
+    """The plugin's session entity must BE the single point of truth, by name."""
+    source = _plugin_source()
+    assert 'SIG_SAVING_SESSION = "{}"'.format(DOWN_SENSOR) in source, "curtailment_plugin.SIG_SAVING_SESSION must be {}".format(DOWN_SENSOR)
+    assert "octoplus_saving_sessions" not in source, "curtailment_plugin still names a retired Octopus entity"
+    print("PASS  the plugin reads the discrimination sensor")
 
 
 def test_automation_has_no_time_of_day_gate():
@@ -262,6 +426,14 @@ def run():
         test_available_but_unjoined_events_are_ignored,
         test_no_consumer_reimplements_the_discriminator,
         test_no_consumer_keys_on_the_legacy_calendar,
+        test_plugin_reads_only_attributes_this_file_publishes,
+        test_window_attributes_look_ahead_before_the_session,
+        test_window_attributes_describe_the_live_session,
+        test_window_attributes_ignore_a_power_up,
+        test_next_window_is_the_earliest_still_to_come,
+        test_absent_times_render_empty_not_the_string_none,
+        test_window_attributes_agree_with_the_sensor_state,
+        test_plugin_points_at_the_discrimination_sensor,
         test_automation_has_no_time_of_day_gate,
         test_handback_restores_whoever_was_driving,
     ):
