@@ -3374,6 +3374,29 @@ class CurtailmentPlugin(PredBatPlugin):
                     max_reserved_kwh=float(getattr(self, "_effective_max_reserved", MAX_RESERVED_KWH) or MAX_RESERVED_KWH),
                     safety_factor=OVERFLOW_SAFETY_FACTOR,
                 )
+                # A joined session is part of TONIGHT'S NEED — the paid part.
+                #
+                # RD28 above banks to the overnight reserve and stops. It predates
+                # RD41 and knew nothing about sessions, so on an overflow-fits day
+                # `charge_below` PUBLISHED the session target while this branch
+                # compared SOC against the overnight reserve alone and answered
+                # Hold. The two disagreed in the open and nothing reconciled them.
+                #
+                # Live 2026-08-17 14:12, the day CM regained sight of sessions:
+                # session_charge_target 10.93 kWh (60.5%), charge_below published
+                # 60.5%, overnight target 6.93 kWh, SOC 7.97 kWh — above the
+                # overnight reserve, so Hold, with an 18:00 session wanting 3.89
+                # kWh out of the pack on top of that reserve. CM sat in Hold all
+                # afternoon and only a manual Solar Charge override banked
+                # anything; the session then sold into the reserve.
+                #
+                # max() and not a replacement: RD28's safeguard is that its own
+                # target is `min(overnight_target, soc_max - required_headroom)`,
+                # and RD41 has already clamped the session target by the headroom
+                # the forecast still needs (`min(session_protect, overflow_floor)`).
+                # Both arms are headroom-aware, so taking the larger cannot eat
+                # curtailment headroom — it can only refuse to stop early.
+                charge_target = max(charge_target, float(self._session_charge_target_kwh or 0.0))
                 schmitt = "Charge" if soc_kwh < charge_target else "Hold"
             else:
                 schmitt = compute_proposed_phase(soc_kwh, self._charge_below, self._drain_above, True, was_draining=self._was_draining)

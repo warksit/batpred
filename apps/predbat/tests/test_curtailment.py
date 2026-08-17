@@ -2561,6 +2561,69 @@ def test_no_drain_branch_holds_once_the_need_is_met():
     print("  test_no_drain_branch_holds_once_the_need_is_met: PASSED")
 
 
+def test_no_drain_branch_charges_to_the_session_target():
+    """A joined session is part of tonight's need — the paid part.
+
+    Reproduces live 2026-08-17 14:12, the day CM regained sight of sessions:
+    overflow fits, session_charge_target 10.93 kWh (60.5%), overnight target 6.93,
+    SOC 7.97 kWh. SOC sits ABOVE the overnight reserve, so RD28's branch answered
+    Hold — while `charge_below` published 60.5% and an 18:00 session wanted 3.89
+    kWh out of the pack on TOP of that reserve. CM held all afternoon; only a
+    manual override banked anything, and the session then sold into the reserve.
+    """
+    base = MockBase(soc_kw=7.97)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._policy_override = "no_drain"
+    plugin._charge_below, plugin._drain_above = 10.93, 18.04
+    plugin._overnight_target_kwh = 6.93
+    plugin._session_charge_target_kwh = 10.93
+    plugin._overflow_p90 = 1.21
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=18.04, soc_kwh=7.97, soc_max=18.06)
+    written = _policy_calls(base)
+    assert written and written[-1] == "Solar Charge Battery", "SOC 7.97 below the 10.93 session target must CHARGE, got {}".format(written)
+    print("  test_no_drain_branch_charges_to_the_session_target: PASSED")
+
+
+def test_no_drain_branch_holds_once_the_session_target_is_met():
+    """...and still stops there. The session raises the target, it does not remove it."""
+    base = MockBase(soc_kw=11.5)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._policy_override = "no_drain"
+    plugin._charge_below, plugin._drain_above = 10.93, 18.04
+    plugin._overnight_target_kwh = 6.93
+    plugin._session_charge_target_kwh = 10.93
+    plugin._overflow_p90 = 1.21
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=18.04, soc_kwh=11.5, soc_max=18.06)
+    written = _policy_calls(base)
+    assert written and written[-1] == "Hold Battery", "SOC 11.5 above the 10.93 session target must HOLD, got {}".format(written)
+    print("  test_no_drain_branch_holds_once_the_session_target_is_met: PASSED")
+
+
+def test_no_drain_branch_unchanged_without_a_session():
+    """No session armed -> RD28's overnight target is still the whole answer.
+
+    Guards the max() from becoming a silent behaviour change on ordinary days:
+    the same SOC that must Charge with a session must still Hold without one.
+    """
+    base = MockBase(soc_kw=7.97)
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    plugin = CurtailmentPlugin(base)
+    plugin._policy_override = "no_drain"
+    plugin._charge_below, plugin._drain_above = 10.93, 18.04
+    plugin._overnight_target_kwh = 6.93
+    plugin._session_charge_target_kwh = 0.0
+    plugin._overflow_p90 = 1.21
+    base.services.clear()
+    plugin._publish_dispatch_policy(True, floor_kwh=18.04, soc_kwh=7.97, soc_max=18.06)
+    written = _policy_calls(base)
+    assert written and written[-1] == "Hold Battery", "with no session, SOC 7.97 above the 6.93 overnight need must HOLD, got {}".format(written)
+    print("  test_no_drain_branch_unchanged_without_a_session: PASSED")
+
+
 def test_no_drain_still_never_drains():
     """RD17 unchanged: the no_drain override still clamps Drain to Hold."""
     base = MockBase(soc_kw=17.0)
@@ -8991,6 +9054,9 @@ def run_curtailment_tests(my_predbat=None):
         test_no_overflow_charge_target_never_eats_the_headroom,
         test_no_drain_branch_charges_to_the_overnight_need,
         test_no_drain_branch_holds_once_the_need_is_met,
+        test_no_drain_branch_charges_to_the_session_target,
+        test_no_drain_branch_holds_once_the_session_target_is_met,
+        test_no_drain_branch_unchanged_without_a_session,
         test_no_drain_still_never_drains,
         test_card_publishes_the_threshold_actually_in_force,
         test_low_soc_never_hands_back_mid_window,
