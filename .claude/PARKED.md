@@ -6,6 +6,20 @@ being appended to replies.
 
 Format: `- [date] finding — why it might matter — evidence`
 
+## Dead config
+
+- **[2026-08-17] `sig_saving_session.yaml` still triggers off the retired Octopus
+  binary sensor** (lines 34, 38:
+  `binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving_sessions`, deleted by
+  the integration in v19.0.0). Harmless **today only because
+  `automation.sig_saving_session_planner` is `off`** on the box — if anyone ever
+  enables it, it will sit there never triggering and look like a broken automation
+  rather than a stale entity reference. Left alone deliberately: it was outside
+  the ask, and re-pointing a disabled automation at
+  `binary_sensor.octoplus_power_down_active` is a change worth making on purpose,
+  not in passing. Either repoint it or delete it. Every live consumer (heartbeat,
+  effective policy, keep-floor guard, curtailment_plugin) is already migrated.
+
 ## Security
 
 - **[2026-08-17] The Predbat MCP bearer token is committed to a PUBLIC repo.**
