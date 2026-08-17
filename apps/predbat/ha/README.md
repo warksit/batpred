@@ -60,6 +60,12 @@ already written. The writer that changed a register must change it back
 | `sig_*_alert*.yaml`, `sig_voltage_protect.yaml`, `sig_saving_session.yaml` | Alerts / protect / sessions |
 | `big_overflow_load_advice.yaml` | Advice only |
 
+### Not an automation
+
+| File | Role |
+|---|---|
+| `mum-apps.yaml` | Mirror of the Predbat **addon** config on the box (`/addon_configs/6adb4f0d_predbat/apps.yaml`). Different deploy path to everything above: edit the box copy, mirror it back here in the same change. `mcp_secret` is redacted — this fork is public. Tracked since 2026-08-17, after an entity rename silently disabled saving sessions in an untracked config. |
+
 ## Legacy / dormant (do not re-enable for control)
 
 | File | Why dormant |
