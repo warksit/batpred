@@ -85,6 +85,27 @@ sensors:
   #
   # `hard` defaults to 2.8 — deliberately HIGHER than the live 1.0% helper, so an
   # unreadable helper under-drains rather than over-drains (RD23).
+  #
+  # RD44 (2026-08-18): DURING A PAID SESSION THE FLOOR IS THE OVERNIGHT RESERVE,
+  # not the deep-discharge floor. The plugin has always PUBLISHED that intent —
+  # `sig_keep_floor_pct` switches to `overnight_target_kwh` for a session dump and
+  # curtailment_plugin.py says in as many words "dump, which still stops at the
+  # overnight reserve (RD20)" — but nothing enforced it. The keep-floor guard
+  # deliberately stands off a live session, so the only bound left was `hard`, at
+  # 1.0%. A session could sell the entire night.
+  #
+  # Live 2026-08-17: the 18:00 dump ran to 30.8% against a 38% reserve and stopped
+  # only because the clock hit 19:00. A two-hour session, or a lower start, would
+  # have kept going to ~1%.
+  #
+  # `max(hard, reserve)` rather than a swap: the deep-discharge floor still binds
+  # if it is ever the higher of the two, so this can only ever sell LESS. The
+  # reserve default (38) is the plugin's DEFAULT_KEEP_FLOOR_PCT and fails safe the
+  # same way `hard` does — an unreadable helper stops the sell early.
+  #
+  # This clamps the SETPOINT, not the policy. Policy stays Max Export, so there is
+  # no Max Export <-> Hold flap at the floor: the battery simply stops discharging
+  # while PV surplus keeps exporting at the premium for the rest of the window.
   # ---------------------------------------------------------------------------
   - name: SIG Dispatch kW
     unique_id: sig_dispatch_kw
@@ -96,7 +117,9 @@ sensors:
       {% set pv = states('sensor.sigen_plant_pv_power') | float(0) %}
       {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(50) %}
       {% set hard = states('input_number.sig_drain_floor_pct') | float(2.8) %}
+      {% set reserve = states('input_number.sig_keep_floor_pct') | float(38) %}
+      {% set floor = [hard, reserve] | max if is_state('binary_sensor.octoplus_power_down_active', 'on') else hard %}
       {% set raw = 6.6 if p == 'Max Export' else ([pv, load] | max if p == 'Hold Battery' else load) %}
       {% set ceil = 6.6 if p == 'Max Export' else [load + cap, 6.6] | min %}
-      {% set pre = ([raw, pv] | min if (soc <= hard and p == 'Max Export') else raw) %}
+      {% set pre = ([raw, pv] | min if (soc <= floor and p == 'Max Export') else raw) %}
       {{ ([[pre, ceil] | min, 0] | max) | round(2) }}

@@ -56,7 +56,7 @@ def render_sensors(states):
     return policy, float(dispatch)
 
 
-def reference(override, select, session, pv, load_raw, soc, cap_w=3680, hard=2.8):
+def reference(override, select, session, pv, load_raw, soc, cap_w=3680, hard=2.8, reserve=38.0):
     """The oracle: the behaviour the helpers replaced, stated independently.
 
     Verified equal to the pre-refactor heartbeat inline formulas over the full
@@ -71,7 +71,11 @@ def reference(override, select, session, pv, load_raw, soc, cap_w=3680, hard=2.8
         raw, ceil = max(pv, load), min(load + cap, 6.6)
     else:
         raw, ceil = load, min(load + cap, 6.6)
-    pre = min(raw, pv) if (soc <= hard and p == "Max Export") else raw
+    # RD44: during a paid session the sell stops at the overnight reserve, not the
+    # deep-discharge floor. max() so the deep floor still binds if it is higher —
+    # the clamp can only ever sell LESS.
+    floor = max(hard, reserve) if session else hard
+    pre = min(raw, pv) if (soc <= floor and p == "Max Export") else raw
     return p, round(max(min(pre, ceil), 0), 2)
 
 
@@ -79,11 +83,14 @@ def _matrix():
     for select in ("Predbat", "Max Export", "Hold Battery", "Solar Charge Battery"):
         for override in ("Off", "Hold Battery", "Max Export", "Solar Charge Battery", "Predbat"):
             for session in (False, True):
-                for pv, load, soc in ((0.1, 1.5, 1.3), (1.329, 0.364, 1.7), (8.0, 0.5, 50), (0.0, 0.4, 90), (3.0, 3.0, 2.8), (3.19, 0.48, 1.8)):
+                # The last three sit in the band between the deep floor (2.8) and
+                # the reserve (38) — where a session clamps and an ordinary drain
+                # does not. Without them this matrix cannot see RD44 at all.
+                for pv, load, soc in ((0.1, 1.5, 1.3), (1.329, 0.364, 1.7), (8.0, 0.5, 50), (0.0, 0.4, 90), (3.0, 3.0, 2.8), (3.19, 0.48, 1.8), (1.2, 0.5, 30.0), (0.8, 0.6, 38.0), (2.0, 0.7, 38.1)):
                     yield override, select, session, pv, load, soc
 
 
-def _states(override, select, session, pv, load, soc, hard=2.8):
+def _states(override, select, session, pv, load, soc, hard=2.8, reserve=38.0):
     return {
         "input_select.sig_override": override,
         "input_select.sig_dispatch_policy": select,
@@ -93,6 +100,7 @@ def _states(override, select, session, pv, load, soc, hard=2.8):
         "sensor.sigen_plant_battery_state_of_charge": str(soc),
         "input_number.dno_export_limit_w": "3680",
         "input_number.sig_drain_floor_pct": str(hard),
+        "input_number.sig_keep_floor_pct": str(reserve),
     }
 
 
@@ -122,6 +130,67 @@ def test_sell_clamp_is_sell_only():
     st = _states("Solar Charge Battery", "Predbat", False, pv=0.311, load=0.359, soc=1.3)
     assert abs(render_sensors(st)[1] - 0.359) < 0.011, "Solar Charge below floor must still cover load"
     print("PASS  sell-clamp is sell-only (RD22) at the single source")
+
+
+def test_session_sell_stops_at_the_overnight_reserve():
+    """RD44: a paid session must not sell the night.
+
+    Andrew, 2026-08-18: "It should stop at overnight reserve." The plugin already
+    PUBLISHED that — `sig_keep_floor_pct` carries `overnight_target_kwh` for a
+    session dump, and the plugin says "dump, which still stops at the overnight
+    reserve (RD20)" — but the keep-floor guard deliberately stands off a live
+    session, so the only bound left was the 1.0% deep-discharge floor.
+
+    Live 2026-08-17: the 18:00 dump ran to 30.8% against a 38% reserve and stopped
+    only because the window closed at 19:00.
+    """
+    st = _states("Off", "Hold Battery", True, pv=1.2, load=0.5, soc=30.0)
+    policy, kw = render_sensors(st)
+    assert policy == "Max Export", "the session must still force Max Export, got {}".format(policy)
+    assert abs(kw - 1.2) < 0.011, "below the 38% reserve the session must dispatch PV only (1.2), got {}".format(kw)
+    print("PASS  session sell stops at the overnight reserve")
+
+
+def test_session_sell_runs_while_above_the_reserve():
+    """...and is untouched above it — this must not cut a session short."""
+    st = _states("Off", "Hold Battery", True, pv=1.2, load=0.5, soc=45.0)
+    policy, kw = render_sensors(st)
+    assert policy == "Max Export", "got {}".format(policy)
+    assert abs(kw - 6.6) < 0.011, "above the reserve the session must sell at full tilt (6.6), got {}".format(kw)
+    print("PASS  session sell runs at full tilt above the reserve")
+
+
+def test_ordinary_drain_still_uses_the_deep_floor():
+    """The reserve floor is SESSION-ONLY. A curtailment drain must still be able to
+    run to the deep floor — that is R25 headroom, and clamping it at 38% would
+    delete the drain mechanism in all but name."""
+    st = _states("Off", "Max Export", False, pv=1.2, load=0.5, soc=30.0)
+    policy, kw = render_sensors(st)
+    assert policy == "Max Export", "got {}".format(policy)
+    assert abs(kw - 6.6) < 0.011, "no session: SOC 30 is far above the 2.8 deep floor and must sell at 6.6, got {}".format(kw)
+    print("PASS  an ordinary curtailment drain still runs to the deep floor")
+
+
+def test_session_floor_never_sells_below_the_deep_floor():
+    """max(), not a swap: if the reserve is ever LOWER than the deep floor, the deep
+    floor still binds. The clamp may only ever sell less."""
+    st = _states("Off", "Hold Battery", True, pv=0.9, load=0.5, soc=2.0, hard=2.8, reserve=1.0)
+    _policy, kw = render_sensors(st)
+    assert abs(kw - 0.9) < 0.011, "deep floor must still bind when the reserve is lower, got {}".format(kw)
+    print("PASS  the deep-discharge floor still binds under the session floor")
+
+
+def test_session_floor_fails_safe_when_the_reserve_is_unreadable():
+    """An unreadable reserve helper must stop the sell EARLY, not sell the night.
+
+    Same direction as RD23's choice for `hard`: the default (38) is the plugin's
+    DEFAULT_KEEP_FLOOR_PCT, so a missing helper behaves like a normal reserve.
+    """
+    st = _states("Off", "Hold Battery", True, pv=1.1, load=0.5, soc=20.0)
+    del st["input_number.sig_keep_floor_pct"]
+    _policy, kw = render_sensors(st)
+    assert abs(kw - 1.1) < 0.011, "unreadable reserve must fall back to 38 and clamp to PV, got {}".format(kw)
+    print("PASS  an unreadable reserve fails safe (stops the sell)")
 
 
 def test_dispatch_never_emits_a_bare_unknown():
@@ -213,6 +282,11 @@ def run():
     for fn in (
         test_intent_sensors_match_reference,
         test_sell_clamp_is_sell_only,
+        test_session_sell_stops_at_the_overnight_reserve,
+        test_session_sell_runs_while_above_the_reserve,
+        test_ordinary_drain_still_uses_the_deep_floor,
+        test_session_floor_never_sells_below_the_deep_floor,
+        test_session_floor_fails_safe_when_the_reserve_is_unreadable,
         test_dispatch_never_emits_a_bare_unknown,
         test_heartbeat_defers_to_intent_sensors,
         test_triggers_fire_on_the_derived_sensor_not_its_inputs,
