@@ -5033,7 +5033,11 @@ def test_holds_past_safe_time_until_sundown():
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=BATTERY_KWH * 0.40,
+        # RD45: a near-full battery, so the surplus genuinely does NOT fit and CM has
+        # a reason to hold the wheel. At 40% the headroom swallows the remaining p90
+        # and RD45 stands CM down first — correctly, but then this test would be
+        # asserting the risk gate rather than the safe_time rule it is named for.
+        soc_kw=BATTERY_KWH * 0.95,
         minutes_now=720,
         best_soc_keep=4.0,
         now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
@@ -7077,11 +7081,22 @@ def test_v32_no_deactivate_past_safe_time_holds():
     print("  test_v32_no_deactivate_past_safe_time_holds: PASSED")
 
 
-def test_v32_overflow_fits_holds_not_off():
-    """v32: mid-day, when the battery headroom can absorb all remaining p90
-    overflow (+buffer), the plugin STAYS ACTIVE with a Hold override — it does NOT
-    deactivate to Predbat/MSC (the v31 early-handback bug that round-tripped PV on
-    2026-07-20)."""
+def test_rd45_no_curtailment_risk_stands_down():
+    """RD45 (2026-08-18): with no curtailment risk, CM has no job and stands down.
+
+    Was `test_v32_overflow_fits_holds_not_off`, which asserted the OPPOSITE — that
+    overflow-fits must stay active with a Hold override. That was right while CM was
+    the only thing driving the day (v31's early handback round-tripped PV through
+    the battery on 2026-07-20). It is wrong now: the evening reserve is Predbat's
+    job, Predbat plans it better, and holding the wheel on a no-risk day only stops
+    it. Live 2026-08-18: p90 0.69 kWh, verdict "fits", CM on the wheel since 06:40
+    charging to its own 58.7% target while Predbat's plan would have banked 85% and
+    sold the 18:00 session for ~60p more.
+
+    The v31 bug this replaces is still guarded — see
+    `test_rd45_still_active_while_the_surplus_does_not_fit`, which is the same
+    scenario with real risk and must still Hold rather than hand back.
+    """
     pv = {m: 2.0 for m in range(0, 480, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
     sensor_overrides = {"sensor.sigen_plant_pv_power": 2.0, "sensor.sigen_plant_consumed_power": 0.5}
@@ -7097,13 +7112,20 @@ def test_v32_overflow_fits_holds_not_off():
         best_soc_keep=4.0,
         sensor_overrides=sensor_overrides,
     )
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
     plugin = CurtailmentPlugin(base)
     plugin._peak_pv = 7.5  # peak already seen today
+    # Through on_update, not calculate(): the gate is a decision about WHO DRIVES,
+    # so it sits at the take-the-wheel point. calculate() still returns "active"
+    # with real floors, which is what keeps the observe-only sensor honest.
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
-    assert phase == "active", f"v32: overflow-fits must NOT deactivate, got {phase}"
-    assert plugin._policy_override == "no_drain", f"v32.1: overflow-fits → no_drain override, got {plugin._policy_override}"
-    assert plugin._safe_time_str > "14:00", f"scenario must be before safe_time to test fits path, safe={plugin._safe_time_str}"
-    print("  test_v32_overflow_fits_holds_not_off: PASSED")
+    assert phase == "active", f"calculate() must still compute the intention, got {phase}"
+    assert plugin._no_risk_latched, "the risk gate must have latched on this scenario"
+    plugin.on_update()
+    assert plugin.last_phase == "off", f"RD45: no curtailment risk must stand CM down, got {plugin.last_phase}"
+    assert plugin._floor_source == "No Curtailment Risk", f"and must name itself, got {plugin._floor_source}"
+    assert plugin._safe_time_str > "14:00", f"scenario must be before safe_time to test the fits path, safe={plugin._safe_time_str}"
+    print("  test_rd45_no_curtailment_risk_stands_down: PASSED")
 
 
 def test_v32_overflow_does_not_fit_schmitt_drives():
@@ -8208,8 +8230,13 @@ def test_no_overflow_left_is_not_reported_as_surplus_fits():
     print("  test_no_overflow_left_is_not_reported_as_surplus_fits: PASSED")
 
 
-def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False):
-    """Plugin already through its PV day, now at dusk with `pv_kw` on the array."""
+def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False, soc_frac=0.40):
+    """Plugin already through its PV day, now at dusk with `pv_kw` on the array.
+
+    `soc_frac` exists for RD45: with a mostly-empty battery the remaining surplus
+    fits trivially at dusk, so CM stands down on the risk gate before the sundown
+    logic is reached. Pass a near-full battery when the SUNDOWN rule is the subject.
+    """
     from datetime import datetime, timezone
 
     pv, load = _make_overflow_pv(minutes_now=720)
@@ -8218,7 +8245,7 @@ def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False):
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=BATTERY_KWH * 0.40,
+        soc_kw=BATTERY_KWH * soc_frac,
         minutes_now=720,
         best_soc_keep=4.0,
         now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
@@ -8261,7 +8288,7 @@ def test_sundown_gated_on_solar_elevation():
     from datetime import datetime, timezone
 
     # 11.1 deg — above the gate, reproducing a false sundown.
-    high = _dusk_rig(datetime(2025, 7, 12, 19, 10, tzinfo=timezone.utc), 20 * 60 + 10, pv_kw=0.03)
+    high = _dusk_rig(datetime(2025, 7, 12, 19, 10, tzinfo=timezone.utc), 20 * 60 + 10, pv_kw=0.03, soc_frac=0.97)
     assert high.last_phase == "active", "sun still 11.1 deg up — PV≈0 is a cloud, not sunset"
 
     # 4.9 deg — below the gate, reproducing a genuine handback.
@@ -9473,7 +9500,7 @@ def run_curtailment_tests(my_predbat=None):
     # v32 evening lifecycle (overflow_fits→Hold, sundown deactivate, sessions)
     v32_tests = [
         test_v32_no_deactivate_past_safe_time_holds,
-        test_v32_overflow_fits_holds_not_off,
+        test_rd45_no_curtailment_risk_stands_down,
         test_v32_overflow_does_not_fit_schmitt_drives,
         test_v32_sundown_still_deactivates,
         test_v32_saving_session_plugin_stays_active_but_delegates_dispatch,
