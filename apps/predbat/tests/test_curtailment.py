@@ -36,6 +36,7 @@ from curtailment_calc import (
     p_scales_from_forecast,
     p90_scale_from_forecast,
     estimate_session_end_kwh,
+    session_sell_floor_kwh,
     estimate_session_export_left_kwh,
     DEEP_DISCHARGE_FLOOR_KWH,
     compute_proposed_phase,
@@ -4553,6 +4554,7 @@ from curtailment_plugin import (
     SOLCAST_TODAY,
     SIG_SAVING_SESSION as SIG_SAVING_SESSION_ENTITY,
     SIG_SESSION_MINUTES,
+    DEFAULT_KEEP_FLOOR_PCT,
     SIG_SESSION_START,
     SIG_SESSION_END,
     SIG_POLICY_SELECT,
@@ -8094,6 +8096,45 @@ def test_session_projection_is_blank_while_the_end_time_is_unknown():
     print("  test_session_projection_is_blank_while_the_end_time_is_unknown: PASSED")
 
 
+def test_session_end_projection_stops_at_the_enforced_floor():
+    """RD44: the card must model the stop the dispatcher will actually make.
+
+    The mirror of `test_session_end_projection_is_not_clamped_at_a_floor_nothing_enforces`,
+    which stays as written: a floor NOTHING enforces must not be clamped to (RD42),
+    and a floor that IS enforced must be. The difference between those two tests is
+    the entire lesson of RD42 -> RD44.
+    """
+    unclamped = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=60, discharge_efficiency=1.0)
+    clamped = estimate_session_end_kwh(soc_kwh=9.0, cap_kw=3.68, load_kw=0.5, pv_kw=0.0, minutes_remaining=60, discharge_efficiency=1.0, floor_kwh=6.87)
+    assert unclamped < 6.87, "the fixture must actually cross the floor or this proves nothing, got {:.2f}".format(unclamped)
+    assert abs(clamped - 6.87) < 0.001, "with an enforced floor the projection must pin to it, got {:.2f}".format(clamped)
+    print("  test_session_end_projection_stops_at_the_enforced_floor: PASSED ({:.2f} -> {:.2f})".format(unclamped, clamped))
+
+
+def test_session_export_left_is_bounded_by_the_pack_above_the_floor():
+    """RD44: "still to sell" cannot exceed what the pack may still give up.
+
+    Otherwise the card offers a sell figure beside an end SOC pinned at the
+    reserve — two answers to the same question, which is the disagreement RD44
+    exists to remove.
+    """
+    by_window = estimate_session_export_left_kwh(3.68, 60)
+    assert abs(by_window - 3.68) < 0.001, "unbounded must stay the pure cap x hours, got {:.2f}".format(by_window)
+    bounded = estimate_session_export_left_kwh(3.68, 60, sellable_pack_kwh=2.13, discharge_efficiency=1.0)
+    assert abs(bounded - 2.13) < 0.001, "must cap at the sellable pack, got {:.2f}".format(bounded)
+    roomy = estimate_session_export_left_kwh(3.68, 60, sellable_pack_kwh=99.0, discharge_efficiency=1.0)
+    assert abs(roomy - 3.68) < 0.001, "with pack to spare the window is still the limit, got {:.2f}".format(roomy)
+    print("  test_session_export_left_is_bounded_by_the_pack_above_the_floor: PASSED")
+
+
+def test_session_sell_floor_takes_the_higher_of_the_two_helpers():
+    """RD44 floor = max(deep floor, keep floor). One definition, shared with the Jinja."""
+    assert abs(session_sell_floor_kwh(1.0, 38.0, 18.08) - 6.8704) < 0.001, "the reserve must win when it is higher"
+    assert abs(session_sell_floor_kwh(45.0, 38.0, 18.08) - 8.136) < 0.001, "the deep floor must win when IT is higher"
+    assert session_sell_floor_kwh("bad", None, 18.08) == 0.0, "unreadable helpers must not raise"
+    print("  test_session_sell_floor_takes_the_higher_of_the_two_helpers: PASSED")
+
+
 def test_session_export_left_is_published_during_the_dump():
     """RD42: the card must be able to say how much is still to sell.
 
@@ -8113,9 +8154,19 @@ def test_session_export_left_is_published_during_the_dump():
     assert left is not None and left > 0, f"mid-dump there must be something left to sell, got {left}"
     # The projection is built from it: end SOC must be below current by at least
     # the exported energy, since the pack also carries house load.
+    #
+    # RD44 tightened this from an inequality to near-equality. With no keep-floor
+    # override the fixture takes DEFAULT_KEEP_FLOOR_PCT (38%), so the sell stops at
+    # 6.87 of the 9.0 kWh and BOTH numbers become the same 2.13 — which is the
+    # agreement being asserted. The tolerance is for `session_end_soc_pct` being
+    # published to 1 dp; without it this compares a rounded percentage against an
+    # unrounded kWh and fails by a hair.
     drop_kwh = (9.0 / 18.08 * 100 - attrs["session_end_soc_pct"]) / 100.0 * 18.08
-    assert drop_kwh >= left, f"the pack must give up at least the {left} kWh sold, got {drop_kwh:.2f}"
-    print(f"  test_session_export_left_is_published_during_the_dump: PASSED ({left} kWh)")
+    assert drop_kwh >= left - 0.02, f"the pack must give up at least the {left} kWh sold, got {drop_kwh:.2f}"
+    floor_pct = DEFAULT_KEEP_FLOOR_PCT
+    assert attrs["session_end_soc_pct"] >= floor_pct - 0.1, "RD44: the projection must not fall below the enforced floor {}%, got {}".format(floor_pct, attrs["session_end_soc_pct"])
+    assert left <= 9.0 - floor_pct / 100.0 * 18.08 + 0.02, f"RD44: cannot sell more than the pack holds above the floor, got {left}"
+    print(f"  test_session_export_left_is_published_during_the_dump: PASSED ({left} kWh, end pinned at the {floor_pct}% floor)")
 
 
 def test_no_overflow_left_is_not_reported_as_surplus_fits():
@@ -9458,6 +9509,9 @@ def run_curtailment_tests(my_predbat=None):
         test_session_export_left_is_the_display_quantity,
         test_session_end_projection_is_not_clamped_at_a_floor_nothing_enforces,
         test_session_end_soc_is_published_during_the_dump,
+        test_session_end_projection_stops_at_the_enforced_floor,
+        test_session_export_left_is_bounded_by_the_pack_above_the_floor,
+        test_session_sell_floor_takes_the_higher_of_the_two_helpers,
         test_session_export_left_is_published_during_the_dump,
         test_session_projection_is_blank_while_the_end_time_is_unknown,
         test_no_overflow_left_is_not_reported_as_surplus_fits,
