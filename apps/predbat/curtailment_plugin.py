@@ -518,6 +518,7 @@ class CurtailmentPlugin(PredBatPlugin):
         # raises drain_above ahead of a known session so the reserve isn't drained.
         self._policy_override = None
         self._overflow_fits_latched = False
+        self._no_risk_latched = False
         self._session_active = False
         self._session_protect_kwh = 0.0
         # Which arm of compute_drain_above set the published Headroom Floor.
@@ -772,6 +773,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._keep_drained_today = False
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
+        self._no_risk_latched = False  # RD45 activation gate hysteresis latch
         self._sundown_latched = False  # O1 dusk-flap latch
         self._dawn_released = False  # v33 dawn-gap reserve re-arms for the new dawn
         self._dawn_cross_count = 0
@@ -1939,6 +1941,18 @@ class CurtailmentPlugin(PredBatPlugin):
             self._overflow_fits_latched = peaked and fits_margin >= (early_buffer - FITS_HYST_KWH)
         else:
             self._overflow_fits_latched = peaked and fits_margin >= early_buffer
+        # RD45: the same margin, WITHOUT the `peaked` requirement, decides whether
+        # CM has a job at all. `peaked` belongs to the Hold/Drain gate above — it
+        # stops us calling the day too early while we are still deciding whether to
+        # keep draining. The activation question is different: "is any curtailment
+        # forecast to breach the headroom I have", which the p90 answers from dawn.
+        # Requiring `peaked` here would keep CM on the wheel every morning of every
+        # no-risk day, which is exactly the behaviour this removes.
+        # Same hysteresis, so the take/stand-down decision cannot chatter.
+        if self._no_risk_latched:
+            self._no_risk_latched = fits_margin >= (early_buffer - FITS_HYST_KWH)
+        else:
+            self._no_risk_latched = fits_margin >= early_buffer
         # R63 drain deadline: the fits-check above is a pure ENERGY test — it asks
         # "does the surplus fit", never "can I still MAKE it fit". Shed rate is
         # cap - max(0, pv - load), which inverts once PV-load clears the cap
@@ -3913,6 +3927,38 @@ class CurtailmentPlugin(PredBatPlugin):
                 return
 
             floor, phase = self.calculate(dno_limit)
+
+            # RD45 (2026-08-18, Andrew: "whenever overflow exists"): CM takes the
+            # wheel ONLY when there is curtailment still to manage. Its one job is
+            # to minimise curtailment; where the forecast surplus fits the headroom
+            # with the p90 defence intact there is nothing to minimise, and holding
+            # the wheel only stops Predbat optimising the day.
+            #
+            # Live 2026-08-18: p90 0.69 kWh, verdict "fits", CM on the wheel since
+            # 06:40 charging to its own 58.7% session target, while Predbat's plan
+            # (read-only, never executed) banked to 85% and sold the 18:00 session
+            # for ~60p more.
+            #
+            # Applied HERE and not inside calculate() on purpose. calculate() still
+            # computes the floors and the policy it WOULD choose, so the observe-only
+            # sensor keeps publishing a real intention (the card renders it as
+            # "shadowing only — CM would be X") and the R54/R55/sundown tests still
+            # reach the maths they exist to check. Standing down is a decision about
+            # who drives, not about where the floor is.
+            #
+            # This DELIBERATELY narrows RD17/RD28, which kept CM active on
+            # no-overflow days to run the Charge arm for the evening reserve. That
+            # existed because CM was the only thing driving; the reserve is Predbat's
+            # job and Predbat plans it better. Agreed explicitly before the change.
+            #
+            # RD14-own still outranks it: never hand back during or minutes before a
+            # joined session, because the heartbeat only forces Max Export while CM
+            # holds the wheel and the select is not `Predbat` (2026-08-03: export
+            # went 3.7 kW -> 0 with 20 minutes of the paid window left).
+            if phase == "active" and self._no_risk_latched and not (self._is_session_dispatching() or self._session_imminent()):
+                phase = "off"
+                self._last_decision = "off: no curtailment risk (p90 fits headroom)"
+                self._floor_source = "No Curtailment Risk"
 
             # Defer to Predbat charge windows when SOC below effective keep (R4).
             # ±0.2 kWh hysteresis via _r4_deferring flag (Bug 6): engage when SOC
