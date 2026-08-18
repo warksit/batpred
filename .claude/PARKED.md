@@ -19,6 +19,19 @@ Format: `- [date] finding — why it might matter — evidence`
   line. Cannot be told apart tonight — the branch only runs inside the curtailment
   window, and there is no session armed.
 
+- **[2026-08-18] RD44 makes the session end-SOC projection pessimistic — my own
+  change created this.** RD42 removed the clamp from `estimate_session_end_kwh`
+  because "the keep-floor guard stops the discharge there" was false — nothing
+  enforced that floor. RD44 now enforces it, so the reasoning RD42 rejected has
+  become true and the projection is the piece that is now wrong: it models the
+  sell running past the overnight reserve, when the setpoint clamp will stop it
+  there. Expect `session_end_soc_pct` to read BELOW the reserve on a session that
+  hits the floor, while the battery actually finishes at it. Display only — the
+  controller is right, the card under-reads. Fix is `max(projection, reserve)`,
+  i.e. re-introducing RD42's clamp with the enforcement it always lacked. Worth
+  doing before the next session so the card and the dispatcher do not disagree,
+  which is the failure mode this codebase keeps paying for.
+
 ## Security
 
 - **[2026-08-17] The Predbat MCP bearer token is committed to a PUBLIC repo.**
