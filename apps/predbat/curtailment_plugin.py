@@ -65,6 +65,7 @@ from curtailment_calc import (
     forecast_energy_to_now,
     day_tracking_ratio,
     estimate_session_end_kwh,
+    session_sell_floor_kwh,
     estimate_session_export_left_kwh,
     compute_proposed_phase,
     phase_to_policy,
@@ -3033,6 +3034,25 @@ class CurtailmentPlugin(PredBatPlugin):
         """
         return max(float(getattr(self.base, "reserve", 0) or 0), DEEP_DISCHARGE_FLOOR_KWH, self._dawn_floor_kwh(soc_max))
 
+    def _session_sell_floor_kwh(self, soc_max):
+        """The SOC a live session's sell stops at (RD44), in kWh.
+
+        Reads both live helpers and defers the arithmetic to
+        `session_sell_floor_kwh` so the Python and the Jinja clamp cannot drift.
+        Defaults match the Jinja's (`float(2.8)` / `float(38)`), which both fail
+        SAFE: an unreadable helper stops the sell early rather than selling the
+        night.
+        """
+        try:
+            drain = float(self.base.get_state_wrapper(SIG_DRAIN_FLOOR_HELPER, default=DEFAULT_DRAIN_FLOOR_PCT))
+        except (TypeError, ValueError):
+            drain = DEFAULT_DRAIN_FLOOR_PCT
+        try:
+            keep = float(self.base.get_state_wrapper(SIG_KEEP_FLOOR_HELPER, default=DEFAULT_KEEP_FLOOR_PCT))
+        except (TypeError, ValueError):
+            keep = DEFAULT_KEEP_FLOOR_PCT
+        return session_sell_floor_kwh(drain, keep, soc_max)
+
     def _drain_floor_kwh(self, soc_max):
         """The released floor, in kWh, from the ONE live drain-floor helper.
 
@@ -3627,7 +3647,11 @@ class CurtailmentPlugin(PredBatPlugin):
                 # on the calendar's naive end_time) — parked, not smuggled here.
                 if not mins_left or mins_left <= 0:
                     raise ValueError("session end time not yet known")
-                session_export_left_kwh = round(estimate_session_export_left_kwh(cap_kw, mins_left), 2)
+                # RD44: bounded by the pack above the enforced floor, not just by
+                # the clock — otherwise the card offers "still to sell" beside an
+                # end SOC pinned at the reserve, two answers to one question.
+                sellable = max(0.0, soc_kwh - self._session_sell_floor_kwh(soc_max))
+                session_export_left_kwh = round(estimate_session_export_left_kwh(cap_kw, mins_left, sellable_pack_kwh=sellable, discharge_efficiency=self._discharge_efficiency()), 2)
                 end_kwh = estimate_session_end_kwh(
                     soc_kwh=soc_kwh,
                     cap_kw=cap_kw,
@@ -3635,6 +3659,12 @@ class CurtailmentPlugin(PredBatPlugin):
                     pv_kw=float(self.base.get_state_wrapper(SIG_PV_POWER, default=0.0) or 0.0),
                     minutes_remaining=mins_left,
                     discharge_efficiency=self._discharge_efficiency(),
+                    # RD44: the sell now really does stop here, so the projection
+                    # must say so. Read from the SAME two helpers the Jinja clamp
+                    # reads, not from `_overnight_target_kwh` — the dispatcher
+                    # obeys the live helper, so the card must be built from the
+                    # live helper or the two can disagree by a cycle.
+                    floor_kwh=self._session_sell_floor_kwh(soc_max),
                 )
                 session_end_soc_pct = round(end_kwh / max(soc_max, 0.1) * 100.0, 1)
             except (TypeError, ValueError, AttributeError):

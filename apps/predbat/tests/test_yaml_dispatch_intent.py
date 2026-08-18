@@ -18,6 +18,9 @@ import sys
 import jinja2
 import yaml
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from curtailment_calc import session_sell_floor_kwh  # noqa: E402
+
 HERE = os.path.dirname(__file__)
 HELPERS_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_intent_helpers.yaml")
 HEARTBEAT_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_heartbeat.yaml")
@@ -193,6 +196,34 @@ def test_session_floor_fails_safe_when_the_reserve_is_unreadable():
     print("PASS  an unreadable reserve fails safe (stops the sell)")
 
 
+def test_jinja_session_floor_matches_the_python_definition():
+    """RD44 floor lives in TWO languages, so probe the REAL clamp point.
+
+    The clamp is Jinja (it sets the dispatch setpoint); the end-SOC projection is
+    Python (it feeds the card). The Charter's rule for a quantity that must live
+    in two places is a test that renders every copy. If they drift, the card
+    promises a stop the dispatcher will not make — the exact failure RD44 exists
+    to remove.
+
+    Written the second time. The first version rebuilt the floor expression inline
+    and compared THAT to Python — a third copy, which passed happily with the real
+    template drifted from max() to min(). This renders the deployed
+    `sig_dispatch_kw` either side of the Python floor and asserts the clamp turns
+    on exactly there, so it cannot pass without touching the real subject.
+    """
+    soc_max = 18.08
+    for hard, reserve in ((1.0, 38.0), (2.8, 38.0), (45.0, 38.0), (5.0, 5.0), (0.0, 95.0)):
+        floor_pct = session_sell_floor_kwh(hard, reserve, soc_max) / soc_max * 100.0
+        below = _states("Off", "Hold Battery", True, pv=1.2, load=0.5, soc=max(0.0, floor_pct - 0.1), hard=hard, reserve=reserve)
+        above = _states("Off", "Hold Battery", True, pv=1.2, load=0.5, soc=min(100.0, floor_pct + 0.1), hard=hard, reserve=reserve)
+        _p, kw_below = render_sensors(below)
+        _p, kw_above = render_sensors(above)
+        assert abs(kw_below - 1.2) < 0.011, "hard={} reserve={}: just BELOW the python floor ({:.2f}%) the dispatcher must clamp to PV, got {}".format(hard, reserve, floor_pct, kw_below)
+        if floor_pct < 99.9:
+            assert abs(kw_above - 6.6) < 0.011, "hard={} reserve={}: just ABOVE the python floor ({:.2f}%) the dispatcher must sell, got {}".format(hard, reserve, floor_pct, kw_above)
+    print("PASS  the deployed clamp turns on exactly at the Python floor")
+
+
 def test_dispatch_never_emits_a_bare_unknown():
     """Fail-safe: with every source entity missing the sensor must still render a
     number, and consumers must be able to tell "no opinion" from a real 0 —
@@ -287,6 +318,7 @@ def run():
         test_ordinary_drain_still_uses_the_deep_floor,
         test_session_floor_never_sells_below_the_deep_floor,
         test_session_floor_fails_safe_when_the_reserve_is_unreadable,
+        test_jinja_session_floor_matches_the_python_definition,
         test_dispatch_never_emits_a_bare_unknown,
         test_heartbeat_defers_to_intent_sensors,
         test_triggers_fire_on_the_derived_sensor_not_its_inputs,

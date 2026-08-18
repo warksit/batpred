@@ -570,7 +570,7 @@ def compute_drain_above_source(reserve, overflow_floor, session_protect_kwh=0.0,
     return "overflow_floor"
 
 
-def estimate_session_export_left_kwh(cap_kw, minutes_remaining):
+def estimate_session_export_left_kwh(cap_kw, minutes_remaining, sellable_pack_kwh=None, discharge_efficiency=1.0):
     """Grid-side energy still to be sold before the saving session ends.
 
         export_left = cap_kw x hours_remaining
@@ -583,6 +583,17 @@ def estimate_session_export_left_kwh(cap_kw, minutes_remaining):
 
     This is the number the card leads with. "How much is there still to sell"
     is the question a human asks mid-session, and it was not on the card at all.
+
+    RD44: the window is no longer the only limit. Once SOC reaches the overnight
+    reserve the setpoint clamps to PV and the battery stops being sold, so the
+    time-based figure over-reads whenever the pack runs out first. Passing
+    `sellable_pack_kwh` (SOC above the enforced floor) caps this at what the pack
+    can actually deliver — converted to the grid side by the discharge efficiency,
+    because the pack must give up more than the meter will see. Without that cap
+    the card can say "4.0 kWh still to sell" beside an end-SOC pinned at the
+    reserve, which are two answers to the same question.
+
+    `sellable_pack_kwh=None` keeps the pure time-based figure.
     """
     try:
         mins = float(minutes_remaining)
@@ -590,10 +601,39 @@ def estimate_session_export_left_kwh(cap_kw, minutes_remaining):
         return 0.0
     if mins <= 0:
         return 0.0
-    return max(0.0, float(cap_kw)) * (mins / 60.0)
+    by_window = max(0.0, float(cap_kw)) * (mins / 60.0)
+    if sellable_pack_kwh is None:
+        return by_window
+    eff = float(discharge_efficiency) if discharge_efficiency else 1.0
+    by_pack = max(0.0, float(sellable_pack_kwh)) * max(0.5, eff)
+    return min(by_window, by_pack)
 
 
-def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining, discharge_efficiency=1.0):
+def session_sell_floor_kwh(drain_floor_pct, keep_floor_pct, soc_max):
+    """The SOC (kWh) a live session's sell actually stops at (RD44).
+
+    ONE definition of the floor RD44 enforces. The clamp itself lives in Jinja,
+    in `ha/sig_dispatch_intent_helpers.yaml`, because that is where the dispatch
+    setpoint is computed; this is the Python copy the end-SOC projection needs so
+    the card cannot promise a different stop from the one the dispatcher will make.
+    Both copies are rendered against each other by
+    `test_jinja_session_floor_matches_the_python_definition`.
+
+    `max()` of the two helpers, matching the Jinja exactly: the deep-discharge
+    floor still binds if it is ever the higher, so this can only raise the stop.
+    """
+    try:
+        drain = float(drain_floor_pct)
+    except (TypeError, ValueError):
+        drain = 0.0
+    try:
+        keep = float(keep_floor_pct)
+    except (TypeError, ValueError):
+        keep = 0.0
+    return max(drain, keep) / 100.0 * max(float(soc_max), 0.0)
+
+
+def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining, discharge_efficiency=1.0, floor_kwh=None):
     """Projected battery energy (kWh) when a live saving session ends.
 
     Built from the energy still to sell rather than from a power extrapolation:
@@ -607,14 +647,22 @@ def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining,
 
     Zero or negative time remaining returns the current SOC unchanged.
 
-    RD42 (2026-08-14) — why there is no floor clamp. It used to end
-    `return max(floor_kwh, projected)`, justified as "the keep-floor guard stops
-    the sell there". The guard DEFERS to a live session (RD14-own), so the dump
-    runs straight through the floor and the clamp promised a stop that does not
-    happen. Live 12 Aug 2026 19:00: published 39.3% — exactly the overnight
-    target, i.e. the clamp itself — with SOC 57.2% and an hour left to run. The
-    session ended at 31.2%. The projection must be free to go below the
-    overnight reserve, because that is precisely the warning worth having.
+    RD42 (2026-08-14) removed a floor clamp; RD44 (2026-08-18) put it back, and
+    the difference is the whole point. RD42's clamp was justified as "the
+    keep-floor guard stops the sell there" — and it did not: the guard DEFERS to a
+    live session (RD14-own), so the dump ran straight through and the clamp
+    promised a stop nothing made. Live 12 Aug 2026 19:00 it published 39.3%,
+    exactly the overnight target (the clamp itself), with SOC 57.2% and an hour to
+    run; the session ended at 31.2%.
+
+    RD44 makes that stop real — the dispatch setpoint clamps to PV once SOC
+    reaches the overnight reserve — so the projection must model it, or the card
+    and the dispatcher disagree in the other direction: reading BELOW a reserve
+    the battery will actually finish at.
+
+    `floor_kwh=None` keeps the unclamped behaviour, so a caller that cannot name
+    an ENFORCED floor still gets the honest, free-running estimate. Never pass a
+    floor that nothing enforces — that is the RD42 defect exactly.
     """
     try:
         mins = float(minutes_remaining)
@@ -626,7 +674,10 @@ def estimate_session_end_kwh(soc_kwh, cap_kw, load_kw, pv_kw, minutes_remaining,
     eff = float(discharge_efficiency) if discharge_efficiency else 1.0
     export_left = estimate_session_export_left_kwh(cap_kw, mins)
     pack_draw = export_left / max(0.5, eff) + (float(load_kw) - float(pv_kw)) * hours
-    return float(soc_kwh) - max(0.0, pack_draw)
+    projected = float(soc_kwh) - max(0.0, pack_draw)
+    if floor_kwh is None:
+        return projected
+    return max(float(floor_kwh), projected)
 
 
 def forecast_energy_to_now(detailed_forecast, minutes_now, local_offset_hours=0):
