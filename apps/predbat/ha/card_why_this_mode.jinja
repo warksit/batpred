@@ -12,6 +12,14 @@ views[3] ("Archive (old layout)") holds an older copy that still renders
 labelled as the archive. Do not "fix" it and do not treat it as a second live
 site.
 
+2026-08-18 — a fourth: the HEADLINE lied. It read `ov if overriding else mode`,
+so with the policy gate off it announced "→ Hold Battery" — CM's hypothetical —
+while Predbat held the wheel and was charging the battery. The supporting lines
+were right ("Live Predbat", "not acting"), but the headline is what gets read.
+It now shows the policy IN FORCE and demotes CM's preference to "shadowing only".
+The "⏳ not applied" tag went with it: it means "CM asked and it has not landed
+yet", which is a lie when CM is not asking at all.
+
 2026-08-11 — three lines were lying:
   * session reserve advertised 43.0% held while 0% was held (the plugin now
     publishes the EFFECTIVE reserve; the `{% if sesspct %}` guard then hides
@@ -29,6 +37,7 @@ site.
 {% set live = states('input_select.sig_dispatch_policy') %}
 {% set ov = states('input_select.sig_override') %}
 {% set overriding = ov not in ['Off', 'unknown', 'unavailable', ''] %}
+{% set acting = state_attr(ip, 'acting') %}
 {% set soc = state_attr(ip, 'soc_pct') %}
 {% set lo = state_attr(ip, 'charge_below_pct') %}
 {% set hi = state_attr(ip, 'drain_above_pct') %}
@@ -53,13 +62,16 @@ site.
 {% set sesstime = (sessstart | as_datetime | as_local).strftime('%H:%M') if sessstart else '' %}
 {% set held = relative_time(states[ip].last_changed) if states[ip] is not none else '?' %}
 {% set stale_s = (now() - (states[ip].last_reported or states[ip].last_updated)).total_seconds() if states[ip] is not none else 0 %}
-### → {{ ov if overriding else mode }}
-*{{ a }}*
+### → {{ ov if overriding else (mode if acting else live) }}
+{% if overriding or acting %}*{{ a }}*
+{% else %}*shadowing only — CM would be **{{ mode }}** · {{ a }}*
+{% endif %}
 
 {% if overriding %}✋ **You set this**
 {% elif sessdisp %}⚡ **saving session** · heartbeat dispatching at the cap · {{ held }}
 {% if sessend is not none %}   ↳ ends at ~**{{ sessend | round(0) }}%**
 {% endif %}
+{% elif not acting %}Live **{{ live }}** · CM is not driving · {{ held }}
 {% else %}Live **{{ live }}**{% if live != mode and stale_s < 360 %} · ⏳ not applied{% elif live != mode %} · ⏳ awaiting next cycle{% endif %} · {{ held }}
 {% endif %}
 {% if stale_s > 660 %}⚠ **stale {{ (stale_s / 60) | round(0) }} min**
