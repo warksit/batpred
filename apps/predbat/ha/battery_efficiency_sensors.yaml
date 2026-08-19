@@ -1,0 +1,108 @@
+# Battery round-trip efficiency measurement — RECORD ONLY
+#
+# These are HA template helpers + input_numbers, created via ha_config_set_helper.
+# HA does not load this file; it is the repo record. Edit here in the same change
+# as the live helper, so the repo stays the source of truth.
+#
+# WHY THIS EXISTS (2026-08-19)
+#
+# "Should PV be exported directly rather than cycled through the battery?" needs a
+# number for what the round trip actually costs, and we did not have one. Two hand
+# calculations over the same fortnight disagreed — 3.85% and 2.0% — purely on how
+# the endpoints were handled. Predbat is configured at 2.78% (battery_loss 1.4% +
+# battery_loss_discharge 1.4%) with no evidence either way.
+#
+# THE MEASUREMENT
+#
+#     loss% = (charge - discharge - Δstored) / charge x 100
+#
+# all since a fixed baseline. Δstored is the whole point: without it the answer is
+# dominated by wherever the battery happens to sit right now. Verified live at the
+# moment of creation — same formula over the battery's whole life returned
+# 1.94% WITH the stored term and 5.78% WITHOUT it, on a 97% full battery. A 3.8
+# point error, which is larger than the quantity being measured.
+#
+# WHY NOT A UTILITY METER OR A RIEMANN INTEGRATION. The SIG already meters this
+# itself: `sensor.sigen_inverter_total_charge_energy` / `..._total_discharge_energy`
+# are monotonic lifetime counters in MWh. Integrating `battery_power` ourselves would
+# add quantisation and sampling error to data the inverter already reports exactly.
+#
+# WHY NOT THE PLANT ENERGY BALANCE as a cross-check: it closes to 0.01 kWh on 31.8
+# kWh of PV, which is far too good — `daily_load_consumption` is a derived residual,
+# so the balance is true by construction and carries no information about losses.
+#
+# THE CONFIDENCE GATE. Below 50 kWh of throughput since baseline the sensor reports
+# `unknown` rather than a number. Δstored can be up to ±18 kWh (a full pack), so at
+# low throughput it swamps the result — a reading there would be noise wearing a
+# decimal point. `sensor.battery_throughput_since_baseline` says how far in we are.
+# Treat the result as indicative under ~200 kWh and solid past ~500 kWh.
+#
+# RE-BASELINING. Set the three input_numbers to the current counter values and the
+# current stored energy, captured in the SAME instant (read them with one template,
+# not three calls). Do that after a battery replacement, a firmware change that
+# resets the counters, or to measure a specific window.
+#
+# CAVEAT NOT YET ADDRESSED: efficiency is load-dependent, and this reports a single
+# blended figure across all charge/discharge rates. If the split matters, bin by
+# average power over matched-SOC spans — see .claude/PARKED.md.
+
+input_numbers:
+  # Baseline snapshot. No `initial:` — that would force the value on every HA
+  # restart and silently reset the measurement.
+  - name: Battery Eff Base Charge kWh
+    entity_id: input_number.battery_eff_base_charge_kwh
+    min: 0
+    max: 1000000
+    step: 0.001
+    unit_of_measurement: kWh
+    mode: box
+    icon: mdi:battery-positive
+    value_at_creation: 456.08
+
+  - name: Battery Eff Base Discharge kWh
+    entity_id: input_number.battery_eff_base_discharge_kwh
+    min: 0
+    max: 1000000
+    step: 0.001
+    unit_of_measurement: kWh
+    mode: box
+    icon: mdi:battery-negative
+    value_at_creation: 429.72
+
+  - name: Battery Eff Base Stored kWh
+    entity_id: input_number.battery_eff_base_stored_kwh
+    min: 0
+    max: 1000
+    step: 0.001
+    unit_of_measurement: kWh
+    mode: box
+    icon: mdi:battery-50
+    value_at_creation: 17.538
+
+sensors:
+  # How far into the measurement we are — read this before believing the loss figure.
+  - name: Battery Throughput Since Baseline
+    entity_id: sensor.battery_throughput_since_baseline
+    unit_of_measurement: kWh
+    state: >-
+      {% set c = states('sensor.sigen_inverter_total_charge_energy') | float(0) * 1000 %}
+      {% set b = states('input_number.battery_eff_base_charge_kwh') | float(0) %}
+      {{ [c - b, 0] | max | round(2) }}
+
+  # The measurement. `unknown` until there is enough throughput to mean anything.
+  # SOC is read with float(-1) so an unavailable sensor cannot silently render as 0%
+  # and inflate the apparent loss by a whole pack.
+  - name: Battery Round Trip Loss
+    entity_id: sensor.battery_round_trip_loss
+    unit_of_measurement: "%"
+    state: >-
+      {% set c = states('sensor.sigen_inverter_total_charge_energy') | float(0) * 1000 - (states('input_number.battery_eff_base_charge_kwh') | float(0)) %}
+      {% set d = states('sensor.sigen_inverter_total_discharge_energy') | float(0) * 1000 - (states('input_number.battery_eff_base_discharge_kwh') | float(0)) %}
+      {% set stored_now = states('sensor.sigen_plant_battery_state_of_charge') | float(-1) / 100 * (states('sensor.sigen_plant_rated_energy_capacity') | float(0)) %}
+      {% set ds = stored_now - (states('input_number.battery_eff_base_stored_kwh') | float(0)) %}
+      {% if c < 50 or stored_now < 0 %} unknown
+      {% else %} {{ (((c - d - ds) / c * 100) | round(2)) }}
+      {% endif %}
+    availability: >-
+      {{ states('sensor.sigen_inverter_total_charge_energy') not in ['unknown','unavailable']
+         and states('sensor.sigen_plant_battery_state_of_charge') not in ['unknown','unavailable'] }}
