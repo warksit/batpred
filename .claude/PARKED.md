@@ -42,6 +42,8 @@ Format: `- [date] finding — why it might matter — evidence`
   behind it, consider lowering `battery_loss`/`battery_loss_discharge` to match — but
   only alongside a deliberate view on `metric_battery_cycle`, since the two knobs
   push the same decision in opposite directions.
+  **Plan with the review steps and the open 3.5% decision:**
+  `.claude/plans/battery-efficiency-review.md`.
   **Known gap:** this is a single blended figure across all charge/discharge rates.
   Efficiency is load-dependent. If that matters, bin by average power over
   matched-SOC spans (the analyser design in
