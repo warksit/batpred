@@ -19,6 +19,34 @@ Format: `- [date] finding — why it might matter — evidence`
   line. Cannot be told apart tonight — the branch only runs inside the curtailment
   window, and there is no session armed.
 
+## Awaiting data (measuring, not yet conclusive)
+
+- **[2026-08-19] Battery round-trip loss: CHECK THE NEW SENSORS AND REFINE.**
+  Built `sensor.battery_round_trip_loss` + `sensor.battery_throughput_since_baseline`
+  (+ three `input_number.battery_eff_base_*` holding the baseline). Repo record:
+  `apps/predbat/ha/battery_efficiency_sensors.yaml`.
+  **Baseline set 2026-08-19 at charge 456.08 / discharge 429.72 / stored 17.538 kWh.**
+  **When to look:** the sensor reports `unknown` below 50 kWh throughput; treat it as
+  indicative under ~200 kWh and solid past ~500 kWh. At ~15 kWh/day of charge that is
+  roughly **two weeks for indicative, five weeks for solid** — so review from early
+  September, and again in late September.
+  **What we think now:** whole-life figure at creation was **1.94%** loss (stored-term
+  corrected; the naive ratio said 5.78% on a 97%-full battery — a 3.8 point error, so
+  never quote the naive one). Predbat is configured at **2.78%** (`battery_loss` 1.4%
+  + `battery_loss_discharge` 1.4%), i.e. slightly PESSIMISTIC about storage.
+  **Decision taken:** leave the loss settings alone. 1.94% vs 2.78% is inside the
+  uncertainty while throughput is this small, and the error points the safe way —
+  it makes Predbat marginally less keen to cycle, which is the direction we want.
+  Correcting them downward would make it MORE willing to cycle.
+  **What to do at review:** if the sensor settles well below 2.78% with >500 kWh
+  behind it, consider lowering `battery_loss`/`battery_loss_discharge` to match — but
+  only alongside a deliberate view on `metric_battery_cycle`, since the two knobs
+  push the same decision in opposite directions.
+  **Known gap:** this is a single blended figure across all charge/discharge rates.
+  Efficiency is load-dependent. If that matters, bin by average power over
+  matched-SOC spans (the analyser design in
+  `~/.claude/plans/mellow-dazzling-platypus.md`, not built).
+
 ## Security
 
 - **[2026-08-17] The Predbat MCP bearer token is committed to a PUBLIC repo.**
