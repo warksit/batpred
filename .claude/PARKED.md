@@ -19,6 +19,26 @@ Format: `- [date] finding — why it might matter — evidence`
   line. Cannot be told apart tonight — the branch only runs inside the curtailment
   window, and there is no session armed.
 
+## Open
+
+- **[2026-08-20] Clearing a manual override drops the plant onto a STALE select for
+  up to one CM cycle.** RD13a has CM stand off `sig_dispatch_policy` entirely while
+  an override is held — the override IS the policy, so CM must not fight it. Correct,
+  but it leaves the select holding whatever was last written, which can be days old.
+  Live this morning: the select still read `Predbat` from the 2026-08-18 handback, so
+  every time the override was cleared the effective policy fell to `Predbat`, the
+  heartbeat parked to MSC, and the **pre-dawn drain paused** — on a day with 15.9 kWh
+  at risk. It looked like "reverting to Predbat" and was in fact a stale value with a
+  ~5 min repair time (measured: 72 s once given a real gap, 08:20:57 -> 08:22:09).
+  Four attempts in a row lasting 7-17 s never gave CM a cycle to fix it, so it looked
+  permanent.
+  **Fix shape:** have CM keep the select in sync while manual is held (write it to the
+  intended policy without acting on it), or write it on the cycle the override
+  releases. The first is better — it means the select is never stale, so the fall-back
+  target is always current. Needs care not to re-create the RD13a fight it was written
+  to prevent: writing the select is not the same as driving from it.
+  Not done: this is control-path code and it surfaced mid-drain.
+
 ## Awaiting data (measuring, not yet conclusive)
 
 - **[2026-08-19] Battery round-trip loss: CHECK THE NEW SENSORS AND REFINE.**
