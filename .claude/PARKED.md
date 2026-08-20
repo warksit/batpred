@@ -19,26 +19,6 @@ Format: `- [date] finding — why it might matter — evidence`
   line. Cannot be told apart tonight — the branch only runs inside the curtailment
   window, and there is no session armed.
 
-## Open
-
-- **[2026-08-20] Clearing a manual override drops the plant onto a STALE select for
-  up to one CM cycle.** RD13a has CM stand off `sig_dispatch_policy` entirely while
-  an override is held — the override IS the policy, so CM must not fight it. Correct,
-  but it leaves the select holding whatever was last written, which can be days old.
-  Live this morning: the select still read `Predbat` from the 2026-08-18 handback, so
-  every time the override was cleared the effective policy fell to `Predbat`, the
-  heartbeat parked to MSC, and the **pre-dawn drain paused** — on a day with 15.9 kWh
-  at risk. It looked like "reverting to Predbat" and was in fact a stale value with a
-  ~5 min repair time (measured: 72 s once given a real gap, 08:20:57 -> 08:22:09).
-  Four attempts in a row lasting 7-17 s never gave CM a cycle to fix it, so it looked
-  permanent.
-  **Fix shape:** have CM keep the select in sync while manual is held (write it to the
-  intended policy without acting on it), or write it on the cycle the override
-  releases. The first is better — it means the select is never stale, so the fall-back
-  target is always current. Needs care not to re-create the RD13a fight it was written
-  to prevent: writing the select is not the same as driving from it.
-  Not done: this is control-path code and it surfaced mid-drain.
-
 ## Awaiting data (measuring, not yet conclusive)
 
 - **[2026-08-19] Battery round-trip loss: CHECK THE NEW SENSORS AND REFINE.**
@@ -118,6 +98,25 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+
+- **[2026-08-20] Clearing a manual override drops the plant onto a STALE select for
+  up to one CM cycle.** RD13a has CM stand off `sig_dispatch_policy` entirely while
+  an override is held — the override IS the policy, so CM must not fight it. Correct,
+  but it leaves the select holding whatever was last written, which can be days old.
+  Live this morning: the select still read `Predbat` from the 2026-08-18 handback, so
+  every time the override was cleared the effective policy fell to `Predbat`, the
+  heartbeat parked to MSC, and the **pre-dawn drain paused** — on a day with 15.9 kWh
+  at risk. It looked like "reverting to Predbat" and was in fact a stale value with a
+  ~5 min repair time (measured: 72 s once given a real gap, 08:20:57 -> 08:22:09).
+  Four attempts in a row lasting 7-17 s never gave CM a cycle to fix it, so it looked
+  permanent.
+  **Fix shape:** have CM keep the select in sync while manual is held (write it to the
+  intended policy without acting on it), or write it on the cycle the override
+  releases. The first is better — it means the select is never stale, so the fall-back
+  target is always current. Needs care not to re-create the RD13a fight it was written
+  to prevent: writing the select is not the same as driving from it.
+  Not done: this is control-path code and it surfaced mid-drain.
+
 - **[2026-08-16] Octopus legacy entities — RESOLVED 2026-08-17.** ADR 0004 renamed
   Saving Sessions -> Power Down; the legacy binary sensor AND calendar are both
   gone on v19.0.0 (the calendar went too, sooner than this note predicted). All
@@ -193,6 +192,26 @@ Format: `- [date] finding — why it might matter — evidence`
 - **[2026-08-12] `sig_keep_floor_guard` writes selects but cannot swap the writer
   role.** Its dusk branch can leave up to 5 minutes with nobody driving.
   (Pre-existing; recorded in REQUIREMENTS.md "Known gap".)
+
+## Answered
+
+- **[2026-08-20] RD7: Predbat's export path DOES fire — the 2026-08-18 session proves it.**
+  With CM stood down and `sig_dispatch_heartbeat` DISABLED, the only possible writer was
+  Predbat's mapper chain, and it ran the whole 18:00-19:00 Power Down unaided:
+  session on 18:00:00.48 -> `requested_mode` Discharging 18:01:19.95 -> EMS
+  `Command Discharging (PV First)` 18:01:20.21 (270 ms) -> `predbat.status` Exporting ->
+  released 19:00:51. **SOC 74.8% -> 52.7%, about 4.0 kWh from the pack** in the paid hour.
+  **This reverses the standing assumption.** The 2026-07-27 note ("Freeze charging took
+  effect, two Exporting windows did not") is best explained by CM holding the wheel that
+  day: the three Predbat mappers are disabled whenever CM drives, so Predbat's export
+  windows had no write path. Not a broken export path — a muzzled one. A hypothesis, but
+  it fits both observations and there is no competing one on offer.
+  **Implication:** CM's saving-session handling is redundant on any day CM is not already
+  driving for curtailment. That is the RD45 direction, and it means RD44's session floor
+  may guard a path that need not exist. Do NOT act on one session's evidence — but stop
+  treating "Predbat cannot export" as a known constraint, because it is not one.
+  **Process note:** I left this open for two days having written that only the session
+  window itself would tell us, then never looked at the window. Andrew asked.
 
 ## Done
 
