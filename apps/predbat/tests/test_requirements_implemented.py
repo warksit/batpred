@@ -80,6 +80,8 @@ REQUIREMENTS = [
     ("RD13a", "manual override is the select alone", r"SIG_OVERRIDE_SELECT"),
     ("RD14c", "saving sessions from the Octoplus calendar", r"octoplus_saving_sessions"),
     ("RD20", "keep floor tracks drain intent", r"_set_keep_floor"),
+    ("RD34", "dawn reserve floors Predbat's export plan", r"_set_predbat_export_floor"),
+    ("RD46", "night need caps Predbat's charge plan", r"_set_predbat_charge_cap|_predbat_charge_cap_kwh"),
 ]
 
 

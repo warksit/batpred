@@ -4564,6 +4564,7 @@ from curtailment_plugin import (
     MIN_BASE_LOAD_KW,
     SESSION_PROTECT_HORIZON_HOURS,
     PREDBAT_SOC_MIN_HELPER,
+    PREDBAT_SOC_MAX_HELPER,
 )
 
 
@@ -7743,6 +7744,207 @@ def test_export_floor_not_rewritten_when_unchanged():
     print("  test_export_floor_not_rewritten_when_unchanged: PASSED")
 
 
+# ---------------------------------------------------------------------------
+# RD46 — cap Predbat's charge plan at the night's own need
+# ---------------------------------------------------------------------------
+
+
+def _soc_max_writes(base):
+    return [c[1]["value"] for c in base.services if c[0] == "input_number/set_value" and c[1].get("entity_id") == PREDBAT_SOC_MAX_HELPER]
+
+
+def _rd46_plugin(overnight_target=5.33, dawn_released=False, current=-1, gate="on", override="Off"):
+    """A plugin positioned at the RD46 decision: night, CM enabled, no override.
+
+    This is the state in which Predbat plans the cheap-window charge RD46 exists
+    to bound. `current` is the helper's existing value, so the write-if-changed
+    path is exercised the same way the RD34 rig exercises the export floor.
+    """
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = gate
+    base._sensor_overrides[SIG_OVERRIDE_SELECT] = override
+    base._sensor_overrides[PREDBAT_SOC_MAX_HELPER] = current
+    plugin = CurtailmentPlugin(base)
+    plugin._overnight_target_kwh = overnight_target
+    plugin._dawn_released = dawn_released
+    plugin._charge_below, plugin._drain_above = 0.5, 0.54
+    plugin._policy_override = None
+    base.services.clear()
+    return plugin, base
+
+
+def test_rd46_night_cap_is_the_live_overnight_target():
+    """The cap Predbat plans against is the night's OWN need, not a fixed %.
+
+    2026-08-20: Predbat imported at 12.42p to hold ~45% into a morning CM took
+    to ~1%. The overnight target is the defensible cap because it SELF-LIQUIDATES
+    — buy exactly what the night burns and it is gone by dawn, so CM gets its
+    headroom anyway. A low fixed % would instead block Predbat buying cheap
+    energy for the house's own overnight load (winter: ~55p of avoidable import).
+    """
+    plugin, base = _rd46_plugin(overnight_target=5.33)
+    plugin._publish_dispatch_policy(False, floor_kwh=0.54, soc_kwh=7.0, soc_max=18.08)
+    writes = _soc_max_writes(base)
+    assert plugin._cm_controlling is False, "precondition: CM must NOT be driving on this path"
+    assert writes, "with Predbat driving overnight the charge cap must be written"
+    assert abs(writes[-1] - 5.33) < 0.01, "cap must be the live overnight target 5.33, got {}".format(writes[-1])
+    print("  test_rd46_night_cap_is_the_live_overnight_target: PASSED ({:.2f} kWh)".format(writes[-1]))
+
+
+def test_rd46_cap_tracks_the_target_down_through_the_night():
+    """Live, not static — this is what kills the 04:00 top-up.
+
+    `compute_morning_gap` measures from NOW to sunrise, so the target shrinks as
+    the night burns down (6.76 kWh at 22:00, ~2 kWh by 04:00). A static cap set
+    at dusk would still authorise the pre-dawn top-up; a live one does not.
+    """
+    plugin, base = _rd46_plugin(overnight_target=6.76)
+    plugin._publish_dispatch_policy(False, floor_kwh=0.54, soc_kwh=7.0, soc_max=18.08)
+    early = _soc_max_writes(base)[-1]
+
+    base._sensor_overrides[PREDBAT_SOC_MAX_HELPER] = early
+    plugin._overnight_target_kwh = 2.04
+    base.services.clear()
+    plugin._publish_dispatch_policy(False, floor_kwh=0.54, soc_kwh=7.0, soc_max=18.08)
+    late = _soc_max_writes(base)[-1]
+
+    assert abs(early - 6.76) < 0.01, "22:00 cap must be 6.76, got {}".format(early)
+    assert abs(late - 2.04) < 0.01, "04:00 cap must be 2.04, got {}".format(late)
+    assert late < early, "the cap must SHRINK across the night, got {} then {}".format(early, late)
+    print("  test_rd46_cap_tracks_the_target_down_through_the_night: PASSED ({:.2f} -> {:.2f} kWh)".format(early, late))
+
+
+def test_rd46_cap_cleared_when_cm_takes_the_wheel():
+    """Cleared at takeover — the catastrophic case if it is ever missed.
+
+    `best_soc_max` caps EVERY charge window in the plan, not just the overnight
+    one. Left set while CM drives, Predbat will not plan to fill the pack from
+    PV, which is precisely backwards on the overflow day CM took the wheel for.
+    """
+    plugin, base = _rd46_plugin(overnight_target=5.33)
+    plugin._publish_dispatch_policy(True, floor_kwh=0.54, soc_kwh=0.56, soc_max=18.08)
+    writes = _soc_max_writes(base)
+    assert plugin._cm_controlling is True, "precondition: CM must be driving inside the window"
+    assert writes and writes[-1] == 0.0, "CM driving must CLEAR the cap (0 = disabled), got {}".format(writes)
+    print("  test_rd46_cap_cleared_when_cm_takes_the_wheel: PASSED")
+
+
+def test_rd46_cap_cleared_under_a_manual_override_that_drives_cm():
+    """The fourth writer path, and the one a per-branch hook would miss.
+
+    RD13a: holding ANY override means CM's executor drives (the select has no
+    "Predbat" option by design), and that decision is taken in the manual branch
+    of _publish_dispatch_policy — a THIRD `_set_writer` call site, separate from
+    the window-start and window-end ones. Anchoring the cap to the two obvious
+    sites would leave Predbat capped all day behind a manual override. The cap
+    is therefore driven off the FINAL value of `_cm_controlling`, which every
+    branch sets, rather than off any one branch.
+    """
+    plugin, base = _rd46_plugin(overnight_target=5.33, override="Hold Battery")
+    plugin._publish_dispatch_policy(True, floor_kwh=0.54, soc_kwh=0.56, soc_max=18.08)
+    writes = _soc_max_writes(base)
+    assert plugin._cm_controlling is True, "precondition: an override must put CM's executor on the wheel"
+    assert writes and writes[-1] == 0.0, "a manual override driving CM must CLEAR the cap, got {}".format(writes)
+    print("  test_rd46_cap_cleared_under_a_manual_override_that_drives_cm: PASSED")
+
+
+def test_rd46_cap_cleared_once_pv_meets_load():
+    """The solar-blocking guard — the reason the cap is a NIGHT instrument.
+
+    On this site `charge_limit` maps to
+    number.sigen_plant_ess_charge_cut_off_state_of_charge (apps.yaml): the SOC at
+    which the pack stops charging from ANY source, solar included. Predbat holds
+    that register at 100% outside charge windows (inverter_soc_reset on, live
+    100.0 on 2026-08-22), so the cap can only reach it INSIDE a charge window —
+    but a daytime window (an Octoplus Power Up grid-charge, say) with the cap
+    still set would write a low cut-off and block solar exactly when the pack
+    should be absorbing. That is the 2026-03-17 charge_limit=0 bug's mechanism.
+
+    "Clear when CM drives" is NOT sufficient cover: post-RD45 CM stands down on
+    low-overflow days and never takes the wheel to clear anything. The dawn
+    crossing is the signal that always fires, on every day-type, and it is the
+    same one-way daily latch RD34 already clears the export floor on.
+    """
+    plugin, base = _rd46_plugin(overnight_target=5.33, dawn_released=True)
+    plugin._publish_dispatch_policy(False, floor_kwh=0.54, soc_kwh=7.0, soc_max=18.08)
+    writes = _soc_max_writes(base)
+    assert plugin._cm_controlling is False, "precondition: this is the fits-day path where CM never drives"
+    assert writes and writes[-1] == 0.0, "once PV meets load the cap must clear so solar can fill the pack, got {}".format(writes)
+    print("  test_rd46_cap_cleared_once_pv_meets_load: PASSED")
+
+
+def test_rd46_cap_not_rewritten_when_unchanged():
+    """No redundant writes — the planner reads this helper every cycle and a
+    write storm is how `sig_keep_floor_pct` wedged on 2026-07-22."""
+    plugin, base = _rd46_plugin(overnight_target=5.33, current=5.33)
+    plugin._publish_dispatch_policy(False, floor_kwh=0.54, soc_kwh=7.0, soc_max=18.08)
+    assert not _soc_max_writes(base), "already correct -> must not rewrite, got {}".format(_soc_max_writes(base))
+    print("  test_rd46_cap_not_rewritten_when_unchanged: PASSED")
+
+
+def test_rd46_no_cap_written_while_the_target_is_unknown():
+    """Unknown is not zero. `_overnight_target_kwh` is None before the first
+    refresh, and _refresh_overnight_target FREEZES it at the previous value on
+    error rather than zeroing it. Writing 0.0 for "I do not know yet" would
+    silently disable the cap; writing the target's absence as a number would be
+    worse. Change nothing and wait for the next cycle."""
+    plugin, base = _rd46_plugin(overnight_target=None)
+    plugin._publish_dispatch_policy(False, floor_kwh=0.54, soc_kwh=7.0, soc_max=18.08)
+    assert not _soc_max_writes(base), "an unknown target must write nothing, got {}".format(_soc_max_writes(base))
+    print("  test_rd46_no_cap_written_while_the_target_is_unknown: PASSED")
+
+
+def test_rd46_charge_limit_maps_to_the_solar_blocking_register():
+    """Pin the site fact the dawn gate exists for.
+
+    If a future apps.yaml points `charge_limit` somewhere harmless, the dawn gate
+    becomes optional and this test says so out loud. If it still points at the
+    charge cut-off SOC, the gate is load-bearing and must not be removed.
+    """
+    import os
+
+    apps = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ha", "mum-apps.yaml")
+    with open(apps) as fh:
+        text = fh.read()
+    assert "charge_limit:" in text, "apps.yaml must still define charge_limit"
+    after = text.split("charge_limit:", 1)[1].split("\n\n", 1)[0]
+    assert "ess_charge_cut_off_state_of_charge" in after, "charge_limit must still map to the charge cut-off SOC register; if this moved, revisit the RD46 dawn gate: {}".format(after[:200])
+    print("  test_rd46_charge_limit_maps_to_the_solar_blocking_register: PASSED")
+
+
+def test_rd46_best_soc_max_caps_charge_candidates_but_not_the_freeze():
+    """Pin the upstream behaviour RD46 depends on, and the one it does NOT fix.
+
+    `best_soc_max` clamps `loop_soc`, which seeds the charge-target candidate
+    list — so it bounds Chrg/HoldChrg. The freeze candidate is `self.reserve`
+    appended independently of `loop_soc`, so the cap cannot suppress a charge
+    freeze, and RD46's accepted residual (~0.56 kWh of incidental import while
+    the pack refuses to serve load) follows from exactly that.
+
+    plan.py is upstream and must never be edited for site behaviour, so this
+    asserts against its source: a Predbat upgrade that changes either half
+    breaks a named test instead of quietly changing an overnight bill.
+    """
+    import os
+
+    plan_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plan.py")
+    with open(plan_py) as fh:
+        src = fh.read()
+    body = src.split("def optimise_charge_limit(", 1)[1].split("\n    def ", 1)[0]
+
+    assert "loop_soc = min(loop_soc, self.best_soc_max)" in body, "best_soc_max must still clamp loop_soc (the charge-candidate seed)"
+
+    cap_at = body.index("loop_soc = min(loop_soc, self.best_soc_max)")
+    loop_at = body.index("while loop_soc > self.reserve")
+    freeze_at = body.index("try_socs.append(self.reserve)")
+    assert cap_at < loop_at, "the cap must still be applied BEFORE the candidate loop"
+    assert freeze_at > loop_at, "the freeze candidate must still be appended after the loop, i.e. OUTSIDE the capped walk"
+
+    walk = body[loop_at:freeze_at]
+    assert "try_socs.append(self.reserve)" not in walk, "the freeze candidate must NOT be gated by loop_soc — if it ever is, best_soc_max would suppress freezes and RD46's residual disappears"
+    print("  test_rd46_best_soc_max_caps_charge_candidates_but_not_the_freeze: PASSED")
+
+
 def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     """RD32 — R63 must drain to the SAME floor the Schmitt does.
 
@@ -9525,6 +9727,15 @@ def run_curtailment_tests(my_predbat=None):
         test_dawn_reserve_floors_predbat_export_plan,
         test_export_floor_clears_when_pv_meets_load,
         test_export_floor_not_rewritten_when_unchanged,
+        test_rd46_night_cap_is_the_live_overnight_target,
+        test_rd46_cap_tracks_the_target_down_through_the_night,
+        test_rd46_cap_cleared_when_cm_takes_the_wheel,
+        test_rd46_cap_cleared_under_a_manual_override_that_drives_cm,
+        test_rd46_cap_cleared_once_pv_meets_load,
+        test_rd46_cap_not_rewritten_when_unchanged,
+        test_rd46_no_cap_written_while_the_target_is_unknown,
+        test_rd46_charge_limit_maps_to_the_solar_blocking_register,
+        test_rd46_best_soc_max_caps_charge_candidates_but_not_the_freeze,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,
