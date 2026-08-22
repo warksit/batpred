@@ -72,43 +72,35 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
-- **[2026-08-22] RD46 — the night's need caps Predbat's charge plan (`e3d01b3f`).**
-  Deployed 21:42 and cycling (plugin ran 21:40:45, overnight target 5.19 kWh).
-  **Not verified, and tonight's evening cannot verify it**: `_dawn_released` is
-  still True from this morning's crossing, so the cap is correctly 0.0 — which is
-  byte-identical to the pre-deploy state, i.e. not discriminating.
-  **Success =** after `_reset_for_new_day()` fires at midnight, and BEFORE
-  tomorrow's dawn crossing, `input_number.predbat_best_soc_max` becomes the live
-  `overnight_target_kwh` (~5 kWh) and shrinks cycle over cycle toward sunrise;
-  then returns to 0.0 once PV meets load. **Failure =** it stays 0.0 all night
-  (the latch or the wrapper never fires), or it is still non-zero after the dawn
-  crossing — the second is the dangerous one, because `charge_limit` maps to the
-  charge cut-off SOC and a stale cap would block solar.
-  **Coverage boundary — and the evidence is already in, same night.** The cap
-  binds only from midnight to the dawn crossing, so a 22:00-00:00 slot is
-  uncapped. I first recorded this as costing nothing, reasoning that the
-  2026-08-20 22:00-00:00 slot was a *freeze* (which `best_soc_max` structurally
-  cannot suppress — the freeze candidate bypasses `loop_soc`). **That was wrong
-  for tonight and the correction is measured, not argued.** Live 2026-08-22:
-    * 22:45 — `predbat.status` "Hold charging", battery -0.466 kW serving a
-      0.378 kW load, grid import 0.000. Costing nothing, as recorded.
-    * 23:46 — same status, but battery **0.000 kW**, load 0.357 kW, grid
-      **+0.397 kW**. SOC flat at 35.5% since 22:44 (the SIG integration is fine —
-      `battery_power`/`consumed_power`/`grid_active_power` all update every few
-      seconds; SOC's timestamp is stale because the value genuinely has not moved).
-  So the evening slot is a **HoldChrg, not a freeze**, and `best_soc_max` DOES
-  cap HoldChrg. With the cap live it would have bound: the target ~5.19 kWh sits
-  BELOW the 6.42 kWh (35.5%) the pack was holding, so Predbat could not have
-  chosen to hold there and the battery would have covered the load instead of the
-  meter. ~0.4 kW for the ~75 min to midnight, call it 0.5 kWh / ~6p — trivial
-  tonight, but it is the winter case in miniature and it is NOT theoretical.
-  **Not acted on, deliberately.** The window self-closes at midnight when the
-  latch resets, so the cost of waiting is a few pence, while widening the gate
-  means designing and deploying a new "sun is down" signal onto the live control
-  path, unsupervised, at midnight. That is Andrew's call, and it now has the
-  evidence I said it would need. **Do not simply drop the dawn gate** — it is
-  what stops a daytime charge window writing a low charge cut-off and blocking
-  solar. The shape wanted is "dark OR pre-dawn", not "no gate".
+- **[2026-08-23] RD46 VERIFIED live on the first pre-dawn window (`e3d01b3f`).**
+  Deployed 2026-08-22 21:42. The evening could not discriminate (`_dawn_released`
+  still latched from that morning, so the cap correctly read 0.0 — identical to
+  pre-deploy). The midnight latch reset is what told them apart:
+    * **00:10:25 — `input_number.predbat_best_soc_max` wrote 3.98 kWh**, its first
+      change since 2026-08-18. The write path works on the box.
+    * **The value is live and shrinking**, as designed: 5.19 kWh at 21:40, 3.98 at
+      00:10, tracking `compute_morning_gap` down toward sunrise. This is the
+      property that kills a pre-dawn top-up; a static cap would not have moved.
+    * **The plan changed shape.** At 00:10 the 48 h plan holds **zero `Chrg` and
+      zero `HoldChrg`** — 00:00-04:00 Demand, then 04:00-07:00 **FrzChrg target
+      23%** (4.16 kWh, i.e. at the cap), FrzExp from 07:00. The 2026-08-20
+      complaint was exactly a 22:00-00:00 hold plus an **active 04:00 top-up**;
+      the top-up is now a freeze, which is the residual RD46 documented as
+      unfixable by this lever (the freeze candidate bypasses `loop_soc`).
+    * **The plant followed**: `predbat.status` Hold charging -> Demand 00:06:15,
+      battery back to -0.469 kW serving load, grid -0.005 kW (was +0.397 kW
+      importing at 23:46), SOC moving again after 90 min flat.
+  **Honest limit on the claim:** no counterfactual was run, so "the cap caused the
+  absence of Chrg" is consistent-with, not proven — conditions also differ from
+  20 Aug. What IS proven is the mechanism: it writes, it tracks, it is non-zero
+  only pre-dawn.
+  **Still unverified — the safety half.** The cap must return to 0.0 at today's
+  dawn crossing, because `charge_limit` maps to the charge cut-off SOC and a
+  stale cap inside a charge window would block solar. **Low risk today** (the plan
+  contains no charge window at all, and `inverter_soc_reset` holds the register at
+  100% outside one), but it is the assertion that matters in general.
+  **Success =** `best_soc_max` back to 0.0 shortly after PV meets load.
+  **Failure =** still non-zero into the afternoon.
 
 - **[2026-08-14] RD41 — session reserve as a charge target (`ac8b04cf`).**
   Deployed 11:57 and confirmed LOADED: `session_charge_target_kwh` appears in the
@@ -135,6 +127,22 @@ Format: `- [date] finding — why it might matter — evidence`
   `meter_dead: false` in the same trace.
 
 ## Open
+
+- **[2026-08-23] The known-broken IOG test fails ONLY between 00:00 and 01:00 BST —
+  cause identified.** `multi_car_iog_load_slots_regression` (MEMORY pending task 5,
+  recorded there as "missing `car_charging_limit`") blocked a push at 00:16 having
+  passed the same suite three times earlier the same night. Not a regression: the
+  only tree change between the green runs and the red one was a markdown file.
+  **Cause:** `tests/test_multi_car_iog.py:199-201` pins the clock with
+  `datetime.now(tz=timezone.utc).replace(hour=12, ...)`, intending "noon today" so
+  the `now+1h..now+3h` slots cannot cross midnight. In the BST hour after local
+  midnight the UTC date is still YESTERDAY, so that resolves to yesterday noon and
+  the slots are filtered as past events — hence "Expected car 0 to have charging
+  slots from IOG, got none". It is a LOCAL-vs-UTC day-boundary bug in the fixture,
+  not in production, and it will fire in the same hour every night of BST.
+  **Fix shape:** derive the pinned time from the same day basis the fixture's
+  `midnight_utc` uses, rather than from a UTC `now()` that has already rolled over.
+  Not done: unrelated to the work in flight, and it self-clears at 01:00.
 
 - **[2026-08-22] RD46 designed, not built — Predbat carries an overnight reserve CM
   dumps at dawn.** Full design, verified mechanism and the two ruled-out approaches:
