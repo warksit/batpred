@@ -72,6 +72,28 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
+- **[2026-08-22] RD46 — the night's need caps Predbat's charge plan (`e3d01b3f`).**
+  Deployed 21:42 and cycling (plugin ran 21:40:45, overnight target 5.19 kWh).
+  **Not verified, and tonight's evening cannot verify it**: `_dawn_released` is
+  still True from this morning's crossing, so the cap is correctly 0.0 — which is
+  byte-identical to the pre-deploy state, i.e. not discriminating.
+  **Success =** after `_reset_for_new_day()` fires at midnight, and BEFORE
+  tomorrow's dawn crossing, `input_number.predbat_best_soc_max` becomes the live
+  `overnight_target_kwh` (~5 kWh) and shrinks cycle over cycle toward sunrise;
+  then returns to 0.0 once PV meets load. **Failure =** it stays 0.0 all night
+  (the latch or the wrapper never fires), or it is still non-zero after the dawn
+  crossing — the second is the dangerous one, because `charge_limit` maps to the
+  charge cut-off SOC and a stale cap would block solar.
+  **Known coverage boundary, by construction, not a defect:** the cap binds only
+  from midnight to the dawn crossing. A 22:00-00:00 slot is therefore uncapped.
+  That costs nothing today because the 2026-08-20 22:00-00:00 slot was a
+  *freeze*, which `best_soc_max` structurally cannot suppress anyway (the freeze
+  candidate bypasses `loop_soc`); the 04:00 active top-up, which is the part RD46
+  can actually prevent, is inside the covered window. It would matter only on a
+  future tariff with a cheap *evening* charge slot. Widening it needs a
+  "sun is down" signal rather than the same-day dawn latch — do not reach for one
+  without that evidence.
+
 - **[2026-08-14] RD41 — session reserve as a charge target (`ac8b04cf`).**
   Deployed 11:57 and confirmed LOADED: `session_charge_target_kwh` appears in the
   published attributes from 12:02 (absent before the reload; HA keeps null
