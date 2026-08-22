@@ -84,15 +84,31 @@ Format: `- [date] finding — why it might matter — evidence`
   (the latch or the wrapper never fires), or it is still non-zero after the dawn
   crossing — the second is the dangerous one, because `charge_limit` maps to the
   charge cut-off SOC and a stale cap would block solar.
-  **Known coverage boundary, by construction, not a defect:** the cap binds only
-  from midnight to the dawn crossing. A 22:00-00:00 slot is therefore uncapped.
-  That costs nothing today because the 2026-08-20 22:00-00:00 slot was a
-  *freeze*, which `best_soc_max` structurally cannot suppress anyway (the freeze
-  candidate bypasses `loop_soc`); the 04:00 active top-up, which is the part RD46
-  can actually prevent, is inside the covered window. It would matter only on a
-  future tariff with a cheap *evening* charge slot. Widening it needs a
-  "sun is down" signal rather than the same-day dawn latch — do not reach for one
-  without that evidence.
+  **Coverage boundary — and the evidence is already in, same night.** The cap
+  binds only from midnight to the dawn crossing, so a 22:00-00:00 slot is
+  uncapped. I first recorded this as costing nothing, reasoning that the
+  2026-08-20 22:00-00:00 slot was a *freeze* (which `best_soc_max` structurally
+  cannot suppress — the freeze candidate bypasses `loop_soc`). **That was wrong
+  for tonight and the correction is measured, not argued.** Live 2026-08-22:
+    * 22:45 — `predbat.status` "Hold charging", battery -0.466 kW serving a
+      0.378 kW load, grid import 0.000. Costing nothing, as recorded.
+    * 23:46 — same status, but battery **0.000 kW**, load 0.357 kW, grid
+      **+0.397 kW**. SOC flat at 35.5% since 22:44 (the SIG integration is fine —
+      `battery_power`/`consumed_power`/`grid_active_power` all update every few
+      seconds; SOC's timestamp is stale because the value genuinely has not moved).
+  So the evening slot is a **HoldChrg, not a freeze**, and `best_soc_max` DOES
+  cap HoldChrg. With the cap live it would have bound: the target ~5.19 kWh sits
+  BELOW the 6.42 kWh (35.5%) the pack was holding, so Predbat could not have
+  chosen to hold there and the battery would have covered the load instead of the
+  meter. ~0.4 kW for the ~75 min to midnight, call it 0.5 kWh / ~6p — trivial
+  tonight, but it is the winter case in miniature and it is NOT theoretical.
+  **Not acted on, deliberately.** The window self-closes at midnight when the
+  latch resets, so the cost of waiting is a few pence, while widening the gate
+  means designing and deploying a new "sun is down" signal onto the live control
+  path, unsupervised, at midnight. That is Andrew's call, and it now has the
+  evidence I said it would need. **Do not simply drop the dawn gate** — it is
+  what stops a daytime charge window writing a low charge cut-off and blocking
+  solar. The shape wanted is "dark OR pre-dawn", not "no gate".
 
 - **[2026-08-14] RD41 — session reserve as a charge target (`ac8b04cf`).**
   Deployed 11:57 and confirmed LOADED: `session_charge_target_kwh` appears in the
