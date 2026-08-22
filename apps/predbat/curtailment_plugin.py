@@ -329,6 +329,29 @@ SESSION_IMMINENT_MINS = 30.0
 #     never writes the reserve, and enabling it means patching config.py.
 PREDBAT_SOC_MIN_HELPER = "input_number.predbat_best_soc_min"
 
+# RD46 — the CHARGE-side twin of the export floor above.
+#
+# Predbat plans its overnight reserve from its own median load forecast; CM's
+# dawn drain defends the p90 Solcast headroom. When the two disagree Predbat
+# buys a reserve at the cheap-window rate that CM drains and exports hours
+# later (2026-08-20: FrzChrg 22:00-00:00 + a 04:00 top-up to ~45%, against a
+# morning CM took to ~1%). `best_soc_max` caps the charge-target candidates in
+# optimise_charge_limit (plan.py:1392), so capping it at the night's OWN need
+# makes the purchase self-liquidating: buy what the night burns, nothing more.
+#
+# MUST be cleared (0 = disabled) the moment it could bite in daylight. On this
+# site `charge_limit` maps straight to
+# number.sigen_plant_ess_charge_cut_off_state_of_charge (apps.yaml), the SOC at
+# which the pack stops charging FROM ANY SOURCE INCLUDING SOLAR — the
+# charge_limit=0 solar-blocking bug of 2026-03-17. Predbat holds that register
+# at 100% outside charge windows (inverter_soc_reset), so a cap only reaches
+# the register inside a charge window; a DAYTIME window with the cap set would
+# write a low cut-off and block solar exactly when CM wants the pack absorbing.
+# Hence the dawn-crossing gate in _predbat_charge_cap_kwh, not just "clear when
+# CM drives" — post-RD45 CM stands down on low-overflow days and never takes
+# the wheel to clear it.
+PREDBAT_SOC_MAX_HELPER = "input_number.predbat_best_soc_max"
+
 # How far ahead of a joined saving session the export reserve arms (hours).
 #
 # 2026-08-11: there was NO horizon — `_get_session_reserve_kwh` reads the
@@ -2848,6 +2871,43 @@ class CurtailmentPlugin(PredBatPlugin):
         except Exception as e:
             self._log_once("soc_min_set_err", "Curtailment: failed to set Predbat export floor {}: {}".format(kwh, e))
 
+    def _set_predbat_charge_cap(self, kwh):
+        """RD46 — cap Predbat's charge plan at the night's own need, 0 to disable.
+
+        Predbat plans its overnight reserve from its own median load forecast;
+        CM's dawn drain defends the p90 Solcast headroom. Predbat cannot see CM
+        at all (no reference to it anywhere in the stock modules), so on any
+        night the two disagree it buys a reserve CM then drains and exports.
+        2026-08-20: FrzChrg 22:00-00:00 plus a 04:00 top-up holding ~45% into a
+        morning CM took to ~1%, bought at 12.42p and sold at ~12p.
+
+        The cap is the overnight target because that number SELF-LIQUIDATES:
+        buy what the night burns and it is gone by dawn, so CM still gets its
+        headroom, while Predbat keeps the freedom to buy cheap energy for the
+        house's own load. A low fixed % would save under 1 kWh of headroom out
+        of ~18 and cost ~55p of avoidable import on a winter night.
+
+        Write-if-changed for the same reason as the export floor: the planner
+        reads the helper every cycle, and a write storm is how
+        `sig_keep_floor_pct` wedged on 2026-07-22. `None` means "not computed
+        yet / frozen after a refresh error" and must change nothing — 0.0 would
+        silently disable the cap and read as a real decision.
+        """
+        if kwh is None:
+            return
+        kwh = round(max(0.0, float(kwh)), 2)
+        try:
+            current = float(self.base.get_state_wrapper(PREDBAT_SOC_MAX_HELPER, default=-1))
+        except (TypeError, ValueError):
+            current = -1
+        if abs(current - kwh) < 0.01:
+            return
+        try:
+            self.base.call_service_wrapper("input_number/set_value", entity_id=PREDBAT_SOC_MAX_HELPER, value=kwh)
+            self.log("Curtailment: RD46 Predbat charge cap {:.2f} -> {:.2f} kWh (0 = uncapped)".format(current, kwh))
+        except Exception as e:
+            self._log_once("soc_max_set_err", "Curtailment: failed to set Predbat charge cap {}: {}".format(kwh, e))
+
     def _set_read_only(self, value):
         """R3 mutex: suppress/resume Predbat via its internal read_only flag (NOT an
         HA entity). True while CM drives the inverter; False on handback."""
@@ -3331,7 +3391,47 @@ class CurtailmentPlugin(PredBatPlugin):
             self._set_read_only(False)
             self._read_only_set = False
 
-    def _publish_dispatch_policy(self, plugin_active, floor_kwh, soc_kwh, soc_max):
+    def _publish_dispatch_policy(self, plugin_active, floor_kwh, soc_kwh, soc_max, cm_enabled=True):
+        """Decide the dispatch policy, then set the RD46 charge cap from the outcome.
+
+        The cap is applied HERE, around the whole decision, rather than inside any
+        of its branches. `_publish_dispatch_policy_impl` sets `_cm_controlling`
+        from four separate places — the not-acting release, the manual-override
+        branch (RD13a), the window-start take, and the window-end handback — and
+        two of them return early. A hook in the obvious two would leave Predbat
+        capped all day behind a manual override; reading the FINAL value instead
+        means a fifth branch cannot reintroduce the gap.
+        """
+        self._publish_dispatch_policy_impl(plugin_active, floor_kwh, soc_kwh, soc_max)
+        self._set_predbat_charge_cap(self._predbat_charge_cap_kwh(cm_enabled))
+
+    def _predbat_charge_cap_kwh(self, cm_enabled=True):
+        """What `best_soc_max` should hold this cycle. 0 = uncapped, None = leave alone.
+
+        Cleared (0) in three cases, any one of which is sufficient:
+
+          * **CM is driving.** The cap bounds EVERY charge window in the plan, so
+            left set on an overflow day Predbat would not plan to fill from PV —
+            backwards on the very day CM took the wheel for.
+          * **The dawn crossing has passed.** `charge_limit` maps to
+            number.sigen_plant_ess_charge_cut_off_state_of_charge (apps.yaml) —
+            the SOC at which the pack stops charging from ANY source, solar
+            included (the charge_limit=0 solar-blocking bug, 2026-03-17). Predbat
+            holds that register at 100% outside charge windows, so the cap only
+            reaches it inside one; a DAYTIME charge window with the cap set would
+            block solar exactly when the pack should be absorbing. CM standing
+            down is not adequate cover here — post-RD45 CM never takes the wheel
+            at all on a low-overflow day, so there would be nothing to clear it.
+            `_dawn_released` is the one signal that fires on every day-type, and
+            it is the same one-way daily latch RD34 clears the export floor on.
+          * **CM is disabled.** A disabled CM will never dump anything, so it has
+            no business constraining Predbat's plan.
+        """
+        if not cm_enabled or self._cm_controlling or self._dawn_released:
+            return 0.0
+        return self._overnight_target_kwh
+
+    def _publish_dispatch_policy_impl(self, plugin_active, floor_kwh, soc_kwh, soc_max):
         """RD9 (v30): decide the dispatch policy + sell floor from the split-threshold
         phase, ALWAYS publish the intended decision (observe-only visibility), and ACT
         (write input_select.sig_dispatch_policy + sig_keep_floor_pct) only when
@@ -3897,7 +3997,9 @@ class CurtailmentPlugin(PredBatPlugin):
             if not enabled:
                 self.publish("off", soc_max, dno_limit)
                 # Hand the policy back once if we were driving (RD10).
-                self._publish_dispatch_policy(False, soc_max, getattr(self.base, "soc_kw", 0), soc_max)
+                # cm_enabled=False: this path skips calculate(), so the dawn latch and
+                # the overnight target are both stale here. A disabled CM must not cap.
+                self._publish_dispatch_policy(False, soc_max, getattr(self.base, "soc_kw", 0), soc_max, cm_enabled=False)
                 return
 
             # Fail closed: unreadable plant SOC → hold position, change nothing.
