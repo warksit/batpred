@@ -98,6 +98,15 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-08-22] RD46 designed, not built — Predbat carries an overnight reserve CM
+  dumps at dawn.** Full design, verified mechanism and the two ruled-out approaches:
+  `.claude/plans/rd46-overnight-soc-cap.md`. Andrew asked for this after overriding
+  the 22:00-00:00 slots to Demand by hand on 2026-08-20. Also holds the
+  `metric_battery_cycle` finding (currently 3.0, documented range 0-2, blocked on the
+  battery's capital cost; 1.5p is the defensible fallback).
+
+
+
 
 - **[2026-08-20] Clearing a manual override drops the plant onto a STALE select for
   up to one CM cycle.** RD13a has CM stand off `sig_dispatch_policy` entirely while

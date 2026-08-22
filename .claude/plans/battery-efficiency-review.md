@@ -82,6 +82,19 @@ as "measured 1.94%, rounded up for uncertainty and high-rate losses" — it is n
 crazy, just unmeasured. What should NOT happen is 3.5% *each* (7% round trip); that
 is 3.6× the measured value and would suppress genuine peak arbitrage.
 
+## Superseded in part (2026-08-22)
+
+The framing above treats the measured round-trip loss as an input to
+`metric_battery_cycle`. It is not — `docs/customisation.md:116-124` is explicit that
+the cycle metric is a **wear** cost (capital / throughput / cycles), while energy
+losses are already modelled by `battery_loss` / `inverter_loss`. Sizing the cycle
+penalty from efficiency double-counts. The measurement still sizes the LOSS settings,
+which is what the review steps below are for.
+
+See `.claude/plans/rd46-overnight-soc-cap.md` for the cycle-penalty analysis
+(currently 3.0, documented range 0-2, ~258 equivalent cycles/year so calendar life
+binds — recommend 1.5p pending the battery's capital cost).
+
 ## Known gap
 
 This is a single blended figure across all charge/discharge rates, and efficiency is
