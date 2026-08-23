@@ -72,35 +72,44 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
-- **[2026-08-23] RD46 VERIFIED live on the first pre-dawn window (`e3d01b3f`).**
+- **[2026-08-23] RD46 VERIFIED END TO END on its first night (`e3d01b3f`).**
   Deployed 2026-08-22 21:42. The evening could not discriminate (`_dawn_released`
   still latched from that morning, so the cap correctly read 0.0 — identical to
-  pre-deploy). The midnight latch reset is what told them apart:
-    * **00:10:25 — `input_number.predbat_best_soc_max` wrote 3.98 kWh**, its first
-      change since 2026-08-18. The write path works on the box.
-    * **The value is live and shrinking**, as designed: 5.19 kWh at 21:40, 3.98 at
-      00:10, tracking `compute_morning_gap` down toward sunrise. This is the
-      property that kills a pre-dawn top-up; a static cap would not have moved.
-    * **The plan changed shape.** At 00:10 the 48 h plan holds **zero `Chrg` and
-      zero `HoldChrg`** — 00:00-04:00 Demand, then 04:00-07:00 **FrzChrg target
-      23%** (4.16 kWh, i.e. at the cap), FrzExp from 07:00. The 2026-08-20
-      complaint was exactly a 22:00-00:00 hold plus an **active 04:00 top-up**;
-      the top-up is now a freeze, which is the residual RD46 documented as
-      unfixable by this lever (the freeze candidate bypasses `loop_soc`).
-    * **The plant followed**: `predbat.status` Hold charging -> Demand 00:06:15,
-      battery back to -0.469 kW serving load, grid -0.005 kW (was +0.397 kW
-      importing at 23:46), SOC moving again after 90 min flat.
-  **Honest limit on the claim:** no counterfactual was run, so "the cap caused the
-  absence of Chrg" is consistent-with, not proven — conditions also differ from
-  20 Aug. What IS proven is the mechanism: it writes, it tracks, it is non-zero
-  only pre-dawn.
-  **Still unverified — the safety half.** The cap must return to 0.0 at today's
-  dawn crossing, because `charge_limit` maps to the charge cut-off SOC and a
-  stale cap inside a charge window would block solar. **Low risk today** (the plan
-  contains no charge window at all, and `inverter_soc_reset` holds the register at
-  100% outside one), but it is the assertion that matters in general.
-  **Success =** `best_soc_max` back to 0.0 shortly after PV meets load.
-  **Failure =** still non-zero into the afternoon.
+  pre-deploy). Everything below is from the first full night.
+  **1. The cap writes and TRACKS.** First change since 2026-08-18: 3.98 kWh at
+  00:10:25, then 2.91 (02:00), 2.21 (03:05), 1.61 (04:05), 1.02 (05:05), 0.41
+  (06:05) — monotonically down as `compute_morning_gap` closes toward sunrise.
+  5.19 kWh at 21:40 the evening before. A static cap would not have moved, and
+  the shrink is what removes the pre-dawn top-up.
+  **2. The plan changed shape.** At 00:10 the 48 h plan held **zero `Chrg` and
+  zero `HoldChrg`**: 00:00-04:00 Demand, 04:00-07:00 FrzChrg target 23%, FrzExp
+  from 07:00. The 2026-08-20 complaint was a 22:00-00:00 hold plus an **active
+  04:00 top-up**; the top-up became a freeze — the residual RD46 documents as
+  unfixable by this lever — and **the freeze never even engaged** (status stayed
+  Demand from 02:56 through 06:40, battery serving load throughout).
+  **3. The night cost nothing.** `sensor.sigen_plant_daily_grid_import_energy`
+  **0.010 kWh** from the midnight reset to 06:40 — ten watt-hours. The house ran
+  on the pack, which drained 35.5% -> 17.2% by 06:09. Compare 23:46 the previous
+  evening, pre-cap: battery idle at 35.5% with 0.397 kW of load on the meter.
+  **4. The solar-blocking path never opened.**
+  `number.sigen_plant_ess_charge_cut_off_state_of_charge` stayed **100.0%,
+  unchanged since 2026-08-21 13:01**, through the whole night with the cap as low
+  as 0.41 kWh. So the cap shaped the PLAN without ever writing a restrictive
+  cut-off to the hardware — `inverter_soc_reset` holds the register open outside
+  a charge window, and there was no charge window. The hazard is real but did not
+  fire, which is the outcome the dawn gate exists to guarantee.
+  **5. The critical clear fired, in one second.** CM took the wheel at 06:40:40
+  (intended policy -> **Max Export**, `predbat.status` -> Read-Only 06:41:29,
+  SOC 17.2% -> 3.0% on the pre-dawn drain). **`best_soc_max` -> 0.0 at
+  06:40:41**, one second after the policy change. This is the
+  `_cm_controlling` branch — the "catastrophically wrong if missed" case — and it
+  is the path a per-branch hook could have missed.
+  **Not observed, and now moot for today:** the DAWN-LATCH clear specifically.
+  CM's takeover cleared the cap first, and at 07:10 PV (0.241 kW) still had not
+  met load (0.476 kW), so the crossing had not happened. That path stays covered
+  by `test_rd46_cap_cleared_once_pv_meets_load` rather than by live observation;
+  worth catching on a day CM stands down (an RD45 "fits" day), which is exactly
+  the day-type it was written for.
 
 - **[2026-08-14] RD41 — session reserve as a charge target (`ac8b04cf`).**
   Deployed 11:57 and confirmed LOADED: `session_charge_target_kwh` appears in the
