@@ -72,6 +72,31 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
+- **[2026-08-24] RD47 — the overflow floor grades instead of saturating (`efb25181`).**
+  Deployed 16:33, after CM handed back (policy Predbat, status Demand) — the
+  charter forbids landing control-path changes mid-window, and CM held the wheel
+  until ~16:30 today. Helper `input_number.curtailment_min_floor_pct` created and
+  **set explicitly to 10.0** (a fresh `input_number` defaults to its MINIMUM, and
+  0 means "disabled" in the code — creating it and walking away would have left
+  RD47 silently inert).
+  **Today cannot verify it.** By deploy time `floor_overflow` had already
+  unsaturated to 14.38 kWh (remaining overflow is small that late), and below
+  ~13.8 kWh the old and new curves are identical by construction.
+  **Success =** on the next morning with forecast overflow above ~15.5 kWh,
+  `sensor.predbat_curtailment_floor_overflow` reads **~1.81 kWh (10%)** instead
+  of 0.00, and minimum SOC lands near 10% instead of the 1.0% drain-floor helper.
+  **Failure =** floor still 0.00 with a large forecast (the softening is not
+  reached), or a floor above the raw requirement on a small-forecast day (the
+  `max` direction inverted — RD43's failure mode in reverse).
+  **Two days of evidence now, not one.** 08-23 realised **12.81 kWh** and peaked
+  at 71.6%; 08-24 realised **11.18 kWh** and peaked at **71.5%** — the same ~28%
+  spare, both days, with the floor saturated at 0.00 all morning both mornings
+  and SOC bottoming at 1.0% and 7.4% respectively.
+  **Still unmeasured:** whether a 10% floor ever actually costs curtailment here.
+  Across the 26 days of `sensor.curtailment_overflow_daily` only one exceeded the
+  16.27 kWh a 10% floor leaves (17.04, by 0.77 kWh). Keep watching that meter
+  against the floor chosen; if a second day exceeds it, revisit the 10%.
+
 - **[2026-08-23] RD46 VERIFIED END TO END on its first night (`e3d01b3f`).**
   Deployed 2026-08-22 21:42. The evening could not discriminate (`_dawn_released`
   still latched from that morning, so the cap correctly read 0.0 — identical to
