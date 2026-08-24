@@ -82,6 +82,7 @@ REQUIREMENTS = [
     ("RD20", "keep floor tracks drain intent", r"_set_keep_floor"),
     ("RD34", "dawn reserve floors Predbat's export plan", r"_set_predbat_export_floor"),
     ("RD46", "night need caps Predbat's charge plan", r"_set_predbat_charge_cap|_predbat_charge_cap_kwh"),
+    ("RD47", "overflow floor grades instead of saturating", r"soften_overflow_floor"),
 ]
 
 

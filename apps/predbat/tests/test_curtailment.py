@@ -52,6 +52,8 @@ from curtailment_calc import (
     compute_effective_export_cap,
     compute_floor_with_source,
     should_defer_to_charge,
+    soften_overflow_floor,
+    compute_pre_pv_target,
 )
 
 # Battery constants (Mum's SIG system)
@@ -7945,6 +7947,171 @@ def test_rd46_best_soc_max_caps_charge_candidates_but_not_the_freeze():
     print("  test_rd46_best_soc_max_caps_charge_candidates_but_not_the_freeze: PASSED")
 
 
+# ---------------------------------------------------------------------------
+# RD47 — the overflow floor grades instead of saturating at zero
+# ---------------------------------------------------------------------------
+
+
+def _raw_overflow_floor(overflow, soc_max=BATTERY_KWH, max_reserved=1.8, safety=1.05):
+    """The floor as it was BEFORE RD47 — the expression at both call sites."""
+    return max(soc_max - required_headroom_kwh(overflow, max_reserved, safety), 0.0)
+
+
+def test_rd47_floor_no_longer_saturates_at_zero():
+    """The defect, stated as a test.
+
+    `required_headroom = 1.05 x overflow + min(1.8, overflow)` drives the floor to
+    0 once overflow reaches ~15.5 kWh on an 18.08 kWh pack. Above that point every
+    forecast gives the SAME instruction — empty the pack — so a 16 kWh day and a
+    30 kWh day are indistinguishable. Live 2026-08-23 and again on 08-24,
+    `sensor.predbat_curtailment_floor_overflow` read 0.00 all morning.
+
+    The old behaviour is asserted here too, so the test says what changed rather
+    than only what is now true.
+    """
+    assert _raw_overflow_floor(16.0) == 0.0, "precondition: the raw floor saturates at 16 kWh"
+    assert _raw_overflow_floor(30.0) == 0.0, "precondition: and is identical at 30 kWh"
+
+    soft_16 = soften_overflow_floor(_raw_overflow_floor(16.0), BATTERY_KWH, 16.0)
+    soft_30 = soften_overflow_floor(_raw_overflow_floor(30.0), BATTERY_KWH, 30.0)
+    assert soft_16 > soft_30, "a 16 kWh forecast must reserve MORE floor than a 30 kWh one, got {:.3f} vs {:.3f}".format(soft_16, soft_30)
+    assert soft_30 == 0.0, "a forecast at/above pack size must still empty the pack (R25), got {:.3f}".format(soft_30)
+    print("  test_rd47_floor_no_longer_saturates_at_zero: PASSED ({:.2f} vs {:.2f} kWh)".format(soft_16, soft_30))
+
+
+def test_rd47_holds_the_minimum_until_the_forecast_needs_it():
+    """Below the hold point the minimum is held intact, not tapered.
+
+    The hold point is `soc_max - min_floor` = the overflow at which the RAW
+    forecast (not the buffered requirement) would exceed what the minimum leaves
+    available. Under that, holding 10% costs nothing the forecast asks for.
+    """
+    min_floor = BATTERY_KWH * 0.10  # 1.808 kWh
+    hold_until = BATTERY_KWH - min_floor  # 16.27 kWh
+
+    # 2026-08-23: the floor saturated to 0 on a day that realised 12.81 kWh.
+    soft = soften_overflow_floor(_raw_overflow_floor(15.5), BATTERY_KWH, 15.5)
+    assert abs(soft - min_floor) < 0.01, "at 15.5 kWh (below the hold point) the full minimum must be held, got {:.3f}".format(soft)
+
+    at_hold = soften_overflow_floor(_raw_overflow_floor(hold_until), BATTERY_KWH, hold_until)
+    assert abs(at_hold - min_floor) < 0.01, "at the hold point itself the minimum must still be intact, got {:.3f}".format(at_hold)
+    print("  test_rd47_holds_the_minimum_until_the_forecast_needs_it: PASSED (hold to {:.2f} kWh)".format(hold_until))
+
+
+def test_rd47_aug23_replays_to_the_minimum_not_zero():
+    """The day that prompted this, replayed.
+
+    2026-08-23: the floor read 0.00 all morning, SOC bottomed at 1.0%, and the
+    pack then absorbed 12.95 kWh (peak 71.6%) against a realised overflow of
+    12.81 kWh (`sensor.curtailment_overflow_daily`). To saturate the floor the
+    dawn forecast must have been >= 15.5 kWh.
+
+    With RD47 the floor holds 10% = 1.81 kWh, leaving 16.27 kWh of headroom —
+    which still covers both the 12.81 kWh realised AND the 15.5 kWh forecast.
+    So the deep drain bought nothing that day, which is the whole argument.
+    """
+    forecast = 15.5
+    realised = 12.81
+    soft = soften_overflow_floor(_raw_overflow_floor(forecast), BATTERY_KWH, forecast)
+    headroom = BATTERY_KWH - soft
+
+    # Saturation begins at (soc_max - 1.8) / 1.05 = 15.5048 kWh, so at 15.5 the raw
+    # floor is 0.005 kWh — zero for every practical purpose, and the pack was duly emptied.
+    assert _raw_overflow_floor(forecast) < 0.01, "precondition: this day saturated the old floor, got {:.4f}".format(_raw_overflow_floor(forecast))
+    assert abs(soft - BATTERY_KWH * 0.10) < 0.01, "must hold the 10% minimum, got {:.3f}".format(soft)
+    assert headroom > realised, "the softened floor must still have absorbed the realised {:.2f} kWh, had {:.2f}".format(realised, headroom)
+    assert headroom > forecast, "and must still have covered the {:.2f} kWh FORECAST, had {:.2f}".format(forecast, headroom)
+    print("  test_rd47_aug23_replays_to_the_minimum_not_zero: PASSED ({:.2f} kWh headroom vs {:.2f} realised)".format(headroom, realised))
+
+
+def test_rd47_extreme_forecast_still_empties_the_pack():
+    """R25 survives. Name the release point and assert it exactly.
+
+    Above `soc_max` of forecast overflow the pack cannot hold the day whatever we
+    do, so holding a reserve only guarantees curtailment. The taper reaches zero
+    exactly there. R25/R11: "an over-drain costs one battery round-trip; an
+    under-drain costs the entire clipped surplus, and cannot be undone."
+    """
+    release_at = BATTERY_KWH  # 18.08 kWh
+    assert soften_overflow_floor(_raw_overflow_floor(release_at), BATTERY_KWH, release_at) == 0.0, "at pack size the floor must release fully"
+    assert soften_overflow_floor(_raw_overflow_floor(25.0), BATTERY_KWH, 25.0) == 0.0, "beyond pack size it must stay released"
+
+    # And the taper between hold point and release is monotone — no cliff.
+    prev = None
+    for ov in (16.3, 16.8, 17.3, 17.8, 18.08):
+        cur = soften_overflow_floor(_raw_overflow_floor(ov), BATTERY_KWH, ov)
+        if prev is not None:
+            assert cur < prev, "the taper must be monotone decreasing at {:.2f}: {:.3f} !< {:.3f}".format(ov, cur, prev)
+        prev = cur
+    print("  test_rd47_extreme_forecast_still_empties_the_pack: PASSED (releases at {:.2f} kWh)".format(release_at))
+
+
+def test_rd47_never_raises_the_floor_above_the_forecast_requirement():
+    """The softening is a `max` against a MINIMUM — it must never deepen a drain.
+
+    RD43 removed a static term because a `min()` in that position could only ever
+    drain HARDER. This reinstates a non-forecast term in the opposite direction,
+    and this test is what pins the direction: on any day the raw floor already
+    exceeds the minimum, RD47 must be a no-op.
+    """
+    for ov in (0.0, 2.0, 5.0, 9.0, 12.0, 13.0):
+        raw = _raw_overflow_floor(ov)
+        soft = soften_overflow_floor(raw, BATTERY_KWH, ov)
+        assert abs(soft - raw) < 1e-9, "at {:.1f} kWh RD47 must be a no-op: raw {:.3f} -> {:.3f}".format(ov, raw, soft)
+    print("  test_rd47_never_raises_the_floor_above_the_forecast_requirement: PASSED")
+
+
+def test_rd47_minimum_of_zero_disables_the_softening():
+    """The helper set to 0 must reproduce the pre-RD47 curve exactly — the
+    dashboard escape hatch, and the way to fall back without a deploy."""
+    for ov in (14.0, 16.0, 20.0, 30.0):
+        raw = _raw_overflow_floor(ov)
+        assert soften_overflow_floor(raw, BATTERY_KWH, ov, min_floor_pct=0.0) == raw, "min_floor_pct=0 must be the old behaviour at {:.1f}".format(ov)
+    print("  test_rd47_minimum_of_zero_disables_the_softening: PASSED")
+
+
+def test_rd47_minimum_is_clamped_so_the_dashboard_cannot_invert_it():
+    """A helper is a live number a human can set wrong. An out-of-range value must
+    clamp, never produce a floor above the pack or a negative one — the
+    `sig_keep_floor_pct` range trap of 2026-07-22, in a new place."""
+    huge = soften_overflow_floor(_raw_overflow_floor(20.0), BATTERY_KWH, 20.0, min_floor_pct=500.0)
+    assert 0.0 <= huge <= BATTERY_KWH, "an absurd percentage must clamp inside the pack, got {:.3f}".format(huge)
+    neg = soften_overflow_floor(_raw_overflow_floor(20.0), BATTERY_KWH, 20.0, min_floor_pct=-10.0)
+    assert neg >= 0.0, "a negative percentage must not produce a negative floor, got {:.3f}".format(neg)
+    print("  test_rd47_minimum_is_clamped_so_the_dashboard_cannot_invert_it: PASSED")
+
+
+def test_rd47_pre_pv_target_grades_too():
+    """The dawn drain is the one that actually emptied the pack, so it must carry
+    RD47 as well.
+
+    `compute_pre_pv_target` holds a SECOND copy of the floor expression
+    (Duplicate-logic index). Hooking only the live daytime site would leave the
+    pre-PV dawn drain — the path that produced 1.0% SOC — unchanged.
+    """
+    deep = compute_pre_pv_target(BATTERY_KWH, reserve=0.0, expected_overflow_kwh=16.0, dawn_load_kwh=0.0)
+    deeper = compute_pre_pv_target(BATTERY_KWH, reserve=0.0, expected_overflow_kwh=30.0, dawn_load_kwh=0.0)
+    assert deep > deeper, "the pre-PV target must grade with forecast size too, got {:.3f} vs {:.3f}".format(deep, deeper)
+    assert deep > DEEP_DISCHARGE_FLOOR_KWH, "a 16 kWh forecast must no longer drain to the deep floor, got {:.3f}".format(deep)
+    print("  test_rd47_pre_pv_target_grades_too: PASSED ({:.2f} vs {:.2f} kWh)".format(deep, deeper))
+
+
+def test_rd47_both_call_sites_agree():
+    """Anti-drift across the known duplication.
+
+    The floor is computed in two places with the same shape. They must give the
+    same answer for the same inputs, or the dawn drain and the daytime Schmitt
+    will disagree about how deep the day needs to go.
+    """
+    for ov in (14.0, 16.0, 17.0, 20.0):
+        live = soften_overflow_floor(_raw_overflow_floor(ov), BATTERY_KWH, ov)
+        pre_pv = compute_pre_pv_target(BATTERY_KWH, reserve=0.0, expected_overflow_kwh=ov, dawn_load_kwh=0.0)
+        # pre-PV also carries the deep-discharge + dawn-load arm, so it is a max()
+        expected = max(DEEP_DISCHARGE_FLOOR_KWH, live)
+        assert abs(pre_pv - expected) < 0.01, "at {:.1f} kWh the two sites disagree: live {:.3f} vs pre-PV {:.3f}".format(ov, live, pre_pv)
+    print("  test_rd47_both_call_sites_agree: PASSED")
+
+
 def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     """RD32 — R63 must drain to the SAME floor the Schmitt does.
 
@@ -9736,6 +9903,15 @@ def run_curtailment_tests(my_predbat=None):
         test_rd46_no_cap_written_while_the_target_is_unknown,
         test_rd46_charge_limit_maps_to_the_solar_blocking_register,
         test_rd46_best_soc_max_caps_charge_candidates_but_not_the_freeze,
+        test_rd47_floor_no_longer_saturates_at_zero,
+        test_rd47_holds_the_minimum_until_the_forecast_needs_it,
+        test_rd47_aug23_replays_to_the_minimum_not_zero,
+        test_rd47_extreme_forecast_still_empties_the_pack,
+        test_rd47_never_raises_the_floor_above_the_forecast_requirement,
+        test_rd47_minimum_of_zero_disables_the_softening,
+        test_rd47_minimum_is_clamped_so_the_dashboard_cannot_invert_it,
+        test_rd47_pre_pv_target_grades_too,
+        test_rd47_both_call_sites_agree,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,

@@ -34,6 +34,7 @@ R63_HYST_KWH = 0.5
 # Hold/export while SOC is empty on sunny-tomorrow days where soc_keep relaxes
 # toward 0 (charge_below).
 DEEP_DISCHARGE_FLOOR_KWH = 0.5
+MIN_FLOOR_PCT_DEFAULT = 10.0  # RD47 — see soften_overflow_floor
 
 # R16a Schmitt deadband for entering Drain (~1% of an 18 kWh battery). Sized to
 # be robust to Sigen's 0.1% SOC quantisation (0.018 kWh) so sensor noise alone
@@ -897,7 +898,7 @@ def compute_charge_below(p10_recovery_floor, soc_keep, session_charge_target=0.0
     return max(p10_recovery_floor, soc_keep, DEEP_DISCHARGE_FLOOR_KWH, session_charge_target)
 
 
-def compute_pre_pv_target(soc_max, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.05):
+def compute_pre_pv_target(soc_max, reserve, expected_overflow_kwh, dawn_load_kwh, max_reserved_kwh=1.8, safety_factor=1.05, min_floor_pct=MIN_FLOOR_PCT_DEFAULT):
     """R62 (2026-07-07): forecast-driven pre-PV drain target.
 
     The drain goes exactly as deep as the forecast headroom requirement, and no
@@ -956,6 +957,10 @@ def compute_pre_pv_target(soc_max, reserve, expected_overflow_kwh, dawn_load_kwh
     overflow = max(0.0, expected_overflow_kwh)
     buffer_kwh = min(max_reserved_kwh, overflow)
     overflow_floor = max(0.0, (soc_max - buffer_kwh) - overflow * safety_factor)
+    # RD47: the dawn drain is the one that actually empties the pack, so it carries
+    # the softened floor too. Hooking only the daytime site would leave this path —
+    # the one that produced 1.0% SOC on 2026-08-23/24 — on the old cliff.
+    overflow_floor = soften_overflow_floor(overflow_floor, soc_max, overflow, min_floor_pct)
     return max(reserve, DEEP_DISCHARGE_FLOOR_KWH + max(0.0, dawn_load_kwh), overflow_floor)
 
 
@@ -1344,6 +1349,83 @@ def required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor=1.05):
     """
     ov = max(0.0, overflow_kwh)
     return safety_factor * ov + min(max_reserved_kwh, ov)
+
+
+def soften_overflow_floor(overflow_floor_kwh, soc_max, expected_overflow_kwh, min_floor_pct=MIN_FLOOR_PCT_DEFAULT):
+    """RD47 — hold a minimum floor until the forecast genuinely needs the pack.
+
+    THE DEFECT. `required_headroom_kwh` adds a 1.05x multiplier AND a flat 1.8 kWh
+    reserve, so on an 18.08 kWh pack the floor reaches zero at only
+    (soc_max - 1.8) / 1.05 = 15.50 kWh of forecast overflow, and passes 10% at
+    13.78. **The entire 10% -> 0% gradation is 1.7 kWh wide.** Above 15.50 every
+    forecast gives an identical instruction — empty the pack — so a 16 kWh day and
+    a 30 kWh day are indistinguishable. Live: `curtailment_floor_overflow` read
+    0.00 all morning on both 2026-08-23 and 2026-08-24.
+
+    That is not a gentle curve running out of road; it is a cliff, and it fires far
+    more often than the realised distribution justifies. 26 days of
+    `sensor.curtailment_overflow_daily` (from 2026-07-29) realised a median of
+    ~9 kWh and a max of 17.04; only TWO days passed 15.50. Yet 08-23 saturated on
+    a day that realised 12.81 kWh, drained to 1% SOC, and then peaked at 71.6% —
+    28 points of pack never used.
+
+    THE SHAPE. Hold `min_floor` until the RAW forecast exceeds what that minimum
+    leaves available, then taper to zero by the time the forecast could fill the
+    whole pack:
+
+        hold_until = soc_max - min_floor     # 16.27 kWh at 10%
+        release_at = soc_max                 # 18.08 kWh
+        floor      = max(raw_floor, min_floor x clamp((release_at - ov) / min_floor))
+
+    Both bounds are DERIVED from the pack and the minimum — no magic constants.
+    Below `hold_until` the raw floor already exceeds `min_floor`, so the `max`
+    picks the raw value and this is a no-op: RD47 can only ever limit an
+    over-drain, never deepen one. That direction matters — RD43 deleted a static
+    term precisely because a `min()` in this position could only drain HARDER.
+
+    WHY THIS AND NOT CONFIDENCE. Solcast's confidence is a real signal (it tracks
+    the P10-P90 spread) but it is the wrong lever and points the wrong way: high
+    confidence means P90 ~ P50, so defending P90 is nearly free; low confidence
+    means P90 >> P50, which is exactly when a "relax unless confident" rule would
+    under-prepare — the failure R50a's fixtures record (27 Jul: blend forecast
+    2.35 kWh against ~13 kWh actually absorbed). It also could not have fixed
+    08-23, where confidence was 0.90-0.93 and the excess came from these fixed
+    buffers. R50a's blend stays retired; this function must never be reached from
+    `_expected_overflow`.
+
+    THE PRICE, stated. Across those 26 days realised overflow exceeded the
+    16.27 kWh that a 10% floor leaves exactly ONCE (17.04 kWh, short by 0.77 kWh
+    ~ 12p of curtailed export). That is the deliberate cost, accepted against
+    R25/R11's asymmetry ("an over-drain costs one battery round-trip; an
+    under-drain costs the entire clipped surplus, and cannot be undone") — which
+    is also why the taper still reaches zero rather than holding a reserve on a
+    day the pack cannot cover whatever it does.
+
+    Args:
+        overflow_floor_kwh: kWh — the raw forecast-driven floor.
+        soc_max: kWh — battery capacity.
+        expected_overflow_kwh: kWh — forecast overflow the floor was built from.
+        min_floor_pct: % of pack to hold. 0 disables (exactly the pre-RD47 curve);
+            clamped to [0, 100] so a bad dashboard value cannot invert the curve.
+
+    Returns:
+        kWh — the floor, never below the raw value and never above the pack.
+    """
+    raw = max(0.0, float(overflow_floor_kwh))
+    pct = min(max(float(min_floor_pct), 0.0), 100.0)
+    if pct <= 0.0 or soc_max <= 0:
+        return raw
+
+    min_floor = soc_max * pct / 100.0
+    overflow = max(0.0, float(expected_overflow_kwh))
+
+    # Taper runs from (soc_max - min_floor) to soc_max, i.e. over exactly min_floor
+    # of forecast. Guarded above by pct > 0, so this cannot divide by zero.
+    hold_until = soc_max - min_floor
+    frac = (soc_max - overflow) / min_floor
+    frac = min(max(frac, 0.0), 1.0)
+
+    return min(max(raw, min_floor * frac), soc_max)
 
 
 def compute_no_overflow_charge_target(overnight_target_kwh, soc_max, overflow_p90_kwh, max_reserved_kwh, safety_factor=1.05):
