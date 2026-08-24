@@ -4565,6 +4565,7 @@ from curtailment_plugin import (
     DAWN_RELEASE_CONFIRM_CYCLES,
     MIN_BASE_LOAD_KW,
     SESSION_PROTECT_HORIZON_HOURS,
+    EXPORT_HOLD_RELEASE_CYCLES,
     PREDBAT_SOC_MIN_HELPER,
     PREDBAT_SOC_MAX_HELPER,
 )
@@ -8262,26 +8263,52 @@ def test_rd48_can_retake_the_wheel_after_handing_back():
     print("  test_rd48_can_retake_the_wheel_after_handing_back: PASSED")
 
 
-def test_rd48_does_not_flap_at_the_cap_boundary():
-    """The 2026-08-03 sundown flap, in test form: 7 writer swaps in 25 minutes.
+def test_rd48_survives_a_single_cloudy_cycle():
+    """The regression that a ±0.1 kW hover test failed to catch.
 
-    Every swap runs _set_writer, which disables/enables all three Predbat mapper
-    automations and toggles read_only. Surplus sitting on the cap must NOT
-    oscillate the decision, so the latch is asymmetric like `_no_risk_latched`.
+    The first cut released on a margin (`surplus > cap - 0.3`). Live 2026-08-24
+    that flapped **Hold 17:19 -> Predbat 17:25 -> Hold 17:30**, banking surplus
+    again for the cycle Predbat held the wheel, because PV fell 4.288 -> 1.747 kW
+    in three minutes behind one cloud. No plausible margin absorbs that swing, and
+    the original test hovered gently either side of the cap so it passed while the
+    real thing oscillated — the fixture was too kind.
+
+    Release is therefore a CONFIRM COUNT, like DAWN_RELEASE_CONFIRM_CYCLES: a
+    momentary dip must not spend the latch. Every swap toggles three mapper
+    automations and read_only (2026-08-03: 7 swaps in 25 min).
     """
     # Rig cap is 4.0 kW, so engaging needs surplus > 4.3 (cap + EXPORT_HOLD_MARGIN_KW).
     plugin, base = _rd48_base(soc_frac=0.90, pv_kw=5.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)  # surplus 4.63
     assert _rd48_run(plugin) == "active", "precondition: must engage above the cap"
 
-    phases = []
-    for pv_kw in (4.3, 4.4, 4.25, 4.45, 4.35):  # surplus 3.88..4.08, straddling the 4.0 cap
+    def cycle(pv_kw):
         base._sensor_overrides["sensor.sigen_plant_pv_power"] = pv_kw
         base.pv_forecast_minute_step = {m: pv_kw * (PLUGIN_STEP / 60.0) for m in range(0, 480, PLUGIN_STEP)}
+        return _rd48_run(plugin)
+
+    # Today's actual collapse, then recovery — one cycle under the cap.
+    assert cycle(1.747) == "active", "a SINGLE cloudy cycle must not hand the wheel back"
+    assert cycle(5.0) == "active", "and recovery must find the latch still held"
+    print("  test_rd48_survives_a_single_cloudy_cycle: PASSED")
+
+
+def test_rd48_releases_after_a_sustained_drop():
+    """The other half: the latch must not be permanent.
+
+    Once PV is genuinely done, CM has to let go so Predbat can run its high-rate
+    export window — `EXPORT_HOLD_RELEASE_CYCLES` consecutive cycles below the cap.
+    """
+    plugin, base = _rd48_base(soc_frac=0.90, pv_kw=5.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
+    assert _rd48_run(plugin) == "active", "precondition: must engage above the cap"
+
+    phases = []
+    for _ in range(EXPORT_HOLD_RELEASE_CYCLES):
+        base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.747
+        base.pv_forecast_minute_step = {m: 1.747 * (PLUGIN_STEP / 60.0) for m in range(0, 480, PLUGIN_STEP)}
         phases.append(_rd48_run(plugin))
 
-    changes = sum(1 for a, b in zip(["active"] + phases, phases) if a != b)
-    assert changes <= 1, "the writer role must not chatter at the boundary — {} changes across {}".format(changes, phases)
-    print("  test_rd48_does_not_flap_at_the_cap_boundary: PASSED ({})".format(phases))
+    assert phases[-1] == "off", "after {} sustained cycles below the cap CM must hand back, got {}".format(EXPORT_HOLD_RELEASE_CYCLES, phases)
+    print("  test_rd48_releases_after_a_sustained_drop: PASSED ({})".format(phases))
 
 
 def test_rd48_session_still_outranks():
@@ -10101,7 +10128,8 @@ def run_curtailment_tests(my_predbat=None):
         test_rd48_ceiling_is_derived_not_hardcoded,
         test_rd48_never_max_export_on_this_path,
         test_rd48_can_retake_the_wheel_after_handing_back,
-        test_rd48_does_not_flap_at_the_cap_boundary,
+        test_rd48_survives_a_single_cloudy_cycle,
+        test_rd48_releases_after_a_sustained_drop,
         test_rd48_session_still_outranks,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
