@@ -8112,6 +8112,188 @@ def test_rd47_both_call_sites_agree():
     print("  test_rd47_both_call_sites_agree: PASSED")
 
 
+# ---------------------------------------------------------------------------
+# RD48 — don't bank PV that could be exported now
+# ---------------------------------------------------------------------------
+
+
+def _rd48_base(soc_frac, pv_kw, load_kw=0.5, minutes_now=840, p90_peak_kw=5.0, solcast_remaining=2.0):
+    """A fits-day afternoon: no curtailment risk left, so RD45 wants to stand down.
+
+    Same shape as the RD45 rig, but the remaining overflow has to be tuned to the
+    SOC under test. Headroom shrinks as SOC rises, so the p90 that comfortably
+    "fits" at 55% does NOT fit at 90% — the day stops being a no-risk day and RD45
+    never fires, which would make these tests pass for the wrong reason. Defaults
+    mirror 2026-08-24 late afternoon (p90 ~0.9 kWh against a mostly-full pack).
+    """
+    pv = {m: pv_kw for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: load_kw for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": pv_kw, "sensor.sigen_plant_consumed_power": load_kw}
+    overrides.update(_make_p90_sensors(p90_peak_kw=p90_peak_kw, solcast_remaining=solcast_remaining))
+    overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base = MockBase(
+        pv_step=pv,
+        load_step=load,
+        soc_kw=BATTERY_KWH * soc_frac,
+        minutes_now=minutes_now,
+        best_soc_keep=4.0,
+        sensor_overrides=overrides,
+    )
+    plugin = CurtailmentPlugin(base)
+    plugin._peak_pv = 7.5
+    return plugin, base
+
+
+def _rd48_run(plugin):
+    """calculate() then on_update(), asserting the precondition RD48 depends on."""
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", "precondition: calculate() must still compute an intention, got {}".format(phase)
+    assert plugin._no_risk_latched, "precondition: this must be a no-risk (fits) day, or RD45 never fires"
+    plugin.on_update()
+    return plugin.last_phase
+
+
+def test_rd48_keeps_the_wheel_while_banking_would_displace_export():
+    """2026-08-24 16:40, the day that prompted this.
+
+    PV 5.62, load 0.37 → surplus 5.25 kW against a 3.68 kW cap, SOC 75.9% with an
+    overnight need of 6.52 kWh. Predbat took the wheel and put the WHOLE 5.25 kW
+    into the battery, exporting 0.000 with the cap idle. Useful fill is only
+    ~59% (overnight + what an export peak can absorb at the cap in an hour), so
+    ~7.5 kWh was being banked with no buyer — and the pack would fill while
+    surplus still exceeded the cap, curtailing the remainder.
+    """
+    plugin, base = _rd48_base(soc_frac=0.759, pv_kw=5.62, load_kw=0.37)
+    phase = _rd48_run(plugin)
+    assert phase == "active", "RD48: CM must keep the wheel while banking displaces exportable PV, got {}".format(phase)
+    assert plugin._policy_override == "hold", "and must hold (battery flat, surplus exported), got {}".format(plugin._policy_override)
+    print("  test_rd48_keeps_the_wheel_while_banking_would_displace_export: PASSED")
+
+
+def test_rd48_rd45_still_stands_down_below_the_ceiling():
+    """The RD45 regression guard — the common case must not change.
+
+    Below the useful ceiling the pack still has somewhere legitimate to put the
+    energy, so there is nothing to protect and Predbat should have the day.
+    """
+    plugin, base = _rd48_base(soc_frac=0.30, pv_kw=5.62, load_kw=0.37)
+    phase = _rd48_run(plugin)
+    assert phase == "off", "below the ceiling RD45 must still stand CM down, got {}".format(phase)
+    assert plugin._floor_source == "No Curtailment Risk", "and must still name itself, got {}".format(plugin._floor_source)
+    print("  test_rd48_rd45_still_stands_down_below_the_ceiling: PASSED")
+
+
+def test_rd48_hands_back_once_surplus_drops_below_the_cap():
+    """This is the assertion that protects Predbat's evening sale.
+
+    Holding the wheel sets read_only, which muzzles Predbat — so an unbounded hold
+    would block its own high-rate export window (2026-08-24: 20.5p at 18:00-19:00
+    against 12.0p in the afternoon). Once surplus falls under the cap there is
+    nothing left to displace: everything exports anyway, so CM must let go.
+    """
+    plugin, base = _rd48_base(soc_frac=0.90, pv_kw=3.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
+    phase = _rd48_run(plugin)
+    assert phase == "off", "with surplus below the cap CM must hand back so Predbat can sell, got {}".format(phase)
+    print("  test_rd48_hands_back_once_surplus_drops_below_the_cap: PASSED")
+
+
+def test_rd48_hands_back_once_soc_reaches_the_ceiling():
+    """Nothing left to shed — the pack is no longer over-filled."""
+    plugin, base = _rd48_base(soc_frac=0.40, pv_kw=5.62, load_kw=0.37)
+    phase = _rd48_run(plugin)
+    # Read the ceiling AFTER calculate(): before it, overnight target is None and
+    # the cap is still the constructor default, so the number means nothing.
+    ceiling = plugin._useful_ceiling_kwh()
+    assert BATTERY_KWH * 0.40 < ceiling, "fixture must sit BELOW the ceiling ({:.2f} kWh) or this proves nothing".format(ceiling)
+    assert phase == "off", "at/below the ceiling CM must hand back, got {}".format(phase)
+    print("  test_rd48_hands_back_once_soc_reaches_the_ceiling: PASSED (ceiling {:.2f} kWh)".format(ceiling))
+
+
+def test_rd48_ceiling_is_derived_not_hardcoded():
+    """overnight need + what an export peak can physically absorb at the cap.
+
+    Andrew's "38 plus 21 for session": the second term is the cap-derived
+    3.68 kWh (= 3.68 kW x 1 h = 20.4% of an 18.08 kWh pack), NOT a magic 21%.
+    A different cap or a different overnight target must move it.
+    """
+    plugin, base = _rd48_base(soc_frac=0.75, pv_kw=5.62)
+    plugin._overnight_target_kwh = 6.52
+    plugin._effective_dno = 3.68
+    assert abs(plugin._useful_ceiling_kwh() - (6.52 + 3.68)) < 0.01, "ceiling must be overnight + cap x 1h, got {:.3f}".format(plugin._useful_ceiling_kwh())
+
+    plugin._effective_dno = 2.0
+    assert abs(plugin._useful_ceiling_kwh() - (6.52 + 2.0)) < 0.01, "a throttled cap must lower the ceiling, got {:.3f}".format(plugin._useful_ceiling_kwh())
+
+    plugin._effective_dno = 3.68
+    plugin._overnight_target_kwh = 2.0
+    assert abs(plugin._useful_ceiling_kwh() - (2.0 + 3.68)) < 0.01, "a smaller overnight need must lower it too, got {:.3f}".format(plugin._useful_ceiling_kwh())
+    print("  test_rd48_ceiling_is_derived_not_hardcoded: PASSED")
+
+
+def test_rd48_never_max_export_on_this_path():
+    """Hold, not Max Export.
+
+    Max Export would sell the pack down at the daytime rate (12p on 2026-08-24),
+    which is worse than keeping it to displace ~25p overnight import. RD48 exists
+    to stop BANKING, not to start selling. Assert the policy explicitly — "not
+    Predbat" would pass on Max Export too.
+    """
+    plugin, base = _rd48_base(soc_frac=0.759, pv_kw=5.62, load_kw=0.37)
+    _rd48_run(plugin)
+    assert plugin._policy_override == "hold", "must be the pure-Hold override, got {}".format(plugin._policy_override)
+    assert plugin._policy_override != "max_export", "must never dump the pack at the low daytime rate"
+    print("  test_rd48_never_max_export_on_this_path: PASSED")
+
+
+def test_rd48_can_retake_the_wheel_after_handing_back():
+    """Andrew asked for this explicitly, so assert it rather than assume it.
+
+    The gate is re-evaluated every cycle, so CM handing back at 16:30 does not
+    prevent it taking the wheel again at 16:45 if the pack is still over-filled
+    with surplus above the cap.
+    """
+    plugin, base = _rd48_base(soc_frac=0.90, pv_kw=3.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
+    assert _rd48_run(plugin) == "off", "precondition: low surplus must stand CM down first"
+
+    # PV picks back up on a later cycle, pack still over-filled.
+    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 5.62
+    base.pv_forecast_minute_step = {m: 5.62 * (PLUGIN_STEP / 60.0) for m in range(0, 480, PLUGIN_STEP)}
+    assert _rd48_run(plugin) == "active", "RD48 must be able to RE-TAKE the wheel, got {}".format(plugin.last_phase)
+    print("  test_rd48_can_retake_the_wheel_after_handing_back: PASSED")
+
+
+def test_rd48_does_not_flap_at_the_cap_boundary():
+    """The 2026-08-03 sundown flap, in test form: 7 writer swaps in 25 minutes.
+
+    Every swap runs _set_writer, which disables/enables all three Predbat mapper
+    automations and toggles read_only. Surplus sitting on the cap must NOT
+    oscillate the decision, so the latch is asymmetric like `_no_risk_latched`.
+    """
+    # Rig cap is 4.0 kW, so engaging needs surplus > 4.3 (cap + EXPORT_HOLD_MARGIN_KW).
+    plugin, base = _rd48_base(soc_frac=0.90, pv_kw=5.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)  # surplus 4.63
+    assert _rd48_run(plugin) == "active", "precondition: must engage above the cap"
+
+    phases = []
+    for pv_kw in (4.3, 4.4, 4.25, 4.45, 4.35):  # surplus 3.88..4.08, straddling the 4.0 cap
+        base._sensor_overrides["sensor.sigen_plant_pv_power"] = pv_kw
+        base.pv_forecast_minute_step = {m: pv_kw * (PLUGIN_STEP / 60.0) for m in range(0, 480, PLUGIN_STEP)}
+        phases.append(_rd48_run(plugin))
+
+    changes = sum(1 for a, b in zip(["active"] + phases, phases) if a != b)
+    assert changes <= 1, "the writer role must not chatter at the boundary — {} changes across {}".format(changes, phases)
+    print("  test_rd48_does_not_flap_at_the_cap_boundary: PASSED ({})".format(phases))
+
+
+def test_rd48_session_still_outranks():
+    """RD14-own is unchanged: a live session keeps CM driving regardless."""
+    plugin, base = _rd48_base(soc_frac=0.30, pv_kw=5.62, load_kw=0.37)
+    base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    plugin.on_update()
+    assert plugin.last_phase == "active", "a live session must keep CM on the wheel, got {}".format(plugin.last_phase)
+    print("  test_rd48_session_still_outranks: PASSED")
+
+
 def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     """RD32 — R63 must drain to the SAME floor the Schmitt does.
 
@@ -9912,6 +10094,15 @@ def run_curtailment_tests(my_predbat=None):
         test_rd47_minimum_is_clamped_so_the_dashboard_cannot_invert_it,
         test_rd47_pre_pv_target_grades_too,
         test_rd47_both_call_sites_agree,
+        test_rd48_keeps_the_wheel_while_banking_would_displace_export,
+        test_rd48_rd45_still_stands_down_below_the_ceiling,
+        test_rd48_hands_back_once_surplus_drops_below_the_cap,
+        test_rd48_hands_back_once_soc_reaches_the_ceiling,
+        test_rd48_ceiling_is_derived_not_hardcoded,
+        test_rd48_never_max_export_on_this_path,
+        test_rd48_can_retake_the_wheel_after_handing_back,
+        test_rd48_does_not_flap_at_the_cap_boundary,
+        test_rd48_session_still_outranks,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,
