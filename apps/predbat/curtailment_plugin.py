@@ -49,6 +49,8 @@ from curtailment_calc import (
     compute_solar_overflow,
     compute_solcast_overflow,
     compute_expected_overflow,
+    soften_overflow_floor,
+    MIN_FLOOR_PCT_DEFAULT,
     compute_p10_recovery_floor,
     compute_max_sheddable,
     compute_overflow_fits_margin,
@@ -439,6 +441,12 @@ CONFIDENCE_LOW_DEFAULT = 0.60  # only used when the blend is re-enabled
 CONFIDENCE_DEFAULT = 0.9
 HA_CONFIDENCE_HIGH = "input_number.curtailment_confidence_high"
 HA_CONFIDENCE_LOW = "input_number.curtailment_confidence_low"
+
+# RD47 minimum drain floor, as a % of pack. Live-tunable so the curve can be
+# moved from the dashboard without a deploy; 0 restores the pre-RD47 behaviour
+# exactly. Default 10% = 1.81 kWh on this pack, leaving 16.27 kWh of headroom —
+# more than the realised overflow on 25 of the 26 days measured since 2026-07-29.
+HA_MIN_FLOOR_PCT = "input_number.curtailment_min_floor_pct"
 
 # v22 R52 pre-PV drain: activate before sunrise on confirmed-overflow days
 # so we drain at full DNO rate while drain capacity is uncontested by PV.
@@ -1303,6 +1311,19 @@ class CurtailmentPlugin(PredBatPlugin):
             high=high,
         )
 
+    def _min_floor_pct(self):
+        """RD47 minimum drain floor (% of pack), from the live helper.
+
+        Falls back to the module default when the helper is absent or unreadable
+        rather than to 0: an unreadable helper must not silently restore the
+        saturating curve this requirement exists to remove.
+        """
+        try:
+            return float(self.base.get_state_wrapper(HA_MIN_FLOOR_PCT, default=MIN_FLOOR_PCT_DEFAULT))
+        except (TypeError, ValueError):
+            self._log_once("min_floor_pct_error", "Curtailment: {} unreadable — using default {}%".format(HA_MIN_FLOOR_PCT, MIN_FLOOR_PCT_DEFAULT))
+            return MIN_FLOOR_PCT_DEFAULT
+
     def _get_solcast_confidence(self):
         """Read Solcast analysis.confidence; fall back to CONFIDENCE_DEFAULT.
 
@@ -1402,6 +1423,7 @@ class CurtailmentPlugin(PredBatPlugin):
             dawn_load_kwh=dawn_load_kwh,
             max_reserved_kwh=MAX_RESERVED_KWH,
             safety_factor=OVERFLOW_SAFETY_FACTOR,
+            min_floor_pct=self._min_floor_pct(),
         )
 
         if soc_kw <= target_kwh + 0.1:
@@ -2096,6 +2118,10 @@ class CurtailmentPlugin(PredBatPlugin):
         # full requirement below.
         max_target_soc = soc_max - min(self._effective_max_reserved, max(0.0, remaining_overflow))
         overflow_floor = max(soc_max - required_headroom_kwh(remaining_overflow, self._effective_max_reserved, OVERFLOW_SAFETY_FACTOR), 0.0)
+        # RD47: hold a minimum floor until the forecast genuinely needs the pack.
+        # The raw expression above saturates to 0 at only ~15.5 kWh of overflow on
+        # this pack, so every larger forecast said "empty everything" identically.
+        overflow_floor = soften_overflow_floor(overflow_floor, soc_max, remaining_overflow, self._min_floor_pct())
 
         # R11 floor ratchet REMOVED 2026-07-28. It clamped
         # `overflow_floor = max(overflow_floor, previous)`, so the floor could only
