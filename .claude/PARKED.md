@@ -72,6 +72,28 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
+- **[2026-08-24] RD48 — VERIFIED on the first cycle after deploy (`5c24b545`).**
+  Deployed 17:17 straight into live trigger conditions, so the check was immediate
+  rather than needing another day.
+  **Before (17:15, Predbat driving):** PV 4.531, load 0.358, surplus 4.17 kW —
+  battery **+4.177 kW** taking essentially all of it, grid **0.0 kW**, cap idle,
+  SOC 84.8% and climbing.
+  **After (17:23, CM holding):** intended policy **Hold Battery**, select written
+  17:19:42, `predbat.status` Read-Only. PV 4.631, load 0.538, surplus 4.09 kW —
+  grid **−3.659 kW (at the 3.68 cap)**, battery **+0.432 kW**. The surplus now
+  splits export-first, banking only the above-cap remainder, which is precisely
+  the designed behaviour.
+  **Still to confirm tonight — the half that protects the arbitrage.** CM must
+  hand back before Predbat's 18:00-19:00 high-rate `Exp` window (20.5p vs 12.0p),
+  which happens when surplus falls below `cap − EXPORT_HOLD_MARGIN_KW` = 3.38 kW,
+  i.e. PV under ~3.9 kW. At 17:23 surplus was 4.09 and falling.
+  **Success =** policy back to Predbat and `read_only` cleared before ~18:00, with
+  the `Exp` window then running. **Failure =** CM still holding at 18:00, in which
+  case Predbat cannot sell — though the loss is bounded, because surplus above
+  3.38 kW means live PV is already filling most of the export pipe and the pack
+  could only have sold the difference. If it does bite, the lever is
+  `EXPORT_HOLD_MARGIN_KW` or a lead-time release before a known high-rate window.
+
 - **[2026-08-24] RD47 — the overflow floor grades instead of saturating (`efb25181`).**
   Deployed 16:33, after CM handed back (policy Predbat, status Demand) — the
   charter forbids landing control-path changes mid-window, and CM held the wheel
