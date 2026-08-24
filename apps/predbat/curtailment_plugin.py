@@ -224,10 +224,18 @@ FITS_HYST_KWH = 0.5
 # = 20.4% of an 18.08 kWh pack — Andrew's "21% for session", derived rather than
 # hardcoded). Above overnight-need + this, banked PV has no buyer.
 SESSION_ALLOWANCE_HOURS = 1.0
-# Hysteresis on the surplus-vs-cap test, same job as FITS_HYST_KWH: every writer
-# swap toggles three mapper automations and read_only, and PV sitting on the cap
-# would otherwise chatter every cycle (the 2026-08-03 sundown flap, 7 in 25 min).
+# Engage margin: only take the wheel when surplus is CLEARLY above the cap, so a
+# brief spike does not grab it.
 EXPORT_HOLD_MARGIN_KW = 0.3
+# Release is a CONFIRM COUNT, not a margin — and this is the correction that
+# matters. A margin cannot survive real PV: live 2026-08-24 the array went
+# 4.288 -> 1.747 kW in three minutes behind one cloud, which no plausible margin
+# absorbs, and CM flapped Hold(17:19) -> Predbat(17:25) -> Hold(17:30) — banking
+# surplus again for the one cycle Predbat held it. Every swap toggles three mapper
+# automations and read_only (the 2026-08-03 sundown flap, 7 in 25 min).
+# Same shape as DAWN_RELEASE_CONFIRM_CYCLES: a momentary dip must not spend the
+# latch. 2 cycles ~ 10 min, and would have removed today's flap entirely.
+EXPORT_HOLD_RELEASE_CYCLES = 2
 
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
@@ -816,7 +824,8 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
         self._no_risk_latched = False  # RD45 activation gate hysteresis latch
-        self._export_hold_latched = False  # RD48 export-hold hysteresis latch
+        self._export_hold_latched = False  # RD48 export-hold latch
+        self._export_hold_below_count = 0  # RD48 consecutive cycles below the cap
         self._sundown_latched = False  # O1 dusk-flap latch
         self._dawn_released = False  # v33 dawn-gap reserve re-arms for the new dawn
         self._dawn_cross_count = 0
@@ -1365,13 +1374,21 @@ class CurtailmentPlugin(PredBatPlugin):
         surplus = max(0.0, pv_kw - load_kw)
         cap = getattr(self, "_effective_dno", 0.0) or 0.0
         above_ceiling = soc_kwh > self._useful_ceiling_kwh()
+        holding = above_ceiling and surplus > cap
 
-        # Asymmetric, like _no_risk_latched: engage only clearly above the cap,
-        # release only clearly below it.
         if self._export_hold_latched:
-            self._export_hold_latched = above_ceiling and surplus > (cap - EXPORT_HOLD_MARGIN_KW)
-        else:
-            self._export_hold_latched = above_ceiling and surplus > (cap + EXPORT_HOLD_MARGIN_KW)
+            # Release only on SUSTAINED absence — one cloudy cycle must not hand
+            # the wheel back and restart the banking.
+            if holding:
+                self._export_hold_below_count = 0
+            else:
+                self._export_hold_below_count += 1
+                if self._export_hold_below_count >= EXPORT_HOLD_RELEASE_CYCLES:
+                    self._export_hold_latched = False
+                    self._export_hold_below_count = 0
+        elif above_ceiling and surplus > (cap + EXPORT_HOLD_MARGIN_KW):
+            self._export_hold_latched = True
+            self._export_hold_below_count = 0
         return self._export_hold_latched
 
     def _min_floor_pct(self):
@@ -4169,6 +4186,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 # Not on the stand-down path — drop the latch so it cannot carry
                 # into a day it was never evaluated for.
                 self._export_hold_latched = False
+                self._export_hold_below_count = 0
 
             # Defer to Predbat charge windows when SOC below effective keep (R4).
             # ±0.2 kWh hysteresis via _r4_deferring flag (Bug 6): engage when SOC
