@@ -219,6 +219,16 @@ EARLY_HANDBACK_BUFFER_DEFAULT = 1.5
 # trigger). Hysteresis so we don't flap Hold<->Drain right at the boundary.
 FITS_HYST_KWH = 0.5
 
+# RD48: how long an export peak can absorb at the cap. 1 h x the DNO cap is the
+# most a single high-rate window can physically take from the pack (3.68 kWh here
+# = 20.4% of an 18.08 kWh pack — Andrew's "21% for session", derived rather than
+# hardcoded). Above overnight-need + this, banked PV has no buyer.
+SESSION_ALLOWANCE_HOURS = 1.0
+# Hysteresis on the surplus-vs-cap test, same job as FITS_HYST_KWH: every writer
+# swap toggles three mapper automations and read_only, and PV sitting on the cap
+# would otherwise chatter every cycle (the 2026-08-03 sundown flap, 7 in 25 min).
+EXPORT_HOLD_MARGIN_KW = 0.3
+
 PREDICT_STEP = 5
 SOC_MARGIN_KWH = 0.5
 
@@ -550,6 +560,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._policy_override = None
         self._overflow_fits_latched = False
         self._no_risk_latched = False
+        self._export_hold_latched = False
         self._session_active = False
         self._session_protect_kwh = 0.0
         # Which arm of compute_drain_above set the published Headroom Floor.
@@ -805,6 +816,7 @@ class CurtailmentPlugin(PredBatPlugin):
         self._r48_engaged_today = False
         self._overflow_fits_latched = False  # v32 Hold-gate hysteresis latch
         self._no_risk_latched = False  # RD45 activation gate hysteresis latch
+        self._export_hold_latched = False  # RD48 export-hold hysteresis latch
         self._sundown_latched = False  # O1 dusk-flap latch
         self._dawn_released = False  # v33 dawn-gap reserve re-arms for the new dawn
         self._dawn_cross_count = 0
@@ -1310,6 +1322,57 @@ class CurtailmentPlugin(PredBatPlugin):
             low=low,
             high=high,
         )
+
+    def _useful_ceiling_kwh(self):
+        """RD48: the most the pack can usefully hold — overnight need + one export peak.
+
+        Above this, banked PV has no buyer: it cannot be sold into a high-rate
+        window (only `cap x 1 h` fits) and is not needed overnight, so it sits
+        until CM dumps it the next morning at roughly the rate it could have been
+        exported at today, minus the round trip.
+        """
+        overnight = self._overnight_target_kwh or 0.0
+        cap = getattr(self, "_effective_dno", 0.0) or 0.0
+        return overnight + cap * SESSION_ALLOWANCE_HOURS
+
+    def _export_hold_active(self, soc_kwh):
+        """RD48: is banking right now displacing PV we could be exporting instead?
+
+        True only while BOTH hold: the pack is above `_useful_ceiling_kwh`, and PV
+        surplus exceeds the export cap. The second condition is what makes this
+        safe to act on — holding the wheel sets `read_only`, which muzzles Predbat,
+        so an unbounded hold would block its own high-rate export window. Once
+        surplus falls below the cap everything exports anyway, there is nothing
+        left to displace, and CM lets go in time for Predbat to sell.
+
+        Live 2026-08-24 16:40: PV 5.62, load 0.37, surplus 5.25 against a 3.68 kW
+        cap, SOC 75.9% vs a 10.2 kWh ceiling — and the plant was exporting 0.000
+        with the whole 5.25 kW going into the battery.
+
+        Fails CLOSED: an unreadable sensor or an overnight target not yet computed drops
+        the latch rather than holding the wheel on a guess.
+        """
+        if self._overnight_target_kwh is None:
+            self._export_hold_latched = False
+            return False
+        try:
+            pv_kw = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0) or 0)
+            load_kw = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0) or 0)
+        except (TypeError, ValueError):
+            self._export_hold_latched = False
+            return False
+
+        surplus = max(0.0, pv_kw - load_kw)
+        cap = getattr(self, "_effective_dno", 0.0) or 0.0
+        above_ceiling = soc_kwh > self._useful_ceiling_kwh()
+
+        # Asymmetric, like _no_risk_latched: engage only clearly above the cap,
+        # release only clearly below it.
+        if self._export_hold_latched:
+            self._export_hold_latched = above_ceiling and surplus > (cap - EXPORT_HOLD_MARGIN_KW)
+        else:
+            self._export_hold_latched = above_ceiling and surplus > (cap + EXPORT_HOLD_MARGIN_KW)
+        return self._export_hold_latched
 
     def _min_floor_pct(self):
         """RD47 minimum drain floor (% of pack), from the live helper.
@@ -4084,9 +4147,28 @@ class CurtailmentPlugin(PredBatPlugin):
             # holds the wheel and the select is not `Predbat` (2026-08-03: export
             # went 3.7 kW -> 0 with 20 minutes of the paid window left).
             if phase == "active" and self._no_risk_latched and not (self._is_session_dispatching() or self._session_imminent()):
-                phase = "off"
-                self._last_decision = "off: no curtailment risk (p90 fits headroom)"
-                self._floor_source = "No Curtailment Risk"
+                # RD48 (2026-08-24): standing down is right ONLY if Predbat will
+                # then do something better with the surplus. On 08-24 it did not —
+                # with the pack already past anything the evening could use it put
+                # the whole 5.25 kW surplus into the battery and exported 0.000,
+                # leaving the 3.68 kW cap idle. Worse than a wasted round trip: the
+                # pack then fills while surplus still exceeds the cap, so the
+                # remainder is curtailed (R25 — after overflow there are no levers).
+                # Keep the wheel and Hold instead: battery flat, surplus exported at
+                # the cap, only the above-cap remainder absorbed. Self-limiting, so
+                # Predbat still gets its high-rate window — see _export_hold_active.
+                if self._export_hold_active(getattr(self.base, "soc_kw", 0)):
+                    self._policy_override = "hold"
+                    self._last_decision = "active: holding to export surplus (pack above useful ceiling)"
+                    self._floor_source = "Export Surplus Hold"
+                else:
+                    phase = "off"
+                    self._last_decision = "off: no curtailment risk (p90 fits headroom)"
+                    self._floor_source = "No Curtailment Risk"
+            else:
+                # Not on the stand-down path — drop the latch so it cannot carry
+                # into a day it was never evaluated for.
+                self._export_hold_latched = False
 
             # Defer to Predbat charge windows when SOC below effective keep (R4).
             # ±0.2 kWh hysteresis via _r4_deferring flag (Bug 6): engage when SOC
