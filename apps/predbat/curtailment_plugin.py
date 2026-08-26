@@ -224,17 +224,15 @@ FITS_HYST_KWH = 0.5
 # = 20.4% of an 18.08 kWh pack — Andrew's "21% for session", derived rather than
 # hardcoded). Above overnight-need + this, banked PV has no buyer.
 SESSION_ALLOWANCE_HOURS = 1.0
-# Engage margin: only take the wheel when surplus is CLEARLY above the cap, so a
-# brief spike does not grab it.
-EXPORT_HOLD_MARGIN_KW = 0.3
-# Release is a CONFIRM COUNT, not a margin — and this is the correction that
-# matters. A margin cannot survive real PV: live 2026-08-24 the array went
-# 4.288 -> 1.747 kW in three minutes behind one cloud, which no plausible margin
-# absorbs, and CM flapped Hold(17:19) -> Predbat(17:25) -> Hold(17:30) — banking
-# surplus again for the one cycle Predbat held it. Every swap toggles three mapper
+# Release is a CONFIRM COUNT, not a margin. RD48 released on a surplus margin and
+# flapped live within minutes: PV went 4.288 -> 1.747 kW in three minutes behind
+# one cloud, and CM went Hold(17:19) -> Predbat(17:25) -> Hold(17:30), banking
+# surplus again for the cycle Predbat held it. Every swap toggles three mapper
 # automations and read_only (the 2026-08-03 sundown flap, 7 in 25 min).
+# RD49 removed the surplus test entirely, so the only way out is dropping back
+# under the ceiling — but SOC wobbles there too, so the confirm count stays.
 # Same shape as DAWN_RELEASE_CONFIRM_CYCLES: a momentary dip must not spend the
-# latch. 2 cycles ~ 10 min, and would have removed today's flap entirely.
+# latch. 2 cycles ~ 10 min.
 EXPORT_HOLD_RELEASE_CYCLES = 2
 
 PREDICT_STEP = 5
@@ -1342,7 +1340,11 @@ class CurtailmentPlugin(PredBatPlugin):
         """
         overnight = self._overnight_target_kwh or 0.0
         cap = getattr(self, "_effective_dno", 0.0) or 0.0
-        return overnight + cap * SESSION_ALLOWANCE_HOURS
+        # RD49: when a session is joined its NEED is the real figure (Andrew's
+        # "38 plus 21 for session"); otherwise fall back to what any export window
+        # could physically absorb at the cap in an hour.
+        session = getattr(self, "_session_reserve_kwh", 0.0) or 0.0
+        return overnight + max(session, cap * SESSION_ALLOWANCE_HOURS)
 
     def _export_hold_active(self, soc_kwh):
         """RD48: is banking right now displacing PV we could be exporting instead?
@@ -1364,17 +1366,23 @@ class CurtailmentPlugin(PredBatPlugin):
         if self._overnight_target_kwh is None:
             self._export_hold_latched = False
             return False
-        try:
-            pv_kw = float(self.base.get_state_wrapper(SIG_PV_POWER, default=0) or 0)
-            load_kw = float(self.base.get_state_wrapper(SIG_LOAD_POWER, default=0) or 0)
-        except (TypeError, ValueError):
-            self._export_hold_latched = False
-            return False
 
-        surplus = max(0.0, pv_kw - load_kw)
-        cap = getattr(self, "_effective_dno", 0.0) or 0.0
         above_ceiling = soc_kwh > self._useful_ceiling_kwh()
-        holding = above_ceiling and surplus > cap
+
+        # RD49 (2026-08-26): hold for the whole SOLAR DAY once the pack is past the
+        # ceiling — not only while surplus exceeds the cap, which is what RD48 did.
+        # Below the cap Predbat still banks past the ceiling, and RD48 could not see
+        # it: live 2026-08-26 15:06, SOC 61.4% against a 61.2% ceiling, +1.07 kW into
+        # the pack and 0.037 kW exported, with surplus ~1.05 kW well under the
+        # 3.68 kW cap. The surplus test was never the point; being past the ceiling
+        # is.
+        #
+        # The solar-day bound comes free: `calculate()` returns "off" at sundown
+        # (the O1 latch), so `phase == "active"` stops being true and the caller
+        # drops the latch. `past_safe` deliberately does NOT end the day here — it
+        # only forces the Hold override — so CM keeps the wheel through the evening
+        # export window, which is the point of RD49.
+        holding = above_ceiling
 
         if self._export_hold_latched:
             # Release only on SUSTAINED absence — one cloudy cycle must not hand
@@ -1386,7 +1394,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 if self._export_hold_below_count >= EXPORT_HOLD_RELEASE_CYCLES:
                     self._export_hold_latched = False
                     self._export_hold_below_count = 0
-        elif above_ceiling and surplus > (cap + EXPORT_HOLD_MARGIN_KW):
+        elif above_ceiling:
             self._export_hold_latched = True
             self._export_hold_below_count = 0
         return self._export_hold_latched
