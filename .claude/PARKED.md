@@ -72,6 +72,29 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
+- **[2026-08-26] RD49 VERIFIED on the discriminating case (`cae3b1c0`).**
+  Deployed 15:17, mid-hold (PV had surged back and CM re-took the wheel), accepted
+  because a Hold reset costs at most one cycle and RD49 re-engages on SOC alone.
+  **The check that separates RD49 from RD48** is holding while surplus is BELOW the
+  export cap — RD48 released there and Predbat resumed banking.
+  **16:27, live:** PV 1.380, load 0.447 -> surplus **0.933 kW** against a 3.68 kW
+  cap, SOC 69.4% (above the ceiling). CM still **Hold Battery**, `predbat.status`
+  Read-Only, grid **-0.933 kW** (whole surplus exported), battery **-0.012 kW —
+  flat, banking nothing**. Compare 15:06 under the old behaviour: SOC 61.4% against
+  a 61.2% ceiling, **+1.07 kW into the pack, 0.037 kW exported**. Same day, same
+  site, opposite outcome.
+  **Earlier the same afternoon** (15:25, surplus 5.78 kW) it split correctly too:
+  -3.646 exported at the cap, +2.111 banked — but that case is NOT discriminating,
+  RD48 would have done the same.
+  **Still unverified — the risk RD49 deliberately took.** RD45 exists because on
+  2026-08-18 CM held at 58.7% while Predbat banked 85% and sold the 18:00 session
+  for ~60p more. RD49 re-opens that scenario on the bet that RD41's session charge
+  target sizes the bank correctly, and that bet has never been tested with CM
+  driving through a session. **Tonight's 18:00 session is the first check.**
+  **Success =** CM sells into the session and ends near the overnight reserve.
+  **Failure =** it under-sells, i.e. ends the session materially above the reserve
+  with export capacity unused — which is the 08-18 loss repeating.
+
 - **[2026-08-24] RD48 — VERIFIED on the first cycle after deploy (`5c24b545`).**
   Deployed 17:17 straight into live trigger conditions, so the check was immediate
   rather than needing another day.
