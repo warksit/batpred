@@ -7100,6 +7100,19 @@ def test_rd45_no_curtailment_risk_stands_down():
     The v31 bug this replaces is still guarded — see
     `test_rd45_still_active_while_the_surplus_does_not_fit`, which is the same
     scenario with real risk and must still Hold rather than hand back.
+
+    NARROWED BY RD49 (2026-08-26). This used to run at 55% SOC. RD49 keeps CM on
+    the wheel for the whole solar day once the pack is past the useful ceiling
+    (overnight need + what the evening can sell), and in this rig that ceiling is
+    44.2% — so 55% now legitimately Holds and the old fixture asserted the
+    opposite. Dropped to 30%, below the ceiling, which is where RD45's claim still
+    holds: no curtailment risk AND nothing over-banked means CM has no job.
+
+    The narrowing is deliberate but NOT free. RD45 exists because on 2026-08-18 CM
+    sat on the wheel at 58.7% while Predbat's plan banked 85% and sold the 18:00
+    session for ~60p more. RD49 re-opens exactly that scenario, betting that RD41's
+    session charge target now sizes the bank correctly. That bet is unverified —
+    see the RD49 row in REQUIREMENTS.md.
     """
     pv = {m: 2.0 for m in range(0, 480, PLUGIN_STEP)}
     load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
@@ -7111,7 +7124,7 @@ def test_rd45_no_curtailment_risk_stands_down():
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=BATTERY_KWH * 0.55,  # ~8 kWh headroom ≫ remaining overflow + buffer
+        soc_kw=BATTERY_KWH * 0.30,  # headroom ≫ remaining overflow, and BELOW the RD49 ceiling
         minutes_now=840,  # 14:00 BST — before safe_time
         best_soc_keep=4.0,
         sensor_overrides=sensor_overrides,
@@ -8184,18 +8197,20 @@ def test_rd48_rd45_still_stands_down_below_the_ceiling():
     print("  test_rd48_rd45_still_stands_down_below_the_ceiling: PASSED")
 
 
-def test_rd48_hands_back_once_surplus_drops_below_the_cap():
-    """This is the assertion that protects Predbat's evening sale.
+def test_rd49_holds_even_when_surplus_is_below_the_cap():
+    """RD49 replaces RD48's surplus test — which missed the common case.
 
-    Holding the wheel sets read_only, which muzzles Predbat — so an unbounded hold
-    would block its own high-rate export window (2026-08-24: 20.5p at 18:00-19:00
-    against 12.0p in the afternoon). Once surplus falls under the cap there is
-    nothing left to displace: everything exports anyway, so CM must let go.
+    RD48 only held while surplus exceeded the export cap, on the theory that below
+    it "everything exports anyway". It does not: Predbat banks it. Live 2026-08-26
+    15:06 — SOC 61.4% against a 61.2% ceiling, +1.07 kW into the pack, 0.037 kW
+    exported, surplus ~1.05 kW against a 3.68 kW cap. Being past the ceiling is the
+    whole test; the surplus never was.
     """
     plugin, base = _rd48_base(soc_frac=0.90, pv_kw=3.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
     phase = _rd48_run(plugin)
-    assert phase == "off", "with surplus below the cap CM must hand back so Predbat can sell, got {}".format(phase)
-    print("  test_rd48_hands_back_once_surplus_drops_below_the_cap: PASSED")
+    assert phase == "active", "RD49: past the ceiling CM must hold even below the cap, got {}".format(phase)
+    assert plugin._policy_override == "hold", "and must Hold, got {}".format(plugin._policy_override)
+    print("  test_rd49_holds_even_when_surplus_is_below_the_cap: PASSED")
 
 
 def test_rd48_hands_back_once_soc_reaches_the_ceiling():
@@ -8253,13 +8268,17 @@ def test_rd48_can_retake_the_wheel_after_handing_back():
     prevent it taking the wheel again at 16:45 if the pack is still over-filled
     with surplus above the cap.
     """
-    plugin, base = _rd48_base(soc_frac=0.90, pv_kw=3.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
-    assert _rd48_run(plugin) == "off", "precondition: low surplus must stand CM down first"
+    # Under RD49 the stand-down is SOC-based, not surplus-based: start under the
+    # ceiling so RD45 hands the day to Predbat as normal.
+    # Low overflow throughout: at 0.90 SOC the headroom shrinks enough that a
+    # bigger forecast stops "fitting", RD45 never fires, and the test would pass
+    # for the wrong reason.
+    plugin, base = _rd48_base(soc_frac=0.30, pv_kw=5.62, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
+    assert _rd48_run(plugin) == "off", "precondition: below the ceiling CM must stand down first"
 
-    # PV picks back up on a later cycle, pack still over-filled.
-    base._sensor_overrides["sensor.sigen_plant_pv_power"] = 5.62
-    base.pv_forecast_minute_step = {m: 5.62 * (PLUGIN_STEP / 60.0) for m in range(0, 480, PLUGIN_STEP)}
-    assert _rd48_run(plugin) == "active", "RD48 must be able to RE-TAKE the wheel, got {}".format(plugin.last_phase)
+    # The pack then fills past the ceiling on a later cycle.
+    base.soc_kw = BATTERY_KWH * 0.90
+    assert _rd48_run(plugin) == "active", "RD49 must be able to RE-TAKE the wheel, got {}".format(plugin.last_phase)
     print("  test_rd48_can_retake_the_wheel_after_handing_back: PASSED")
 
 
@@ -8277,7 +8296,7 @@ def test_rd48_survives_a_single_cloudy_cycle():
     momentary dip must not spend the latch. Every swap toggles three mapper
     automations and read_only (2026-08-03: 7 swaps in 25 min).
     """
-    # Rig cap is 4.0 kW, so engaging needs surplus > 4.3 (cap + EXPORT_HOLD_MARGIN_KW).
+    # Engaging now needs only SOC past the ceiling (RD49); PV level is incidental.
     plugin, base = _rd48_base(soc_frac=0.90, pv_kw=5.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)  # surplus 4.63
     assert _rd48_run(plugin) == "active", "precondition: must engage above the cap"
 
@@ -8292,23 +8311,28 @@ def test_rd48_survives_a_single_cloudy_cycle():
     print("  test_rd48_survives_a_single_cloudy_cycle: PASSED")
 
 
-def test_rd48_releases_after_a_sustained_drop():
-    """The other half: the latch must not be permanent.
+def test_rd49_releases_only_when_soc_falls_back_under_the_ceiling():
+    """The latch must not be permanent — but low PV is no longer the way out.
 
-    Once PV is genuinely done, CM has to let go so Predbat can run its high-rate
-    export window — `EXPORT_HOLD_RELEASE_CYCLES` consecutive cycles below the cap.
+    Under RD49 the only release inside the solar day is the pack dropping back
+    under the ceiling (sundown is the other, and it arrives via calculate()
+    returning "off", not through this function). Sustained low PV alone must NOT
+    hand the wheel back, or Predbat resumes banking exactly as it did on 08-26.
     """
     plugin, base = _rd48_base(soc_frac=0.90, pv_kw=5.0, load_kw=0.37, p90_peak_kw=4.5, solcast_remaining=1.0)
-    assert _rd48_run(plugin) == "active", "precondition: must engage above the cap"
+    assert _rd48_run(plugin) == "active", "precondition: must engage above the ceiling"
 
-    phases = []
-    for _ in range(EXPORT_HOLD_RELEASE_CYCLES):
+    # PV collapses and stays down — the pack is still full, so CM keeps the wheel.
+    for _ in range(EXPORT_HOLD_RELEASE_CYCLES + 1):
         base._sensor_overrides["sensor.sigen_plant_pv_power"] = 1.747
         base.pv_forecast_minute_step = {m: 1.747 * (PLUGIN_STEP / 60.0) for m in range(0, 480, PLUGIN_STEP)}
-        phases.append(_rd48_run(plugin))
+        assert _rd48_run(plugin) == "active", "sustained low PV must NOT release while the pack is past the ceiling"
 
-    assert phases[-1] == "off", "after {} sustained cycles below the cap CM must hand back, got {}".format(EXPORT_HOLD_RELEASE_CYCLES, phases)
-    print("  test_rd48_releases_after_a_sustained_drop: PASSED ({})".format(phases))
+    # Now the pack drains back under the ceiling — that IS the release.
+    base.soc_kw = BATTERY_KWH * 0.20
+    phases = [_rd48_run(plugin) for _ in range(EXPORT_HOLD_RELEASE_CYCLES)]
+    assert phases[-1] == "off", "back under the ceiling CM must hand back, got {}".format(phases)
+    print("  test_rd49_releases_only_when_soc_falls_back_under_the_ceiling: PASSED ({})".format(phases))
 
 
 def test_rd48_session_still_outranks():
@@ -10123,13 +10147,13 @@ def run_curtailment_tests(my_predbat=None):
         test_rd47_both_call_sites_agree,
         test_rd48_keeps_the_wheel_while_banking_would_displace_export,
         test_rd48_rd45_still_stands_down_below_the_ceiling,
-        test_rd48_hands_back_once_surplus_drops_below_the_cap,
+        test_rd49_holds_even_when_surplus_is_below_the_cap,
         test_rd48_hands_back_once_soc_reaches_the_ceiling,
         test_rd48_ceiling_is_derived_not_hardcoded,
         test_rd48_never_max_export_on_this_path,
         test_rd48_can_retake_the_wheel_after_handing_back,
         test_rd48_survives_a_single_cloudy_cycle,
-        test_rd48_releases_after_a_sustained_drop,
+        test_rd49_releases_only_when_soc_falls_back_under_the_ceiling,
         test_rd48_session_still_outranks,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
