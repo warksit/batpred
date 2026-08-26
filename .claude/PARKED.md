@@ -72,28 +72,31 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
-- **[2026-08-26] RD49 VERIFIED on the discriminating case (`cae3b1c0`).**
-  Deployed 15:17, mid-hold (PV had surged back and CM re-took the wheel), accepted
-  because a Hold reset costs at most one cycle and RD49 re-engages on SOC alone.
-  **The check that separates RD49 from RD48** is holding while surplus is BELOW the
-  export cap — RD48 released there and Predbat resumed banking.
-  **16:27, live:** PV 1.380, load 0.447 -> surplus **0.933 kW** against a 3.68 kW
-  cap, SOC 69.4% (above the ceiling). CM still **Hold Battery**, `predbat.status`
-  Read-Only, grid **-0.933 kW** (whole surplus exported), battery **-0.012 kW —
-  flat, banking nothing**. Compare 15:06 under the old behaviour: SOC 61.4% against
-  a 61.2% ceiling, **+1.07 kW into the pack, 0.037 kW exported**. Same day, same
-  site, opposite outcome.
-  **Earlier the same afternoon** (15:25, surplus 5.78 kW) it split correctly too:
-  -3.646 exported at the cap, +2.111 banked — but that case is NOT discriminating,
-  RD48 would have done the same.
-  **Still unverified — the risk RD49 deliberately took.** RD45 exists because on
-  2026-08-18 CM held at 58.7% while Predbat banked 85% and sold the 18:00 session
-  for ~60p more. RD49 re-opens that scenario on the bet that RD41's session charge
-  target sizes the bank correctly, and that bet has never been tested with CM
-  driving through a session. **Tonight's 18:00 session is the first check.**
-  **Success =** CM sells into the session and ends near the overnight reserve.
-  **Failure =** it under-sells, i.e. ends the session materially above the reserve
-  with export capacity unused — which is the 08-18 loss repeating.
+- **[2026-08-26] RD49 FULLY VERIFIED, including the session risk it took (`cae3b1c0`).**
+  Deployed 15:17 mid-hold; a Hold reset costs at most one cycle and RD49 re-engages
+  on SOC alone.
+  **1. The discriminating case — holding BELOW the cap, which RD48 could not.**
+  16:27: PV 1.380, load 0.447 -> surplus **0.933 kW** against a 3.68 kW cap, SOC
+  69.4%. CM still **Hold Battery**, grid **-0.933 kW** (whole surplus exported),
+  battery **-0.012 kW — flat**. Compare 15:06 under the old code: SOC 61.4% vs a
+  61.2% ceiling, **+1.07 kW into the pack, 0.037 kW exported**. Same day, same site,
+  opposite outcome. (The 15:25 reading — surplus 5.78, split -3.646 export /
+  +2.111 bank — is correct but NOT discriminating; RD48 would have matched it.)
+  **2. The risk RD49 knowingly took did NOT materialise.** RD45 exists because on
+  2026-08-18 CM held at 58.7% while Predbat banked 85% and sold the session for
+  ~60p more. Tonight was the first test of RD41's charge target with CM driving:
+    * Pre-session 17:20: SOC **69.6%** against `session_charge_target` **61.2%** —
+      banked ABOVE its own target, not below it.
+    * Session hour 18:00-19:00: SOC **69.5% -> 49.5%** (3.62 kWh from the pack),
+      daily export **25.36 -> 29.04 kWh = exactly 3.68 kWh — the DNO cap x 1 h.**
+  **The window was saturated for its full duration; selling more was physically
+  impossible.** RD41 sized the bank correctly and the 08-18 under-sell did not
+  repeat. Ended 49.5%, comfortably above the 40% keep floor, because filling the
+  cap for an hour only needed 3.62 kWh.
+  **Method note:** an `ha_get_state` read during this check returned data stamped
+  **17:20 while the box clock said 20:20** — a three-hour stale MCP cache that
+  briefly looked like a dead plugin. Clocks matched to the second once compared
+  directly. Read `last_reported` against the BOX clock, every time.
 
 - **[2026-08-24] RD48 — VERIFIED on the first cycle after deploy (`5c24b545`).**
   Deployed 17:17 straight into live trigger conditions, so the check was immediate
