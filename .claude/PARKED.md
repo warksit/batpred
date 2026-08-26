@@ -210,6 +210,25 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-08-26] STRATEGIC: Predbat already prices curtailment — it just cannot see
+  it.** Andrew: "the more we tweak CM, the more I wish Predbat understood
+  curtailment cost." The investigation says that wish is cheaper to grant than it
+  looks. Predbat models the export cap end to end and clips in the forward
+  simulation (`prediction.py:1074-1081`); `clipped_today` carries no metric term
+  and does not need one, because clipped PV never reaches the export branch, so the
+  metric loses `export_rate x energy` — **curtailment is already priced, and priced
+  correctly.** What is missing is (a) **risk posture** — Predbat plans the median
+  and there is no P90 load scenario in stock at all, so on a "fits" day it never
+  SEES the clipping coming; and (b) the **terminal-value bug** (`plan.py:1326-1331`)
+  biasing toward holding.
+  **Why it matters:** RD46, RD47 and RD48/RD49 are all scaffolding around that blind
+  spot, not around a missing cost model. Fix the posture and the valuation and most
+  of the drain-depth tuning, the useful ceiling and the handback boundary become
+  redundant.
+  Full write-up, evidence and suggested sequencing:
+  `.claude/plans/predbat-curtailment-awareness.md`. **Deferred proposal, NOT the
+  current path** — do not start without deciding it explicitly.
+
 - **[2026-08-26] The solar-blocking cut-off register is being commanded LOW every
   cycle, and occasionally the write lands.** Found while asking whether RD46's
   `best_soc_max` channel could bound daytime banking.
