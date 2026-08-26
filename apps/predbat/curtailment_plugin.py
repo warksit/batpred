@@ -3522,10 +3522,15 @@ class CurtailmentPlugin(PredBatPlugin):
           * **The dawn crossing has passed.** `charge_limit` maps to
             number.sigen_plant_ess_charge_cut_off_state_of_charge (apps.yaml) —
             the SOC at which the pack stops charging from ANY source, solar
-            included (the charge_limit=0 solar-blocking bug, 2026-03-17). Predbat
-            holds that register at 100% outside charge windows, so the cap only
-            reaches it inside one; a DAYTIME charge window with the cap set would
-            block solar exactly when the pack should be absorbing. CM standing
+            included (the charge_limit=0 solar-blocking bug, 2026-03-17). A DAYTIME
+            charge window with the cap set would block solar exactly when the pack
+            should be absorbing.
+
+            NOTE (2026-08-26): this used to say Predbat holds that register at 100%
+            outside charge windows via `inverter_soc_reset`. It does NOT — those
+            branches are gated on `not inverter_hybrid` and this site is hybrid, so
+            they never run. Predbat actually commands 1% there. The dawn gate is
+            still right; the reassurance was not. See PARKED 2026-08-26. CM standing
             down is not adequate cover here — post-RD45 CM never takes the wheel
             at all on a low-overflow day, so there would be nothing to clear it.
             `_dawn_released` is the one signal that fires on every day-type, and

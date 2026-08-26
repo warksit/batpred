@@ -184,6 +184,51 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-08-26] The solar-blocking cut-off register is being commanded LOW every
+  cycle, and occasionally the write lands.** Found while asking whether RD46's
+  `best_soc_max` channel could bound daytime banking.
+  `charge_limit` maps to `number.sigen_plant_ess_charge_cut_off_state_of_charge`
+  (`ha/mum-apps.yaml:105-106`) — the SOC at which the pack stops charging from ANY
+  source, solar included (the 2026-03-17 bug).
+  **Outside a charge window Predbat commands it to 1%.** SIG is `has_target_soc:
+  False`, so the path is `execute.py:574-577` -> `adjust_battery_target_multi(…, 0)`
+  -> `execute.py:656-657` -> `inverter.adjust_battery_target(0.0)` -> clamped to
+  `reserve_percent` (live `set_reserve_min` = **1**) at `inverter.py:1897` ->
+  written at `inverter.py:1919`. Box log 2026-08-26 04:00:47: "setting charging SoC
+  to 0% … inverter doesn't support target SoC" then "Wrote 1 to charge_limit".
+  **Most writes do not reach the plant** — `write_and_poll_value`'s verify-read is
+  a no-op when Predbat holds an HA key (`ha.py:763`, `if refresh and not
+  self.ha_key`), so Predbat confirms against its own cache. **But some DO:** the
+  register history for 25-26 Aug has exactly three records — 100.0, then **0.0 at
+  18:22:00 on 25 Aug**, then 100.0 at 18:22:05. Five seconds at the value that
+  blocks all charging. Intermittent, not dormant.
+  **Not acted on:** this is stock `execute.py`/`inverter.py` behaviour, which the
+  charter forbids editing for site behaviour, and the correct fix is not obvious —
+  candidates are `set_reserve_min`, the `has_target_soc` declaration for SIG, or an
+  upstream fix to the hybrid gating below. Needs a decision, not a patch.
+
+- **[2026-08-26] RD46's stated safety premise is FALSE — correct the record.**
+  RD46 (and my `REQUIREMENTS.md` row for it) justify clearing the charge cap at
+  dawn by claiming "Predbat holds that register at 100% outside charge windows
+  (`inverter_soc_reset`)". **It does not.** All four reset-to-100% branches are
+  gated on `not self.inverter_hybrid` (`execute.py:509, 545, 566, 578`), and live
+  `switch.predbat_inverter_hybrid` = **on**, so every one is dead code here.
+  `inverter_soc_reset` = on is inert.
+  **The dawn gate itself is still right** — but for a different reason than
+  recorded, and RD46 does not make the register situation worse (the cap would
+  produce ~55%, far above the 1% already being commanded). Fix the reasoning in the
+  RD46 row and the `_predbat_charge_cap_kwh` docstring rather than the behaviour.
+
+- **[2026-08-26] `best_soc_max` CANNOT bound daytime PV banking — answered, no.**
+  Its only functional use is `plan.py:1392-1393` (`loop_soc = min(loop_soc,
+  best_soc_max)`), seeding `try_socs` in `optimise_charge_limit` — charge-**window**
+  targets only. Passive PV -> battery in Demand mode never consults it, in the plan
+  or in `execute.py`. On a sunny afternoon with no charge window planned there is no
+  target to cap. Capping can only shrink or remove **grid** charge windows; it
+  cannot create export. Forcing export needs the export side
+  (`export_limits_best` / `calculate_export_on_pv`), which is why RD48 acts through
+  CM's dispatch policy instead.
+
 - **[2026-08-23] The known-broken IOG test fails ONLY between 00:00 and 01:00 BST —
   cause identified.** `multi_car_iog_load_slots_regression` (MEMORY pending task 5,
   recorded there as "missing `car_charging_limit`") blocked a push at 00:16 having
