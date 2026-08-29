@@ -73,6 +73,8 @@ Format: `- [date] finding — why it might matter — evidence`
 ## Awaiting a discriminating observation (deployed, NOT verified)
 
 - **[2026-08-26] RD49 FULLY VERIFIED, including the session risk it took (`cae3b1c0`).**
+  **❌ RD49 REMOVED 2026-08-29 by RD50 (`b4c89fbb`) — the observations below still
+  happened, but they are no longer evidence for anything in force. Do not cite.**
   Deployed 15:17 mid-hold; a Hold reset costs at most one cycle and RD49 re-engages
   on SOC alone.
   **1. The discriminating case — holding BELOW the cap, which RD48 could not.**
@@ -99,6 +101,7 @@ Format: `- [date] finding — why it might matter — evidence`
   directly. Read `last_reported` against the BOX clock, every time.
 
 - **[2026-08-24] RD48 — VERIFIED on the first cycle after deploy (`5c24b545`).**
+  **❌ RD48 REMOVED 2026-08-29 by RD50 (`b4c89fbb`). Do not cite.**
   Deployed 17:17 straight into live trigger conditions, so the check was immediate
   rather than needing another day.
   **Before (17:15, Predbat driving):** PV 4.531, load 0.358, surplus 4.17 kW —
