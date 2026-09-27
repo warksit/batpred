@@ -4,7 +4,7 @@
       "type": "http",
       "url": "http://100.110.70.80:8199/mcp",
       "headers": {
-        "Authorization": "Bearer hjgjhg456465dffgh2cf786376RRtyd23uf78v"
+        "Authorization": "Bearer ${PREDBAT_MCP_SECRET}"
       }
     }
   }
