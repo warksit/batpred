@@ -54,6 +54,7 @@ from curtailment_calc import (
     compute_p10_recovery_floor,
     compute_max_sheddable,
     compute_overflow_fits_margin,
+    overflow_poses_no_risk,
     required_headroom_kwh,
     compute_no_overflow_charge_target,
     smooth_overflow_samples,
@@ -1993,11 +1994,14 @@ class CurtailmentPlugin(PredBatPlugin):
         # forecast to breach the headroom I have", which the p90 answers from dawn.
         # Requiring `peaked` here would keep CM on the wheel every morning of every
         # no-risk day, which is exactly the behaviour this removes.
-        # Same hysteresis, so the take/stand-down decision cannot chatter.
-        if self._no_risk_latched:
-            self._no_risk_latched = fits_margin >= (early_buffer - FITS_HYST_KWH)
-        else:
-            self._no_risk_latched = fits_margin >= early_buffer
+        #
+        # RD51 (2026-09-27): the spare buffer asked for here never exceeds the
+        # overflow it defends. The flat buffer is a demand for HEADROOM, so a pack
+        # within 1.5 kWh of full could not stand down even at zero overflow —
+        # live 2026-09-26 16:50, SOC 94%, overflow 0.0, wheel held until 18:35.
+        # The Hold/Drain gate above keeps the flat buffer: it only ever acts
+        # while CM is driving, where erring towards Drain is R25's safe side.
+        self._no_risk_latched = overflow_poses_no_risk(fits_margin, overflow_p90, early_buffer, FITS_HYST_KWH, self._no_risk_latched)
         # R63 drain deadline: the fits-check above is a pure ENERGY test — it asks
         # "does the surplus fit", never "can I still MAKE it fit". Shed rate is
         # cap - max(0, pv - load), which inverts once PV-load clears the cap

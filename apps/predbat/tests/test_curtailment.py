@@ -43,6 +43,7 @@ from curtailment_calc import (
     compute_p10_recovery_floor,
     compute_shed_rate,
     compute_overflow_fits_margin,
+    overflow_poses_no_risk,
     smooth_overflow_samples,
     required_headroom_kwh,
     compute_no_overflow_charge_target,
@@ -5019,11 +5020,19 @@ def test_on_update_stays_off_low_pv():
     print("  test_on_update_stays_off_low_pv: PASSED")
 
 
-def test_holds_past_safe_time_until_sundown():
-    """v32 (supersedes RD6 deactivate-at-safe_time): past safe_time with PV still
-    flowing (>0.1), the plugin stays ACTIVE and Holds — it must NOT hand back to
-    Predbat/MSC while PV flows (that round-trips the excess). It only deactivates
-    at sundown (PV≈0).
+def test_past_safe_time_intends_no_drain_and_stands_down():
+    """Two decisions, kept apart: what CM WOULD do, and whether CM drives.
+
+    v32: calculate() does not deactivate at safe_time — past it, with PV still
+    flowing, its intention is `no_drain`, and only sundown returns "off".
+
+    RD50/RD51: past safe_time there is no overflow left to manage, so on_update
+    hands the evening to Predbat however full the pack is.
+
+    Until RD51 this test ran a 95% pack to keep CM on the wheel and asserted
+    "active" here. That worked only because the flat 1.5 kWh buffer could not be
+    met by a nearly full pack at ANY overflow — the fixture was leaning on the
+    defect (live 2026-09-26 16:50-18:35), not on a surplus that did not fit.
     """
     from datetime import datetime, timezone
 
@@ -5036,10 +5045,8 @@ def test_holds_past_safe_time_until_sundown():
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        # RD45: a near-full battery, so the surplus genuinely does NOT fit and CM has
-        # a reason to hold the wheel. At 40% the headroom swallows the remaining p90
-        # and RD45 stands CM down first — correctly, but then this test would be
-        # asserting the risk gate rather than the safe_time rule it is named for.
+        # Near-full, so at noon the remaining p90 genuinely does not fit and CM
+        # takes the wheel on a real requirement.
         soc_kw=BATTERY_KWH * 0.95,
         minutes_now=720,
         best_soc_keep=4.0,
@@ -5050,17 +5057,20 @@ def test_holds_past_safe_time_until_sundown():
     plugin.on_update()
     assert plugin.last_phase == "active", "Should activate at noon (mid-overflow)"
 
-    # Past safe_time but PV still 0.3 kW (>0.1) → stay active + Hold, not off.
+    # Past safe_time but PV still 0.3 kW (>0.1).
     base.minutes_now = 18 * 60 + 30
     base.now_utc = datetime(2025, 7, 12, 18, 30, tzinfo=timezone.utc)
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.3
     base.services.clear()
     plugin.base = base
     plugin.on_update()
-    assert plugin.last_phase == "active", "v32: stay active past safe_time while PV flows"
-    assert plugin._policy_override == "no_drain", f"v32.1: no_drain past safe_time, got {plugin._policy_override}"
+    assert plugin._overflow_p90 == 0.0, f"precondition: nothing left to overflow past safe_time, got {plugin._overflow_p90}"
+    assert plugin._policy_override == "no_drain", f"v32.1: calculate() intends no_drain past safe_time, got {plugin._policy_override}"
+    assert not plugin._sundown_latched, "v32: safe_time is not sundown — calculate() must not have deactivated"
+    assert plugin.last_phase == "off", f"RD51: no overflow, no CM, even at 95% SOC — got {plugin.last_phase}"
+    assert plugin._floor_source == "No Curtailment Risk", f"stood down by the risk gate, not by sundown, got {plugin._floor_source}"
 
-    # Now PV falls to ≈0 AND the sun is genuinely down → deactivate.
+    # Now PV falls to ≈0 AND the sun is genuinely down → calculate() itself says off.
     # 20:00 UTC on doy 193 = 4.9 deg elevation. (Was 19:00 UTC = 12.4 deg, which
     # O1 now correctly refuses to call sundown — at that height PV≈0 is a cloud.)
     base._sensor_overrides["sensor.sigen_plant_pv_power"] = 0.05
@@ -5068,7 +5078,9 @@ def test_holds_past_safe_time_until_sundown():
     base.now_utc = datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc)
     plugin.on_update()
     assert plugin.last_phase == "off", "v32: deactivate at sundown (PV≈0, sun down)"
-    print("  test_holds_past_safe_time_until_sundown: PASSED")
+    assert plugin._sundown_latched, "and this time it IS sundown"
+    assert plugin._floor_source == "Overnight Reserve", f"sundown names itself, got {plugin._floor_source}"
+    print("  test_past_safe_time_intends_no_drain_and_stands_down: PASSED")
 
 
 def test_sundown_defers_while_a_saving_session_is_live():
@@ -8249,6 +8261,97 @@ def test_rd50_session_still_outranks():
     print("  test_rd50_session_still_outranks: PASSED")
 
 
+# ---------------------------------------------------------------------------
+# RD51 — the stand-down buffer never exceeds the overflow it defends
+# ---------------------------------------------------------------------------
+
+
+def test_rd51_full_pack_with_no_overflow_stands_down():
+    """2026-09-26 16:50 BST — the live failure.
+
+    `PHASE off -> active | SOC=17.0kWh (94%) floor=18.0kWh (100%) overflow=0.0kWh`,
+    and CM then held the wheel, read_only on, until 18:35. The gate demanded the
+    flat 1.5 kWh early-handback buffer of HEADROOM with nothing forecast to fill
+    it, so a pack within 1.5 kWh of full could never stand down. The RD50 suite
+    stopped at 90% SOC and passed throughout.
+
+    Swept to 100% because a grid-charged winter pack is the case that matters.
+    """
+    for soc_frac in (0.94, 0.971, 1.0):
+        plugin, base = _rd50_base(soc_frac=soc_frac, pv_kw=3.0, load_kw=0.4, minutes_now=1010, p90_peak_kw=3.0, solcast_remaining=1.0)
+        floor, phase = plugin.calculate(dno_limit_kw=4.0)
+        assert phase == "active", "precondition: calculate() must still compute an intention, got {}".format(phase)
+        assert plugin._overflow_p90 == 0.0, "precondition: this must be a ZERO-overflow day, got {}".format(plugin._overflow_p90)
+        assert BATTERY_KWH * (1 - soc_frac) < 1.5, "precondition: headroom must be inside the old flat buffer"
+        plugin.on_update()
+        assert plugin.last_phase == "off", "at {:.1f}% with no overflow CM must not drive, got {}".format(soc_frac * 100, plugin.last_phase)
+        assert plugin._floor_source == "No Curtailment Risk", "and must name itself, got {}".format(plugin._floor_source)
+    print("  test_rd51_full_pack_with_no_overflow_stands_down: PASSED")
+
+
+def test_rd51_small_overflow_that_does_not_fit_still_takes_the_wheel():
+    """The other half: RD51 relaxes the spare buffer, never the requirement.
+
+    0.90 kWh of p90 overflow needs 1.05 x 0.90 + 0.90 = 1.85 kWh; a 95% pack has
+    0.90. That does not fit, and a small forecast is still a forecast.
+    """
+    plugin, base = _rd50_base(soc_frac=0.95, pv_kw=5.0, load_kw=0.4, p90_peak_kw=5.0, solcast_remaining=6.0)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", "precondition: calculate() must want the wheel, got {}".format(phase)
+    assert plugin._overflow_p90 == 0.9, "precondition: the fixture is a 0.90 kWh overflow, got {}".format(plugin._overflow_p90)
+    plugin.on_update()
+    assert plugin.last_phase == "active", "overflow that does not fit must put CM on the wheel, got {}".format(plugin.last_phase)
+    print("  test_rd51_small_overflow_that_does_not_fit_still_takes_the_wheel: PASSED")
+
+
+def test_rd51_buffer_never_exceeds_the_overflow_it_defends():
+    """The discriminating SOC: between the new threshold and the old one.
+
+    0.90 kWh of overflow requires 1.85 kWh. The old gate wanted 1.5 kWh spare on
+    top (3.35 kWh, SOC <= 81.5%); RD51 wants 0.90 spare (2.75 kWh, SOC <= 84.8%).
+    At 83% the two disagree, and only there.
+    """
+    plugin, base = _rd50_base(soc_frac=0.83, pv_kw=5.0, load_kw=0.4, p90_peak_kw=5.0, solcast_remaining=6.0)
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert plugin._overflow_p90 == 0.9, "precondition: the fixture is a 0.90 kWh overflow, got {}".format(plugin._overflow_p90)
+    headroom = BATTERY_KWH * (1 - 0.83)
+    assert 2.75 < headroom < 3.35, "precondition: headroom must sit between the two thresholds, got {:.2f}".format(headroom)
+    plugin.on_update()
+    assert plugin.last_phase == "off", "requirement plus an overflow-sized buffer fits, so CM stands down, got {}".format(plugin.last_phase)
+    print("  test_rd51_buffer_never_exceeds_the_overflow_it_defends: PASSED")
+
+
+def test_rd51_large_overflow_gate_is_unchanged():
+    """At or above the buffer the gate is exactly what RD45 shipped: 1.5 in, 1.0 out."""
+    for overflow in (1.5, 4.0, 14.0):
+        assert overflow_poses_no_risk(1.5, overflow, 1.5, 0.5, latched=False) is True, "engages at the buffer ({} kWh)".format(overflow)
+        assert overflow_poses_no_risk(1.49, overflow, 1.5, 0.5, latched=False) is False, "and not below it ({} kWh)".format(overflow)
+        assert overflow_poses_no_risk(1.0, overflow, 1.5, 0.5, latched=True) is True, "holds to buffer - hysteresis ({} kWh)".format(overflow)
+        assert overflow_poses_no_risk(0.99, overflow, 1.5, 0.5, latched=True) is False, "and releases below it ({} kWh)".format(overflow)
+    print("  test_rd51_large_overflow_gate_is_unchanged: PASSED")
+
+
+def test_rd51_hysteresis_never_tolerates_a_shortfall():
+    """A small buffer must not let the hysteresis carry the threshold below zero.
+
+    `buffer - FITS_HYST_KWH` is negative for any overflow under 0.5 kWh, which
+    would keep CM stood down while the requirement itself was unmet.
+    """
+    assert overflow_poses_no_risk(0.0, 0.3, 1.5, 0.5, latched=True) is True, "exactly meeting the requirement holds the latch"
+    assert overflow_poses_no_risk(-0.01, 0.3, 1.5, 0.5, latched=True) is False, "any shortfall releases it"
+    assert overflow_poses_no_risk(0.29, 0.3, 1.5, 0.5, latched=False) is False, "engaging still needs the overflow-sized buffer"
+    assert overflow_poses_no_risk(0.3, 0.3, 1.5, 0.5, latched=False) is True
+    print("  test_rd51_hysteresis_never_tolerates_a_shortfall: PASSED")
+
+
+def test_rd51_zero_overflow_is_no_risk_whatever_the_margin():
+    """No overflow, no CM — including a pack that reads fractionally over soc_max."""
+    for margin in (5.0, 0.0, -0.05):
+        for latched in (False, True):
+            assert overflow_poses_no_risk(margin, 0.0, 1.5, 0.5, latched=latched) is True, "margin {} latched {}".format(margin, latched)
+    print("  test_rd51_zero_overflow_is_no_risk_whatever_the_margin: PASSED")
+
+
 def test_r63_floor_is_the_dawn_reserve_not_the_deep_floor():
     """RD32 — R63 must drain to the SAME floor the Schmitt does.
 
@@ -8736,12 +8839,15 @@ def test_no_overflow_left_is_not_reported_as_surplus_fits():
     print("  test_no_overflow_left_is_not_reported_as_surplus_fits: PASSED")
 
 
-def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False, soc_frac=0.40):
+def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False):
     """Plugin already through its PV day, now at dusk with `pv_kw` on the array.
 
-    `soc_frac` exists for RD45: with a mostly-empty battery the remaining surplus
-    fits trivially at dusk, so CM stands down on the risk gate before the sundown
-    logic is reached. Pass a near-full battery when the SUNDOWN rule is the subject.
+    At dusk there is no overflow left, so RD50/RD51 stand CM down on the risk gate
+    whatever the SOC and `last_phase` reads "off" with or without a sundown. When
+    the SUNDOWN rule is the subject, assert on `_sundown_latched` and
+    `_floor_source`, which say WHICH rule spoke. (This rig used to take a
+    `soc_frac` and recommend a near-full pack to hold the wheel; that only worked
+    through the flat-buffer defect RD51 removed.)
     """
     from datetime import datetime, timezone
 
@@ -8751,7 +8857,7 @@ def _dusk_rig(now_local, minutes_now, pv_kw, latched=False, session=False, soc_f
     base = MockBase(
         pv_step=pv,
         load_step=load,
-        soc_kw=BATTERY_KWH * soc_frac,
+        soc_kw=BATTERY_KWH * 0.40,
         minutes_now=720,
         best_soc_keep=4.0,
         now_utc=datetime(2025, 7, 12, 12, 0, tzinfo=timezone.utc),
@@ -8793,14 +8899,19 @@ def test_sundown_gated_on_solar_elevation():
     """
     from datetime import datetime, timezone
 
-    # 11.1 deg — above the gate, reproducing a false sundown.
-    high = _dusk_rig(datetime(2025, 7, 12, 19, 10, tzinfo=timezone.utc), 20 * 60 + 10, pv_kw=0.03, soc_frac=0.97)
-    assert high.last_phase == "active", "sun still 11.1 deg up — PV≈0 is a cloud, not sunset"
+    # 11.1 deg — above the gate, reproducing a false sundown. Asserted on the
+    # latch, not on last_phase: with no overflow left CM is stood down by the
+    # risk gate either way (RD51), so only the latch says whether SUNDOWN spoke.
+    high = _dusk_rig(datetime(2025, 7, 12, 19, 10, tzinfo=timezone.utc), 20 * 60 + 10, pv_kw=0.03)
+    assert not high._sundown_latched, "sun still 11.1 deg up — PV≈0 is a cloud, not sunset"
+    assert high._floor_source == "No Curtailment Risk", "stood down by the risk gate, not by sundown, got {}".format(high._floor_source)
 
     # 4.9 deg — below the gate, reproducing a genuine handback.
     low = _dusk_rig(datetime(2025, 7, 12, 20, 0, tzinfo=timezone.utc), 21 * 60, pv_kw=0.03)
     assert low.last_phase == "off", "sun down to 4.9 deg with PV≈0 — genuine sundown"
-    print("  test_sundown_gated_on_solar_elevation: PASSED (11.1 deg stays active, 4.9 deg hands back)")
+    assert low._sundown_latched, "and the latch arms"
+    assert low._floor_source == "Overnight Reserve", "sundown names itself, got {}".format(low._floor_source)
+    print("  test_sundown_gated_on_solar_elevation: PASSED (11.1 deg does not call sundown, 4.9 deg does)")
 
 
 def test_sundown_latches_for_the_day():
@@ -9733,7 +9844,7 @@ def run_curtailment_tests(my_predbat=None):
     apply_tests = [
         test_on_update_full_flow,
         test_on_update_stays_off_low_pv,
-        test_holds_past_safe_time_until_sundown,
+        test_past_safe_time_intends_no_drain_and_stands_down,
         test_sundown_defers_while_a_saving_session_is_live,
         test_sundown_gated_on_solar_elevation,
         test_sundown_latches_for_the_day,
@@ -10055,6 +10166,12 @@ def run_curtailment_tests(my_predbat=None):
         test_rd50_soc_cannot_retake_the_wheel_on_a_no_risk_day,
         test_rd50_takes_the_wheel_when_overflow_does_not_fit,
         test_rd50_session_still_outranks,
+        test_rd51_full_pack_with_no_overflow_stands_down,
+        test_rd51_small_overflow_that_does_not_fit_still_takes_the_wheel,
+        test_rd51_buffer_never_exceeds_the_overflow_it_defends,
+        test_rd51_large_overflow_gate_is_unchanged,
+        test_rd51_hysteresis_never_tolerates_a_shortfall,
+        test_rd51_zero_overflow_is_no_risk_whatever_the_margin,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,
