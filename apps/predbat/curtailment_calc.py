@@ -1498,6 +1498,50 @@ def compute_overflow_fits_margin(battery_headroom_kwh, overflow_kwh, safety_fact
     return battery_headroom_kwh - required_headroom_kwh(overflow_kwh, max_reserved_kwh, safety_factor)
 
 
+def overflow_poses_no_risk(fits_margin_kwh, overflow_kwh, early_buffer_kwh, hysteresis_kwh, latched):
+    """RD45/RD51 — is there curtailment left for CM to manage? True = stand down.
+
+    The requirement (`required_headroom_kwh`) must fit with a spare buffer on top,
+    and **the buffer never exceeds the overflow it defends**:
+
+        buffer    = min(early_buffer, overflow)
+        engage at   margin >= buffer
+        hold while  margin >= max(0, buffer - hysteresis)
+
+    Why (2026-09-26 16:50): the buffer was a flat 1.5 kWh, which is a demand for
+    HEADROOM. A pack within 1.5 kWh of full could not satisfy it whatever the
+    forecast said, so CM took the wheel at SOC 94% with overflow 0.0 and held it
+    for 1 h 45. On a grid-charged winter pack that is every day.
+
+    At or above `early_buffer` of overflow nothing changes. Below it the buffer
+    shrinks with the forecast, the same shape as the R45 reserve inside
+    `required_headroom_kwh` (`min(max_reserved, overflow)`). The requirement
+    itself is untouched — this relaxes the spare, never the defence.
+
+    The hold threshold is floored at zero: for overflow under `hysteresis` a bare
+    `buffer - hysteresis` goes negative and would keep CM stood down while short.
+
+    Zero overflow is no risk outright, not via the margin, so a pack reading a
+    hair over soc_max (negative headroom) cannot take the wheel on nothing.
+
+    Args:
+        fits_margin_kwh: `compute_overflow_fits_margin` — headroom left over once
+            the safety-factored requirement is met. Negative = short.
+        overflow_kwh: remaining forecast overflow (p90, smoothed).
+        early_buffer_kwh: the early-handback buffer helper.
+        hysteresis_kwh: FITS_HYST_KWH.
+        latched: the verdict last cycle.
+
+    Returns:
+        bool — True when the forecast overflow poses no curtailment risk.
+    """
+    if overflow_kwh <= 0:
+        return True
+    buffer_kwh = max(0.0, min(early_buffer_kwh, overflow_kwh))
+    threshold = max(0.0, buffer_kwh - hysteresis_kwh) if latched else buffer_kwh
+    return fits_margin_kwh >= threshold
+
+
 def compute_shed_rate(pv_kw, load_kw, export_cap_kw):
     """R63 — the rate at which the battery can actually be drained, kW.
 

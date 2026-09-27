@@ -84,6 +84,7 @@ REQUIREMENTS = [
     ("RD46", "night need caps Predbat's charge plan", r"_set_predbat_charge_cap|_predbat_charge_cap_kwh"),
     ("RD47", "overflow floor grades instead of saturating", r"soften_overflow_floor"),
     ("RD50", "no overflow means CM does not drive", r"_no_risk_latched|No Curtailment Risk"),
+    ("RD51", "stand-down buffer never exceeds the overflow it defends", r"overflow_poses_no_risk"),
 ]
 
 
