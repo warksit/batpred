@@ -1608,6 +1608,7 @@ class CurtailmentPlugin(PredBatPlugin):
             self._effective_keep_kwh = round(soc_kw, 2)
             self._overflow_floor_kwh = round(soc_kw, 2)
             self._p10_recovery_floor = 0.0
+            self._active_for_session_only = True
             self._last_decision = "active (session): no PV, holding the wheel for the session"
             return soc_kw, "active"
 
@@ -1640,6 +1641,10 @@ class CurtailmentPlugin(PredBatPlugin):
         # session floor from yesterday evening.
         self._policy_override = None
         self._session_protect_kwh = 0.0
+        # RD53: set by the two branches below that return "active" for no reason
+        # but a live session (no PV yet / no Solcast). They exist so an incumbent
+        # does not hand back mid-dump; on_update refuses to TAKE the wheel on them.
+        self._active_for_session_only = False
 
         # RD35: advance the dawn-release latch exactly ONCE per cycle, here,
         # before any early return — every path below reads the floor, and the
@@ -1764,6 +1769,7 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._effective_keep_kwh = round(soc_kw, 2)
                 self._overflow_floor_kwh = round(soc_kw, 2)
                 self._p10_recovery_floor = 0.0
+                self._active_for_session_only = True
                 self._last_decision = "active (session): no Solcast, holding the wheel for the session"
                 return soc_kw, "active"
             self._last_decision = "off: p90_scale<0.5 (no Solcast)"
@@ -3227,6 +3233,20 @@ class CurtailmentPlugin(PredBatPlugin):
             return None
         return delta if delta > 0 else None
 
+    def _cm_holds_the_wheel(self):
+        """RD53 — did CM come into this cycle driving?
+
+        `last_phase` is the decision this method published last cycle, in both the
+        acting and the observe-only modes, so it is the one signal that works for
+        both. It is None on the first cycle after a restart (every deploy resets
+        plugin state); then adopt the live mutex, exactly as `_publish_dispatch_policy`
+        adopts `_cm_controlling` from `read_only` — otherwise a deploy mid-dump
+        would hand the session back.
+        """
+        if self.last_phase is not None:
+            return self.last_phase == "active"
+        return bool(getattr(self.base, "set_read_only", False))
+
     def _session_imminent(self, within_minutes=SESSION_IMMINENT_MINS):
         """True when a joined session starts within `within_minutes`.
 
@@ -4107,9 +4127,31 @@ class CurtailmentPlugin(PredBatPlugin):
             # is CM driving all season on a curtailment brief with no curtailment.
             # If Predbat banks PV it should be exporting, that is Predbat's bug to
             # fix upstream, not CM's to sit on the wheel over.
-            if phase == "active" and self._no_risk_latched and not (self._is_session_dispatching() or self._session_imminent()):
+            #
+            # RD53 (2026-10-01, Andrew: "cm only if already in charge"): the session
+            # exception protects an INCUMBENT only. RD14-own was written for
+            # 2026-08-03, when CM was driving at dusk and sundown handed back
+            # mid-dump; it says "do not hand back during a session", and that is
+            # all it may say. Read without the incumbency test it also made CM
+            # TAKE the wheel for a session it had not been driving — every session
+            # from 2026-09-21 on — and bring RD44's reserve floor with it. On
+            # 2026-10-01 17:30 that seized an 18:00 Power Down from a Predbat plan
+            # already set to sell to 6-17% at 20.5p; SOC 44% sat under the 48%
+            # reserve, so CM sold nothing and (RD52) imported 0.65 kWh. Predbat
+            # runs a session fine on its own (RD7, 2026-08-18); CM's session
+            # handling is only ever needed when CM is already on the wheel.
+            session_live = self._is_session_dispatching() or self._session_imminent()
+            incumbent = self._cm_holds_the_wheel()
+            if phase == "active" and self._no_risk_latched and not (session_live and incumbent):
                 phase = "off"
-                self._last_decision = "off: no curtailment risk (p90 fits headroom)"
+                if session_live:
+                    self._last_decision = "off: session is Predbat's — CM was not driving (RD53)"
+                else:
+                    self._last_decision = "off: no curtailment risk (p90 fits headroom)"
+                self._floor_source = "No Curtailment Risk"
+            elif phase == "active" and self._active_for_session_only and not incumbent:
+                phase = "off"
+                self._last_decision = "off: session is Predbat's — CM was not driving (RD53)"
                 self._floor_source = "No Curtailment Risk"
 
             # Defer to Predbat charge windows when SOC below effective keep (R4).
