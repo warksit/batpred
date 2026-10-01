@@ -126,6 +126,7 @@ dstart
 dwindow
 eauth
 Eddi
+Eero
 elif
 EMEA
 emlite

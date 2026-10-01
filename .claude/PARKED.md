@@ -19,6 +19,29 @@ Format: `- [date] finding — why it might matter — evidence`
   line. Cannot be told apart tonight — the branch only runs inside the curtailment
   window, and there is no session armed.
 
+- [2026-09-28] HA Green came back from a power cut with IPv6 only, no IPv4, and
+  stayed that way for 14.7 h until power-cycled — no inverter data and no control
+  path for the whole night (SOC 89% -> 51% unobserved). `end0` is `method: auto`
+  (DHCP), so the box depends on the Eero answering inside NetworkManager's 45 s
+  window at boot. A static IPv4 on `end0` would remove the dependency. Evidence:
+  every failure in that boot is IPv4 `Network unreachable` (Sigen 192.168.5.145,
+  Cloudflared, Solcast) while DNS still resolved.
+  **APPLIED 2026-09-28 10:03, NOT verified against the fault.** Andrew set `end0`
+  to static 192.168.5.179/22, gateway and DNS 192.168.4.1, and reserved the
+  address on the Eero. Box reports `method: static`; gateway, inverter and
+  internet all reachable. **Success =** after the next power cut, or a staged
+  power-cycle of the Eero and the box together, the box is reachable on IPv4
+  without intervention. A plain reboot of the box alone proves only that the
+  setting persists.
+- [2026-09-28] The Sigen integration logs three tracebacks per poll when the
+  inverter is unreachable (`int('unknown')` in `sigen_entity.py:175`) — over
+  200,000 journal lines in 100 minutes, which rotated the boot-time
+  NetworkManager records out of the journal and destroyed the evidence for the
+  entry above. Matters the next time anything needs diagnosing after an outage.
+- [2026-09-28] HA Green RTC reports `rtc-pcf8563: low voltage detected, date/time
+  is not reliable` on every boot. Without NTP the clock resumes from the last
+  recorded timestamp, so an outage's duration is invisible in box timestamps.
+
 ## Awaiting data (measuring, not yet conclusive)
 
 - **[2026-08-19] Battery round-trip loss: CHECK THE NEW SENSORS AND REFINE.**
