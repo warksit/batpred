@@ -8252,13 +8252,117 @@ def test_rd50_takes_the_wheel_when_overflow_does_not_fit():
 
 
 def test_rd50_session_still_outranks():
-    """RD14-own is unchanged: a live session keeps CM driving regardless."""
+    """RD14-own survives RD50 — for the INCUMBENT. A live session keeps CM driving
+    when CM was already driving (RD53 narrows this to the incumbent; see below)."""
     plugin, base = _rd50_base(soc_frac=0.30, pv_kw=5.62, load_kw=0.37)
     base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
+    plugin.last_phase = "active"  # CM came into this cycle holding the wheel
     floor, phase = plugin.calculate(dno_limit_kw=4.0)
     plugin.on_update()
-    assert plugin.last_phase == "active", "a live session must keep CM on the wheel, got {}".format(plugin.last_phase)
+    assert plugin.last_phase == "active", "a live session must keep an incumbent CM on the wheel, got {}".format(plugin.last_phase)
     print("  test_rd50_session_still_outranks: PASSED")
+
+
+# ---------------------------------------------------------------------------
+# RD53 — a session keeps the wheel, it never takes it
+# ---------------------------------------------------------------------------
+
+
+def _rd53_dusk_session_base(session_entity_on=True, session_start_in_min=None):
+    """2026-10-01 17:30 BST: zero overflow, pack at 44% under a 48% reserve, a Power
+    Down 30 minutes out. CM had handed back at 12:45 and Predbat's plan was set to
+    sell 18:00-19:00 at 20.5p down to 6-17%."""
+    plugin, base = _rd50_base(soc_frac=0.44, pv_kw=0.8, load_kw=0.85, minutes_now=1050, p90_peak_kw=3.0, solcast_remaining=0.3)
+    if session_entity_on:
+        base._sensor_overrides[SIG_SAVING_SESSION_ENTITY] = "on"
+    if session_start_in_min is not None:
+        from datetime import timedelta
+
+        start = base.now_utc + timedelta(minutes=session_start_in_min)
+        base._sensor_overrides[SIG_SESSION_START] = start.isoformat()
+    return plugin, base
+
+
+def test_rd53_cm_does_not_take_the_wheel_for_a_session():
+    """The live failure, replayed: CM was NOT driving, a session is imminent, and
+    there is no overflow. Under RD50 the only exception was "a session", and it
+    did not ask whether CM already held the wheel — so CM seized one it had no
+    business in, brought RD44's 48% reserve floor with it, and a Predbat plan to
+    sell to 6-17% at 20.5p produced zero export and 0.65 kWh of import."""
+    plugin, base = _rd53_dusk_session_base(session_entity_on=False, session_start_in_min=20)
+    plugin.last_phase = "off"  # handed back at 12:45; Predbat has been driving since
+    floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active", "precondition: calculate() still computes an intention, got {}".format(phase)
+    assert plugin._overflow_p90 == 0.0, "precondition: a zero-overflow evening, got {}".format(plugin._overflow_p90)
+    assert plugin._session_imminent(), "precondition: the session must be inside SESSION_IMMINENT_MINS"
+    plugin.on_update()
+    assert plugin.last_phase == "off", "RD53: a session is not a reason to TAKE the wheel, got {}".format(plugin.last_phase)
+    assert "RD53" in plugin._last_decision, "and the decision must say why, got {}".format(plugin._last_decision)
+    print("  test_rd53_cm_does_not_take_the_wheel_for_a_session: PASSED")
+
+
+def test_rd53_cm_does_not_take_the_wheel_once_the_session_is_live_either():
+    """Same evening, 18:05: the session is dispatching. Still Predbat's."""
+    plugin, base = _rd53_dusk_session_base(session_entity_on=True)
+    plugin.last_phase = "off"
+    plugin.calculate(dno_limit_kw=4.0)
+    plugin.on_update()
+    assert plugin.last_phase == "off", "a live session must not pull CM onto the wheel either, got {}".format(plugin.last_phase)
+    print("  test_rd53_cm_does_not_take_the_wheel_once_the_session_is_live_either: PASSED")
+
+
+def test_rd53_incumbent_keeps_the_wheel_through_a_session():
+    """RD14-own, intact: the SAME evening with CM already driving must not hand back
+    — the heartbeat only forces Max Export while CM holds the wheel (2026-08-03)."""
+    plugin, base = _rd53_dusk_session_base(session_entity_on=True)
+    plugin.last_phase = "active"
+    plugin.calculate(dno_limit_kw=4.0)
+    plugin.on_update()
+    assert plugin.last_phase == "active", "an incumbent CM must keep the wheel through the session, got {}".format(plugin.last_phase)
+    print("  test_rd53_incumbent_keeps_the_wheel_through_a_session: PASSED")
+
+
+def test_rd53_session_only_intentions_do_not_take_the_wheel():
+    """calculate() has two branches that return "active" for no reason but a live
+    session (no PV yet; no Solcast). They exist so an INCUMBENT does not hand back
+    mid-dump. Without the wheel they are not a reason to take it."""
+    pv = {m: 0.0 for m in range(0, 480, PLUGIN_STEP)}
+    load = {m: 0.5 for m in range(0, 480, PLUGIN_STEP)}
+    overrides = {"sensor.sigen_plant_pv_power": 0.0, "sensor.sigen_plant_consumed_power": 0.5, SIG_SAVING_SESSION_ENTITY: "on", "input_boolean.sig_plugin_policy_control": "on"}
+    overrides.update(_make_p90_sensors())
+    base = MockBase(pv_step=pv, load_step=load, soc_kw=BATTERY_KWH * 0.50, minutes_now=20 * 60, best_soc_keep=4.0, now_utc=datetime(2025, 7, 12, 19, 0, tzinfo=_tz.utc), sensor_overrides=overrides)
+    plugin = CurtailmentPlugin(base)
+    plugin.last_phase = "off"
+    _floor, phase = plugin.calculate(dno_limit_kw=4.0)
+    assert phase == "active" and plugin._floor_source == "Saving Session", "precondition: this must be the no-PV session branch, got {} / {}".format(phase, plugin._floor_source)
+    plugin.on_update()
+    assert plugin.last_phase == "off", "the no-PV session branch must not take the wheel, got {}".format(plugin.last_phase)
+
+    incumbent = CurtailmentPlugin(base)
+    incumbent.last_phase = "active"
+    incumbent.calculate(dno_limit_kw=4.0)
+    incumbent.on_update()
+    assert incumbent.last_phase == "active", "but an incumbent on the same branch keeps it, got {}".format(incumbent.last_phase)
+    print("  test_rd53_session_only_intentions_do_not_take_the_wheel: PASSED")
+
+
+def test_rd53_restart_mid_session_adopts_the_live_mutex():
+    """Every deploy resets plugin state, so `last_phase` is None on the first cycle.
+    Incumbency then comes from the live mutex, exactly as `_publish_dispatch_policy`
+    adopts `_cm_controlling` — otherwise a deploy mid-dump would hand back."""
+    plugin, base = _rd53_dusk_session_base(session_entity_on=True)
+    assert plugin.last_phase is None, "precondition: fresh plugin"
+    base.set_read_only = True  # CM held the wheel when the process restarted
+    plugin.calculate(dno_limit_kw=4.0)
+    plugin.on_update()
+    assert plugin.last_phase == "active", "a restart mid-session with read_only set must keep the wheel, got {}".format(plugin.last_phase)
+
+    fresh, base2 = _rd53_dusk_session_base(session_entity_on=True)
+    base2.set_read_only = False
+    fresh.calculate(dno_limit_kw=4.0)
+    fresh.on_update()
+    assert fresh.last_phase == "off", "and a restart with Predbat driving must not take it, got {}".format(fresh.last_phase)
+    print("  test_rd53_restart_mid_session_adopts_the_live_mutex: PASSED")
 
 
 # ---------------------------------------------------------------------------
@@ -10172,6 +10276,11 @@ def run_curtailment_tests(my_predbat=None):
         test_rd51_large_overflow_gate_is_unchanged,
         test_rd51_hysteresis_never_tolerates_a_shortfall,
         test_rd51_zero_overflow_is_no_risk_whatever_the_margin,
+        test_rd53_cm_does_not_take_the_wheel_for_a_session,
+        test_rd53_cm_does_not_take_the_wheel_once_the_session_is_live_either,
+        test_rd53_incumbent_keeps_the_wheel_through_a_session,
+        test_rd53_session_only_intentions_do_not_take_the_wheel,
+        test_rd53_restart_mid_session_adopts_the_live_mutex,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,
