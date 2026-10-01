@@ -157,13 +157,26 @@ def test_blocked_import_also_reads_as_clamped():
     print("PASS  clamped: import limit 0 -> battery-clamped diagnosis")
 
 
-def test_open_limits_still_report_meter_fault():
-    """Limits open and still idle -> genuinely the meter. Must not be swallowed."""
+def test_open_limits_with_a_live_meter_do_not_blame_the_meter():
+    """Running, idle, limits open, meter LIVE -> an unexplained idle, not a meter fault.
+
+    2026-10-01 18:42 BST: the session sell clamp had pinned dispatch to a PV of
+    zero (RD52), the inverter read 0.0 for two minutes, and this branch paged
+    Andrew with "Meter Communication Fault ... may need meter power cycle" while
+    the SAME trace held meter_dead=false and grid_age_s=0. Fourth instance of the
+    2026-07-28 lesson: the discriminator was computed and then not consulted.
+    `meter_dead` is the only thing that may say "meter"; this branch may not.
+
+    Until RD52 this test asserted the meter text here — with `_ages()` defaulting
+    to a 5 s fresh meter. The fixture was pinning the misdiagnosis.
+    """
     msg = _render_fault_type(_load(), _mock(running="Running", disch=9.6, imp=100), _ages())
-    assert "Meter Communication Fault" in msg, f"open limits must still flag the meter: {msg}"
-    assert "4001_2" in msg, f"meter fault must still point at mySigen: {msg}"
+    assert "Meter Communication Fault" not in msg, f"a live meter must never be reported as a meter fault: {msg}"
+    assert "power cycle" not in msg.lower() and "4001" not in msg, f"must not send anyone to reset a healthy meter: {msg}"
     assert "CLAMPED" not in msg, f"must not cry clamp when limits are open: {msg}"
-    print("PASS  meter: limits open -> meter fault diagnosis retained")
+    assert "IDLE" in msg and "meter is HEALTHY" in msg, f"must say what it knows — idle, meter healthy — and no more: {msg}"
+    assert "sig_dispatch_kw" in msg, f"must point at the setpoint, which is where an unexplained idle is diagnosed: {msg}"
+    print("PASS  idle with a live meter -> unexplained-idle text, meter explicitly healthy")
 
 
 def test_protective_states_unchanged():
@@ -466,7 +479,7 @@ def main():
         test_intended_freeze_sends_no_notification_at_all,
         test_clamp_still_fires_when_cm_owns_the_wheel,
         test_blocked_import_also_reads_as_clamped,
-        test_open_limits_still_report_meter_fault,
+        test_open_limits_with_a_live_meter_do_not_blame_the_meter,
         test_protective_states_unchanged,
         test_critical_sound_only_for_genuine_faults,
     ):
