@@ -555,16 +555,22 @@ def test_drain_floor_does_not_strand_hold_below_the_floor():
 
 
 def test_drain_floor_still_blocks_selling_below_the_floor():
-    """The other half: Max Export below the floor must STILL clamp to PV.
+    """The other half: Max Export below the floor must STILL not sell the pack.
 
     Both halves in one commit deliberately — the change is "the clamp applies to
     SELLING, not to load-covering", and a test that only pins the new behaviour
     would let the old requirement (R5, stop selling at the floor) be deleted by
     accident.
+
+    RD52 (2026-10-01): "not selling" is the Hold setpoint, max(pv, load) = 0.36,
+    not PV (0.31). Clamping to PV left the 48 W shortfall on the import meter —
+    the strand the test above pins for Hold, kept alive here for Max Export. The
+    grid still sees nothing from the pack: 0.36 is the house load.
     """
     d = _render_dispatch(_load(), _mock("Max Export", pv=0.311, load=0.359, soc=1.3, hard=2.8))
-    assert abs(d - 0.31) < 0.001, "Max Export below the drain floor must clamp to PV (0.31), got {}".format(d)
-    print("PASS  drain floor: Max Export @SOC1.3% still clamped to PV {:.2f}".format(d))
+    assert abs(d - 0.36) < 0.001, "Max Export below the drain floor must cover load and sell nothing (0.36), got {}".format(d)
+    assert d < 6.6, "and must certainly not sell at full tilt"
+    print("PASS  drain floor: Max Export @SOC1.3% covers load {:.2f}, sells nothing (RD52)".format(d))
 
 
 def test_drain_floor_solar_charge_not_stranded():
