@@ -78,7 +78,10 @@ def reference(override, select, session, pv, load_raw, soc, cap_w=3680, hard=2.8
     # deep-discharge floor. max() so the deep floor still binds if it is higher —
     # the clamp can only ever sell LESS.
     floor = max(hard, reserve) if session else hard
-    pre = min(raw, pv) if (soc <= floor and p == "Max Export") else raw
+    # RD52: below the floor Max Export dispatches as Hold — the battery stops
+    # SELLING but keeps covering load. Was min(raw, pv), which idled the battery
+    # and imported the whole house load through a paid session (2026-10-01).
+    pre = max(pv, load) if (soc <= floor and p == "Max Export") else raw
     return p, round(max(min(pre, ceil), 0), 2)
 
 
@@ -124,10 +127,15 @@ def test_intent_sensors_match_reference():
 
 
 def test_sell_clamp_is_sell_only():
-    """RD22, restated against the single source: below the drain floor Max Export
-    clamps to PV, Hold and Solar Charge still cover load."""
+    """RD22/RD52, restated against the single source: below the drain floor every
+    policy covers load and none of them sells. Max Export below the floor is Hold.
+
+    Until RD52 this asserted Max Export -> PV (0.31) here, which left the house
+    importing the 48 W shortfall — the same strand the RD22 comment records for
+    Hold on 2026-08-06, kept alive in the one arm that mattered most.
+    """
     st = _states("Max Export", "Predbat", False, pv=0.311, load=0.359, soc=1.3)
-    assert abs(render_sensors(st)[1] - 0.31) < 0.011, "Max Export below floor must clamp to PV"
+    assert abs(render_sensors(st)[1] - 0.359) < 0.011, "Max Export below floor must cover load like Hold, got {}".format(render_sensors(st)[1])
     st = _states("Hold Battery", "Predbat", False, pv=0.311, load=0.359, soc=1.3)
     assert abs(render_sensors(st)[1] - 0.359) < 0.011, "Hold below floor must still cover load"
     st = _states("Solar Charge Battery", "Predbat", False, pv=0.311, load=0.359, soc=1.3)
@@ -150,8 +158,30 @@ def test_session_sell_stops_at_the_overnight_reserve():
     st = _states("Off", "Hold Battery", True, pv=1.2, load=0.5, soc=30.0)
     policy, kw = render_sensors(st)
     assert policy == "Max Export", "the session must still force Max Export, got {}".format(policy)
-    assert abs(kw - 1.2) < 0.011, "below the 38% reserve the session must dispatch PV only (1.2), got {}".format(kw)
+    assert abs(kw - 1.2) < 0.011, "below the 38% reserve the session must stop selling the pack: max(pv 1.2, load 0.5) = 1.2, got {}".format(kw)
     print("PASS  session sell stops at the overnight reserve")
+
+
+def test_session_below_the_reserve_still_covers_load():
+    """RD52 — 2026-10-01 18:00-18:48 BST, the live failure.
+
+    Power Down 18:00-19:00, SOC 40% against a 48% overnight reserve, PV falling
+    0.85 -> 0 kW at dusk. The RD44 clamp held Max Export to PV, so the battery sat
+    idle at 40.0% while the house imported 0.65 kWh inside the paid hour; when PV
+    reached zero the inverter went to 0.0 and the fault alert blamed the meter.
+
+    Below the sell floor the right dispatch is Hold: cover load, sell nothing.
+    """
+    st = _states("Off", "Solar Charge Battery", True, pv=0.0, load=0.85, soc=40.0, hard=1.0, reserve=48.0)
+    policy, kw = render_sensors(st)
+    assert policy == "Max Export", "precondition: the session forces Max Export, got {}".format(policy)
+    assert abs(kw - 0.85) < 0.011, "below the reserve the battery must still cover the 0.85 kW load, got {}".format(kw)
+    # And it must still not SELL: with PV above load the setpoint is PV, so the
+    # grid sees only the surplus — identical to Hold.
+    st = _states("Off", "Solar Charge Battery", True, pv=1.3, load=0.85, soc=40.0, hard=1.0, reserve=48.0)
+    _policy, kw = render_sensors(st)
+    assert abs(kw - 1.3) < 0.011, "below the reserve with PV above load the setpoint is PV (no pack sold), got {}".format(kw)
+    print("PASS  a session below the reserve covers load instead of importing it (RD52)")
 
 
 def test_session_sell_runs_while_above_the_reserve():
@@ -218,7 +248,7 @@ def test_jinja_session_floor_matches_the_python_definition():
         above = _states("Off", "Hold Battery", True, pv=1.2, load=0.5, soc=min(100.0, floor_pct + 0.1), hard=hard, reserve=reserve)
         _p, kw_below = render_sensors(below)
         _p, kw_above = render_sensors(above)
-        assert abs(kw_below - 1.2) < 0.011, "hard={} reserve={}: just BELOW the python floor ({:.2f}%) the dispatcher must clamp to PV, got {}".format(hard, reserve, floor_pct, kw_below)
+        assert abs(kw_below - 1.2) < 0.011, "hard={} reserve={}: just BELOW the python floor ({:.2f}%) the dispatcher must stop selling (max(pv 1.2, load 0.5)), got {}".format(hard, reserve, floor_pct, kw_below)
         if floor_pct < 99.9:
             assert abs(kw_above - 6.6) < 0.011, "hard={} reserve={}: just ABOVE the python floor ({:.2f}%) the dispatcher must sell, got {}".format(hard, reserve, floor_pct, kw_above)
     print("PASS  the deployed clamp turns on exactly at the Python floor")
@@ -314,6 +344,7 @@ def run():
         test_intent_sensors_match_reference,
         test_sell_clamp_is_sell_only,
         test_session_sell_stops_at_the_overnight_reserve,
+        test_session_below_the_reserve_still_covers_load,
         test_session_sell_runs_while_above_the_reserve,
         test_ordinary_drain_still_uses_the_deep_floor,
         test_session_floor_never_sells_below_the_deep_floor,

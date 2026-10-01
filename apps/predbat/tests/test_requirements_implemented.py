@@ -85,6 +85,7 @@ REQUIREMENTS = [
     ("RD47", "overflow floor grades instead of saturating", r"soften_overflow_floor"),
     ("RD50", "no overflow means CM does not drive", r"_no_risk_latched|No Curtailment Risk"),
     ("RD51", "stand-down buffer never exceeds the overflow it defends", r"overflow_poses_no_risk"),
+    ("RD52", "below the sell floor Max Export dispatches as Hold", r"\[pv, load\] \| max if \(soc <= floor and p == 'Max Export'\)"),
 ]
 
 
