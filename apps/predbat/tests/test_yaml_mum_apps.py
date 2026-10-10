@@ -82,6 +82,26 @@ def test_saving_session_does_not_match_power_up_events():
     assert resolved is None, "octopus_saving_session must not match the Power Up entity, matched {!r}".format(resolved)
 
 
+def test_free_electricity_points_at_the_live_power_up_feed():
+    """Predbat must be TOLD about free sessions, and told the right entity.
+
+    2026-10-10: a Free Electricity session was booked for the next day 13:00-15:00
+    and Predbat planned the whole afternoon at 11.83p ("Import rates: min 11.83p"),
+    because no `octopus_free_*` key had ever been set. `fetch_octopus_sessions` is
+    gated on the key being present, the same shape as the 2026-08-17 defect.
+
+    `octopus_free_electricity`, NOT `octopus_free_session`: the latter skips any
+    event without a `code`, and the 2026 campaign events carry `code: null`.
+
+    A LITERAL, not a `re:` — an unmatched `re:` is deleted by auto_config and the
+    feature goes quiet again; a literal that goes stale fails this test instead.
+    """
+    cfg = _load()
+    assert "octopus_free_session" not in cfg, "octopus_free_session drops events whose code is null — use octopus_free_electricity"
+    value = cfg.get("octopus_free_electricity")
+    assert value == LIVE_POWER_UP_EVENTS, "octopus_free_electricity must be the live Power Up events entity {!r}, found {!r}".format(LIVE_POWER_UP_EVENTS, value)
+
+
 def test_no_pointer_at_a_retired_octopus_entity():
     """The exact 2026-08-17 defect: a config value naming an entity that no longer exists."""
     with open(APPS_YAML) as handle:
@@ -105,6 +125,7 @@ def run():
         test_config_parses_and_is_the_site_config,
         test_saving_session_resolves_to_the_live_power_down_entity,
         test_saving_session_does_not_match_power_up_events,
+        test_free_electricity_points_at_the_live_power_up_feed,
         test_no_pointer_at_a_retired_octopus_entity,
         test_mcp_secret_is_redacted_in_the_repo_copy,
     ):
