@@ -135,6 +135,19 @@ calendar...octoplus_power_up                  ==  calendar...octoplus_free_elect
 event...octoplus_power_up_events              ==  event...octoplus_free_electricity_session_events
 ```
 
+> **UPDATE 2026-10-10 — the Power Up feed is alive again.** Observed live:
+> `event...octoplus_power_up_events` carries 2026 campaign events in `events`
+> (ids 5145 for 2026-08-16, 6810/6811 for 2026-10-11 13:00-15:00) with `code: null`
+> and no points field, plus `available_events` for offers not yet taken (11:00 and
+> 12:00 that day, `availability: AVAILABLE`). The 11 Oct session appeared **only**
+> here — nothing in `joined_events` — so the proxy alone would have missed it.
+> `binary_sensor.octoplus_power_up_active` now reads this feed as well as the
+> proxy, and Predbat is given it via `octopus_free_electricity` in apps.yaml.
+> **Unverified:** whether upstream #1590 landed or the scrape was revived, and
+> whether `events` is strictly "sessions this account is in" — it matches on the
+> two days seen (one of four 08-16 slots; two of four 10-11 slots). The warning
+> below is kept as history.
+
 **Do not key anything on these** — an automation triggered off them will never
 fire again. Confirmed by other users too: the 2026-08-16 Power Up did not appear
 on the old free-electricity calendar either.

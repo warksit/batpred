@@ -20,10 +20,14 @@
 # the payload that varies between the two categories. `savingSessions` exposes
 # id / code / rewardPerKwhInOctoPoints / startAt / endAt and nothing else.
 #
-# WHY THE POWER UP ENTITIES ARE NOT USED. They look like the right answer and
-# they are not: the integration feeds them from a hardcoded third-party scrape
-# (`oe-api.davidskendall.co.uk/free_electricity.json`), dead since 2025-10-25.
-# They are not stale, they are abandoned. See OCTOPUS_SESSIONS.md.
+# THE POWER UP ENTITIES: abandoned 2025-10-25 to 2026-08, alive again by
+# 2026-10-10. The integration fed them from a hardcoded third-party scrape
+# (`oe-api.davidskendall.co.uk/free_electricity.json`) that stopped in October
+# 2025, which is why this file was built on the proxy. Observed 2026-10-10 the
+# event entity carries 2026 campaign events (ids 5145, 6810, 6811) with `code`
+# null and no points field, so the Power Up sensor now reads it AS WELL AS the
+# proxy. Whether upstream #1590 landed or the scrape was revived is unverified.
+# See OCTOPUS_SESSIONS.md.
 #
 # REMOVAL TRIGGER. When upstream #1590 lands and power_up is fed from
 # `customerFlexibilityCampaignEvents(campaignSlug:)`, or the integration exposes
@@ -62,19 +66,44 @@
 binary_sensors:
   # ---------------------------------------------------------------------------
   # Power Up: free import running right now -> charge the battery from the grid.
+  #
+  # TWO SOURCES since 2026-10-10 (the #1590 swap, half done):
+  #   1. a joined 0-point event on the unified feed — the original proxy, kept;
+  #   2. a running event in the NATIVE Power Up feed's `events` list.
+  # The native feed was a dead scrape when this file was written. By 2026-10-10 it
+  # was carrying real campaign events again, and the Free Electricity session for
+  # 2026-10-11 13:00-15:00 appeared ONLY there: nothing in `joined_events`, so this
+  # sensor would have sat off through two free hours while the automation waited
+  # for an edge. `events` is this account's sessions; `available_events` on the
+  # same entity are offers not yet taken and are deliberately not read.
+  #
+  # A paid session running in the same minute outranks the native feed (`paid`),
+  # for the same reason an unreadable reward fails towards Power Down. That also
+  # keeps this sensor and the one below exact complements.
   # ---------------------------------------------------------------------------
   - name: Octoplus Power Up Active
     unique_id: octoplus_power_up_active
     state: >-
-      {% set ns = namespace(hit=false) %}
+      {% set ns = namespace(hit=false, paid=false, native=false) %}
       {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_down_events', 'joined_events') or [] %}
       {% set st = as_datetime(e.start) %}
       {% set en = as_datetime(e.end) %}
-      {% if st is not none and en is not none and st <= now() < en and (e.get('octopoints_per_kwh', -1) | int(-1)) == 0 %}
+      {% if st is not none and en is not none and st <= now() < en %}
+      {% if (e.get('octopoints_per_kwh', -1) | int(-1)) == 0 %}
       {% set ns.hit = true %}
+      {% else %}
+      {% set ns.paid = true %}
+      {% endif %}
       {% endif %}
       {% endfor %}
-      {{ ns.hit }}
+      {% for e in state_attr('event.octopus_energy_a_4ba7c915_octoplus_power_up_events', 'events') or [] %}
+      {% set st = as_datetime(e.start) %}
+      {% set en = as_datetime(e.end) %}
+      {% if st is not none and en is not none and st <= now() < en %}
+      {% set ns.native = true %}
+      {% endif %}
+      {% endfor %}
+      {{ ns.hit or (ns.native and not ns.paid) }}
 
   # ---------------------------------------------------------------------------
   # Power Down: paid saving session running right now -> export at the cap.
