@@ -292,6 +292,17 @@ pred_bat:
   octopus_saving_session: 're:(event.octopus_energy([0-9a-z_]+|)_octoplus_power_down_events)'
   octopus_saving_session_octopoints_per_penny: 8
 
+  # Free Electricity / Power Up sessions -> 0p import slots in the plan (added 2026-10-10).
+  # Nothing told Predbat about these before: with a session booked for 11 Oct 13:00-15:00 it
+  # planned the whole afternoon at 11.83p. Reads the `events` attribute (this account's sessions;
+  # `available_events` are offers and are not read by Predbat).
+  # octopus_free_electricity, NOT octopus_free_session: that one skips events with no `code`, and
+  # the 2026 campaign events carry code: null. A LITERAL, not re: - an unmatched re: is deleted by
+  # auto_config and the feature goes quiet with only a log line (the 2026-08-17 defect).
+  # In-window the charge itself is done by the HA automation octoplus_power_up_grid_charge, which
+  # stands Predbat's mappers down; this key is what shapes the plan AROUND the window.
+  octopus_free_electricity: 'event.octopus_energy_a_4ba7c915_octoplus_power_up_events'
+
   # Enter your Axle VPP API key if you have signed up to the Axle service in the UK
   # axle_api_key: "xxxxxxx"
 

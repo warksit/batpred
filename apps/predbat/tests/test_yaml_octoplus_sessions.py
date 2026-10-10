@@ -30,6 +30,10 @@ INTENT_PATH = os.path.join(HERE, "..", "ha", "sig_dispatch_intent_helpers.yaml")
 AUTOMATION_PATH = os.path.join(HERE, "..", "ha", "octoplus_power_up_grid_charge.yaml")
 
 EVENTS_ENTITY = "event.octopus_energy_a_4ba7c915_octoplus_power_down_events"
+# The native Power Up feed. Dead from 2025-10-25 (a scraped file) until it started
+# carrying real campaign events again — first seen live 2026-10-10. Its `events`
+# list is this account's sessions; `available_events` are offers not yet taken.
+UP_EVENTS_ENTITY = "event.octopus_energy_a_4ba7c915_octoplus_power_up_events"
 LEGACY_CALENDAR = "calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
 UP_SENSOR = "binary_sensor.octoplus_power_up_active"
 DOWN_SENSOR = "binary_sensor.octoplus_power_down_active"
@@ -56,8 +60,9 @@ def _event(start_h, end_h, points, drop_points=False):
     return ev
 
 
-def render(joined, now=NOW):
-    """Render both discrimination sensors against a joined_events list."""
+def render(joined, now=NOW, native=None, native_available=None):
+    """Render both discrimination sensors against a joined_events list, plus
+    (optionally) the native Power Up feed's `events` / `available_events`."""
     doc = _load(HELPERS_PATH)
     by_id = {s["unique_id"]: s for s in doc["binary_sensors"]}
     env = jinja2.Environment()
@@ -70,8 +75,13 @@ def render(joined, now=NOW):
         except (TypeError, ValueError):
             return None
 
+    attrs = {
+        (EVENTS_ENTITY, "joined_events"): joined,
+        (UP_EVENTS_ENTITY, "events"): native,
+        (UP_EVENTS_ENTITY, "available_events"): native_available,
+    }
     ctx = {
-        "state_attr": lambda e, a: joined if (e == EVENTS_ENTITY and a == "joined_events") else None,
+        "state_attr": lambda e, a: attrs.get((e, a)),
         "as_datetime": as_datetime,
         "now": lambda: now,
     }
@@ -194,6 +204,66 @@ def test_available_but_unjoined_events_are_ignored():
     for sensor in doc["binary_sensors"]:
         assert "available_events" not in sensor["state"], "{} must read joined_events only — an offer is not participation".format(sensor["unique_id"])
     print("PASS  sensors read joined_events only, never available_events")
+
+
+def _native(start_h, end_h, day=None):
+    """One entry of the native Power Up feed, shaped as observed 2026-10-10:
+    ISO strings, `code` null, and NO octopoints field at all."""
+    day = day or NOW.date()
+    mk = lambda h: datetime.datetime(day.year, day.month, day.day, h, 0, tzinfo=UTC).isoformat()
+    return {"id": 6810, "code": None, "start": mk(start_h), "end": mk(end_h), "duration_in_minutes": 60}
+
+
+def test_native_power_up_event_is_a_power_up():
+    """2026-10-11 13:00-15:00: a Free Electricity session that never appeared in
+    `joined_events` at all. It arrived only on the native Power Up feed — the one
+    this file used to call dead — so the sensor stayed off, the grid-charge
+    automation had no edge to fire on, and Predbat saw 11.83p all afternoon."""
+    for hour in (13, 14):
+        up, down = render([], now=_at(hour, 30), native=[_native(13, 14), _native(14, 15)])
+        assert up, "a running native Power Up event must turn the sensor on ({}:30)".format(hour)
+        assert not down, "and must not force Max Export ({}:30)".format(hour)
+    print("PASS  a native Power Up event classifies as Power Up")
+
+
+def test_native_power_up_window_is_start_inclusive_end_exclusive():
+    """Same [start, end) as the joined path, and history does not fire it."""
+    native = [_native(13, 14, day=datetime.date(2025, 10, 5)), _native(13, 15)]
+    assert not render([], now=_at(12, 59), native=native)[0], "before the window"
+    assert render([], now=_at(13, 0), native=native)[0], "start is inclusive"
+    assert render([], now=_at(14, 59), native=native)[0], "inside the window"
+    assert not render([], now=_at(15, 0), native=native)[0], "end is exclusive"
+    print("PASS  native Power Up window is [start, end); past events are inert")
+
+
+def test_native_offer_not_taken_is_ignored():
+    """`available_events` on the native feed are offers. On 2026-10-10 two sat
+    there (11:00 and 12:00) beside the two that were ours (13:00 and 14:00)."""
+    up, down = render([], now=_at(11, 30), native=[_native(13, 14)], native_available=[_native(11, 12)])
+    assert not up and not down, "an offer we did not take must drive nothing; got up={} down={}".format(up, down)
+    print("PASS  a native offer that was not taken drives nothing")
+
+
+def test_paid_session_outranks_a_native_power_up():
+    """If both feeds claim the same minute, the paid session wins.
+
+    Same fail-safe direction as an unreadable reward: losing a free hour costs
+    the import/export spread; importing 6.6 kW through a paid session costs the
+    premium and the import. It also keeps the two sensors exact complements."""
+    up, down = render([_event(13, 14, 96)], now=_at(13, 30), native=[_native(13, 14)])
+    assert down, "the paid session must still force Max Export"
+    assert not up, "and the native feed must not authorise a grid charge over it"
+    print("PASS  a paid session outranks a native Power Up in the same window")
+
+
+def test_native_feed_missing_changes_nothing():
+    """The entity is `disabled_by: integration` on some installs and unavailable
+    while the integration reloads. Absent must behave exactly as before."""
+    for native in (None, []):
+        assert render([_event(13, 14, 0)], native=native) == (True, False), "joined 0-pt path must be untouched"
+        assert render([_event(13, 14, 96)], native=native) == (False, True), "joined paid path must be untouched"
+        assert render([], native=native) == (False, False), "nothing joined, nothing native -> nothing"
+    print("PASS  an absent native feed leaves the joined-events behaviour unchanged")
 
 
 def _plugin_source():
@@ -448,6 +518,11 @@ def run():
         test_unreadable_reward_fails_towards_power_down,
         test_no_joined_events_drives_nothing,
         test_available_but_unjoined_events_are_ignored,
+        test_native_power_up_event_is_a_power_up,
+        test_native_power_up_window_is_start_inclusive_end_exclusive,
+        test_native_offer_not_taken_is_ignored,
+        test_paid_session_outranks_a_native_power_up,
+        test_native_feed_missing_changes_nothing,
         test_no_consumer_reimplements_the_discriminator,
         test_no_consumer_keys_on_the_legacy_calendar,
         test_plugin_reads_only_window_sensors_this_file_publishes,
