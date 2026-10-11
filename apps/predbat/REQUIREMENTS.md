@@ -2327,7 +2327,7 @@ and the natural switch is **SOC reaching the floor** (the existing Schmitt).
   Fix: `policy_change` **OR** live EMS mode == `PCS Remote Control`, on any trigger.
   Keying the self-heal on the MODE is what makes it safe and complete:
   `predbat_requested_mode_action` selects only `Maximum Self Consumption`,
-  `Command Charging (Grid First)`, `Command Discharging (PV First)` — **never** PCS
+  `Command Charging (PV First)` (Grid First until 2026-10-11), `Command Discharging (PV First)` — **never** PCS
   Remote Control, which only the heartbeat's active branch writes. So reverting it
   cannot stomp Predbat (the 2026-07-27 regression), and unlike simply adding
   `override_change` it also recovers after an HA restart, where no trigger fires at

@@ -24,7 +24,11 @@ YAML_PATH = os.path.join(
 
 EXPECTED_MAP = {
     "Demand": "Maximum Self Consumption",
-    "Charging": "Command Charging (Grid First)",
+    # STOCK mapping (docs/inverter-setup.md, SigEnergy Sigenstor). Was Grid First from
+    # 2026-06-12 to 2026-10-11; that deviation was made on the AC-coupled hardware and
+    # on the DC-coupled SigenStor it switches the panels OFF. Measured 2026-10-11 13:17-13:34,
+    # battery limit 8.8 kW: Grid First 6.1 kW battery / 0.0 kW PV; PV First 8.8 / 4.7.
+    "Charging": "Command Charging (PV First)",
     "Freeze Charging": "Maximum Self Consumption",
     "Discharging": "Command Discharging (PV First)",
     "Freeze Discharging": "Maximum Self Consumption",

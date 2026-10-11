@@ -6,17 +6,23 @@
 #
 # Mode map:
 #   Demand             → Maximum Self Consumption
-#   Charging           → Command Charging (Grid First)
+#   Charging           → Command Charging (PV First)   [STOCK]
 #   Freeze Charging    → Maximum Self Consumption (+ grid import limit 0)
 #   Discharging        → Command Discharging (PV First)
 #   Freeze Discharging → Maximum Self Consumption (+ grid import limit 0)
 #
-# 2026-06-12: Charging changed PV First → Grid First. A Predbat charge window
-# is a grid charge (cheap-rate slot, usually overnight with zero PV).
-# "Command Charging (PV First)" cannot be relied on to pull from grid at
-# night; the March 2026 in-Predbat SIG control used Grid First for active
-# charge windows and was validated live. Trade-off: a daytime charge window
-# will draw grid (at the cheap rate Predbat chose) even when PV is available.
+# 2026-10-11: Charging is back on the STOCK mapping, PV First.
+# It was Grid First from 2026-06-12, because PV First "cannot be relied on to
+# pull from grid at night". That was decided on the AC-coupled hardware, before
+# the 2026-07-15 swap: the panels were on the SMA then, so the SigenStor had no
+# PV of its own. On the DC-coupled SigenStor, Grid First switches the panels OFF.
+# Measured live 2026-10-11, same sky, battery charge limit 8.8 kW:
+#     Grid First   battery 6.1 kW   PV 0.0 kW   AC import 6.4 kW
+#     PV First     battery 8.8 kW   PV 4.7 kW   AC import 4.1 kW
+# PV First fills at the battery's limit, takes all the PV, and buys only the
+# difference. NOT YET VERIFIED: that PV First imports in a night slot with zero
+# PV on this hardware (the June failure mode). First check: 2026-10-11 22:00.
+# If it does not import, the fallback is Grid First at night only.
 #
 # 2026-07-27: SINGLE-WRITER MUTEX IS ENABLE/DISABLE, NOT A CONDITION.
 # This automation was disabled at the 2026-07-15 inverter swap (last triggered
@@ -55,7 +61,7 @@ action:
     data:
       option: >-
         {% if is_state('input_select.predbat_requested_mode', 'Demand') %}Maximum Self Consumption
-        {%- elif is_state('input_select.predbat_requested_mode', 'Charging') %}Command Charging (Grid First)
+        {%- elif is_state('input_select.predbat_requested_mode', 'Charging') %}Command Charging (PV First)
         {%- elif is_state('input_select.predbat_requested_mode', 'Freeze Charging') %}Maximum Self Consumption
         {%- elif is_state('input_select.predbat_requested_mode', 'Discharging') %}Command Discharging (PV First)
         {%- elif is_state('input_select.predbat_requested_mode', 'Freeze Discharging') %}Maximum Self Consumption
