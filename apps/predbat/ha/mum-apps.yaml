@@ -21,11 +21,11 @@
 #     | diff - apps/predbat/ha/mum-apps.yaml
 # The only expected hunks are this header and the mcp_secret block.
 #
-# KNOWN, NOT FIXED HERE: `sig_discharge_cut_off_soc` is defined three times. All three carry the
-# SAME value, so YAML last-wins is harmless today — it is untidy, not a defect. check-yaml (ruamel)
-# rejects duplicate keys where PyYAML (what Predbat itself uses) accepts them, which is the other
-# reason this path is excluded from that hook. Deduplicating touches live battery config, so it
-# goes on its own change.
+# DUPLICATE KEYS: none, and it must stay that way. `sig_discharge_cut_off_soc` used to be defined
+# three times (same value). PyYAML, which Predbat loads the config with, takes the last one
+# silently; v9's unmasked-credentials check re-reads the file with a strict loader and failed on
+# it at every start. Deduplicated 2026-10-11; tests/test_yaml_mum_apps.py guards it. check-yaml
+# stays excluded for this path only because the hooks must never rewrite a mirror.
 
 pred_bat:
   module: predbat
@@ -258,8 +258,6 @@ pred_bat:
   # This matches the intelligent slot from the Octopus Energy integration
   # octopus_intelligent_slot: 're:(binary_sensor.octopus_energy([0-9a-z_]+|)_intelligent_dispatching)'
   # octopus_ready_time: 're:((select|time).octopus_energy_([0-9a-z_]+|)_intelligent_target_time)'
-  sig_discharge_cut_off_soc:
-    - number.sigen_plant_ess_discharge_cut_off_state_of_charge
   # octopus_charge_limit: 're:(number.octopus_energy([0-9a-z_]+|)_intelligent_charge_target)'
 
   # Carbon Intensity data from National grid
@@ -269,8 +267,6 @@ pred_bat:
   # Example alternative configuration for Ohme integration release >=v0.6.1
   #octopus_intelligent_slot: 'binary_sensor.ohme_slot_active'
   #octopus_ready_time: 'time.ohme_target_time'
-  sig_discharge_cut_off_soc:
-    - number.sigen_plant_ess_discharge_cut_off_state_of_charge
   #octopus_charge_limit: 'number.ohme_target_percent'
 
   # Set this to False if you use Octopus Intelligent slot for car planning but when on another tariff e.g. Agile
