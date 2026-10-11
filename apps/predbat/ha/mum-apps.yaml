@@ -150,8 +150,11 @@ pred_bat:
   # The maximum rate the inverter can charge and discharge the battery can be overwritten, this will change
   # the register programming and thus cap the max rates. The default is to use the maximum supported rates (recommended)
   #
-  #inverter_limit_charge:
-  #  - 4000
+  # 2026-10-11: the pack CHARGES at 8.8 kW but battery_rate_max above is the rated DISCHARGING
+  # power (9.6 kW), which Predbat otherwise uses for both directions. It was modelling a 9.6 kW
+  # charge and promised 0% -> 100% inside a two-hour free session. Discharge is left at the default.
+  inverter_limit_charge:
+  - sensor.sigen_plant_ess_rated_charging_power
   #inverter_limit_discharge:
   #  - 4000
 
@@ -299,8 +302,8 @@ pred_bat:
   # octopus_free_electricity, NOT octopus_free_session: that one skips events with no `code`, and
   # the 2026 campaign events carry code: null. A LITERAL, not re: - an unmatched re: is deleted by
   # auto_config and the feature goes quiet with only a log line (the 2026-08-17 defect).
-  # In-window the charge itself is done by the HA automation octoplus_power_up_grid_charge, which
-  # stands Predbat's mappers down; this key is what shapes the plan AROUND the window.
+  # Predbat does the charge itself (stock mapper: Charging -> Command Charging (PV First)). The HA
+  # automation octoplus_power_up_grid_charge only stands CM down for the window if CM is driving.
   octopus_free_electricity: 'event.octopus_energy_a_4ba7c915_octoplus_power_up_events'
 
   # Enter your Axle VPP API key if you have signed up to the Axle service in the UK
