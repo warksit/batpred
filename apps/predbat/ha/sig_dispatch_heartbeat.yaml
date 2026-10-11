@@ -215,7 +215,7 @@ action:
           #                      ONLY by this automation's active branch —
           #                      predbat_requested_mode_action selects only
           #                      Maximum Self Consumption / Command Charging
-          #                      (Grid First) / Command Discharging (PV First).
+          #                      (PV First) / Command Discharging (PV First).
           #                      So reverting it can never stomp Predbat, and the
           #                      1-min beat is safe to act on it.
           #
