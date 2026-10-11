@@ -120,6 +120,26 @@ def test_charge_rate_limit_is_the_rated_charging_power():
     assert cfg.get("inverter_limit_charge") == [8800], "inverter_limit_charge must be the pack's 8.8 kW charge limit as integer watts, got {!r}".format(cfg.get("inverter_limit_charge"))
 
 
+def test_no_key_is_defined_twice():
+    """A duplicated key is silently last-wins in PyYAML and an ERROR in a strict loader.
+
+    `sig_discharge_cut_off_soc` sat in this file three times (same value each time,
+    two of them stranded among the commented-out car-charging examples). Harmless on
+    v8. On v9.3.7 Predbat re-reads apps.yaml with a strict loader to look for unmasked
+    credentials, and logged "Unable to re-read /config/apps.yaml to check for unmasked
+    secrets: while constructing a mapping" on every start - so that check never ran.
+    """
+    seen = {}
+    with open(APPS_YAML) as handle:
+        for number, line in enumerate(handle, 1):
+            found = re.match(r"^  ([A-Za-z0-9_]+):", line)
+            if found:
+                seen.setdefault(found.group(1), []).append(number)
+    duplicated = {key: lines for key, lines in seen.items() if len(lines) > 1}
+    assert not duplicated, "keys defined more than once under pred_bat: {}".format(duplicated)
+    assert seen.get("sig_discharge_cut_off_soc"), "sig_discharge_cut_off_soc must still be defined once"
+
+
 def test_no_pointer_at_a_retired_octopus_entity():
     """The exact 2026-08-17 defect: a config value naming an entity that no longer exists."""
     with open(APPS_YAML) as handle:
@@ -145,6 +165,7 @@ def run():
         test_saving_session_does_not_match_power_up_events,
         test_free_electricity_points_at_the_live_power_up_feed,
         test_charge_rate_limit_is_the_rated_charging_power,
+        test_no_key_is_defined_twice,
         test_no_pointer_at_a_retired_octopus_entity,
         test_mcp_secret_is_redacted_in_the_repo_copy,
     ):
