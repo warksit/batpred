@@ -113,7 +113,11 @@ def test_charge_rate_limit_is_the_rated_charging_power():
     """
     cfg = _load()
     assert cfg["battery_rate_max"] == ["sensor.sigen_plant_ess_rated_discharging_power"], "precondition: battery_rate_max is still the discharge rating, got {!r}".format(cfg["battery_rate_max"])
-    assert cfg.get("inverter_limit_charge") == ["sensor.sigen_plant_ess_rated_charging_power"], "inverter_limit_charge must be the rated CHARGING power sensor, got {!r}".format(cfg.get("inverter_limit_charge"))
+    # A literal in watts, NOT the sensor. The key validates as an integer; pointing it at
+    # sensor.sigen_plant_ess_rated_charging_power (8.8, in kW) modelled the right rate but
+    # logged "is not a valid type integer ... found 1 configuration errors" on every start
+    # (live 2026-10-11 15:03).
+    assert cfg.get("inverter_limit_charge") == [8800], "inverter_limit_charge must be the pack's 8.8 kW charge limit as integer watts, got {!r}".format(cfg.get("inverter_limit_charge"))
 
 
 def test_no_pointer_at_a_retired_octopus_entity():

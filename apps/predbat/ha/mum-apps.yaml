@@ -153,8 +153,11 @@ pred_bat:
   # 2026-10-11: the pack CHARGES at 8.8 kW but battery_rate_max above is the rated DISCHARGING
   # power (9.6 kW), which Predbat otherwise uses for both directions. It was modelling a 9.6 kW
   # charge and promised 0% -> 100% inside a two-hour free session. Discharge is left at the default.
+  # A literal in WATTS, not the sensor: this key validates as an integer and
+  # sensor.sigen_plant_ess_rated_charging_power reads 8.8 (kW), which works but logs a
+  # configuration error on every start. 8800 = that sensor's value; re-check if the pack changes.
   inverter_limit_charge:
-  - sensor.sigen_plant_ess_rated_charging_power
+  - 8800
   #inverter_limit_discharge:
   #  - 4000
 
