@@ -216,7 +216,7 @@ point: when upstream is fixed there is exactly one body to rewrite.
 - **Max Export forcing** (`sig_dispatch_intent_helpers.yaml`) reads
   `power_down_active`. Keying it on the calendar alone makes CM export through a
   Power Up — the opposite of right.
-- **Grid charge** (`octoplus_power_up_grid_charge.yaml`) reads `power_up_active`.
+- **Grid charge** (`octoplus_power_up_grid_charge.yaml`) reads `power_up_active`. Since 2026-10-11 it no longer charges anything itself: it stands CM down for the window if CM is driving and restores it after; Predbat does the charge.
 - Migrate remaining references from `saving_sessions` to `power_down` naming
   before January 2027. When the legacy calendar is removed,
   `is_state(..., 'on')` becomes permanently false and anything still keyed on it

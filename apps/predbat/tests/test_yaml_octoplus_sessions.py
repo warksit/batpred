@@ -477,33 +477,150 @@ def test_automation_has_no_time_of_day_gate():
     print("PASS  no time-of-day gate in the power-up automation")
 
 
-def test_handback_restores_whoever_was_driving():
-    """Same owner both sides: CM -> session -> CM, or Predbat -> session -> Predbat.
+CM_ENABLE = "input_boolean.curtailment_manager_enable"
+STOOD_DOWN_FLAG = "input_boolean.power_up_cm_stood_down"
+POLICY_SELECT = "input_select.sig_dispatch_policy"
+OVERRIDE_SELECT = "input_select.sig_override"
+GRID_IMPORT = "sensor.sigen_plant_grid_import_power"
+SOC_SENSOR = "sensor.sigen_plant_battery_state_of_charge"
 
-    The previous version cleared `sig_override`, stood CM down and disabled the
-    three Predbat mappers, then restored only CM — leaving the override cleared
-    and the mappers off.
-    """
+
+def _cond(cond, states, trigger_id):
+    """Evaluate one NATIVE HA condition. Templates are refused on purpose: this
+    automation is safety-relevant and every gate in it must be schema-checked."""
+    kind = cond["condition"]
+    if kind == "state":
+        want = cond["state"]
+        want = want if isinstance(want, list) else [want]
+        return states.get(cond["entity_id"], "unknown") in want
+    if kind == "not":
+        return not any(_cond(c, states, trigger_id) for c in cond["conditions"])
+    if kind == "trigger":
+        ids = cond["id"]
+        return trigger_id in (ids if isinstance(ids, list) else [ids])
+    if kind == "numeric_state":
+        try:
+            value = float(states.get(cond["entity_id"], "unknown"))
+        except ValueError:
+            return False
+        return ("below" not in cond or value < cond["below"]) and ("above" not in cond or value > cond["above"])
+    raise AssertionError("non-native condition {!r} in the Power Up automation".format(kind))
+
+
+def _run_automation(states, trigger_id):
+    """Which branch runs, and the service calls it makes, for a scenario."""
     doc = _load(AUTOMATION_PATH)
-    blob = yaml.safe_dump(doc)
-    for var in ("prev_override", "prev_cm_on", "prev_mappers_on"):
-        assert var in blob, "the automation must capture {} before it takes the wheel, or handback is a guess".format(var)
+    assert len(doc["actions"]) == 1 and "choose" in doc["actions"][0], "the automation must be ONE choose - no unconditional step may run on the 5-minute sweep"
+    for branch in doc["actions"][0]["choose"]:
+        if all(_cond(c, states, trigger_id) for c in branch["conditions"]):
+            calls = []
+            for step in branch["sequence"]:
+                target = step.get("target", {}).get("entity_id")
+                for entity in target if isinstance(target, list) else [target]:
+                    calls.append((step["action"], entity))
+            return calls
+    return []
 
-    # The capture must happen before anything is switched off, or it records our
-    # own changes instead of the pre-window owner.
-    actions = doc["actions"]
-    capture_idx = next((i for i, a in enumerate(actions) if "variables" in a), None)
-    assert capture_idx is not None, "no variables block captures the pre-window owner"
-    for i, action in enumerate(actions):
-        if action.get("action") in ("input_boolean.turn_off", "automation.turn_off", "input_select.select_option"):
-            assert i > capture_idx, "action #{} ({}) runs BEFORE the owner is captured".format(i, action.get("action"))
 
-    # Restoring the mappers unconditionally would hand Predbat the registers in
-    # the seconds before CM's mutex disabled them again.
-    turn_on_mappers = [a for a in actions if a.get("action") == "automation.turn_on"]
-    assert not turn_on_mappers, "mapper restore must be guarded by prev_mappers_on, not an unconditional turn_on"
-    assert "automation.turn_on" in blob, "the mappers must be restored when they were on before the window"
-    print("PASS  handback captures and restores the pre-window owner")
+def _scenario(power_up="on", cm_enable="on", policy="Hold Battery", override="Off", flag="off", grid_import="6.0", soc="40"):
+    return {UP_SENSOR: power_up, CM_ENABLE: cm_enable, POLICY_SELECT: policy, OVERRIDE_SELECT: override, STOOD_DOWN_FLAG: flag, GRID_IMPORT: grid_import, SOC_SENSOR: soc}
+
+
+def test_power_up_does_nothing_while_predbat_is_driving():
+    """2026-10-11 13:00, the live failure (Andrew: "That automation is for when cm
+    is in charge").
+
+    Predbat was driving and had the 0p slot planned. The automation took the plant
+    anyway: switched Predbat's three mappers off - freezing the inverter in the
+    `Command Discharging (PV First)` Predbat had set at 12:51 - and wrote a -6.6 kW
+    setpoint that mode ignores. The plant exported 3.6 kW into a free-import hour
+    for 15 minutes, with Predbat asking for "Charging" and no path to deliver it.
+    """
+    for trigger_id in ("window_open", "sweep", "recover"):
+        calls = _run_automation(_scenario(policy="Predbat"), trigger_id)
+        assert calls == [], "Predbat is driving - the automation must not act ({}), did {}".format(trigger_id, calls)
+    print("PASS  Predbat driving -> the Power Up automation does nothing")
+
+
+def test_power_up_stands_cm_down_and_only_that():
+    """CM driving at window open: stand CM down so Predbat can take the free energy.
+
+    The automation writes NO inverter register and touches NO mapper. Predbat owns
+    the charge (it prices the slot at 0p via octopus_free_electricity, and the
+    stock mapper's Charging is PV First - battery at its limit with all the PV).
+    CM's own release path does the handover, so there is one writer for it.
+    """
+    for policy in ("Max Export", "Hold Battery", "Solar Charge Battery"):
+        for trigger_id in ("window_open", "sweep"):
+            calls = _run_automation(_scenario(policy=policy), trigger_id)
+            assert ("input_boolean.turn_off", CM_ENABLE) in calls, "CM driving ({}) must be stood down on {}, did {}".format(policy, trigger_id, calls)
+            assert ("input_boolean.turn_on", STOOD_DOWN_FLAG) in calls, "and the automation must record that IT did so, or the restore is a guess"
+            assert calls.index(("input_boolean.turn_on", STOOD_DOWN_FLAG)) < calls.index(("input_boolean.turn_off", CM_ENABLE)), "flag first: a crash between the two must leave a restore owed, never a CM left off"
+            touched = {entity for _action, entity in calls}
+            banned = [e for e in touched if e and (e.startswith(("number.", "select.", "automation.")) or e in (POLICY_SELECT, OVERRIDE_SELECT))]
+            assert not banned, "the automation must not write registers, modes, mappers, policy or override: {}".format(banned)
+    print("PASS  CM driving -> stood down, flag set first, nothing else written")
+
+
+def test_power_up_restores_only_what_it_took():
+    """The restore is keyed on the automation's own flag, not on a guess.
+
+    `curtailment_manager_enable` is the master switch; if it is off because a
+    person turned it off, a free session must not turn it back on.
+    """
+    for trigger_id in ("window_close", "sweep", "recover"):
+        calls = _run_automation(_scenario(power_up="off", cm_enable="off", policy="Predbat", flag="on"), trigger_id)
+        assert ("input_boolean.turn_on", CM_ENABLE) in calls, "window closed with a restore owed ({}): CM must come back, did {}".format(trigger_id, calls)
+        assert ("input_boolean.turn_off", STOOD_DOWN_FLAG) in calls, "and the flag must be cleared"
+        assert calls.index(("input_boolean.turn_on", CM_ENABLE)) < calls.index(("input_boolean.turn_off", STOOD_DOWN_FLAG)), "restore first, then clear: a crash between must leave the restore still owed"
+    # CM was off before the window and we never touched it -> leave it off.
+    for trigger_id in ("window_close", "sweep", "recover"):
+        calls = _run_automation(_scenario(power_up="off", cm_enable="off", policy="Predbat", flag="off"), trigger_id)
+        assert calls == [], "CM was off by someone else's hand - must not be turned on ({}), did {}".format(trigger_id, calls)
+    # Still inside the window -> not yet.
+    calls = _run_automation(_scenario(power_up="on", cm_enable="off", policy="Predbat", flag="on"), "sweep")
+    assert ("input_boolean.turn_on", CM_ENABLE) not in calls, "must not restore CM while the window is still open"
+    print("PASS  restore is owed only when the flag says we stood CM down, and only after the window")
+
+
+def test_power_up_defers_to_a_human_override():
+    """A person driving by hand outranks a free session. The old version cleared
+    the override and restored it afterwards; not touching it is simpler and safer."""
+    calls = _run_automation(_scenario(policy="Hold Battery", override="Hold Battery"), "window_open")
+    assert calls == [], "a manual override is live - leave the plant alone, did {}".format(calls)
+    print("PASS  a manual override is left alone")
+
+
+def test_power_up_has_no_timed_wait():
+    """No run may outlive its trigger.
+
+    The old version sat in a wait_for_trigger with a 70-minute timeout, written
+    for one-hour sessions. On the two-hour session of 2026-10-11 it would have
+    "finished" at 14:10 and re-taken the plant on the 14:15 sweep. With no wait
+    there is no timeout to get wrong and nothing for an HA restart to lose.
+    """
+    blob = yaml.safe_dump(_load(AUTOMATION_PATH))
+    for token in ("wait_for_trigger", "wait_template", "timeout", "delay"):
+        assert token not in blob, "the Power Up automation must hold no timed wait, found {!r}".format(token)
+    print("PASS  no timed wait - session length cannot be got wrong")
+
+
+def test_power_up_warns_once_when_the_free_hour_is_not_being_used():
+    """Ten minutes in, importing nothing, battery not full: say so, once.
+
+    On 2026-10-11 the plant exported for 15 minutes of a free session and nothing
+    spoke. The old "two minutes in" report only ran on the path that took the
+    wheel; this fires whoever is driving.
+    """
+    idle = _scenario(policy="Predbat", grid_import="0.0", soc="12")
+    assert any(a.startswith("notify.") for a, _e in _run_automation(idle, "ten_minutes_in")), "idle 10 min into a free session must warn"
+    assert _run_automation(idle, "sweep") == [], "and only on the ten-minute trigger, not on every sweep"
+    assert _run_automation(_scenario(policy="Predbat", grid_import="6.2", soc="12"), "ten_minutes_in") == [], "importing -> no warning"
+    assert _run_automation(_scenario(policy="Predbat", grid_import="0.0", soc="99"), "ten_minutes_in") == [], "battery full -> nothing to warn about"
+    doc = _load(AUTOMATION_PATH)
+    slow = [t for t in doc["triggers"] if t.get("id") == "ten_minutes_in"]
+    assert slow and slow[0]["entity_id"] == UP_SENSOR and slow[0].get("to") == "on" and slow[0].get("for"), "ten_minutes_in must be the sensor holding 'on' for a duration"
+    print("PASS  warns once, ten minutes in, if the free hour is not being used")
 
 
 def run():
@@ -536,7 +653,12 @@ def run():
         test_window_agrees_with_the_sensor_state,
         test_plugin_points_at_the_discrimination_sensor,
         test_automation_has_no_time_of_day_gate,
-        test_handback_restores_whoever_was_driving,
+        test_power_up_does_nothing_while_predbat_is_driving,
+        test_power_up_stands_cm_down_and_only_that,
+        test_power_up_restores_only_what_it_took,
+        test_power_up_defers_to_a_human_override,
+        test_power_up_has_no_timed_wait,
+        test_power_up_warns_once_when_the_free_hour_is_not_being_used,
     ):
         try:
             fn()

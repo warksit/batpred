@@ -24,6 +24,23 @@
 # PV on this hardware (the June failure mode). First check: 2026-10-11 22:00.
 # If it does not import, the fallback is Grid First at night only.
 #
+# WHERE THIS STILL DIFFERS FROM UPSTREAM, ON PURPOSE (reviewed 2026-10-11).
+# Upstream's current mapper also writes ess_charge_cut_off_state_of_charge and
+# ess_discharge_cut_off_state_of_charge in every branch: Freeze Charging pins the
+# discharge cut-off just under live SOC, Freeze Discharging sets the charge
+# cut-off to 0. This copy writes neither, and should not without a wider change:
+#   * Here a freeze is already delivered by the RATE mappers (Predbat sets
+#     discharge_rate / charge_rate to 0 -> ess_max_*_limit 0), and the heartbeat
+#     re-opens those limits when CM takes the wheel. Verified live repeatedly.
+#   * Nothing on the CM side resets the cut-off registers. CM disables this
+#     automation the moment it takes over (stop_actions), so a pinned discharge
+#     cut-off could be left stranded above SOC with CM trying to drain - and the
+#     Sigenergy firmware bug upstream documents (#4375) then IMPORTS from grid to
+#     reach the cut-off. We do not have that bug today because the cut-off is
+#     never moved off 0; adopting the pin would create the exposure.
+# Taking it needs the heartbeat / _neutralise_predbat to own those two registers
+# as well (REQUIREMENTS register-ownership table). Not done; Andrew's decision.
+#
 # 2026-07-27: SINGLE-WRITER MUTEX IS ENABLE/DISABLE, NOT A CONDITION.
 # This automation was disabled at the 2026-07-15 inverter swap (last triggered
 # 2026-07-14 23:34) and nothing re-enabled it, so Predbat had no control path to
