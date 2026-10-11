@@ -102,6 +102,20 @@ def test_free_electricity_points_at_the_live_power_up_feed():
     assert value == LIVE_POWER_UP_EVENTS, "octopus_free_electricity must be the live Power Up events entity {!r}, found {!r}".format(LIVE_POWER_UP_EVENTS, value)
 
 
+def test_charge_rate_limit_is_the_rated_charging_power():
+    """Predbat must model the battery's CHARGE limit, not its discharge limit.
+
+    `battery_rate_max` points at the rated DISCHARGING power (9.6 kW) and Predbat
+    uses it for both directions unless told otherwise. The pack's charge limit is
+    8.8 kW. Live 2026-10-11: "charge rate 9.6kW" in the log, and a plan that
+    promised 0% -> 100% of 18.08 kWh inside a two-hour free session, which 8.8 kW
+    cannot deliver (17.6 kWh).
+    """
+    cfg = _load()
+    assert cfg["battery_rate_max"] == ["sensor.sigen_plant_ess_rated_discharging_power"], "precondition: battery_rate_max is still the discharge rating, got {!r}".format(cfg["battery_rate_max"])
+    assert cfg.get("inverter_limit_charge") == ["sensor.sigen_plant_ess_rated_charging_power"], "inverter_limit_charge must be the rated CHARGING power sensor, got {!r}".format(cfg.get("inverter_limit_charge"))
+
+
 def test_no_pointer_at_a_retired_octopus_entity():
     """The exact 2026-08-17 defect: a config value naming an entity that no longer exists."""
     with open(APPS_YAML) as handle:
@@ -126,6 +140,7 @@ def run():
         test_saving_session_resolves_to_the_live_power_down_entity,
         test_saving_session_does_not_match_power_up_events,
         test_free_electricity_points_at_the_live_power_up_feed,
+        test_charge_rate_limit_is_the_rated_charging_power,
         test_no_pointer_at_a_retired_octopus_entity,
         test_mcp_secret_is_redacted_in_the_repo_copy,
     ):

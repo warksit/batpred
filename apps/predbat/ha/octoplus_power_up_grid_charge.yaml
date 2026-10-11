@@ -15,29 +15,69 @@
 # this file before 2026-08-16 (trigger, gate, wait, comment) and the discriminator
 # is expected to change when upstream #1590 lands. One definition, one place.
 #
-# OWNERSHIP — SAME OWNER BOTH SIDES (Andrew, 2026-08-16).
-# CM -> session -> CM, or Predbat -> session -> Predbat. Never crossing. The
-# window is an hour in the middle of the curtailment day, so in practice CM has
-# the wheel, but the automation does not assume it: it CAPTURES who was driving
-# and restores exactly that. The previous version cleared `sig_override`, stood
-# CM down and disabled the three Predbat mapper automations, then restored only
-# CM — leaving the override cleared and the mappers off, for Predbat's own mutex
-# to sort out later.
+# WHAT THIS DOES — AND NO LONGER DOES (rewritten 2026-10-11).
+# It gets CM out of Predbat's way for the window, and puts it back. That is all.
+# It writes no inverter register, no EMS mode, and never touches Predbat's
+# mapper automations.
 #
-# Why all three levers have to move: an override outranks the select in the
-# effective-policy sensor, `sig_dispatch_heartbeat` writes nothing only while
-# policy == Predbat, and the mappers are Predbat's path to the same registers.
-# Anything left live is a second writer fighting us for the hour.
+# Why. Until 2026-10-10 Predbat knew nothing about free sessions, so this file
+# did the charge itself: stand everyone down, disable the three mappers, write
+# -6.6 kW to active_power_fixed_adjustment. Two things changed:
+#   * Predbat now prices the window at 0p (octopus_free_electricity in apps.yaml)
+#     and plans the charge; and
+#   * the stock mapper's Charging is Command Charging (PV First), which measured
+#     live fills the battery at its 8.8 kW limit with ALL the PV (2026-10-11:
+#     battery 8.8, PV 4.7, AC import 4.1). Nothing here can do better.
+#
+# The live failure that forced the rewrite, 2026-10-11 13:00. Predbat was driving
+# (CM stood down, no overflow risk). This automation took the plant anyway:
+# mappers off - which froze the inverter in the Command Discharging (PV First)
+# Predbat had set at 12:51 - then a -6.6 setpoint that mode ignores. It never set
+# a mode itself; it had only ever run with CM driving, where PCS Remote Control
+# was already in place. The plant exported 3.6 kW into a free-import hour for 15
+# minutes while Predbat asked for "Charging" with no path to deliver it.
+#
+# OWNERSHIP (Andrew, 2026-10-11: "That automation is for when cm is in charge").
+#   Predbat driving  -> do nothing. It is already charging on its own plan.
+#   CM driving       -> switch curtailment_manager_enable off. CM's own release
+#                       path hands the registers back (one writer for that
+#                       handover, not two); Predbat then charges. Switch it back
+#                       on when the window closes.
+#   Manual override  -> do nothing. A person driving outranks a free session.
+#
+# COST, STATED: with CM driving, the handover is not instant. CM releases on its
+# next cycle (up to 5 min) and Predbat acts on the cycle after (up to 5 more), so
+# a session that opens with CM on the wheel can lose up to ~10 minutes. The old
+# direct write was faster and was also the thing that broke. Closing that gap
+# belongs in the plugin (stand down ahead of a known Power Up, as RD14-own looks
+# ahead for a Power Down), not here.
+#
+# NO TIMED WAIT. The old version held a wait_for_trigger with a 70-minute
+# timeout, written for one-hour sessions; on a two-hour session it "finished" at
+# +70 min and re-took the plant on the next sweep. Each run here ends at once.
+# What is owed across the window lives in input_boolean.power_up_cm_stood_down,
+# which survives an HA restart - so there is no in-flight state to lose and no
+# separate recovery path to keep right.
+#
+# THE FLAG IS LOAD-BEARING. curtailment_manager_enable is the master switch. If a
+# person has it off, a free session must not turn it back on, so the restore is
+# owed only when this automation recorded that IT stood CM down. Flag on BEFORE
+# CM off, and CM on BEFORE flag off: a crash between either pair leaves a restore
+# still owed, never a CM silently left off.
+#
+# EVERY GATE IS A NATIVE CONDITION - no templates. tests/test_yaml_octoplus_sessions.py
+# evaluates the real conditions over the ownership matrix and refuses anything
+# it cannot evaluate.
 #
 # IMPORTANT: Update and commit this file before changing the automation in HA.
 
 id: "1786900000002"
 alias: "Octoplus Power Up - grid charge"
 description: >-
-  During an Octopus Power Up (free electricity) window, stand the current owner
-  down and command the plant to import, charging the battery for free. Restores
-  whoever was driving on window close, on timeout, and after an HA restart that
-  finds the plant still importing.
+  During an Octopus Power Up (free electricity) window, stand the Curtailment
+  Manager down if it is driving so Predbat can take the free energy, and switch
+  it back on when the window closes. Does nothing while Predbat is already
+  driving or a manual override is set. Writes no inverter register.
 mode: single
 max_exceeded: silent
 
@@ -46,175 +86,104 @@ triggers:
     entity_id: binary_sensor.octoplus_power_up_active
     to: "on"
     id: window_open
+  - trigger: state
+    entity_id: binary_sensor.octoplus_power_up_active
+    to: "off"
+    id: window_close
+  - trigger: state
+    entity_id: binary_sensor.octoplus_power_up_active
+    to: "on"
+    for:
+      minutes: 10
+    id: ten_minutes_in
   - trigger: homeassistant
     event: start
     id: recover
 
-  # Backstop. The sensor edge is the only thing that opens the window, and a
-  # missed edge means the whole hour is lost. The sensor re-renders every minute
-  # (its template contains now()), so this should be redundant — but "should be"
-  # is not a plan when the window is 60 minutes long and does not come round
-  # again. Costs at most 5 minutes of the hour if the edge is missed.
+  # Backstop for a missed edge in either direction, and the path that catches CM
+  # taking the wheel part-way through a window. Every branch below is gated, so
+  # this does nothing at all outside the two cases that need it.
   - trigger: time_pattern
     minutes: "/5"
     id: sweep
 
 actions:
-  # RECOVERY. A restart mid-window loses the in-flight run, which would strand
-  # the plant importing at 6.6 kW with nobody to stop it. Same lesson as the
-  # unreachable alert: the restart is the case a state machine forgets.
-  #
-  # The captured pre-window state does not survive the restart, so recovery
-  # restores the common case (CM driving) rather than guessing. Stated plainly
-  # in the notification so it can be corrected by hand if it was wrong.
-  - if:
-      - condition: trigger
-        id: recover
-    then:
-      - if:
-          - condition: numeric_state
-            entity_id: number.sigen_plant_active_power_fixed_adjustment
-            below: -0.01
-        then:
-          - action: number.set_value
-            target:
-              entity_id: number.sigen_plant_active_power_fixed_adjustment
-            data:
-              value: 0
+  - choose:
+      # --- CM is driving into a free session: get it out of Predbat's way ---
+      - conditions:
+          - condition: state
+            entity_id: binary_sensor.octoplus_power_up_active
+            state: "on"
+          - condition: state
+            entity_id: input_boolean.curtailment_manager_enable
+            state: "on"
+          - condition: state
+            entity_id: input_select.sig_override
+            state: "Off"
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: input_select.sig_dispatch_policy
+                state: "Predbat"
+        sequence:
           - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.power_up_cm_stood_down
+          - action: input_boolean.turn_off
             target:
               entity_id: input_boolean.curtailment_manager_enable
           - action: notify.mobile_app_andrew_iphone
             data:
-              title: "Power Up — recovered after restart"
+              title: "Power Up — CM stood down"
               message: >-
-                HA restarted while the plant was importing. Setpoint reset to 0
-                and CM re-enabled. Pre-window owner could not be recovered —
-                check the override and the Predbat mappers if they were not CM's.
-      - stop: "Recovery path complete"
+                Free session open with CM driving
+                ({{ states('input_select.sig_dispatch_policy') }}). CM switched off
+                for the window; Predbat should start charging within ~10 min.
+                SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%.
 
-  # --- WINDOW OPEN ---
-  # Gate. Mandatory once the /5 sweep exists: the sweep fires regardless of the
-  # window, so without this the automation would stand the owner down every 5
-  # minutes all day.
-  - condition: state
-    entity_id: binary_sensor.octoplus_power_up_active
-    state: "on"
+      # --- Window closed and a restore is owed: put CM back ---
+      - conditions:
+          - condition: state
+            entity_id: binary_sensor.octoplus_power_up_active
+            state: "off"
+          - condition: state
+            entity_id: input_boolean.power_up_cm_stood_down
+            state: "on"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.curtailment_manager_enable
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.power_up_cm_stood_down
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "Power Up — finished"
+              message: >-
+                SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%.
+                CM switched back on.
 
-  # 1. Capture who is driving, BEFORE anything is changed. This is what makes
-  #    the handback symmetric rather than a guess.
-  - variables:
-      prev_override: "{{ states('input_select.sig_override') }}"
-      prev_cm_on: "{{ is_state('input_boolean.curtailment_manager_enable', 'on') }}"
-      prev_mappers_on: "{{ is_state('automation.predbat_requested_mode_action', 'on') }}"
-
-  # 2. Take the wheel. Override first: it outranks the select.
-  - action: input_select.select_option
-    target:
-      entity_id: input_select.sig_override
-    data:
-      option: "Off"
-  - action: input_boolean.turn_off
-    target:
-      entity_id: input_boolean.curtailment_manager_enable
-  # 3. Silence the heartbeat NOW rather than waiting up to 5 min for CM's own
-  #    handback cycle — the window is only an hour.
-  - action: input_select.select_option
-    target:
-      entity_id: input_select.sig_dispatch_policy
-    data:
-      option: "Predbat"
-  # 4. Stop Predbat becoming the second writer. Deliberately NOT via
-  #    predbat_set_read_only: changing that forces a full inverter reset to
-  #    defaults.
-  - action: automation.turn_off
-    target:
-      entity_id:
-        - automation.predbat_requested_mode_action
-        - automation.predbat_max_charging_limit_action
-        - automation.predbat_max_discharging_limit_action
-    data:
-      stop_actions: true
-
-  # 5. Command the import. Negative = draw from grid. The plant clamps to the
-  #    8.8 kW ESS charge limit and the 6.6 kW AC rating, so this asks for the
-  #    maximum and lets hardware decide — same pattern as Max Export's 6.6.
-  - action: number.set_value
-    target:
-      entity_id: number.sigen_plant_active_power_fixed_adjustment
-    data:
-      value: -6.6
-
-  # 6. Report what ACTUALLY happened, two minutes in. If import is still 0.000
-  #    something is writing over us and that needs to be known at 14:02, not 15:00.
-  - delay:
-      minutes: 2
-  - action: notify.mobile_app_andrew_iphone
-    data:
-      title: "Power Up — charging"
-      message: >-
-        import {{ states('sensor.sigen_plant_grid_import_power') }} kW ·
-        battery {{ states('sensor.sigen_plant_battery_power') }} kW ·
-        SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}% ·
-        setpoint {{ states('number.sigen_plant_active_power_fixed_adjustment') }}
-        {{ '— WARNING: not importing, something is overwriting the setpoint'
-           if (states('sensor.sigen_plant_grid_import_power') | float(0)) < 0.5 else '' }}
-
-  # 7. Hold until the window closes. The timeout is the belt to the wait's
-  #    braces: if the sensor never goes off the run still reverts.
-  - wait_for_trigger:
-      - trigger: state
-        entity_id: binary_sensor.octoplus_power_up_active
-        to: "off"
-    timeout:
-      minutes: 70
-    continue_on_timeout: true
-
-  # --- WINDOW CLOSED: hand back to whoever had it ---
-  - action: number.set_value
-    target:
-      entity_id: number.sigen_plant_active_power_fixed_adjustment
-    data:
-      value: 0
-
-  # Restore the mappers only if they were on when we arrived. If CM was driving
-  # they were already off, and turning them on here would hand Predbat the
-  # registers for the seconds before CM's mutex disabled them again.
-  - if:
-      - condition: template
-        value_template: "{{ prev_mappers_on }}"
-    then:
-      - action: automation.turn_on
-        target:
-          entity_id:
-            - automation.predbat_requested_mode_action
-            - automation.predbat_max_charging_limit_action
-            - automation.predbat_max_discharging_limit_action
-
-  - if:
-      - condition: template
-        value_template: "{{ prev_cm_on }}"
-    then:
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.curtailment_manager_enable
-
-  # Restore the human's override last, so it lands after the machinery is back.
-  - if:
-      - condition: template
-        value_template: "{{ prev_override not in ['Off', 'unknown', 'unavailable', ''] }}"
-    then:
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.sig_override
-        data:
-          option: "{{ prev_override }}"
-
-  - action: notify.mobile_app_andrew_iphone
-    data:
-      title: "Power Up — finished"
-      message: >-
-        SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%.
-        Setpoint reset. Handed back to {{ 'CM' if prev_cm_on else 'Predbat' }}
-        {{ '(override ' ~ prev_override ~ ' restored)'
-           if prev_override not in ['Off', 'unknown', 'unavailable', ''] else '' }}.
+      # --- Ten minutes in and the free hour is not being used: say so, once ---
+      - conditions:
+          - condition: trigger
+            id: ten_minutes_in
+          - condition: state
+            entity_id: binary_sensor.octoplus_power_up_active
+            state: "on"
+          - condition: numeric_state
+            entity_id: sensor.sigen_plant_grid_import_power
+            below: 0.5
+          - condition: numeric_state
+            entity_id: sensor.sigen_plant_battery_state_of_charge
+            below: 95
+        sequence:
+          - action: notify.mobile_app_andrew_iphone
+            data:
+              title: "Power Up — NOT importing"
+              message: >-
+                10 min into a free session and import is
+                {{ states('sensor.sigen_plant_grid_import_power') }} kW.
+                SOC {{ states('sensor.sigen_plant_battery_state_of_charge') }}%,
+                EMS {{ states('select.sigen_plant_remote_ems_control_mode') }},
+                Predbat wants {{ states('input_select.predbat_requested_mode') }},
+                policy {{ states('input_select.sig_dispatch_policy') }}.
