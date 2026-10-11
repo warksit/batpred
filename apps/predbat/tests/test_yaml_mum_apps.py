@@ -38,10 +38,20 @@ RETIRED_BINARY_SENSOR = "binary_sensor.octopus_energy_a_4ba7c915_octoplus_saving
 RETIRED_CALENDAR = "calendar.octopus_energy_a_4ba7c915_octoplus_saving_sessions"
 
 
+class _MirrorLoader(yaml.SafeLoader):
+    """SafeLoader that understands `!secret name`, as Predbat's own loader does.
+
+    Here it resolves to a marker, never a value: the repo has no secrets.yaml, and the
+    tests only need to know THAT a key is a reference and to which name."""
+
+
+_MirrorLoader.add_constructor("!secret", lambda loader, node: "!secret " + loader.construct_scalar(node))
+
+
 def _load():
     """Parse the mirrored config with PyYAML, which is what Predbat itself uses."""
     with open(APPS_YAML) as handle:
-        return yaml.safe_load(handle)["pred_bat"]
+        return yaml.load(handle, Loader=_MirrorLoader)["pred_bat"]
 
 
 def _resolve(arg_value, entity_names):
@@ -148,11 +158,24 @@ def test_no_pointer_at_a_retired_octopus_entity():
         assert retired not in body, "config still references retired Octopus entity {!r} (removed in integration v19.0.0)".format(retired)
 
 
-def test_mcp_secret_is_redacted_in_the_repo_copy():
-    """This fork is public. The mirror must never carry the live MCP secret."""
+def test_mcp_secret_is_a_secret_reference():
+    """The MCP token must live in secrets.yaml, never in apps.yaml or this public repo.
+
+    Until 2026-10-11 the box carried the token inline and this mirror carried a
+    redaction marker, so the two files could never be identical. v9's credentials check
+    flagged it ("credential-like value(s) not using the !secret mechanism: mcp_secret").
+
+    TRAP when changing this: an unresolved `!secret` becomes None, and the MCP
+    component then falls back to its built-in default token, the literal string
+    "predbat_mcp_secret" - which is public. Add the entry to secrets.yaml on the box
+    BEFORE pointing apps.yaml at it. The secret is therefore named `mcp_secret`, not
+    `predbat_mcp_secret`, so a missing entry can never be mistaken for a working one.
+    """
     cfg = _load()
-    secret = cfg["mcp_secret"]
-    assert secret == "REDACTED-SEE-BOX", "mcp_secret in the repo mirror must be 'REDACTED-SEE-BOX', found {!r} — do not commit the live value".format(secret)
+    assert cfg["mcp_secret"] == "!secret mcp_secret", "mcp_secret must be `!secret mcp_secret`, found {!r} — never commit a token".format(cfg["mcp_secret"])
+    with open(APPS_YAML) as handle:
+        body = handle.read()
+    assert "REDACTED-SEE-BOX" not in body, "the redaction marker is obsolete - the mirror is now identical to the box"
 
 
 def run():
@@ -167,7 +190,7 @@ def run():
         test_charge_rate_limit_is_the_rated_charging_power,
         test_no_key_is_defined_twice,
         test_no_pointer_at_a_retired_octopus_entity,
-        test_mcp_secret_is_redacted_in_the_repo_copy,
+        test_mcp_secret_is_a_secret_reference,
     ):
         try:
             fn()

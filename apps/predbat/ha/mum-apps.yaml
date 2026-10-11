@@ -15,11 +15,12 @@
 # the copy makes it diverge from the box, which is the one thing it exists not to do. Validation
 # is not lost: tests/test_yaml_mum_apps.py parses it and guards the entity pointers.
 #
-# ONE DELIBERATE DIFFERENCE FROM THE BOX: `mcp_secret` is redacted (this fork is public).
-# Everything else is byte-identical. Verify with:
+# NO DIFFERENCE FROM THE BOX below this header. Since 2026-10-11 `mcp_secret` is a
+# `!secret mcp_secret` reference; the token itself lives in secrets.yaml on the box, which is
+# never mirrored. Verify with:
 #   ssh hassio@100.110.70.80 "cat /addon_configs/6adb4f0d_predbat/apps.yaml" \
 #     | diff - apps/predbat/ha/mum-apps.yaml
-# The only expected hunks are this header and the mcp_secret block.
+# The only expected hunk is this header.
 #
 # DUPLICATE KEYS: none, and it must stay that way. `sig_discharge_cut_off_soc` used to be defined
 # three times (same value). PyYAML, which Predbat loads the config with, takes the last one
@@ -472,10 +473,7 @@ pred_bat:
   temperature_enable: True
   
   mcp_enable: True
-  # REDACTED IN REPO. This fork is public; the real value lives only in the box copy at
-  # /addon_configs/6adb4f0d_predbat/apps.yaml. This is the ONE value where the repo copy is
-  # deliberately not identical to the box — see the header note at the top of this file.
-  mcp_secret: 'REDACTED-SEE-BOX'
+  mcp_secret: !secret mcp_secret
   mcp_port: 8199
 
   # PredHeat — GSHP space-heating physics forecast (STANDALONE: not wired into load_forecast yet)
