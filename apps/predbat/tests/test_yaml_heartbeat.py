@@ -468,7 +468,8 @@ def test_self_heal_cannot_stomp_predbat_own_modes():
     """The other half, and the reason this is safe.
 
     `predbat_requested_mode_action` only ever selects Maximum Self Consumption,
-    Command Charging (Grid First), or Command Discharging (PV First) — it never
+    Command Charging (PV First) [Grid First before 2026-10-11], or Command
+    Discharging (PV First) — it never
     selects PCS Remote Control, which is the heartbeat's own mode. So keying the
     self-heal on that value cannot fight Predbat.
 
@@ -477,7 +478,7 @@ def test_self_heal_cannot_stomp_predbat_own_modes():
     Predbat had just commanded Charging/Discharging — so Predbat's mode was
     reverted within a minute and enabling the mapper achieved nothing.
     """
-    for mode in ("Command Charging (Grid First)", "Command Discharging (PV First)"):
+    for mode in ("Command Charging (PV First)", "Command Charging (Grid First)", "Command Discharging (PV First)"):
         assert _msc_write_fires("beat", mode) is False, "the beat must NOT revert Predbat's own {!r}".format(mode)
         assert _msc_write_fires("override_change", mode) is False, "an override change must NOT revert Predbat's own {!r}".format(mode)
         # The deliberate handback is still allowed to park in MSC (RD2).
