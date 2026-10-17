@@ -494,34 +494,34 @@ pred_bat:
     heating_energy: sensor.heat_pump_energy_meter_energy    # includes DHW; stats-only while standalone
     heating_active: binary_sensor.heat_pump_running         # threshold helper: meter power > 500 W
     smart_thermostat: False    # real system is dumb; timer blocks pre-06:00 running anyway
-    heat_cop: 3.5              # 11 kW thermal / ~3.1 kW electric measured
+    heat_cop: 4.5              # Dimplex SIH 11ME rated COP 4.5 at B0/W35; 9 kW / 4.5 = 2.0 kW electric (CH draw measured 1.85-2.14 kW, 2026-10-11)
     heat_pump_efficiency:      # flat — ground source, outdoor temp irrelevant.
       # MUST override EVERY default-table key: predheat MERGES this dict into the
       # default ASHP curve (then interpolates gaps) — a sparse table left default
       # dips between anchors and max=4.3 skewed cop_adjust (seen live 2026-07-13)
-      -20: 3.5
-      -18: 3.5
-      -16: 3.5
-      -14: 3.5
-      -12: 3.5
-      -10: 3.5
-      -8: 3.5
-      -6: 3.5
-      -4: 3.5
-      -2: 3.5
-      0: 3.5
-      2: 3.5
-      4: 3.5
-      6: 3.5
-      8: 3.5
-      10: 3.5
-      12: 3.5
-      14: 3.5
-      16: 3.5
-      18: 3.5
-      20: 3.5
-    heat_max_power: 11000      # thermal W; min==max models fixed-output on/off GSHP
-    heat_min_power: 11000
+      -20: 4.5
+      -18: 4.5
+      -16: 4.5
+      -14: 4.5
+      -12: 4.5
+      -10: 4.5
+      -8: 4.5
+      -6: 4.5
+      -4: 4.5
+      -2: 4.5
+      0: 4.5
+      2: 4.5
+      4: 4.5
+      6: 4.5
+      8: 4.5
+      10: 4.5
+      12: 4.5
+      14: 4.5
+      16: 4.5
+      18: 4.5
+      20: 4.5
+    heat_max_power: 9000       # thermal W; min==max models fixed-output on/off GSHP. 9 kW x COP 4.5 -> 2.0 kW in
+    heat_min_power: 9000
     flow_temp: 35              # PLACEHOLDER — read real value off GSHP display next visit
     flow_difference_target: 5
     heat_loss_watts: 130       # Mar 2026: 426 kWh elec x 3.5 COP / 31d ≈ 2.0 kW at dT≈15C
