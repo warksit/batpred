@@ -523,6 +523,25 @@ load_forecast_only). Widen fit beyond 04-08 to day/evening, heating-season days 
 backtest first, clip at >= 0. Retire the keep/weight boosts once it works; revisit
 best_soc_keep 4.0. PredHeat stays display-only (room-stat model vs return-temp WPM —
 manual in .claude/reference/). LoadML (has temperature feature) revisit late Nov.
+Fit done 2026-10-18 (66 heating days, 26 Feb-26 Apr + 11-17 Oct, Open-Meteo actuals,
+leave-one-out): DAILY kWh = HDD(15.5) + daily wind + daily solar → LOO-R² 0.78, MAE 1.5 kWh on
+mean 10.9 (HDD alone 0.57; the plugin's morning features on the daily target 0.29). Base 15.5
+is chosen, not fitted (in-season temps never reach it); its 2.1 kWh intercept matches summer
+DHW-only days. Coefficients ≈ 1.31 kWh/HDD, +0.14 per km/h wind, −0.020 per W/m² mean solar.
+Use this for the daily total; spread it over the day by the hourly shape (hourly LTS kept).
+Scripts: scratchpad only — rebuild from this note.
+
+## Parked 2026-10-18 — cold-weather plugin: add previous-day solar to the morning model
+Same fit: 04-08 kWh with the plugin's own features (temp 20-03, wind 12-03, drop) LOO-R² 0.61;
+adding previous-day mean solar radiation → 0.70, MAE 0.66 → 0.57 kWh. Degree days alone are
+WORSE for the morning (0.48), so keep the plugin's features and add solar. Sunny day = warm slab
+= smaller warm-up. Open-Meteo archive has `shortwave_radiation`.
+
+## Parked 2026-10-18 — HA records nothing long-term for the heating-season flag
+`input_boolean.gshp_ch_active` has no long-term stats, and raw history keeps ~10 days (oldest row
+10-08). The spring switch-off date is lost — the fit had to infer 26 Apr from daily kWh. Fix:
+a template sensor 1/0 from it with `state_class: measurement`, so hourly means persist. Same for
+any WPM Modbus entities when they land: temps `measurement`, energy/heat `total_increasing`.
 
 ## Open 2026-10-18 — should CM take the wheel during a FREE session?
 12:05:21 CM `PHASE off -> active` (overflow 3.5 kWh, floor 100%) mid Power Up session while
