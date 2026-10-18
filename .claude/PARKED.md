@@ -542,6 +542,10 @@ WORSE for the morning (0.48), so keep the plugin's features and add solar. Sunny
 10-08). The spring switch-off date is lost — the fit had to infer 26 Apr from daily kWh. Fix:
 a template sensor 1/0 from it with `state_class: measurement`, so hourly means persist. Same for
 any WPM Modbus entities when they land: temps `measurement`, energy/heat `total_increasing`.
+Andrew 2026-10-18: Modbus will report summer/winter itself — operating mode register 142/222
+(column TBD, see the GSHP Modbus memory note). Define it as a NUMERIC sensor with
+`state_class: measurement` so the mode persists long-term; it can then replace the manual
+`gshp_ch_active` flag in cold_weather_plugin. Interim template sensor only if Modbus slips.
 
 ## Open 2026-10-18 — should CM take the wheel during a FREE session?
 12:05:21 CM `PHASE off -> active` (overflow 3.5 kWh, floor 100%) mid Power Up session while
