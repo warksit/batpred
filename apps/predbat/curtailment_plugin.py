@@ -3380,6 +3380,18 @@ class CurtailmentPlugin(PredBatPlugin):
                 self._log_once("neutralise_err", "Curtailment: failed to neutralise {}: {}".format(entity, e))
         self.log("Curtailment: Predbat neutralised (mode=Demand, rates={:.0f}/{:.0f} W) before taking control".format(rated_d * 1000, rated_c * 1000))
 
+    def _forget_predbat_sent_commands(self):
+        """Clear Predbat's record of service calls already made (RD54).
+
+        `call_service_template` skips a mode service whose hash matches the last one
+        sent. Live 2026-10-18 12:10-13:00: CM had switched the helper to Demand, Predbat
+        still wanted Charging, logged "Skipped service charge_start_service ... as it
+        was previously called" every cycle, and lost 55 min of a free session."""
+        sent = getattr(self.base, "last_service_hash", None)
+        if isinstance(sent, dict):
+            sent.clear()
+            self.log("Curtailment: cleared Predbat's sent-command record so it re-sends its mode")
+
     def _float_state(self, entity, default):
         """Read a numeric entity state, falling back on unknown/unavailable."""
         try:
@@ -3432,9 +3444,15 @@ class CurtailmentPlugin(PredBatPlugin):
         Order (RD2/RD6/RD10): swap the writer role (heartbeat off, mapper on), park
         EMS-MSC, set policy Predbat, reset the sell floor, then clear read_only so
         Predbat resumes. The mapper must be live BEFORE read_only clears, or
-        Predbat's first requested_mode change lands with nothing listening."""
+        Predbat's first requested_mode change lands with nothing listening.
+
+        RD54: `_neutralise_predbat` rewrote Predbat's mode helper behind its back,
+        but Predbat still remembers the command it last sent and skips resending
+        it. Forget that record, as Predbat's own reset_inverter does, so its next
+        cycle re-sends the mode it wants."""
         self._set_writer(cm_driving=False)
         self._park_ems_msc()
+        self._forget_predbat_sent_commands()
         self._set_policy(POLICY_PREDBAT)
         self._set_keep_floor(DEFAULT_KEEP_FLOOR_PCT)
         if self._read_only_set:

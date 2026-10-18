@@ -236,6 +236,64 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Open
 
+- **[2026-10-17] R26 (sunny-day keep reduction) is dead in production.** It runs in
+  `on_before_plan`, before `calculate_plan` fills `pv_forecast_minute_step`, and
+  Predbat clears that forecast at the end of every cycle unless debug is on. So it
+  always returns `no_pv_forecast`. Masked all summer because the keep was 0 anyway.
+  It matters now that the keep is 4.0. The Status index lists R26 as IN FORCE.
+
+- **[2026-10-17] PredHeat: the GSHP runs at 04:31 every day, but the model's day
+  period starts at 06:00.** The heat pump ran at 04:31 every morning from 10-13 to
+  10-17, for 21-62 min (longer on colder nights, so likely CH, not DHW). The tod helper
+  `binary_sensor.predheat_day_period` is 06:00-22:00 and the night target is 12, so
+  PredHeat forecasts nothing before 06:00. That is the run that drains the battery
+  overnight. The apps.yaml comment "timer blocks pre-06:00 running anyway" is wrong.
+  Fix candidate: day period from 04:30. Not done; needs Andrew's OK.
+- **[2026-10-17] PredHeat `heat_loss_watts: 130` was derived with COP 3.5.** With
+  COP 4.5 (984d2a1a), the same March meter data implies ~1.29x the heat (≈167). Not
+  changed; recalibrate against the cooling curve alongside it.
+- **[2026-10-17] PredHeat still has no DHW.** ~2 kWh at 13:09 daily on the same
+  meter; needs a fixed-schedule adder before `load_forecast` wiring.
+
+- **[2026-10-17] apps.yaml `reserve:` points at the wrong register vs upstream.**
+  Ours is `number.sigen_plant_ess_backup_state_of_charge` (40046), which proved
+  inert tonight. Upstream `templates/sigenergy_sigenstor.yaml` uses
+  `number.sigen_plant_ess_discharge_cut_off_state_of_charge` (40048). The Sigen
+  Modbus protocol V2.9 (local clone `~/Documents/code/Sigenergy-Local-Modbus`)
+  lists 40046-40048 with no semantics at all; the integration's code and issues
+  say nothing either. Harmless today, because has_reserve_soc is False and
+  Predbat only reads it. Decide: repoint, or leave it with a comment. Don't
+  enable has_reserve_soc onto 40048 without the R-rules: a cut-off above SoC
+  grid-charges in MSC (sig-control.md), and #4375.
+  **Cut-off retested DC-coupled, 2026-10-17 21:18 BST** (MSC, PV 0, load ~1.0 kW):
+  cut-off set to 50.7 with SoC 50.9. At 21:19:23 SoC reached 50.7: battery went
+  from -1.13 kW to 0.0 within 10 s, grid from 0.0 to +1.08 kW (import), steady for
+  2.5 min. Restored to 0.0 at 21:22 (read-back 0.0): a 10 s transient of -2.96 kW
+  battery and -0.64 kW grid (export), then normal (-0.92 kW battery, grid 0). So
+  it IS a working hard floor that hands the load to the grid, i.e. the reserve
+  semantics Predbat expects. Untested: cut-off above SoC (grid-charge, per the
+  AC-era notes) and whether PV still charges above the floor (needs daylight).
+
+- **[2026-10-17] SIG backup-SOC reserve test RUN: reserve IGNORED (DC-coupled).**
+  20:20 BST, PV 0, Remote EMS = Maximum Self Consumption, status Demand, policy
+  Predbat. Backup SOC set to 54.0 with SoC 54.3. SoC passed 54.0 (20:24:48), 53.9
+  (20:26:53), 53.8 (20:28:58) with battery steady at -0.50 kW and grid 0.0. No
+  stop. Restored to 0.0 at ~20:30 (read-back 0.0). The SoC+3 grid-charge step
+  was skipped to avoid import at 24p. So `has_reserve_soc: true` is NOT a lever
+  in MSC remote-EMS mode. Untested: whether it applies in other EMS modes or
+  only on grid loss. The SoC floor has to come from best_soc_keep/min (plan) or
+  discharge cut-off / discharge limit 0 (execution).
+
+- **[2026-10-17] v9 plans twice per 5 min (xx:x0:20 and xx:x0:55).** Each SIG
+  hold at target (Freeze Charging, discharge limit 0) is undone by the :55 replan,
+  which lowers the target ~1% and requests Demand again. On v8.46.4 (2026-10-08)
+  the flips were ~5 min apart. Find what triggers the second run; it may halve
+  every hold on the SIG.
+- **[2026-10-17] Stock "Hold charging" with SoC above target has no stop on the
+  SIG** (`has_reserve_soc` and `has_timed_pause` are both False; `execute.py`
+  "Else we will be holding on reserve"). It discharges freely until SoC reaches
+  target. Behaviour identical on v8.46.4 (10-08) and v9.3.7 (10-17).
+
 - **[2026-08-26] STRATEGIC: Predbat already prices curtailment — it just cannot see
   it.** Andrew: "the more we tweak CM, the more I wish Predbat understood
   curtailment cost." The investigation says that wish is cheaper to grant than it
@@ -456,3 +514,19 @@ Format: `- [date] finding — why it might matter — evidence`
   failed gate, caught 3 real issues on day one), pre-push hook runs 15 suites
   (`72d8d64d`), orphan-test guard (`baca17df`). Both hooks copied to
   `.claude/hooks/`; `.git/hooks` is untracked so a fresh clone needs re-install.
+
+## Parked 2026-10-18 — cold-weather plugin: feed GSHP energy into load_forecast, not keep/weight
+Andrew: "park for now". Proposal: cold_weather_plugin publishes a per-slot additive kWh delta
+(weather-fit GSHP energy minus what history already carries), wired as
+`load_forecast: <sensor>$external` (fetch.py adds load_forecast on top of history unless
+load_forecast_only). Widen fit beyond 04-08 to day/evening, heating-season days only,
+backtest first, clip at >= 0. Retire the keep/weight boosts once it works; revisit
+best_soc_keep 4.0. PredHeat stays display-only (room-stat model vs return-temp WPM —
+manual in .claude/reference/). LoadML (has temperature feature) revisit late Nov.
+
+## Open 2026-10-18 — should CM take the wheel during a FREE session?
+12:05:21 CM `PHASE off -> active` (overflow 3.5 kWh, floor 100%) mid Power Up session while
+Predbat grid-charged at 8.8 kW; handed back 12:10:30. RD53 keeps CM out of SAVING sessions
+only. CM's argument (filling to 100% from grid just before a 3.5 kWh-overflow afternoon only
+displaces PV that would be curtailed) is not obviously wrong, but a 5-minute grab decides
+nothing. Andrew's call. The hand-back half is fixed as RD54.

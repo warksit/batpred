@@ -8365,6 +8365,51 @@ def test_rd53_restart_mid_session_adopts_the_live_mutex():
     print("  test_rd53_restart_mid_session_adopts_the_live_mutex: PASSED")
 
 
+def _rd54_take_then_hand_back(acting_on_release):
+    """Drive one CM take-over and hand-back with Predbat's dedupe record populated.
+
+    The record is what Predbat holds after sending Charging at the start of a free
+    session: one hash per domain. `acting_on_release` picks which of the two
+    release paths runs (window end while acting, or the observe-only release)."""
+    base = MockBase()
+    base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "on"
+    base.last_service_hash = {"charge": 1111, "discharge": 2222}
+    plugin = CurtailmentPlugin(base)
+    plugin._charge_below, plugin._drain_above = 2.0, 14.0
+    plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert plugin._cm_controlling, "precondition: CM must have taken the wheel"
+    neutralised = [s for s in base.services if s[1].get("entity_id") == "input_select.predbat_requested_mode"]
+    assert neutralised and neutralised[-1][1].get("option") == "Demand", f"precondition: take-over rewrites Predbat's mode to Demand, got {neutralised}"
+    if acting_on_release:
+        plugin._publish_dispatch_policy(False, floor_kwh=18.08, soc_kwh=10.0, soc_max=18.08)
+    else:
+        base._sensor_overrides["input_boolean.sig_plugin_policy_control"] = "off"
+        plugin._publish_dispatch_policy(True, floor_kwh=8.0, soc_kwh=8.0, soc_max=18.08)
+    assert not plugin._cm_controlling, "precondition: CM must have handed back"
+    return base
+
+
+def test_rd54_handback_forgets_sent_commands():
+    """Replays 2026-10-18 12:05-13:00. CM took the wheel mid free session and its
+    take-over rewrote Predbat's requested mode Charging -> Demand. At the 12:10
+    hand-back Predbat still wanted Charging, but its dedupe record said Charging had
+    already been sent, so every cycle to 13:00 logged "Skipped service
+    charge_start_service ... as it was previously called". The mode mapper only acts
+    on a change, the helper stayed Demand, and 55 min of free import was lost.
+    The hand-back must empty the record so Predbat's next cycle re-sends its mode."""
+    base = _rd54_take_then_hand_back(acting_on_release=True)
+    assert base.last_service_hash == {}, f"hand-back must clear Predbat's dedupe record, got {base.last_service_hash}"
+    print("  test_rd54_handback_forgets_sent_commands: PASSED")
+
+
+def test_rd54_observe_only_release_forgets_too():
+    """The other release path (gate switched off while CM drives) hands back the
+    same plant with the same rewritten mode, so it must clear the record as well."""
+    base = _rd54_take_then_hand_back(acting_on_release=False)
+    assert base.last_service_hash == {}, f"observe-only release must clear Predbat's dedupe record, got {base.last_service_hash}"
+    print("  test_rd54_observe_only_release_forgets_too: PASSED")
+
+
 # ---------------------------------------------------------------------------
 # RD51 — the stand-down buffer never exceeds the overflow it defends
 # ---------------------------------------------------------------------------
@@ -10281,6 +10326,8 @@ def run_curtailment_tests(my_predbat=None):
         test_rd53_incumbent_keeps_the_wheel_through_a_session,
         test_rd53_session_only_intentions_do_not_take_the_wheel,
         test_rd53_restart_mid_session_adopts_the_live_mutex,
+        test_rd54_handback_forgets_sent_commands,
+        test_rd54_observe_only_release_forgets_too,
         test_r63_floor_is_the_dawn_reserve_not_the_deep_floor,
         test_r63_does_not_engage_below_the_dawn_reserve,
         test_r63_still_fires_above_the_dawn_reserve,

@@ -87,6 +87,7 @@ REQUIREMENTS = [
     ("RD51", "stand-down buffer never exceeds the overflow it defends", r"overflow_poses_no_risk"),
     ("RD52", "below the sell floor Max Export dispatches as Hold", r"\[pv, load\] \| max if \(soc <= floor and p == 'Max Export'\)"),
     ("RD53", "a session keeps the wheel, never takes it", r"_cm_holds_the_wheel"),
+    ("RD54", "hand-back makes Predbat re-send its mode", r"_forget_predbat_sent_commands"),
 ]
 
 
