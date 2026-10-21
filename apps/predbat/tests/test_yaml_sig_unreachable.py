@@ -161,30 +161,72 @@ def test_power_cut_and_network_fault_are_told_apart():
 
 
 def _state_gate(auto):
-    """The native state condition that gates the notify."""
+    """The gate that holds the notify: a condition step whose leaves are all
+    native state conditions (an `and` of one `or` per entity)."""
     for step in _actions(auto):
-        if isinstance(step, dict) and step.get("condition") == "state":
+        if isinstance(step, dict) and step.get("condition") in ("state", "and"):
             return step
-    raise AssertionError("no native state condition found")
+    raise AssertionError("no native state gate found")
+
+
+def _state_leaves(node):
+    """Every native state condition under a condition tree."""
+    if node.get("condition") == "state":
+        return [node]
+    leaves = []
+    for child in node.get("conditions", []):
+        leaves.extend(_state_leaves(child))
+    return leaves
+
+
+def _gate_passes(gate, dark_for):
+    """Evaluate the gate the way HA does. dark_for maps entity -> (state, minutes
+    held). A leaf passes when the entity is in its one state for at least `for`."""
+    kind = gate.get("condition")
+    if kind == "state":
+        ids = gate["entity_id"] if isinstance(gate["entity_id"], list) else [gate["entity_id"]]
+        return all(dark_for[e][0] == gate["state"] and dark_for[e][1] >= gate["for"]["minutes"] for e in ids)
+    results = [_gate_passes(c, dark_for) for c in gate["conditions"]]
+    return all(results) if kind == "and" else any(results)
+
+
+def test_gate_loads_in_ha():
+    """HA rejects `for:` with a list of states ("Cannot use 'for' with a list of
+    states"), and an automation that fails schema validation never loads — the
+    alert sat dead behind a repair from 2026-10-15. Every state leaf with `for:`
+    must name ONE state."""
+    for leaf in _state_leaves(_state_gate(_load())):
+        if "for" in leaf:
+            assert isinstance(leaf["state"], str), f"`for:` needs a single state, got {leaf['state']}"
+    print("  test_gate_loads_in_ha: PASSED")
 
 
 def test_short_blip_does_not_alert():
     """The /15 sweep has no `for:`, so the duration gate lives in the condition.
     A 2-minute integration reload must not page."""
     gate = _state_gate(_load())
-    assert gate["for"]["minutes"] >= 5, f"gate must require >= 5 min, got {gate['for']}"
+    for_minutes = {leaf["for"]["minutes"] for leaf in _state_leaves(gate)}
+    assert for_minutes == {5}, f"every leaf must require 5 min, got {for_minutes}"
+    assert not _gate_passes(gate, {e: ("unknown", 2) for e in (SOC, RUN, PV)}), "2-minute blip must not pass"
     settle = _actions(_load())[0]["then"][0]["delay"]["minutes"]
-    assert settle > gate["for"]["minutes"], f"restart settle ({settle}) must exceed the gate ({gate['for']['minutes']}) or the restart path can never satisfy it"
+    assert settle > 5, f"restart settle ({settle}) must exceed the gate (5) or the restart path can never satisfy it"
     print("  test_short_blip_does_not_alert: PASSED")
 
 
 def test_gate_is_native_and_requires_all_three():
-    """Native condition over a template: validated at config load rather than
-    failing silently at runtime. A list of entity_ids is ANDed by HA, which is
-    the all-dark-not-any rule."""
+    """Native conditions over a template: validated at config load rather than
+    failing silently at runtime. All three must be dark (unknown OR unavailable,
+    mixed across entities is fine); any one alive blocks it."""
     gate = _state_gate(_load())
-    assert set(gate["entity_id"]) == {SOC, RUN, PV}, gate["entity_id"]
-    assert set(gate["state"]) == {"unavailable", "unknown"}, gate["state"]
+    leaves = _state_leaves(gate)
+    assert {e for leaf in leaves for e in (leaf["entity_id"] if isinstance(leaf["entity_id"], list) else [leaf["entity_id"]])} == {SOC, RUN, PV}
+    assert {leaf["state"] for leaf in leaves} == {"unavailable", "unknown"}
+    assert _gate_passes(gate, {SOC: ("unknown", 9), RUN: ("unavailable", 9), PV: ("unknown", 9)}), "mixed dark must pass"
+    assert _gate_passes(gate, {e: ("unavailable", 9) for e in (SOC, RUN, PV)}), "all unavailable must pass"
+    for live_one in (SOC, RUN, PV):
+        states = {e: ("unknown", 9) for e in (SOC, RUN, PV)}
+        states[live_one] = ("63.0", 9)
+        assert not _gate_passes(gate, states), f"{live_one} alive must block the gate"
     templates = [s for s in _actions(_load()) if isinstance(s, dict) and s.get("condition") == "template"]
     assert not templates, f"gate must be native, found template conditions: {templates}"
     print("  test_gate_is_native_and_requires_all_three: PASSED")
@@ -229,6 +271,7 @@ def main():
         test_all_dark_is_required_not_any,
         test_healthy_plant_is_never_dark,
         test_power_cut_and_network_fault_are_told_apart,
+        test_gate_loads_in_ha,
         test_short_blip_does_not_alert,
         test_gate_is_native_and_requires_all_three,
         test_the_2026_08_15_outage_would_have_paged,

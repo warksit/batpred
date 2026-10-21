@@ -70,27 +70,60 @@ actions:
       - delay:
           minutes: 7
 
-  # Native state condition, not a template: validated at config load, and its
-  # `for:` gives the duration gate that the /15 sweep trigger lacks. A list of
-  # entity_ids is ANDed, which is the "all dark, not any" rule — one entity
-  # dropping out is Modbus jitter, and an alert that fires on noise trains us to
-  # ignore it. The restart settle above is 7 min so this 5 min is comfortably
-  # satisfied by the time it is evaluated.
+  # Native state conditions, not a template: validated at config load, and
+  # `for:` gives the duration gate that the /15 sweep trigger lacks. All three
+  # entities must be dark — one dropping out is Modbus jitter, and an alert that
+  # fires on noise trains us to ignore it. The restart settle above is 7 min so
+  # this 5 min is comfortably satisfied by the time it is evaluated.
+  #
+  # One `or` per entity, each leaf naming ONE state: HA rejects `for:` with a
+  # list of states ("Cannot use 'for' with a list of states"), and a schema
+  # failure stops the whole automation loading. That is how this alert sat dead
+  # behind a repair from 2026-10-15. Accepted side effect: an entity flipping
+  # unknown <-> unavailable restarts its 5-minute clock.
   #
   # Limitation, accepted: this matches entities that EXIST and read
   # unavailable/unknown, which is what a failed integration setup produces (the
   # registry keeps them and marks them unavailable). Entities removed from the
   # registry entirely would not match.
-  - condition: state
-    entity_id:
-      - sensor.sigen_plant_battery_state_of_charge
-      - sensor.sigen_plant_plant_running_state
-      - sensor.sigen_plant_pv_power
-    state:
-      - "unavailable"
-      - "unknown"
-    for:
-      minutes: 5
+  - condition: and
+    conditions:
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: sensor.sigen_plant_battery_state_of_charge
+            state: "unavailable"
+            for:
+              minutes: 5
+          - condition: state
+            entity_id: sensor.sigen_plant_battery_state_of_charge
+            state: "unknown"
+            for:
+              minutes: 5
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: sensor.sigen_plant_plant_running_state
+            state: "unavailable"
+            for:
+              minutes: 5
+          - condition: state
+            entity_id: sensor.sigen_plant_plant_running_state
+            state: "unknown"
+            for:
+              minutes: 5
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: sensor.sigen_plant_pv_power
+            state: "unavailable"
+            for:
+              minutes: 5
+          - condition: state
+            entity_id: sensor.sigen_plant_pv_power
+            state: "unknown"
+            for:
+              minutes: 5
 
   # Variables are evaluated TOP-DOWN and each may only reference those above it.
   # Do not reorder (a reordered variables block cost a 2-hour outage 2026-05-06).
