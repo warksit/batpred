@@ -553,3 +553,8 @@ Predbat grid-charged at 8.8 kW; handed back 12:10:30. RD53 keeps CM out of SAVIN
 only. CM's argument (filling to 100% from grid just before a 3.5 kWh-overflow afternoon only
 displaces PV that would be curtailed) is not obviously wrong, but a 5-minute grab decides
 nothing. Andrew's call. The hand-back half is fixed as RD54.
+
+## Parked 2026-10-21 — apps.yaml comment says the PredHeat indoor sensor is in the office
+`internal_temperature: sensor.gw1200a_indoor_temperature  # in the office — ...` — it is now in the
+hallway. Comment-only, but the mirror must stay byte-identical, and editing the box apps.yaml restarts
+Predbat (~3.5 min). Fold it into the next real apps.yaml change.
