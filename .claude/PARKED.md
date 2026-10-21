@@ -558,3 +558,15 @@ nothing. Andrew's call. The hand-back half is fixed as RD54.
 `internal_temperature: sensor.gw1200a_indoor_temperature  # in the office — ...` — it is now in the
 hallway. Comment-only, but the mirror must stay byte-identical, and editing the box apps.yaml restarts
 Predbat (~3.5 min). Fold it into the next real apps.yaml change.
+
+## Parked 2026-10-21 — upstream octopus.py day/night schedule drops a night across the clock change (blocks pushes until ~28 Oct)
+`async_get_day_night_rates` (octopus.py ~2010): with a pytz `local_tz` (production uses pytz,
+predbat.py:725), `normalize(local_base).replace(hour=0)` after the BST→GMT change turns 26 Oct
+00:00+01:00 into **25 Oct** 00:00+00:00. The 25 Oct night appears twice (00:30-05:30 BST and GMT),
+26 Oct is missing, and the 8-day schedule has 15 entries. Reproduced with a pinned clock: today
+→ 15, June/March/27 Oct → 16. The standard-library ZoneInfo path is fine. Fix: `local_tz.localize(datetime.combine(local_midnight.date()
++ timedelta(days=day), time()))`. Its test (test_octopus_url Test 1/7) pins `my_predbat.now_utc_exact`,
+which OctopusAPI never reads (component_base.py:276 uses the real clock), so it only fails during
+the clock-change window. Stock module — upstream issue/PR, not a site edit. Mum is probably not
+affected (rates come from the Octopus integration, not a standard-unit-rates URL) — unverified.
+Pre-push unit suite fails on this until the window passes (~28 Oct); commits since 10-21 are local only.
