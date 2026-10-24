@@ -442,27 +442,43 @@ pred_bat:
   #iboost_energy_scaling: 1.0
   
     # Tariff comparison feature
+  # Current = Cosy import + Outgoing Octopus (12p flat). FIT is generation-only, so export is on Outgoing.
+  # No EV, so Go / Intelligent Go are not eligible and are not compared. Intelligent Flux is left out:
+  # Octopus drives the battery on it, which Predbat cannot model (and would fight CM).
+  # Question being asked (2026-10-24): is Agile/Prime export better in WINTER? Summer stays on flat
+  # export because curtailment forces midday export whatever the price.
   dno_region: "B"
   compare_list:
     - id: 'current'
-      name: 'Current Tariff'
-    - id: 'cosy_outgoing'
-      name: 'Cosy + Outgoing'
-      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/COSY-22-12-08/electricity-tariffs/E-1R-COSY-22-12-08-{dno_region}/standard-unit-rates'
-      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/OUTGOING-FIX-12M-19-05-13/electricity-tariffs/E-1R-OUTGOING-FIX-12M-19-05-13-{dno_region}/standard-unit-rates'  
+      name: 'Current Tariff (Cosy + Outgoing 12p)'
+    - id: 'cosy_agile'
+      name: 'Cosy import/Agile Outgoing export'
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/COSY-22-12-08/electricity-tariffs/E-1R-COSY-22-12-08-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/AGILE-OUTGOING-19-05-13/electricity-tariffs/E-1R-AGILE-OUTGOING-19-05-13-{dno_region}/standard-unit-rates/'
+    - id: 'cosy_prime'
+      name: 'Cosy import/Prime Outgoing export (16p 4-7pm, 9p otherwise)'
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/COSY-22-12-08/electricity-tariffs/E-1R-COSY-22-12-08-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/OUTGOING-PRIME-FIX-12M-26-06-23/electricity-tariffs/E-1R-OUTGOING-PRIME-FIX-12M-26-06-23-{dno_region}/standard-unit-rates/'
+    - id: 'snug_outgoing'
+      name: 'Snug import/Outgoing export'
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/SNUG-24-11-07/electricity-tariffs/E-1R-SNUG-24-11-07-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/OUTGOING-VAR-24-10-26/electricity-tariffs/E-1R-OUTGOING-VAR-24-10-26-{dno_region}/standard-unit-rates/'
+    - id: 'snug_agile'
+      name: 'Snug import/Agile Outgoing export'
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/SNUG-24-11-07/electricity-tariffs/E-1R-SNUG-24-11-07-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/AGILE-OUTGOING-19-05-13/electricity-tariffs/E-1R-AGILE-OUTGOING-19-05-13-{dno_region}/standard-unit-rates/'
+    - id: 'agile_outgoing'
+      name: 'Agile import/Outgoing export'
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/AGILE-24-10-01/electricity-tariffs/E-1R-AGILE-24-10-01-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/OUTGOING-VAR-24-10-26/electricity-tariffs/E-1R-OUTGOING-VAR-24-10-26-{dno_region}/standard-unit-rates/'
+    - id: 'agile_agile'
+      name: 'Agile import/Agile Outgoing export'
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/AGILE-24-10-01/electricity-tariffs/E-1R-AGILE-24-10-01-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/AGILE-OUTGOING-19-05-13/electricity-tariffs/E-1R-AGILE-OUTGOING-19-05-13-{dno_region}/standard-unit-rates/'
     - id: 'flux'
       name: 'Flux import/Export'
-      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/FLUX-IMPORT-23-02-14/electricity-tariffs/E-1R-FLUX-IMPORT-23-02-14-{dno_region}/standard-unit-rates'
-      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/FLUX-EXPORT-23-02-14/electricity-tariffs/E-1R-FLUX-EXPORT-23-02-14-{dno_region}/standard-unit-rates'
-    - id: 'go_outgoing'
-      name: 'GO import/Outgoing export'
-      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/GO-VAR-22-10-14/electricity-tariffs/E-1R-GO-VAR-22-10-14-{dno_region}/standard-unit-rates/'
-      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/OUTGOING-VAR-24-10-26/electricity-tariffs/E-1R-OUTGOING-VAR-24-10-26-{dno_region}/standard-unit-rates/'
-    - id: 'go_noexport'
-      name: 'GO import/No export'
-      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/GO-VAR-22-10-14/electricity-tariffs/E-1R-GO-VAR-22-10-14-{dno_region}/standard-unit-rates/'
-      rates_export:
-        - rate: 0
+      rates_import_octopus_url: 'https://api.octopus.energy/v1/products/FLUX-IMPORT-23-02-14/electricity-tariffs/E-1R-FLUX-IMPORT-23-02-14-{dno_region}/standard-unit-rates/'
+      rates_export_octopus_url: 'https://api.octopus.energy/v1/products/FLUX-EXPORT-23-02-14/electricity-tariffs/E-1R-FLUX-EXPORT-23-02-14-{dno_region}/standard-unit-rates/'
   # ML Load Prediction
   load_ml_enable: False  # Disabled for summer 2026-05-06 — heat pump 21:30 phantom; days_previous averaging works fine for DHW + cooking patterns
   load_ml_source: True        # Start with False to observe predictions without affecting battery control
