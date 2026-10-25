@@ -8,6 +8,19 @@ Format: `- [date] finding — why it might matter — evidence`
 
 ## Live behaviour
 
+- [2026-10-25] CM's full-pack take-the-wheel runs Max Export, which SELLS the pack
+  and throttles PV — the opposite of curtailment management. With the pack at 100%
+  and a 0.1 kWh overflow forecast, CM flapped on/off four times 12:10-13:35 GMT
+  (RD51 hand-offs). Each active spell: Max Export dispatches 6.6 kW, the battery
+  discharges ~6.1 kW and PV is crowded out by the 6.6 kW AC limit — 13:33-13:35 PV
+  0.46 kW against ~5 kW either side (PV + discharge = 6.59 kW), export pinned at
+  3.43 kW. Pack 100% -> 97.3% in 5 min, sold at 12p inside the 13.46p Cosy window,
+  then refilled from PV under Predbat (PV back to 4.7-5.0 kW, battery +1.5-2.0,
+  grid ~0, nothing lost). So the active spells are the only time PV is lost. May
+  want Hold (max(pv, load)) rather than Max Export when CM takes a full pack on a
+  sub-1 kWh overflow. Evidence: HA history 2026-10-25 13:30-13:42 GMT; box log
+  `Curtailment: PHASE` 12:10/12:55/13:15/13:25/13:35.
+
 - **[2026-08-17] FIXED same day (`81c5112d`), NOT yet verified live.** RD41's
   session charge target did not reach the decision on an overflow-fits day: RD28's
   `no_drain` branch computed its target from the overnight reserve alone, so
