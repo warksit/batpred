@@ -583,3 +583,14 @@ which OctopusAPI never reads (component_base.py:276 uses the real clock), so it 
 the clock-change window. Stock module — upstream issue/PR, not a site edit. Mum is probably not
 affected (rates come from the Octopus integration, not a standard-unit-rates URL) — unverified.
 Pre-push unit suite fails on this until the window passes (~28 Oct); commits since 10-21 are local only.
+
+## Parked 2026-10-27 — Predbat mapper missed a write across the HA core restart; pack full, importing at peak
+Predbat set `input_number.discharge_rate` 0 → 9200 at 15:16 GMT (after CM's 13:25 Freeze), but
+`automation.predbat_max_discharging_limit_action` never ran (last_triggered 13:25; HA core restarted
+~15:37 — Predbat's websocket got 502s 15:37:24–15:38:05). `number.sigen_plant_ess_max_discharging_limit`
+stayed 0.0 while Predbat logged "current discharge rate 9660W" from the helper, so it never rewrote it.
+Result: 100% pack in MSC, ~0.9–2.5 kW grid import through the 16–19 peak until fixed by hand
+(`automation.trigger` on the mapper, 17:43; register 9.2, battery −1.4 kW). Same exposure on the
+charge-limit and requested-mode mappers. Fix candidate: a `homeassistant: start` trigger (plus a
+periodic sweep) on the three mappers so they re-sync register from helper; repo YAML + harness first.
+Also check why the 15:16 state change didn't trigger at all (shutdown already in progress?).
