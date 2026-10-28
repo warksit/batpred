@@ -188,6 +188,7 @@ Eddi
 eddis
 Eero
 efgh
+elec
 elif
 elinter
 eload

@@ -594,3 +594,11 @@ Result: 100% pack in MSC, ~0.9–2.5 kW grid import through the 16–19 peak unt
 charge-limit and requested-mode mappers. Fix candidate: a `homeassistant: start` trigger (plus a
 periodic sweep) on the three mappers so they re-sync register from helper; repo YAML + harness first.
 Also check why the 15:16 state change didn't trigger at all (shutdown already in progress?).
+
+## Parked 2026-10-28 — GSHP DHW/CH split (kept the existing `gshp_mode` set) has gaps
+
+Andrew chose the existing UI-helper split (`sensor.gshp_{dhw,heating}_electrical_power` -> energy -> `*_elec_today`) over a parallel one built 2026-10-27 (deleted). Not in the repo; known gaps, none urgent:
+- No idle bucket: pump-only (~46 W) and standby draw lands in neither, so DHW + heating < `sensor.gshp_daily`. Option: one template "GSHP other today" = gshp_daily − DHW − heating.
+- `float(0)` with no availability guard: Modbus/meter dark files the energy as 0 W (lost), not unknown.
+- DHW = compressor AND DHW pump, so DHW-pump run-on after the compressor stops counts as "Pumps only".
+- Record the helpers in `apps/predbat/ha/` with a Jinja harness if they ever feed Predbat.
