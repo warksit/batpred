@@ -178,6 +178,21 @@ def test_mcp_secret_is_a_secret_reference():
     assert "REDACTED-SEE-BOX" not in body, "the redaction marker is obsolete - the mirror is now identical to the box"
 
 
+def test_predheat_reads_the_modbus_heating_split():
+    """PredHeat's pump inputs must exclude the daily DHW reheat (2026-10-28).
+
+    The whole-pump meter counts the ~2 kWh 13:10 reheat as space heating, and a
+    "meter > 500 W" running flag seeds every forecast during the reheat with CH on.
+    The Modbus coils separate the two. `volume_temp` is the measured return water
+    temperature while the heating pump circulates, else PredHeat's own estimate
+    (UI template helper `sensor.gshp_volume_temp`).
+    """
+    predheat = _load()["predheat"]
+    assert predheat["heating_energy"] == "sensor.gshp_heating_electrical_energy", predheat["heating_energy"]
+    assert predheat["heating_active"] == "binary_sensor.gshp_heating_active", predheat["heating_active"]
+    assert predheat.get("volume_temp") == "sensor.gshp_volume_temp", predheat.get("volume_temp")
+
+
 def run():
     """Run the mirrored addon-config harness."""
     print("**** mum-apps.yaml (mirrored Predbat addon config) ****")
@@ -191,6 +206,7 @@ def run():
         test_no_key_is_defined_twice,
         test_no_pointer_at_a_retired_octopus_entity,
         test_mcp_secret_is_a_secret_reference,
+        test_predheat_reads_the_modbus_heating_split,
     ):
         try:
             fn()

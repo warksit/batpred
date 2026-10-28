@@ -507,8 +507,9 @@ pred_bat:
       - sensor.gw1200a_indoor_temperature   # in the office — slightly warm-biased vs rest of house
     weather: weather.forecast_home
     target_temperature: sensor.predheat_target_temperature  # template: day/night input_numbers via tod helper
-    heating_energy: sensor.heat_pump_energy_meter_energy    # includes DHW; stats-only while standalone
-    heating_active: binary_sensor.heat_pump_running         # threshold helper: meter power > 500 W
+    heating_energy: sensor.gshp_heating_electrical_energy   # Modbus split: CH only, excludes the DHW reheat (was the whole meter)
+    heating_active: binary_sensor.gshp_heating_active       # template: gshp_mode == Heating (was meter > 500 W, which fired on DHW)
+    volume_temp: sensor.gshp_volume_temp                    # template: return temp while the heating pump runs, else predheat.volume_temp
     smart_thermostat: False    # real system is dumb; timer blocks pre-06:00 running anyway
     heat_cop: 4.5              # Dimplex SIH 11ME rated COP 4.5 at B0/W35; 9 kW / 4.5 = 2.0 kW electric (CH draw measured 1.85-2.14 kW, 2026-10-11)
     heat_pump_efficiency:      # flat — ground source, outdoor temp irrelevant.
