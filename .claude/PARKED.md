@@ -602,3 +602,7 @@ Andrew chose the existing UI-helper split (`sensor.gshp_{dhw,heating}_electrical
 - `float(0)` with no availability guard: Modbus/meter dark files the energy as 0 W (lost), not unknown.
 - DHW = compressor AND DHW pump, so DHW-pump run-on after the compressor stops counts as "Pumps only".
 - Record the helpers in `apps/predbat/ha/` with a Jinja harness if they ever feed Predbat.
+
+## Parked 2026-10-28 — upstream: predheat.py reads `volume_temp` without `domain="predheat"`
+
+`predheat.py:575` `self.get_arg("volume_temp", self.get_arg("next_volume_temp", ...))` has no `domain="predheat"`, unlike every other PredHeat arg, so a `volume_temp` under `predheat:` is silently ignored. Workaround: key at top level of apps.yaml (guarded by test_yaml_mum_apps). Candidate one-line upstream PR. Also: `minute_data_age` is the MIN age over all four inputs, so pointing any input at a new entity drops PredHeat to 0 days and `get_historical` returns its default (target 20.0) until that entity has a day of history.

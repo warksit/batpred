@@ -186,11 +186,17 @@ def test_predheat_reads_the_modbus_heating_split():
     The Modbus coils separate the two. `volume_temp` is the measured return water
     temperature while the heating pump circulates, else PredHeat's own estimate
     (UI template helper `sensor.gshp_volume_temp`).
+
+    TRAP: predheat.py reads `volume_temp` WITHOUT domain="predheat", so it must sit at
+    the TOP level of pred_bat. Inside `predheat:` it is silently ignored (first deploy,
+    2026-10-28 08:22: log showed PredHeat's own 19.999 while the helper read 22.5).
     """
-    predheat = _load()["predheat"]
+    cfg = _load()
+    predheat = cfg["predheat"]
     assert predheat["heating_energy"] == "sensor.gshp_heating_electrical_energy", predheat["heating_energy"]
     assert predheat["heating_active"] == "binary_sensor.gshp_heating_active", predheat["heating_active"]
-    assert predheat.get("volume_temp") == "sensor.gshp_volume_temp", predheat.get("volume_temp")
+    assert cfg.get("volume_temp") == "sensor.gshp_volume_temp", cfg.get("volume_temp")
+    assert "volume_temp" not in predheat, "volume_temp inside predheat: is ignored by predheat.py"
 
 
 def run():

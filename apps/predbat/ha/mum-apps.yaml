@@ -496,6 +496,10 @@ pred_bat:
   # Setup interview + calibration notes 2026-07-08: .claude/plans/nested-wandering-gem.md
   # Placeholders to calibrate: flow_temp (read GSHP display), heat_volume (buffer label),
   # heat_loss_watts / heat_output / heat_loss_degrees (tune against real CH runs in season)
+  # PredHeat start-of-run water temperature. TOP LEVEL on purpose: predheat.py reads
+  # volume_temp without domain="predheat", so inside predheat: it is silently ignored.
+  # Template: return temp while the heating pump runs, else predheat.volume_temp.
+  volume_temp: sensor.gshp_volume_temp
   predheat:
     forecast_days: 2
     run_every: 5
@@ -509,7 +513,6 @@ pred_bat:
     target_temperature: sensor.predheat_target_temperature  # template: day/night input_numbers via tod helper
     heating_energy: sensor.gshp_heating_electrical_energy   # Modbus split: CH only, excludes the DHW reheat (was the whole meter)
     heating_active: binary_sensor.gshp_heating_active       # template: gshp_mode == Heating (was meter > 500 W, which fired on DHW)
-    volume_temp: sensor.gshp_volume_temp                    # template: return temp while the heating pump runs, else predheat.volume_temp
     smart_thermostat: False    # real system is dumb; timer blocks pre-06:00 running anyway
     heat_cop: 4.5              # Dimplex SIH 11ME rated COP 4.5 at B0/W35; 9 kW / 4.5 = 2.0 kW electric (CH draw measured 1.85-2.14 kW, 2026-10-11)
     heat_pump_efficiency:      # flat — ground source, outdoor temp irrelevant.
