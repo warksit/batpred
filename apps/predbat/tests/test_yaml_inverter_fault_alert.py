@@ -321,7 +321,7 @@ def test_live_meter_is_never_reported_dead():
     """The gag test. A jittering CT and a legitimately-zero grid must both stay
     silent — `Solar Charge Battery` targets zero grid flow BY DESIGN, so a
     value-based test would false-alarm every time it ran. Only staleness counts."""
-    for grid_age in (0, 5, 60, 599):
+    for grid_age in (0, 5, 60, 336, 359):  # 336 s = longest healthy flat 0.0 grid in 10 days to 2026-11-04
         ctx = _render_block(_actions(_load())[0]["variables"], _mock(running="Running", policy="Solar Charge Battery"), _ages(grid_age=grid_age, poll_age=1))
         assert ctx["meter_dead"] is False, f"grid {grid_age}s old is a live meter, not a fault"
         assert "METER DEAD" not in ctx["fault_type"], f"grid {grid_age}s old must not alert"
@@ -346,14 +346,30 @@ def test_trigger_and_variable_agree():
     trig_tmpl = _meter_trigger(_load())["value_template"]
     variables = _actions(_load())[0]["variables"]
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
-    for grid_age, poll_age in ((2175, 2), (5, 1), (3000, 3000), (601, 119), (599, 121), (700, 60)):
+    for grid_age, poll_age in ((2175, 2), (5, 1), (3000, 3000), (361, 119), (359, 121), (359, 1), (361, 1), (700, 60)):
         states = _mock(running="Running")
         ages = _ages(grid_age=grid_age, poll_age=poll_age)
         ctx = {"states": _States(states, ages), "is_state": lambda e, v: states.get(e) == v, "now": lambda: NOW}
         trig = env.from_string(trig_tmpl).render(**ctx).strip().lower() == "true"
         var = _render_block(variables, states, ages)["meter_dead"]
         assert trig == var, f"grid_age={grid_age} poll_age={poll_age}: trigger says {trig}, variable says {var}"
-    print("PASS  duplicate-logic: meter_stale trigger and meter_dead variable agree on all 6 cases")
+    print("PASS  duplicate-logic: meter_stale trigger and meter_dead variable agree on all 8 cases")
+
+
+def test_meter_declared_dead_at_six_minutes():
+    """The liveness threshold itself, pinned on both sides.
+
+    Lowered from 600 s on 2026-11-04 so the alert fires at 8 min (6 stale + 2 hold) not 12.
+    Longest healthy flat grid over the 10 days before was 5.6 min (336 s), always at 0.0.
+    """
+    variables = _actions(_load())[0]["variables"]
+    below = _render_block(variables, _mock(running="Running"), _ages(grid_age=359, poll_age=1))
+    above = _render_block(variables, _mock(running="Running"), _ages(grid_age=361, poll_age=1))
+    assert below["meter_dead"] is False, "359 s stale is below the threshold"
+    assert above["meter_dead"] is True, "361 s stale with a live poll is a dead meter"
+    trigger = _meter_trigger(_load())
+    assert trigger["for"] == {"minutes": 2}, f"the hold is what makes the total 8 min, got {trigger['for']}"
+    print("PASS  threshold: dead at 360 s stale, alert 8 min after the freeze")
 
 
 HOUSEHOLD_SERVICES = ("notify.mobile_app_iphone", "notify.mobile_app_shona_s_ipad")
@@ -474,6 +490,7 @@ def main():
         test_live_meter_is_never_reported_dead,
         test_stale_poll_is_not_blamed_on_the_meter,
         test_trigger_and_variable_agree,
+        test_meter_declared_dead_at_six_minutes,
         test_clamped_battery_is_not_reported_as_a_meter_fault,
         test_predbat_freeze_is_not_a_fault,
         test_intended_freeze_sends_no_notification_at_all,
